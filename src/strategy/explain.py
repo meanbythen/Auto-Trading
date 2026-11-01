@@ -1,0 +1,92 @@
+"""
+扫描解说（给人看的白话日志）
+功能：每次拉完K线、策略评估后，用一两句话说明「最新K线长什么样」以及「能不能开仓」。
+原理：只做展示，不改交易决策；形态用通用影线/实体描述，开仓结论直接复用 StrategyDecision。
+"""
+
+from __future__ import annotations
+
+from typing import Any
+
+import pandas as pd
+from loguru import logger
+
+from .indicators import detect_pinbar
+from .types import StrategyAction, StrategyDecision
+
+
+def _bar_shape(row: pd.Series) -> str:
+    """把一根 OHLC 说成人话：阴阳、影线比例、是否像 Pin。"""
+    o = float(row["open"])
+    h = float(row["high"])
+    lo = float(row["low"])
+    c = float(row["close"])
+    rng = max(h - lo, 1e-9)
+    body = abs(c - o)
+    up = h - max(o, c)
+    dn = min(o, c) - lo
+    candle = "阳线" if c > o else ("阴线" if c < o else "十字星")
+    pin = detect_pinbar(o, h, lo, c, wick_body_ratio=2.0, wick_range_ratio=0.55, max_opposite_wick_ratio=0.3)
+    if pin.side == "bull":
+        pin_txt = "形态≈看涨Pin(长下影)"
+    elif pin.side == "bear":
+        pin_txt = "形态≈看跌Pin(长上影)"
+    else:
+        pin_txt = "形态=普通K(非标准Pin)"
+    return (
+        f"{candle} O={o:.0f} H={h:.0f} L={lo:.0f} C={c:.0f} "
+        f"| 上影占{up/rng:.0%} 下影占{dn/rng:.0%} 实体占{body/rng:.0%} | {pin_txt}"
+    )
+
+
+def _entry_verdict(decision: StrategyDecision) -> str:
+    """是否符合开仓：直接翻译决策动作。"""
+    if decision.action == StrategyAction.BUY_OPEN:
+        return f"符合开仓条件 → 做多 | {decision.reason}"
+    if decision.action == StrategyAction.SELL_OPEN:
+        return f"符合开仓条件 → 做空 | {decision.reason}"
+    if decision.action == StrategyAction.CLOSE:
+        return f"持仓平仓信号（非新开仓）| {decision.reason}"
+    # HOLD：可能是空仓观望，也可能是持仓中继续拿着
+    reason = decision.reason or "无信号"
+    if "持有" in reason or "持仓" in reason or "trail" in reason.lower() or "止损" in reason:
+        return f"已有持仓，继续持有 | {reason}"
+    return f"不符合开仓条件（观望）| {reason}"
+
+
+def log_scan_brief(
+    symbol: str,
+    bars: pd.DataFrame | None,
+    decision: StrategyDecision,
+    strategy: Any,
+    *,
+    signal_tf: str = "15",
+) -> None:
+    """
+    打出扫描解说日志。
+
+    参数:
+        symbol: 合约
+        bars: 策略评估用的已收盘信号周期K线
+        decision: 本轮策略结论
+        strategy: 当前策略实例（保留参数，方便以后加解说）
+        signal_tf: 信号周期（仅用于日志文字）
+    """
+    if bars is None or len(bars) == 0:
+        logger.info("{} 扫描解说：暂无K线", symbol)
+        return
+
+    last = bars.iloc[-1]
+    ts = str(bars.index[-1])
+    shape = _bar_shape(last)
+    verdict = _entry_verdict(decision)
+    # strategy 先留着，解说以后如果要按策略补充文字，不用改调用处。
+    _ = strategy
+    logger.info(
+        "{} 扫描解说 | 信号{}m 最新已收盘 {} | {} | {}",
+        symbol,
+        signal_tf,
+        ts,
+        shape,
+        verdict,
+    )

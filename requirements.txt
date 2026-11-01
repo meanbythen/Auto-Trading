@@ -1,0 +1,17 @@
+# 自动交易机器人依赖（Python 3.10+）
+numpy>=1.24.0                 # 数值计算
+pandas>=2.0.0                 # K线数据处理
+openpyxl>=3.1.0               # 优化参数导入导出 Excel
+akshare>=1.12.0               # 国内期货分钟K线（算Pinbar/SAR用）
+Pillow>=10.0.0                # 鼠标操作用到的图像库
+pyautogui>=0.9.54             # 鼠标键盘自动化（同花顺界面操作）
+pyyaml>=6.0                   # 读取 YAML 配置
+schedule>=1.2.0               # 简易定时任务
+psutil>=5.9.0                 # 检测进程是否已启动
+uiautomation>=2.0.0         # 识别同花顺交易登录框里的密码框和登录按钮
+loguru>=0.7.0                 # 更友好的日志
+customtkinter>=5.2.0          # 桌面图形控制台
+keyboard>=0.13.5              # 标定同花顺按钮坐标时监听按键
+pytest>=7.4.0                 # 单元测试（可选）
+openctp-ctp>=6.7.0            # CTP 交易接口的 Python 封装。华泰指定的 dll 仍放在 ctp/api，优先使用
+tqsdk>=3.0.0                  # 天勤行情（需账号密码登录，一分钟及以上K线）

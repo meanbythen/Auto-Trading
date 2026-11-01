@@ -1,0 +1,7 @@
+# 早盘高低递进（方案B）
+name: morning_structure_b
+route: |
+  config.yaml → strategy.engine: morning_structure_b（短名 morning_b）
+principle:
+  - 与方案A共用开平仓：回踩入场、保本、拿收盘、每段两笔；日盘+夜盘钟点相同映射
+  - 仅方向不同：开盘半小时内低点抬高且高点抬高→只做多；反过来→只做空；穿插→不做

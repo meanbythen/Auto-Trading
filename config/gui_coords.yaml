@@ -1,0 +1,17 @@
+trade:
+  gui:
+    price_input:
+    - 658
+    - 1041
+    volume_input:
+    - 507
+    - 1042
+    buy_open_btn:
+    - 386
+    - 1123
+    sell_open_btn:
+    - 550
+    - 1125
+    close_btn:
+    - 704
+    - 1127

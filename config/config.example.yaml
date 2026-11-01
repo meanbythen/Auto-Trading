@@ -1,0 +1,282 @@
+# ============================================================
+# 华泰期货 · 沥青/玉米 · 多策略/多通道路线配置
+# copy config\config.example.yaml config\config.yaml
+#
+# 【路线菜单】只改下面两个开关即可切换（一次只跑一套，不并行）
+#
+# 1) 策略引擎 strategy.engine（主推 daily_body）
+#    - daily_body            日内实体：ETH画开盘箱体，收盘突破才开
+#    - morning_box_a / morning_structure_b  早盘两套
+#    - trend_follow / supertrend / single_ma / dual_ma
+#
+# 2) 执行通道 trade.executor
+#    - sim   模拟成交（默认，不下真单）
+#    - gui   点击同花顺界面（需标定坐标；未开程序化时的实盘路径）
+#    - ctp   华泰 CTP。填好前置、BrokerID、认证码后再切换，没填好不会发单
+# ============================================================
+
+dry_run: true
+
+app:
+  path: "D:\\同花顺期货通\\bin\\hexinlauncher.exe"
+  window_title: "期货通"
+  startup_wait_sec: 15
+
+account:
+  broker: "华泰期货"
+  channel: "华泰期货_CTP主席"
+  user_id: "你的资金账号"
+  password_env: "FUTURES_PASSWORD"
+  captcha_mode: "pause"
+  # 配置页「自动登录」打开时，这里是 false。模板保持 true，复制成新配置时不会自动去点登录。
+  skip_auto_login: true
+  force_relogin: false
+  note: "未开通程序化交易权限"
+
+schedule:
+  login_times:
+    - "08:50"
+    - "20:50"
+  # 15分钟策略：扫描间隔可 30~60 秒
+  scan_interval_sec: 30
+  # 全时段 / 只做日盘 / 只做夜盘：只决定这一段能不能开新仓。已经拿着的仓照旧按止损和收盘清仓走。
+  session_scope: all
+  trading_sessions:
+    - ["09:00", "11:30"]
+    - ["13:30", "15:00"]
+    - ["21:00", "23:00"]
+
+# ---------- 策略引擎（见文件顶部路线菜单） ----------
+strategy:
+  enabled: true
+  # 切换策略：daily_body | morning_box_a | morning_structure_b | trend_follow | supertrend | single_ma | dual_ma | swing_trend
+  engine: "daily_body"
+  # 信号周期：5 / 15 / 60 是分钟。日线写 D，周线写 W。自定义分钟直接写数字，如 120
+  timeframe: "5"
+  # 移动止损周期：比信号周期钝一档，少被噪音扫出
+  trail_timeframe: "15"
+  # 关注列表。第一项是当前合约，例如 bu2612。界面上选中的会排到第一项，启动时只盯第一项
+  symbols:
+    - "bu2612"
+  # 交叉测试要跑的策略。不写就用程序里的每一套。正在用的策略仍是上面的 engine。
+  cross_engines:
+    - daily_body
+    - morning_box_a
+    - morning_structure_b
+    - trend_follow
+    - supertrend
+    - single_ma
+    - dual_ma
+    - swing_trend
+  flatten_times:
+    - "14:55"
+    - "22:55"
+  # true=到清仓时刻强平；false=不按收盘平仓，仓可以留过午盘、夜盘和周末
+  flatten_at_close: true
+
+  # 启动常驻后的第一轮扫描：往前最多看几根已收盘信号 K 线，条件仍合适就补开一笔。
+  # 之后每轮仍只看最新一根，不会反复补单。关掉 enabled 就完全不回溯。
+  catch_up_on_start:
+    enabled: true
+    lookback_bars: 3
+    max_age_minutes: 20
+    max_entry_atr: 0.5
+    atr_period: 14
+
+  # 趋势跟随（engine=trend_follow 时生效）。收盘冲破前一段最高做多、跌破最低做空。
+  # 不看成交量。保护止损是 2 倍平均波动，并且只往有利方向收紧。更短的一段被收盘打穿就离场。
+  # flatten_at_close 只属于这一套，默认关。配置页的收盘清仓总开关不管它。
+  trend_follow:
+    entry_bars: 36
+    exit_bars: 12
+    atr_period: 14
+    atr_mult: 2.0
+    flatten_at_close: false
+
+  # SuperTrend（engine=supertrend / st）。ATR 通道翻转开仓；默认不听收盘清仓总开关。
+  supertrend:
+    atr_period: 10
+    multiplier: 3.0
+    reverse_on_flip: true
+    flatten_at_close: false
+
+  # 单均线系统（engine=Single_ma）。根数可改；听收盘清仓总开关。
+  single_ma:
+    ma_period: 20
+    reverse_on_cross: true
+
+  # 双均线趋势（engine=dual_ma / ma_cross）。短线上穿长线做多；听收盘清仓总开关。
+  dual_ma:
+    short_period: 20
+    long_period: 60
+    reverse_on_cross: true
+
+  # 早盘 A：开盘半小时箱体，放量突破定方向。钟点可用默认，一般不用改。
+  morning_box_a:
+    be_box_mult: 0.9
+    vol_confirm_bars: 3
+    fake_break_bars: 2
+    max_trades_per_day: 2
+    stop_buffer_ticks: 2
+    enable_night: true
+    no_new_before_close_minutes: 15
+
+  # 早盘 B：半小时高低递进定方向。参数含义和 A 类似。
+  morning_structure_b:
+    be_box_mult: 0.9
+    max_trades_per_day: 2
+    stop_buffer_ticks: 2
+    enable_night: true
+    no_new_before_close_minutes: 15
+
+  # 日内实体（engine=daily_body 时生效）。
+  # 方向看信号周期。ETH 走完后，收盘离开开盘区间才开仓。夜盘用夜盘自己的区间。
+  # 止损固定在开盘箱体对沿再让 stop_extra_ticks 跳（默认 1）：多守箱底、空守箱顶，开仓后冻结。
+  # 打破箱体对沿才平仓；中间不做回撤止损；否则顺着捅破方向拿到收盘。
+  # 策略优化只搜：ETH分钟数、信号周期。配置页可改 ETH 分钟数、箱沿外再让几跳、跳空上限、箱体宽度上限。
+  daily_body:
+    eth_minutes: 20
+    # 第二段 ETH：日盘第一段止损后、截止前，用这段箱体再开一次（仅日盘，夜盘仍只开一次）。0=关闭二次开仓。
+    eth_minutes2: 30
+    stop_extra_ticks: 1
+    # 这一段开盘相对上一段收盘跳空超过多少跳就不开；0=关闭。缺口回补时箱沿止损会被一次打穿。
+    skip_gap_ticks: 50
+    # 开盘箱体最高-最低超过多少跳就不开；0=关闭。箱体越宽，箱沿止损离进场价越远。
+    max_box_ticks: 100
+    # 开仓截止钟点：过了这个钟点，这一段不再开新仓。日盘和夜盘分开设。
+    day_cutoff: "10:30"
+    night_cutoff: "22:15"
+
+  # 长线趋势加减仓（engine=swing_trend）。
+  # 逻辑自相似：scale=D_60 为日线定方向+60分钟回调；scale=60_15 为60分钟定方向+15分钟回调。
+  # 浮盈后可再回调加仓，伸展过远先减仓。配置页总信号周期对它不生效。
+  # 加仓上限 = 单元手数 ×（1+最多加仓次数）。默认不收盘清仓。
+  swing_trend:
+    scale: "D_60"
+    signal_timeframe: "60"
+    trend_timeframe: "D"
+    daily_ma: 20
+    signal_ma: 20
+    atr_period: 14
+    pullback_lookback: 8
+    touch_atr: 0.6
+    unit_volume: 1
+    max_adds: 2
+    add_min_atr: 1.0
+    reduce_extend_atr: 2.5
+    min_core_units: 1
+    stop_atr: 2.0
+    flatten_at_close: false
+
+
+data:
+  source: "akshare"
+  # 行情来源。akshare 是新浪，eastmoney 是东方财富，tq 是天勤。界面下拉里选，一次只用一家。
+  # 三家的K线分开存放：新浪用原合约名，东方财富加 @eastmoney，天勤加 @tq（如 fu2701@tq）。
+  cache_dir: "data/klines"
+  # 每次下载都会追加进 data/klines/market.sqlite。新浪不再提供的旧K线留在库里，回测按日期从库里取。
+  min_bars: 80
+  live_max_bars: 200   # 实盘扫描只看最近这些根；库里更早的不删
+  max_stale_minutes: 90  # 缓存K线超过该分钟数则禁止开仓（仍可平仓）
+  # 天勤要账号密码。账号写在这里，密码建议放 config/secrets.local.yaml 的 tq_password，
+  # 或设环境变量 TQ_PASSWORD，不要直接写进这个文件。
+  tq:
+    user: ""
+    password: ""
+  symbol_map:
+    bu: "BU0"
+    c: "C0"
+    沥青: "BU0"
+    玉米: "C0"
+    bu2612: "BU2612"
+
+# 历史回测 / 策略优化（界面「历史回测」「策略优化」选项卡）
+backtest:
+  max_bars: 1200
+  warmup: 40
+  max_trials: 60
+  range_preset: "全部可用"
+  start_date: ""          # 空着时，界面默认填当年1月1日
+  end_date: ""
+
+# ---------- 执行通道（见文件顶部路线菜单） ----------
+trade:
+  symbol: "bu"
+  volume: 1
+  # 切换通道：sim | gui | ctp。没拿到前置和认证码之前保持 sim 或 gui
+  executor: "sim"
+  ctp:
+    # 下面几项由华泰技术提供。留空时程序只准备接口，不会去连柜台。
+    td_front: ""
+    # 仿真报价的行情前置。华泰测试环境是交易端口 27226，行情端口 27236。留空时程序会按这个配对。
+    md_front: ""
+    broker_id: ""
+    # 仿真账号写在这里。留空时会用 account.user_id，但测试前置会拒绝实盘账号。
+    user_id: ""
+    app_id: "client_AutoTrading_1.0"
+    # 认证码不要写在这个文件里。放到环境变量 CTP_AUTH_CODE，或 config/secrets.local.yaml 的 ctp_auth_code
+    # 仿真密码另写 secrets.local.yaml 的 ctp_password，不要覆盖同花顺用的 password
+    auth_code_env: "CTP_AUTH_CODE"
+    price_tick: 1
+    max_order_volume: 2
+    order_count_warn: 8
+    cancel_count_warn: 8
+    flow_dir: "data/ctp_flow"
+    query_interval_sec: 30
+    order_wait_sec: 8
+    # 沥青、玉米平仓要分开报平今和平昨。其他品种用普通平仓。
+    close_split_products: ["bu", "c"]
+  gui:
+    # 下单确认框：enter | click | both（推荐 both）
+    confirm_mode: both
+    confirm_delay_sec: 0.6
+    confirm_times: 2
+    # true=点击后立刻改内部持仓（挂机方便，但点击≠成交）；false=只记发单不改仓（更安全）
+    assume_fill: true
+    # GUI 默认禁止多品种；标定了 symbol_input 且确需多品种时才开
+    allow_multi_symbol: false
+    # symbol_input: [1200, 380]  # 可选：品种输入框坐标
+    # confirm_btn: [900, 600]   # 可选：弹窗「确定」按钮坐标
+    # 启动常驻后，程序会把这个价格框设成「对手价」，之后下单只改手数、不改价格。
+    # 对手价会立刻吃掉对面的挂单。最新价只是挂在刚成交的价格上，常常买不到、卖不掉。
+    price_input: [1200, 400]
+    volume_input: [1200, 450]
+    buy_open_btn: [1200, 520]
+    sell_open_btn: [1300, 520]
+    close_btn: [1250, 560]
+
+risk:
+  # 手数取小：①意图（risk_pct 或 fixed）②仓位上限%
+  # risk_pct：意图手数 = capital × risk_per_trade_pct% ÷ (止损距离 × 乘数)
+  # fixed：意图手数 = trade.volume
+  # 仓位上限：floor((权益×margin_usage_pct% − 已占用) ÷ 每手保证金)；≤0 按全部权益估
+  sizing_mode: risk_pct
+  # 当前账户余额。配置页只显示，不在这里手改。要改去账户分析。
+  # 历史回测和策略优化可以另填一个数，用来测保证金高的品种，也可以再从配置页抄回当前余额。
+  capital: 1000000
+  risk_per_trade_pct: 0.5
+  # 权益里最多拿出这么多交保证金，推荐 70~80。例：2 手×10500、上限 70% → 权益至少约 30000
+  margin_usage_pct: 80
+  min_volume: 1
+  max_daily_loss: 5000
+  min_order_interval_sec: 60
+  max_orders_per_day: 20
+  # 每手保证金。0 表示不看。表里没写的品种用这个数。
+  margin_per_lot: 0
+  # 关注合约+保证金/乘数只认这张总表（配置页可打开/重新读取）。同品种保证金必须相同。
+  universe_table: config/品种与合约.xlsx
+  margin_table: config/品种与合约.xlsx
+  contracts:
+    bu: { multiplier: 10, name: 沥青, margin: 0 }
+    c: { multiplier: 10, name: 玉米, margin: 0 }
+
+# 挂机防休眠：常驻运行时调用 Windows SetThreadExecutionState
+runtime:
+  keep_display_awake: true
+  # 收盘后自动关机（默认关）。有夜盘时等到夜盘最后清仓之后，不会在下午 14:55 就关
+  auto_shutdown_after_close: false
+  shutdown_grace_minutes: 5   # 过了最后收盘时刻后再等几分钟
+  shutdown_delay_sec: 180     # 预约倒计时秒数；期间可执行 shutdown /a 取消
+logging:
+  level: "INFO"
+  dir: "logs"

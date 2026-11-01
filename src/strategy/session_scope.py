@@ -1,0 +1,71 @@
+"""
+交易时段范围（配置页的公共设置）。
+
+功能：选出「全时段 / 只做日盘 / 只做夜盘」，只决定这一段能不能开新仓。
+原理：日盘最晚 15:15 收，夜盘最早 21:00 开，中间没有交易，
+     所以 18:00 以后到次日 08:00 以前都算夜盘，其余算日盘。
+     已经拿着的仓不受这个限制，仍按各自的止损和收盘清仓走。
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, time as dtime
+from typing import Any
+
+SCOPE_ALL = "all"
+SCOPE_DAY = "day"
+SCOPE_NIGHT = "night"
+
+# 配置里存代码，界面上显示中文。
+SCOPE_LABELS = {SCOPE_ALL: "全时段", SCOPE_DAY: "只做日盘", SCOPE_NIGHT: "只做夜盘"}
+_LABEL_TO_SCOPE = {label: code for code, label in SCOPE_LABELS.items()}
+
+_NIGHT_FROM = dtime(18, 0)
+_NIGHT_UNTIL = dtime(8, 0)
+
+
+def normalize_scope(value: Any) -> str:
+    """把配置或界面上的值收成 all/day/night。认不出来就当全时段。"""
+    text = str(value or "").strip()
+    if text in SCOPE_LABELS:
+        return text
+    if text in _LABEL_TO_SCOPE:
+        return _LABEL_TO_SCOPE[text]
+    low = text.lower()
+    return low if low in SCOPE_LABELS else SCOPE_ALL
+
+
+def scope_from_cfg(cfg: dict[str, Any] | None) -> str:
+    """读公共设置 schedule.session_scope，缺省是全时段。"""
+    schedule = (cfg or {}).get("schedule") or {}
+    return normalize_scope(schedule.get("session_scope"))
+
+
+def scope_code(label: Any) -> str:
+    """界面上的中文标签换回配置代码。"""
+    return normalize_scope(label)
+
+
+def scope_label(scope: Any) -> str:
+    return SCOPE_LABELS[normalize_scope(scope)]
+
+
+def session_kind(moment: datetime | dtime) -> str:
+    """这一刻算日盘还是夜盘。"""
+    clock = moment if isinstance(moment, dtime) else moment.time()
+    if clock >= _NIGHT_FROM or clock < _NIGHT_UNTIL:
+        return SCOPE_NIGHT
+    return SCOPE_DAY
+
+
+def scope_allows(scope: Any, moment: datetime | dtime) -> bool:
+    """这一段能不能开新仓。"""
+    code = normalize_scope(scope)
+    if code == SCOPE_ALL:
+        return True
+    return session_kind(moment) == code
+
+
+def scope_block_reason(scope: Any) -> str:
+    """被时段范围拦下时给人看的原因。"""
+    return f"时段范围设成「{scope_label(scope)}」，这一段不开新仓"

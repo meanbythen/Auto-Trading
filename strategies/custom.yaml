@@ -1,0 +1,14 @@
+# 预留策略槽位（尚未实现）
+name: custom
+status: placeholder
+how_to_enable: |
+  在 config.yaml 写 strategy.engine: custom
+  当前会自动回退到 daily_body，并在日志里提示。
+how_to_implement: |
+  1. 新建 src/strategy/your_strategy.py，实现 evaluate / on_filled / is_flatten_time
+  2. 在 src/strategy/factory.py 的 REGISTRY["custom"] 换成你的类
+  3. 本文件改成真实说明书
+ideas_for_third_strategy:
+  - 纯量价背离单独体系
+  - 突破回踩
+  - 双周期「5m预警 + 15m确认」

@@ -1,0 +1,22 @@
+# SuperTrend 趋势跟随
+name: supertrend
+route: |
+  config.yaml → strategy.engine: supertrend（短名 st）
+  回测页策略引擎里选 supertrend。不会自动改掉正在用的策略。
+principle:
+  - 经典 ATR 通道趋势：通道半宽 = 倍数 × 平均波动
+  - 收盘从通道下方翻到上方做多，从上翻到下做空；止损就是当前 SuperTrend 线
+  - 默认翻向反手；也可关掉 reverse_on_flip，只平仓不开新仓
+  - 默认不按 14:55、22:55 清仓，仓可以隔夜，靠通道线离场（和 trend_follow 一样）
+  - 配置页收盘清仓总开关不管这一套；要到点平就写 flatten_at_close: true
+  - 和「海龟通道」trend_follow、SAR 翻转不是同一套
+
+defaults:
+  atr_period: 10
+  multiplier: 3.0
+  reverse_on_flip: true
+  flatten_at_close: false
+
+notes:
+  - 适合日线或较长分钟线拿趋势；5 分钟会交易更勤，可把倍数调大（如 3.5～4）减假信号
+  - 「更稳」是相对双均线交叉而言：波动带宽一点，窄幅震荡里少抽打

@@ -1,0 +1,32 @@
+# 本地配置（含账号信息，勿提交）
+config/config.yaml
+config/secrets.local.yaml
+.env
+
+# 虚拟环境与缓存
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# PyInstaller 打包产物
+build/
+dist/
+
+# 运行产物
+logs/
+data/*.jsonl
+data/account_ledger.json
+data/accounts/
+data/Auto-Trading导出.xlsx
+*.log
+
+# 系统文件
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# 编辑器
+.idea/
+.vscode/

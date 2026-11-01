@@ -1,0 +1,168 @@
+"""
+回测绩效指标
+功能：胜率、盈亏比、最大回撤、收益等，方便对比参数好坏。
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Any
+
+
+@dataclass
+class TradeRecord:
+    """一笔已平仓交易。"""
+
+    symbol: str
+    side: str  # long / short
+    entry_time: str
+    exit_time: str
+    entry_price: float
+    exit_price: float
+    volume: int
+    pnl: float  # 元（已扣本笔分摊的开平手续费）
+    reason_entry: str = ""
+    reason_exit: str = ""
+    commission: float = 0.0  # 本笔开+平手续费合计（元）
+
+
+# 收益率只用这个比例估算每笔要交的保证金。不改变开仓手数，也不参与优选排名。
+# 10% 和账户分析里「填 10 表示 10%」是同一个意思。
+MARGIN_RATE = 0.10
+
+
+def peak_margin(
+    trades: list[TradeRecord],
+    multiplier: float,
+    margin_rate: float = MARGIN_RATE,
+) -> float:
+    """
+    这次测试里，拿住一笔仓实际要交的保证金，取占用最多的那一笔。
+
+    保证金 = 开仓价 × 合约乘数 × 手数 × 保证金比例。
+    前后两笔不会同时拿着，所以不把每一笔保证金加在一起。
+    """
+    mult = float(multiplier or 0)
+    rate = float(margin_rate or 0)
+    if mult <= 0 or rate <= 0:
+        return 0.0
+    peak = 0.0
+    for trade in trades:
+        price = float(getattr(trade, "entry_price", 0) or 0)
+        volume = int(getattr(trade, "volume", 0) or 0)
+        if price <= 0 or volume <= 0:
+            continue
+        peak = max(peak, price * mult * volume * rate)
+    return peak
+
+
+@dataclass
+class Performance:
+    trades: int = 0
+    wins: int = 0
+    losses: int = 0
+    win_rate: float = 0.0
+    net_pnl: float = 0.0
+    gross_profit: float = 0.0
+    gross_loss: float = 0.0
+    profit_factor: float = 0.0
+    avg_win: float = 0.0
+    avg_loss: float = 0.0
+    max_drawdown: float = 0.0
+    max_drawdown_pct: float = 0.0
+    score: float = 0.0
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "trades": self.trades,
+            "wins": self.wins,
+            "losses": self.losses,
+            "win_rate": round(self.win_rate, 4),
+            "net_pnl": round(self.net_pnl, 2),
+            "gross_profit": round(self.gross_profit, 2),
+            "gross_loss": round(self.gross_loss, 2),
+            "profit_factor": round(self.profit_factor, 4),
+            "avg_win": round(self.avg_win, 2),
+            "avg_loss": round(self.avg_loss, 2),
+            "max_drawdown": round(self.max_drawdown, 2),
+            "max_drawdown_pct": round(self.max_drawdown_pct, 4),
+            "score": round(self.score, 4),
+        }
+
+
+def calc_performance(
+    trades: list[TradeRecord],
+    equity: list[float],
+    *,
+    min_trades: int = 5,
+) -> Performance:
+    """根据成交列表与权益曲线算绩效，并给出综合得分。"""
+    p = Performance(trades=len(trades))
+    if not trades:
+        return p
+
+    pnls = [t.pnl for t in trades]
+    wins = [x for x in pnls if x > 0]
+    losses = [x for x in pnls if x <= 0]
+    p.wins = len(wins)
+    p.losses = len(losses)
+    p.win_rate = p.wins / p.trades if p.trades else 0.0
+    p.net_pnl = float(sum(pnls))
+    p.gross_profit = float(sum(wins)) if wins else 0.0
+    p.gross_loss = float(abs(sum(losses))) if losses else 0.0
+    p.profit_factor = (
+        p.gross_profit / p.gross_loss if p.gross_loss > 1e-9 else (99.0 if p.gross_profit > 0 else 0.0)
+    )
+    p.avg_win = p.gross_profit / p.wins if p.wins else 0.0
+    p.avg_loss = p.gross_loss / p.losses if p.losses else 0.0
+
+    # 最大回撤（按权益曲线）
+    if equity:
+        peak = equity[0]
+        max_dd = 0.0
+        max_dd_pct = 0.0
+        for e in equity:
+            peak = max(peak, e)
+            dd = peak - e
+            dd_pct = dd / peak if peak > 1e-9 else 0.0
+            if dd > max_dd:
+                max_dd = dd
+                max_dd_pct = dd_pct
+        p.max_drawdown = float(max_dd)
+        p.max_drawdown_pct = float(max_dd_pct)
+
+    # 综合得分不看胜率。胜率高只说明赚的笔数多，不说明实盘更能赚钱。
+    # 看两件好事：盈利因子到 2 为止，再高也不加分；净赚能不能盖住最大回撤。
+    # 回撤占本金越大，扣得越多。不满 30 笔的正分再打个折，避免三四笔全胜排到前面。
+    if p.trades < min_trades:
+        p.score = -999.0 + p.trades  # 样本太少直接垫底
+    else:
+        p.score = _money_score(p)
+
+    return p
+
+
+def _money_score(p: Performance) -> float:
+    """
+    把绩效收成一个用来排名的分数。胜率不参加。
+
+    盈利因子：0 到 2 之间越高越好，2 和 99 一样，不再奖励特别好看的数字。
+    净盈亏对回撤：亏钱是 0；净赚刚好等于回撤是一半；净赚达到回撤的两倍就满分。
+    回撤比例：最多按权益的 50% 来扣。
+    笔数：30 笔才给满正分，更少就按比例少给一点。
+    """
+    # 盈利因子到 2 就封顶。四笔全胜那种 99，不会比稳在 2 附近的更高。
+    profit_factor_score = min(max(p.profit_factor, 0.0), 2.0) / 2.0
+    if p.net_pnl <= 0:
+        cover_score = 0.0
+    elif p.max_drawdown <= 1e-9:
+        cover_score = 1.0
+    else:
+        cover_score = min(p.net_pnl / p.max_drawdown, 2.0) / 2.0
+    drawdown_penalty = min(max(p.max_drawdown_pct, 0.0), 0.5)
+    raw = 0.40 * profit_factor_score + 0.45 * cover_score - 0.30 * drawdown_penalty
+    if raw > 0 and p.trades < 30:
+        # 5 笔大约打七五折，30 笔才是满分。亏钱的分数不再乘这个折扣，免得少亏的反而更吃亏。
+        trust = 0.7 + 0.3 * (p.trades / 30.0)
+        raw *= trust
+    return raw

@@ -1,0 +1,75 @@
+"""
+交易执行器工厂（多通道路线注册表）
+功能：根据 trade.executor 创建 sim / gui / ctp。
+原理：与策略工厂同样用注册表，非法名称回退 sim。
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Callable
+
+from loguru import logger
+
+from .base import TraderBase
+from .ctp_trader import CtpTrader
+from .gui_trader import GuiTrader
+from .sim_trader import SimTrader
+
+TraderFactory = Callable[[dict[str, Any]], TraderBase]
+
+DEFAULT_EXECUTOR = "sim"
+
+
+def _make_sim(cfg: dict[str, Any]) -> TraderBase:
+    root = Path(cfg.get("_project_root", "."))
+    return SimTrader(data_dir=root / "data")
+
+
+def _make_gui(cfg: dict[str, Any]) -> TraderBase:
+    return GuiTrader(cfg)
+
+
+def _make_ctp(cfg: dict[str, Any]) -> TraderBase:
+    return CtpTrader(cfg)
+
+
+# 执行通道菜单：配置里 executor 填左边的名字
+REGISTRY: dict[str, TraderFactory] = {
+    "sim": _make_sim,
+    "gui": _make_gui,
+    "ctp": _make_ctp,
+}
+
+
+def list_executors() -> list[str]:
+    """返回可供配置的执行通道名。"""
+    return sorted(REGISTRY.keys())
+
+
+def create_trader(cfg: dict[str, Any]) -> TraderBase:
+    """
+    创建交易执行器。
+
+    参数:
+        cfg: 全局配置
+
+    返回:
+        TraderBase 子类实例
+    """
+    raw = str(cfg.get("trade", {}).get("executor", DEFAULT_EXECUTOR)).lower().strip()
+    name = raw or DEFAULT_EXECUTOR
+    factory = REGISTRY.get(name)
+    if factory is None:
+        logger.warning(
+            "未知 trade.executor={}，可选: {}；回退到 {}",
+            name,
+            ", ".join(list_executors()),
+            DEFAULT_EXECUTOR,
+        )
+        name = DEFAULT_EXECUTOR
+        factory = REGISTRY[DEFAULT_EXECUTOR]
+
+    trader = factory(cfg)
+    logger.info("执行通道已加载: executor={} class={}", name, type(trader).__name__)
+    return trader
