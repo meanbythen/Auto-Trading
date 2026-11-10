@@ -33,8 +33,8 @@ def _frame(rows: list[tuple[str, float, float, float]]) -> pd.DataFrame:
     )
 
 
-def test_next_open_only_within_continuous_session() -> None:
-    """连续时段用下一根开盘；最后一根、或者跨午休/夜盘断开时退回收盘价。"""
+def test_next_open_spans_session_break_and_returns_next_bar_open() -> None:
+    """跨午休/夜盘断开也按下一根开盘成交，不能拿上一段收盘价顶替。"""
     bars = _frame(
         [
             ("2026-10-16 09:00", 100, 101, 99),
@@ -52,7 +52,7 @@ def test_next_open_only_within_continuous_session() -> None:
             ("2026-10-16 13:35", 102, 103, 101),
         ]
     )
-    assert _next_open_price(gap, 0, "5") is None
+    assert _next_open_price(gap, 0, "5") == 102
 
 
 def test_fill_model_reads_config_and_defaults_to_one_tick() -> None:
@@ -87,6 +87,21 @@ def test_stop_fill_uses_stop_price_and_gap_open() -> None:
     # 空单：跳空高开 → 按开盘价 103
     up = _frame([("2026-10-16 09:00", 103, 104, 102)])
     assert _exit_fill_price(side="short", stop=100, bar=up, next_open=None, close_px=104, fill=fill) == 103
+
+
+def test_close_confirmed_stop_exits_at_next_open_not_stop_price() -> None:
+    """收盘确认止损：这根虽然影线打穿止损，平仓价也不能按止损价成交。"""
+    bar = _frame([("2026-10-16 09:00", 101, 102, 99)])
+    fill = FillModel(slippage_ticks=0)
+    assert (
+        _exit_fill_price(side="long", stop=100, bar=bar, next_open=98, close_px=99, fill=fill) == 100
+    )
+    assert (
+        _exit_fill_price(
+            side="long", stop=100, bar=bar, next_open=98, close_px=99, fill=fill, touch_stop=False
+        )
+        == 98
+    )
 
 
 def test_exit_without_stop_uses_next_open_then_slippage() -> None:
@@ -186,6 +201,7 @@ def _cfg(**backtest) -> dict:
             "symbols": ["bu"],
             "flatten_times": ["14:55", "22:55"],
             "flatten_at_close": False,
+            "market_filter": {"enabled": False},
             "trend_follow": {
                 "entry_bars": 20,
                 "exit_bars": 8,

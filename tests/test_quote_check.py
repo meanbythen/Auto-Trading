@@ -6,8 +6,12 @@ import pandas as pd
 
 from src.data.kline import KlineProvider
 from src.data.quote_check import (
+    BACKTEST_SOURCE_LABELS,
+    SOURCE_LABELS,
     eastmoney_secid,
     frame_from_eastmoney_lines,
+    is_ths_source,
+    is_tq_source,
     normalize_source,
     source_label,
     storage_symbol,
@@ -37,6 +41,31 @@ def test_tq_is_stored_apart_from_sina() -> None:
     assert storage_symbol("fu2701", "天勤") == "fu2701@tq"
     assert storage_symbol("fu2701", "tq") == "fu2701@tq"
     assert storage_symbol("fu2701", "akshare") == "fu2701"
+
+
+def test_ths_chart_is_backtest_only_and_stored_apart() -> None:
+    """同花顺图不进实盘下拉，库存带 @ths，不会盖住另外三家。"""
+    assert "同花顺图" not in SOURCE_LABELS
+    assert "同花顺图" in BACKTEST_SOURCE_LABELS
+    assert normalize_source("同花顺图") == "ths"
+    assert normalize_source("ths") == "ths"
+    assert source_label("ths") == "同花顺图"
+    assert storage_symbol("fu2701", "ths") == "fu2701@ths"
+    assert storage_symbol("fu2701", "同花顺图") == "fu2701@ths"
+    assert is_ths_source("同花顺图")
+    assert not is_ths_source("天勤")
+    assert not is_tq_source("同花顺图")
+
+
+def test_only_tianqin_source_logs_into_tq() -> None:
+    """选新浪或东方财富时，即使填了天勤账号也不该去登录。"""
+    assert is_tq_source("天勤")
+    assert is_tq_source("tq")
+    assert not is_tq_source("新浪")
+    assert not is_tq_source("akshare")
+    assert not is_tq_source("东方财富")
+    assert not is_tq_source("eastmoney")
+    assert not is_tq_source("")
 
 
 def test_eastmoney_tries_the_next_address_after_a_dropped_connection() -> None:

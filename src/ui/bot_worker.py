@@ -59,15 +59,17 @@ class BotWorker:
         self._thread.start()
 
     def stop(self) -> None:
-        """请求停止。"""
+        """结束常驻主循环（扫描、清仓钟点、防休眠一并停）。"""
         if self.bot:
             self.bot.stop()
 
-    def emergency_flatten(self) -> list[str]:
-        """紧急清仓（若机器人已创建）。"""
-        if not self.bot:
-            return ["机器人未启动"]
-        return self.bot.emergency_flatten()
+    def set_orders_paused(self, paused: bool) -> None:
+        """只停发单，不停扫描。"""
+        if self.bot:
+            self.bot.set_orders_paused(paused)
+
+    def orders_paused(self) -> bool:
+        return bool(self.bot and getattr(self.bot, "_orders_paused", False))
 
     def status_snapshot(self) -> dict[str, Any]:
         if not self.bot:

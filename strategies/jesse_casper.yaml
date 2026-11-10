@@ -1,0 +1,32 @@
+# Jesse Rogers Casper 简化 SMC（K 线阉割版）
+name: jesse_casper
+route: |
+  config.yaml → strategy.engine: jesse_casper（短名 casper / jesse）
+  配置页策略下拉选「Jesse Casper（简化SMC）」。参数在 strategy.jesse_casper。
+principle:
+  - 原版要看足迹图、Delta、CVD、吸收。国内分钟 K 没有这些，所以这是资料里的 vnpy 简化版。
+  - 15 分钟高低点结构定方向；信号周期跟配置页公共项（建议 5 分钟）。
+  - 先扫流动性（长影刺破近期高低点），再等后面的放量大实体当位移，最后回踩入场。三步不挤在同一根 K 上。
+  - 止损钉在流动性外侧；目标至少 3 倍风险；默认收盘清仓。
+  - 上一完整日盘/夜盘的价值区：价格还在区内当震荡，不开趋势单。
+  - 默认只在 09:00–10:00、21:00–22:30 开新仓；亏两笔或赚一笔当天停手。
+  - 不走公共 ADX 行情过滤。
+
+defaults:
+  trend_timeframe: "15"
+  lookback_liq: 20
+  vol_ma_len: 20
+  vol_mult: 1.2
+  displacement_body_ratio: 0.5
+  min_rr: 3.0
+  price_tick: 1.0
+  va_pct: 0.70
+  use_va: true
+  use_kill_zone: true
+  use_daily_halt: true
+  flatten_at_close: true
+
+notes:
+  - 假扫会比原版多。先仿真，燃油/纯碱更贴近资料口径。
+  - 每跳价格算价值区用：燃油 0.1，纯碱/玉米 1。
+  - 公共信号周期请用 5 分钟；15 分钟偏见由程序另拉或从 5 分钟拼。

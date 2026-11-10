@@ -5,7 +5,7 @@
   1) 配置与模拟通道
   2) 登录（dry_run）
   3) K线拉取（demo）
-  4) 单均线开仓（模拟成交）
+  4) 双均线开仓（模拟成交）
   5) 止损触发平仓
   6) 收盘清仓 14:55 / 22:55
   8) 风控拦截（超仓/过频）
@@ -34,7 +34,7 @@ sys.path.insert(0, str(ROOT))
 from src.data.kline import KlineProvider  # noqa: E402
 from src.risk import RiskGuardian  # noqa: E402
 from src.scheduler import TradingBot  # noqa: E402
-from src.strategy.single_ma import SingleMaStrategy  # noqa: E402
+from src.strategy.dual_ma import DualMaStrategy  # noqa: E402
 from src.strategy.types import StrategyAction  # noqa: E402
 from src.utils import load_config, setup_logger  # noqa: E402
 
@@ -48,15 +48,18 @@ def _fail(name: str, detail: str) -> dict[str, Any]:
 
 
 def _ma_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
-    """模拟测试用短均线，方便人造穿越信号；不改正在用的实盘策略名以外的配置。"""
+    """模拟测试用短周期双均线，方便人造穿越信号；不改正在用的实盘策略名以外的配置。"""
     out = deepcopy(cfg)
     st = out.setdefault("strategy", {})
-    st["engine"] = "single_ma"
+    st["engine"] = "dual_ma"
     st["timeframe"] = "5"
     st["flatten_at_close"] = True
-    st["single_ma"] = {
-        "ma_period": 5,
+    st["dual_ma"] = {
+        "short_period": 2,
+        "long_period": 3,
         "reverse_on_cross": False,
+        "atr_period": 3,
+        "atr_stop_mult": 2.0,
     }
     out.setdefault("schedule", {})["trading_sessions"] = [["09:00", "15:00"], ["21:00", "23:00"]]
     return out
@@ -78,14 +81,14 @@ def _price_frame(closes: list[float], *, high_at: dict[int, float] | None = None
 
 
 def _make_long_cross() -> pd.DataFrame:
-    """先在均线下面走，最后一根收盘上穿 5 均线做多；止损用这根最低价。"""
+    """先在长均线下面走，最后一根短均线上穿长均线做多；止损按 ATR。"""
     # 前几根压在下面，均线偏低；最后一根明显站上。
     closes = [100.0, 99.0, 98.0, 97.0, 96.0, 95.0, 102.0]
     return _price_frame(closes, low_at={6: 90.0})
 
 
 def _make_short_cross() -> pd.DataFrame:
-    """先在均线上面走，最后一根收盘下穿 5 均线做空。"""
+    """先在长均线上面走，最后一根短均线下穿长均线做空。"""
     closes = [100.0, 101.0, 102.0, 103.0, 104.0, 105.0, 98.0]
     return _price_frame(closes, high_at={6: 110.0})
 
@@ -143,9 +146,9 @@ def run() -> dict[str, Any]:
     except Exception as e:  # noqa: BLE001
         results.append(_fail("K线demo", str(e)))
 
-    # 4) 单均线上穿买开
+    # 4) 双均线上穿买开
     try:
-        st = SingleMaStrategy(_ma_cfg(cfg))
+        st = DualMaStrategy(_ma_cfg(cfg))
         bars = _make_long_cross()
         d = st.evaluate("c", bars, now=datetime(2026, 10, 13, 11, 55))
         if d.action == StrategyAction.BUY_OPEN and d.stop_price is not None:
@@ -187,7 +190,7 @@ def run() -> dict[str, Any]:
 
     # 6) 卖开 + 收盘清仓（22:55）
     try:
-        st = SingleMaStrategy(_ma_cfg(cfg))
+        st = DualMaStrategy(_ma_cfg(cfg))
         bot.strategy = st
         bot.risk = RiskGuardian.from_config(cfg)
         d_sell = st.evaluate("bu", _make_short_cross(), now=datetime(2026, 10, 13, 11, 55))
@@ -207,7 +210,7 @@ def run() -> dict[str, Any]:
 
     # 7) 日盘 14:55 清仓
     try:
-        st = SingleMaStrategy(_ma_cfg(cfg))
+        st = DualMaStrategy(_ma_cfg(cfg))
         bot.strategy = st
         bot.risk = RiskGuardian.from_config(cfg)
         d_buy = st.evaluate("c", _make_long_cross(), now=datetime(2026, 10, 13, 11, 55))

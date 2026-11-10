@@ -2,11 +2,8 @@
 from .daily_body import DailyBodyStrategy
 from .dual_ma import DualMaStrategy
 from .factory import REGISTRY, create_strategy, list_engines, sanitize_strategy_config
-from .morning_edge import (
-    MorningBoxAStrategy,
-    MorningStructureBStrategy,
-)
-from .single_ma import SingleMaStrategy
+from .jesse_casper import JesseCasperStrategy
+from .morning_edge import MorningBoxAStrategy
 from .supertrend import SuperTrendStrategy
 from .swing_trend import SwingTrendStrategy
 from .trend_follow import TrendFollowStrategy
@@ -19,12 +16,11 @@ __all__ = [
     "sanitize_strategy_config",
     "DailyBodyStrategy",
     "MorningBoxAStrategy",
-    "MorningStructureBStrategy",
     "SuperTrendStrategy",
-    "SingleMaStrategy",
     "DualMaStrategy",
     "TrendFollowStrategy",
     "SwingTrendStrategy",
+    "JesseCasperStrategy",
     "StrategyAction",
     "StrategyDecision",
     "PositionState",

@@ -89,6 +89,35 @@ def detect_pinbar(
     return PinbarResult("none", wick_extreme=close, body=body, upper_wick=upper, lower_wick=lower)
 
 
+def price_1d(values: Any) -> pd.Series:
+    """
+    把开高低收收成一列数字。
+
+    表里同一列名出现两次时，传入的会是一张小表而不是一列。
+    后面的均线、ATR、ADX 必须用一列，否则会把一串数字拿去写 if。
+    """
+    if values is None:
+        return pd.Series(dtype=float)
+    if isinstance(values, pd.DataFrame):
+        if values.shape[1] == 0:
+            return pd.Series(dtype=float)
+        values = values.iloc[:, -1]
+    series = pd.to_numeric(values, errors="coerce")
+    if not isinstance(series, pd.Series):
+        series = pd.Series(series)
+    return series
+
+
+def ema_series(close: pd.Series, period: int) -> pd.Series:
+    """
+    N 根指数均线，和同花顺 EXPMA 同一类。
+
+    全程序价格均线都走这里，不再用简单平均。成交量均量、ATR 不算均线，不走这里。
+    """
+    n = max(1, int(period))
+    return pd.to_numeric(close, errors="coerce").ewm(span=n, adjust=False).mean()
+
+
 def macd_lines(
     close: pd.Series,
     *,
@@ -102,8 +131,8 @@ def macd_lines(
     DIF 是快慢两条指数均线的差，DEA 是 DIF 自己的均线，柱子是两者的差。
     背离看的是 DIF：价格走新低时 DIF 没有走新低，或价格走新高时 DIF 没有走新高。
     """
-    fast_ema = close.astype(float).ewm(span=int(fast), adjust=False).mean()
-    slow_ema = close.astype(float).ewm(span=int(slow), adjust=False).mean()
+    fast_ema = ema_series(close, fast)
+    slow_ema = ema_series(close, slow)
     dif = fast_ema - slow_ema
     dea = dif.ewm(span=int(signal), adjust=False).mean()
     hist = dif - dea
@@ -326,9 +355,9 @@ def average_true_range(
 
     每根取「最高-最低 / 最高离昨收 / 最低离昨收」三者最大，再对 period 根简单平均。
     """
-    high_f = high.astype(float)
-    low_f = low.astype(float)
-    close_f = close.astype(float)
+    high_f = price_1d(high)
+    low_f = price_1d(low)
+    close_f = price_1d(close)
     prev = close_f.shift(1)
     tr = pd.concat(
         [(high_f - low_f), (high_f - prev).abs(), (low_f - prev).abs()],
@@ -410,23 +439,18 @@ def supertrend(
     )
 
 
-def parabolic_sar(
+def _parabolic_sar_state(
     high: pd.Series,
     low: pd.Series,
     *,
     af_start: float = 0.02,
     af_step: float = 0.02,
     af_max: float = 0.2,
-) -> pd.Series:
-    """
-    计算抛物线 SAR（Parabolic Stop and Reverse）。
-
-    原理：价格朝一个方向走时，止损点沿趋势加速上移/下移；
-    碰到价格则翻转方向。适合你说的「方向确认后用 SAR 做移动止损」。
-    """
+) -> tuple[np.ndarray, bool, float, float]:
+    """算完整段 SAR，并带回最后一根之后的状态（供推算下一根的止损位）。"""
     n = len(high)
     if n == 0:
-        return pd.Series(dtype=float)
+        return np.zeros(0, dtype=float), True, af_start, 0.0
 
     sar = np.zeros(n, dtype=float)
     bull = True
@@ -463,4 +487,71 @@ def parabolic_sar(
                     ep = float(low.iloc[i])
                     af = min(af + af_step, af_max)
 
+    return sar, bull, af, ep
+
+
+def parabolic_sar(
+    high: pd.Series,
+    low: pd.Series,
+    *,
+    af_start: float = 0.02,
+    af_step: float = 0.02,
+    af_max: float = 0.2,
+) -> pd.Series:
+    """
+    计算抛物线 SAR（Parabolic Stop and Reverse）。
+
+    原理：价格朝一个方向走时，止损点沿趋势加速上移/下移；
+    碰到价格则翻转方向。适合你说的「方向确认后用 SAR 做移动止损」。
+    """
+    if len(high) == 0:
+        return pd.Series(dtype=float)
+    sar, _, _, _ = _parabolic_sar_state(
+        high, low, af_start=af_start, af_step=af_step, af_max=af_max
+    )
     return pd.Series(sar, index=high.index, name="sar")
+
+
+def parabolic_sar_next_state(
+    high: pd.Series,
+    low: pd.Series,
+    *,
+    af_start: float = 0.02,
+    af_step: float = 0.02,
+    af_max: float = 0.2,
+) -> tuple[float, bool] | None:
+    """
+    下一根K线的 SAR 价位和方向（True=多头 SAR 在价格下方，False=空头 SAR 在价格上方）。
+
+    只用已经收盘的这些K线推。SAR 是逐根判的：下一根的高（空头）或低（多头）
+    越过这条线就翻向。这条线比「最后一根的 SAR 值」更贴近实际——最后一根的
+    SAR 只管它自己，下一根还要沿趋势再走一步，并且不能越过前两根的极值。
+    通用止损用这条线判，才不会差一跳把翻向漏掉。
+    """
+    if len(high) == 0:
+        return None
+    sar, bull, af, ep = _parabolic_sar_state(
+        high, low, af_start=af_start, af_step=af_step, af_max=af_max
+    )
+    prev_sar = float(sar[-1])
+    raw = prev_sar + af * (ep - prev_sar)
+    if bull:
+        level = min(raw, float(low.iloc[-1]), float(low.iloc[max(0, len(high) - 2)]))
+    else:
+        level = max(raw, float(high.iloc[-1]), float(high.iloc[max(0, len(high) - 2)]))
+    return float(level), bull
+
+
+def parabolic_sar_next_level(
+    high: pd.Series,
+    low: pd.Series,
+    *,
+    af_start: float = 0.02,
+    af_step: float = 0.02,
+    af_max: float = 0.2,
+) -> float | None:
+    """下一根K线要碰到的 SAR 价位，方向用 parabolic_sar_next_state 取。"""
+    state = parabolic_sar_next_state(
+        high, low, af_start=af_start, af_step=af_step, af_max=af_max
+    )
+    return None if state is None else state[0]

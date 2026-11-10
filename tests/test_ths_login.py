@@ -112,6 +112,63 @@ def test_settlement_click_only_hits_the_named_button() -> None:
     assert confirm_settlement_if_present(wait_sec=0, look=lambda: "stuck") is False
 
 
+def test_settlement_check_runs_once_per_trading_day(monkeypatch) -> None:
+    """同一交易日只查一次；换交易日才再查。下单链路不再调用它。"""
+    from datetime import date
+
+    from src.login import ths_login as ths
+
+    calls: list[int] = []
+    day = {"value": "2026-11-09"}
+    monkeypatch.setattr(ths, "_SETTLEMENT_DONE_DAY", "")
+    monkeypatch.setattr(ths, "settlement_session_day", lambda: date.fromisoformat(day["value"]))
+    monkeypatch.setattr(ths, "_look_and_click_settlement", lambda: calls.append(1) or "absent")
+
+    assert ths.confirm_settlement_if_present(wait_sec=0) is True
+    assert ths.confirm_settlement_if_present(wait_sec=0) is True
+    assert len(calls) == 1, "同一交易日第二次不该再扫"
+
+    # 结算单会话日换了才重扫。20:50 夜盘登录和次日日盘共用这一天。
+    day["value"] = "2026-11-10"
+    assert ths.confirm_settlement_if_present(wait_sec=0) is True
+    assert len(calls) == 2
+
+
+def test_settlement_still_open_keeps_retrying(monkeypatch) -> None:
+    """结算单还挡着时不记「今天查过」，下次登录还会再查，避免把订单点进结算单。"""
+    from datetime import date
+
+    from src.login import ths_login as ths
+
+    calls: list[int] = []
+    monkeypatch.setattr(ths, "_SETTLEMENT_DONE_DAY", "")
+    monkeypatch.setattr(ths, "settlement_session_day", lambda: date(2026, 11, 9))
+    monkeypatch.setattr(ths, "_look_and_click_settlement", lambda: calls.append(1) or "stuck")
+
+    assert ths.confirm_settlement_if_present(wait_sec=0) is False
+    assert ths.confirm_settlement_if_present(wait_sec=0) is False
+    assert len(calls) == 2
+
+
+def test_settlement_check_before_login_does_not_use_up_the_day(monkeypatch) -> None:
+    """登录前那一眼不占额度；登录后那次才记账，之后整天不再扫。"""
+    from datetime import date
+
+    from src.login import ths_login as ths
+
+    calls: list[int] = []
+    monkeypatch.setattr(ths, "_SETTLEMENT_DONE_DAY", "")
+    monkeypatch.setattr(ths, "settlement_session_day", lambda: date(2026, 11, 9))
+    monkeypatch.setattr(ths, "_look_and_click_settlement", lambda: calls.append(1) or "absent")
+
+    assert ths.confirm_settlement_if_present(wait_sec=0, mark_day=False) is True
+    assert ths._SETTLEMENT_DONE_DAY == "", "登录前看到没有窗口，不能记成今天查过"
+    assert ths.confirm_settlement_if_present(wait_sec=0) is True
+    assert ths._SETTLEMENT_DONE_DAY == "2026-11-09"
+    assert ths.confirm_settlement_if_present(wait_sec=0) is True
+    assert len(calls) == 2
+
+
 def test_empty_window_handle_is_not_brought_forward() -> None:
     """没有窗口句柄时不要去调用置顶。"""
     from src.login.app_login import force_foreground

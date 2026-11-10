@@ -1,0 +1,25 @@
+# SAR 波段趋势
+name: sar_trend
+route: |
+  config.yaml → strategy.engine: sar_trend（短名 parabolic_sar / sar）
+  配置页策略下拉选「SAR波段趋势」。参数在 config.yaml 的 strategy.sar_trend。
+principle:
+  - 《策略基础逻辑》第 4 套。SAR 在 K 线下方算多头趋势，上方算空头趋势
+  - SAR 翻多且收盘站上 EMA20 → 做多；SAR 翻空且收盘跌破 EMA20 → 做空
+  - SAR 线本身就是移动止损，只往有利方向收，不再额外设固定止损
+  - SAR 反向翻转（K 线碰 SAR）即离场
+  - 市场状态过滤：ADX < 20 或 ATR 低分位时不开新仓
+  - 默认按 14:55、22:55 强平
+
+defaults:
+  af_start: 0.02
+  af_step: 0.02
+  af_max: 0.2
+  ma_filter: 20
+  atr_period: 14
+  flatten_at_close: true
+
+notes:
+  - 震荡行情 SAR 会高频翻转，是这个策略最大的痛点；MA20 过滤只能挡掉一部分，剩下靠 ADX 过滤
+  - 跳空大的品种（燃油等）SAR 基点会错位，当天信号可信度下降，市场过滤会顺势停手
+  - 优化网格只搜方向过滤均线根数和加速步长，速度上限固定 0.2

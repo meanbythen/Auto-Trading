@@ -16,6 +16,8 @@ _login_lock = threading.Lock()
 
 from loguru import logger
 
+from src.utils.trading_day import settlement_session_day
+
 
 def escape_sendkeys(text: str) -> str:
     """让密码里的大括号按原样输入，而不是被当成特殊按键。"""
@@ -187,7 +189,17 @@ def order_window_is_open(points: list[tuple[int, int]] | None = None) -> bool:
     先看标定的价格框和买卖按钮上的字。这些字只有下单面板开着才读得到。
     再点「交易 → 期货交易」会把已经开着的下单窗口关掉。
     """
-    seen = _texts_at_points(list(points or []))
+    # 快路径：先只读价格框一个点。面板开着时这里就能读到「对手价/最新价」，
+    # 省掉后面枚举窗口标题、遍历控件树的时间。读不到才走完整检查。
+    if points:
+        first = _texts_at_points(list(points[:1]))
+        if any(text_shows_order_panel(text) for text in first):
+            logger.info("下单坐标上读到「{}」，窗口还在，不点登录。", "、".join(first))
+            return True
+        # 第一个点已经读过，后面只补读剩下的，别再读一遍。
+        seen = list(first) + _texts_at_points(list(points[1:]))
+    else:
+        seen = []
     matched = [text for text in seen if text_shows_order_panel(text)]
     if matched:
         logger.info("下单坐标上读到「{}」，窗口还在，不点登录。", "、".join(matched))
@@ -722,7 +734,6 @@ def _click_control_center(ctrl: Any) -> bool:
     left, top, right, bottom = rect
     x = (left + right) // 2
     y = (top + bottom) // 2
-    pyautogui.FAILSAFE = True
     pyautogui.click(x=x, y=y)
     logger.info("已点击「确认结算单」按钮，大约在 ({}, {})。没有点买卖。", x, y)
     return True
@@ -876,10 +887,19 @@ def _settlement_still_open() -> bool:
     return bool(_find_settlement_buttons() or _find_settlement_windows())
 
 
+# 结算单每个夜盘登录周期只处理一次：20:50 登录后查一次，次日日盘沿用。
+# 全量找要遍历同花顺控件树，一次 4 秒左右；查过之后连窗口标题也不看。
+# 缓存换日比期货交易日早一小时（20:00），避免 20:50 登录还算「今天已经查过」。
+# 只有「登录之后」那次检查才占用当天的额度，登录前那一眼不记账，
+# 否则窗口还没弹出来就被记成查过，当天再也不会去点它。
+_SETTLEMENT_DONE_DAY = ""
+
+
 def confirm_settlement_if_present(
     *,
     wait_sec: float = 0,
     look: Any = None,
+    mark_day: bool = True,
 ) -> bool:
     """
     如果弹出了「确认结算单」，就点窗口里的那个按钮。
@@ -887,18 +907,31 @@ def confirm_settlement_if_present(
     没有这个窗口时直接返回 True，不点击任何地方。
     点掉了也返回 True。窗口还在、按钮没点到时返回 False。
     wait_sec 用来等登录后晚一点才弹出的窗口。look 只给测试用。
+
+    每个夜盘登录周期只处理一次：登录完成后查一次（有就点掉、没有就记下），
+    这一整天直接返回，不再读控件、也不再看窗口标题。20:00 之后的下一次登录才会再查。
+    mark_day=False 时只检查、不占用当天额度，给登录前那一眼用。
     """
+    global _SETTLEMENT_DONE_DAY
+    today = settlement_session_day().isoformat()
+    use_cache = look is None  # 测试传了假 finder，不走缓存，免得互相影响
+    if use_cache and _SETTLEMENT_DONE_DAY == today:
+        return True
     finder = look or _look_and_click_settlement
     deadline = time.time() + max(0.0, float(wait_sec))
     while True:
         state = finder()
         if state == "clicked":
             logger.info("已点击「确认结算单」。没有点买开、卖开或平仓。")
+            if use_cache and mark_day:
+                _SETTLEMENT_DONE_DAY = today
             return True
         if state == "stuck":
             logger.warning("看到「确认结算单」窗口，但没有点到同名按钮。")
             return False
         if time.time() >= deadline:
+            if use_cache and mark_day:
+                _SETTLEMENT_DONE_DAY = today
             return True
         time.sleep(0.4)
 

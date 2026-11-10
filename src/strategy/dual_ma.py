@@ -4,7 +4,7 @@
 功能：短均线上穿长均线做多，下穿做空；止损跟着长均线走；默认可反手。
      是否 14:55/22:55 清仓，听配置页「收盘清仓」总开关。
 原理：教科书级双均线交叉，不加成交量、影线、ATR 倍数等拟合门槛。
-     默认短 20、长 60（常见搭配）；配置页可改。和「价格穿单均线」不是同一套。
+     默认短 20、长 60（常见搭配）；配置页可改。短长都是 EMA。用双均线交叉，不靠单根均线判断。
 """
 
 from __future__ import annotations
@@ -15,8 +15,18 @@ from typing import Any
 import pandas as pd
 from loguru import logger
 
+from .indicators import average_true_range, ema_series
+from .market_state import MarketFilter, trend_params_for_section
 from .session_scope import scope_allows, scope_from_cfg
-from .types import PositionState, StrategyAction, StrategyDecision, config_flag
+from .types import (
+    STOP_MODE_TOUCH,
+    PositionState,
+    StrategyAction,
+    StrategyDecision,
+    config_flag,
+    stop_mode_from_cfg,
+    stop_triggered,
+)
 
 
 def _parse_hhmm(value: str) -> dtime:
@@ -28,6 +38,7 @@ class DualMaStrategy:
     """短均线与长均线交叉开仓；长均线当移动止损。"""
 
     def __init__(self, cfg: dict[str, Any]) -> None:
+        self.cfg = cfg
         st = cfg.get("strategy", {}) or {}
         box = st.get("dual_ma") or {}
         trade = cfg.get("trade", {}) or {}
@@ -36,6 +47,9 @@ class DualMaStrategy:
         self.trail_timeframe = self.timeframe
         self.symbols: list[str] = list(st.get("symbols") or [trade.get("symbol", "bu2612")])
         self.volume = int(trade.get("volume", 1))
+        # 止损触发方式（全策略共用）：touch 影线碰到止损位就平，close 等收盘确认。
+        self.stop_mode = stop_mode_from_cfg(cfg)
+        self.stop_on_touch = self.stop_mode == STOP_MODE_TOUCH
 
         try:
             short = max(2, int(box.get("short_period", 20) or 20))
@@ -55,13 +69,20 @@ class DualMaStrategy:
         self.short_period = short
         self.long_period = long
         self.reverse_on_cross = config_flag(box.get("reverse_on_cross", True), default=True)
+        # 文档口径：初始止损 2×ATR（比「开仓那根的高低点」宽，避免被正常波动扫掉）。
+        self.atr_period = max(2, int(box.get("atr_period", 14) or 14))
+        self.atr_stop_mult = float(box.get("atr_stop_mult", 2.0) or 2.0)
+        if self.atr_stop_mult <= 0:
+            self.atr_stop_mult = 2.0
+        # 双均线自己的趋势过滤：震荡交叉多，ADX 太低或波动压缩就不开。
+        self.market_filter = MarketFilter(trend_params_for_section(cfg, "dual_ma"))
 
-        self.flatten_times = [
-            _parse_hhmm(x) for x in st.get("flatten_times", ["14:55", "22:55"])
-        ]
+        from src.utils.session_clock import flatten_clocks_for_symbol, session_tuples
+
+        live = self.symbols[0] if self.symbols else ""
+        self.flatten_times = flatten_clocks_for_symbol(cfg, live)
         self.flatten_at_close = config_flag(st.get("flatten_at_close", True), default=True)
-        sessions = cfg.get("schedule", {}).get("trading_sessions") or []
-        self.entry_sessions = [(_parse_hhmm(a), _parse_hhmm(b)) for a, b in sessions]
+        self.entry_sessions = session_tuples(cfg, live)
         self.session_scope = scope_from_cfg(cfg)
 
         self.positions: dict[str, PositionState] = {
@@ -76,25 +97,25 @@ class DualMaStrategy:
     def is_flatten_time(self, now: datetime | None = None) -> bool:
         if not self.flatten_at_close:
             return False
-        now = now or datetime.now()
-        t = now.time().replace(second=0, microsecond=0)
-        cur = datetime.combine(now.date(), t)
-        for ft in self.flatten_times:
-            start = datetime.combine(now.date(), ft)
-            end = start + timedelta(minutes=10)
-            if start <= cur <= end:
-                return True
-        return False
+        from src.utils.session_clock import in_flatten_window
 
-    def in_entry_session(self, now: datetime) -> bool:
+        return in_flatten_window(self.flatten_times, now or datetime.now())
+
+    def in_entry_session(self, now: datetime, symbol: str | None = None) -> bool:
         if str(self.timeframe).upper() in {"D", "W"}:
             return True
         if not scope_allows(self.session_scope, now):
             return False
-        if not self.entry_sessions:
+        from src.utils.session_clock import in_session_windows, parse_hhmm, sessions_for_symbol
+
+        windows = self.entry_sessions
+        if symbol:
+            rows = sessions_for_symbol(self.cfg, symbol)
+            if rows:
+                windows = [(parse_hhmm(a), parse_hhmm(b)) for a, b in rows]
+        if not windows:
             return True
-        t = now.time()
-        return any(a <= t <= b for a, b in self.entry_sessions)
+        return in_session_windows(windows, now)
 
     def on_filled(
         self,
@@ -140,6 +161,8 @@ class DualMaStrategy:
         now = now or datetime.now()
         pos = self.positions.setdefault(symbol, PositionState(symbol=symbol))
         need = self.long_period + 2
+        if self.market_filter.enabled:
+            need = max(need, self.market_filter.params.need_bars)
         if bars is None or len(bars) < need:
             return StrategyDecision(
                 StrategyAction.HOLD,
@@ -150,8 +173,8 @@ class DualMaStrategy:
             return StrategyDecision(StrategyAction.HOLD, symbol, "K线没有收盘价")
 
         close_s = pd.to_numeric(bars["close"], errors="coerce")
-        short = close_s.rolling(self.short_period).mean()
-        long = close_s.rolling(self.long_period).mean()
+        short = ema_series(close_s, self.short_period)
+        long = ema_series(close_s, self.long_period)
         if (
             pd.isna(short.iloc[-1])
             or pd.isna(short.iloc[-2])
@@ -188,23 +211,44 @@ class DualMaStrategy:
                 close,
                 l_now,
                 s_now,
+                high=float(bar["high"]),
+                low=float(bar["low"]),
                 cross_up=cross_up,
                 cross_down=cross_down,
             )
 
         if self.is_flatten_time(now):
             return StrategyDecision(StrategyAction.HOLD, symbol, "收盘清仓时段，不再开新仓")
-        if not self.in_entry_session(now):
+        if not self.in_entry_session(now, symbol):
             return StrategyDecision(StrategyAction.HOLD, symbol, "非交易时段")
         if self._signaled_bar.get(symbol) == bar_id:
             return StrategyDecision(StrategyAction.HOLD, symbol, "这一根已经处理过双均线交叉")
 
-        if cross_up:
-            stop = float(pd.to_numeric(bar["low"], errors="coerce"))
-            return self._open(symbol, now, bar_id, close, "long", stop, s_now, l_now)
-        if cross_down:
-            stop = float(pd.to_numeric(bar["high"], errors="coerce"))
-            return self._open(symbol, now, bar_id, close, "short", stop, s_now, l_now)
+        # 文档第 1 条：行情不匹配直接停手。ADX 太低或 ATR 在低分位时不开新仓。
+        state = self.market_filter.check(bars)
+        if not state.ok:
+            return StrategyDecision(
+                StrategyAction.HOLD,
+                symbol,
+                f"行情不匹配：{state.reason}",
+                stop_price=l_now,
+            )
+
+        atr = float(
+            average_true_range(
+                bars["high"], bars["low"], bars["close"], period=self.atr_period
+            ).iloc[-1]
+        )
+        if not pd.isna(atr) and atr > 0:
+            pad = self.atr_stop_mult * atr
+        else:
+            pad = max(abs(close) * 0.005, 1.0)
+
+        # 文档方向过滤：金叉还要站上长均线才多，死叉还要跌破长均线才空。
+        if cross_up and close >= l_now:
+            return self._open(symbol, now, bar_id, close, "long", close - pad, s_now, l_now)
+        if cross_down and close <= l_now:
+            return self._open(symbol, now, bar_id, close, "short", close + pad, s_now, l_now)
 
         side_txt = "多" if s_now > l_now else ("空" if s_now < l_now else "纠缠")
         return StrategyDecision(
@@ -212,7 +256,8 @@ class DualMaStrategy:
             symbol,
             (
                 f"双均线偏{side_txt} "
-                f"短{self.short_period}={s_now:.2f} 长{self.long_period}={l_now:.2f}，等金叉/死叉"
+                f"短{self.short_period}={s_now:.2f} 长{self.long_period}={l_now:.2f}，"
+                f"等金叉/死叉  {state.describe()}"
             ),
             stop_price=l_now,
         )
@@ -227,6 +272,8 @@ class DualMaStrategy:
         long_now: float,
         short_now: float,
         *,
+        high: float = 0.0,
+        low: float = 0.0,
         cross_up: bool,
         cross_down: bool,
     ) -> StrategyDecision:
@@ -247,7 +294,7 @@ class DualMaStrategy:
         if opposite:
             if (
                 self.reverse_on_cross
-                and self.in_entry_session(now)
+                and self.in_entry_session(now, symbol)
                 and not self.is_flatten_time(now)
             ):
                 new_side = "long" if cross_up else "short"
@@ -274,6 +321,19 @@ class DualMaStrategy:
                     f"平{'多' if pos.side == 'long' else '空'} "
                     f"长均={long_now:.2f}"
                 ),
+            )
+
+        # 止损触发方式（全策略共用）：touch 时影线碰到长均线就平；close 时等收盘穿越确认。
+        # 反向交叉优先，避免反手被止损抢走。
+        if self.stop_on_touch and stop_triggered(
+            side=pos.side, stop=long_now, close=close, high=high, low=low, mode=self.stop_mode
+        ):
+            return self._close_decision(
+                symbol,
+                pos,
+                now,
+                bar_id,
+                f"盘中触及{self.long_period}长均线 {long_now:.2f}，先平",
             )
 
         # 短线已回到长线错误一侧（未等到完整交叉判定时的保险）

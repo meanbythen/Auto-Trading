@@ -102,7 +102,7 @@ def build_gap_report(
 
 def _count_event_orders(lines: list[str]) -> int:
     """从 actual_lines 已经生成的人话里粗数下单相关条数。"""
-    keys = ("下单", "风控拦住", "紧急清仓", "行情太旧")
+    keys = ("下单", "风控拦住", "行情太旧")
     return sum(1 for line in lines if any(k in line for k in keys) and "·" in line)
 
 

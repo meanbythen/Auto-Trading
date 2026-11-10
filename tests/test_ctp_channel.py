@@ -11,17 +11,38 @@ import time
 
 from src.trader.base import OrderRequest
 from src.trader.ctp_gateway import CtpGateway, CtpSettings
+from src.trader.ctp_display import (
+    account_headline,
+    account_pairs,
+    contract_search_key,
+    describe_contract,
+    format_contract_row,
+    order_matches_filter,
+    pct_from_ratio,
+    position_footer,
+    split_position_rows,
+    trade_footer,
+)
 from src.trader.ctp_logic import (
     OFFSET_CLOSE,
     OFFSET_CLOSE_TODAY,
     OFFSET_CLOSE_YESTERDAY,
+    OrderTable,
     PositionView,
+    keep_order_sys_id,
+    close_sides_for_view,
+    direction_cn,
+    offset_cn,
+    reverse_open_side,
     SessionTracker,
     TrackedOrder,
     absorb_position_row,
     apply_order_report,
+    format_position_marks,
+    position_avg_price,
     apply_trade,
     book_differences,
+    describe_positions,
     plan_close,
     product_code,
 )
@@ -74,6 +95,12 @@ class FakeClient:
     def query_account(self, _settings) -> None:
         self.listener.on_account(88000.5, True)
 
+    def query_trades(self, _settings) -> None:
+        self.listener.on_query_trade(None, True)
+
+    def cancel(self, _settings, order: dict) -> None:
+        self.listener.on_order_status(order["order_ref"], "5", 0, "已撤")
+
     def insert(self, _settings, order: dict) -> None:
         self.inserts.append(dict(order))
         if self.on_insert is not None:
@@ -86,6 +113,33 @@ class FakeClient:
         return None
 
 
+def test_direction_and_offset_words() -> None:
+    """买卖、开平要写成中文，方便对照无限易。"""
+    assert direction_cn("0") == "买"
+    assert direction_cn("1") == "卖"
+    assert offset_cn("0") == "开仓"
+    assert offset_cn("3") == "平今"
+    assert offset_cn("4") == "平昨"
+
+
+def test_keep_order_sys_id_keeps_shfe_padding() -> None:
+    """上期所柜台号去掉空格就对不上，撤单会报找不到报单。"""
+    assert keep_order_sys_id("13094") == "13094".rjust(12)
+    assert keep_order_sys_id("     13094") == "     13094"
+    assert keep_order_sys_id("  ") == ""
+
+
+def test_order_table_matches_padded_order_ref() -> None:
+    """柜台回报把编号补空格或前导零时，仍要找回这一笔。"""
+    table = OrderTable()
+    order = TrackedOrder("1", "bu2612", "0", "0", 1, 4400)
+    table.add(order)
+    assert table.get("1") is order
+    assert table.get("           1") is order
+    assert table.get("000000000001") is order
+    assert table.get("2") is None
+
+
 def test_product_code_does_not_treat_copper_as_corn() -> None:
     """沪铜 cu 不能因为首字母是 c 就被当成玉米。"""
     assert product_code("bu2612") == "bu"
@@ -94,7 +148,7 @@ def test_product_code_does_not_treat_copper_as_corn() -> None:
 
 
 def test_asphalt_and_corn_split_yesterday_then_today() -> None:
-    """先平昨，剩下的再平今。其他品种一笔普通平仓。"""
+    """上期所、大商所先平昨再平今；郑商所用普通平仓。"""
     asphalt = plan_close("bu2612", 3, today=1, yesterday=2)
     assert [(item.offset, item.volume) for item in asphalt] == [
         (OFFSET_CLOSE_YESTERDAY, 2),
@@ -103,7 +157,11 @@ def test_asphalt_and_corn_split_yesterday_then_today() -> None:
     corn = plan_close("c2511", 1, today=0, yesterday=1)
     assert [(item.offset, item.volume) for item in corn] == [(OFFSET_CLOSE_YESTERDAY, 1)]
     copper = plan_close("cu2601", 2, today=2, yesterday=0)
-    assert [(item.offset, item.volume) for item in copper] == [(OFFSET_CLOSE, 2)]
+    assert [(item.offset, item.volume) for item in copper] == [(OFFSET_CLOSE_TODAY, 2)]
+    fuel = plan_close("fu2701", 1, today=1, yesterday=0)
+    assert [(item.offset, item.volume) for item in fuel] == [(OFFSET_CLOSE_TODAY, 1)]
+    sugar = plan_close("SA2701", 1, today=1, yesterday=0)
+    assert [(item.offset, item.volume) for item in sugar] == [(OFFSET_CLOSE, 1)]
 
 
 def test_reports_cover_accept_reject_partial_fill_and_cancel() -> None:
@@ -144,6 +202,158 @@ def test_position_rows_for_shfe_and_dce() -> None:
     assert corn.short_today == 1
     assert corn.short_yesterday == 3
     assert corn.net == -4
+
+
+def test_position_avg_and_profit_come_from_counter() -> None:
+    """均价用开仓成本反推，浮盈直接用柜台持仓盈亏，不必自己记成交。"""
+    assert position_avg_price(40310.0, 1, 10.0) == 4031.0
+    assert position_avg_price(0.0, 1, 10.0) is None
+    view = PositionView()
+    absorb_position_row(
+        view,
+        {
+            "symbol": "fu2701",
+            "exchange": "SHFE",
+            "direction": "2",
+            "position": 1,
+            "today": 1,
+            "yesterday": 0,
+            "open_cost": 40310.0,
+            "position_profit": -140.0,
+        },
+    )
+    avg, pnl = format_position_marks(view, 10.0)
+    assert avg == "4031"
+    assert pnl == "-140.00"
+
+
+def test_locked_position_splits_into_two_rows() -> None:
+    """同一合约买开和卖开要分成两行，不能挤在一起。"""
+    view = PositionView(
+        long_today=1,
+        short_today=1,
+        long_open_cost=23280.0,
+        short_open_cost=22250.0,
+        long_profit=-1030.0,
+        short_profit=50.0,
+        long_margin=5463.6,
+        short_margin=5000.0,
+    )
+    rows = split_position_rows("c2701", view, multiplier=10.0)
+    assert [item["side"] for item in rows] == ["买", "卖"]
+    assert rows[0]["lots"] == "1"
+    assert rows[1]["lots"] == "1"
+    assert rows[0]["avg"] == "2328"
+    assert rows[1]["avg"] == "2225"
+    assert rows[0]["pnl"] == "-1030.00"
+    assert rows[1]["pnl"] == "+50.00"
+    foot = position_footer(rows)
+    assert foot[0] == "合计"
+    assert foot[2] == "2"
+    assert foot[6] == "-980.00"
+    assert foot[5] == "—"
+
+
+def test_orders_newest_time_first() -> None:
+    """委托按时间从新到旧，同一秒编号大的在上。"""
+    from src.ui.ctp_probe import _order_row_sort_key
+
+    rows = [
+        ("10:38:44", "bu2612", "1"),
+        ("14:48:42", "c2701", "22"),
+        ("14:48:42", "c2701", "21"),
+    ]
+    rows.sort(key=_order_row_sort_key, reverse=True)
+    assert [row[2] for row in rows] == ["22", "21", "1"]
+
+
+def test_trade_footer_sums_volume_and_money() -> None:
+    """成交底栏把当天成交量、平仓盈亏、手续费加起来。"""
+    rows = [
+        ("10:00", "fu2701", "买", "开仓", "4035", "1", "—", "12.50", "", "投机", "13"),
+        ("10:01", "c2701", "卖", "平仓", "2225", "2", "-30.00", "8.00", "", "投机", "14"),
+    ]
+    foot = trade_footer(rows)
+    assert foot[0] == "合计"
+    assert foot[1] == "2笔"
+    assert foot[5] == "3"
+    assert foot[6] == "-30.00"
+    assert foot[7] == "20.50"
+    assert foot[4] == "—"
+
+
+def test_account_page_uses_counter_fields() -> None:
+    """资金页要把期初、动态权益、可用、保证金都展示出来。"""
+    row = {
+        "pre_balance": 30000,
+        "balance": 30139.28,
+        "available": 30139.28,
+        "margin": 0,
+        "close_profit": 0,
+        "position_profit": 0,
+        "currency": "CNY",
+    }
+    text = account_headline(row)
+    assert "30139.28" in text
+    assert "资金使用率" in text
+    pairs = dict(account_pairs({**row, "account_id": "28077"}))
+    assert pairs["资金账号"] == "28077"
+    assert pairs["期初权益"] == "30000.00"
+    assert pairs["动态权益"] == "30139.28"
+    assert pairs["市种"] == "人民币"
+
+
+def test_contract_row_click_text() -> None:
+    """点合约一行，要用中文把乘数、保证金、手续费念出来。"""
+    assert contract_search_key("", "fu2701") == "fu"
+    assert pct_from_ratio(0.13) == "13%"
+    row = {
+        "symbol": "ad2701",
+        "name": "铝合2701",
+        "exchange": "SHFE",
+        "product_class": "1",
+        "volume_multiple": 10,
+        "price_tick": 5,
+        "long_margin_money": 0.13,
+        "short_margin_money": 0.13,
+        "open_volume": 0.01,
+        "close_volume": 0.01,
+        "close_today_volume": 0,
+        "open_date": "20250915",
+    }
+    cells = format_contract_row(row)
+    assert cells[0] == "ad2701"
+    assert "上期所" in cells
+    assert "13%" in cells
+    spoken = describe_contract(row)
+    assert "ad2701" in spoken
+    assert "每手 10" in spoken
+    assert "13%" in spoken
+
+
+def test_order_filter_keeps_working_orders() -> None:
+    live = TrackedOrder("1", "fu2701", "0", "0", 1, 4000, status="submitted")
+    done = TrackedOrder("2", "fu2701", "0", "0", 1, 4000, status="filled")
+    assert order_matches_filter(live, "可撤")
+    assert not order_matches_filter(done, "可撤")
+    assert order_matches_filter(done, "成交")
+
+
+def test_describe_positions_matches_what_user_sees() -> None:
+    """柜台持仓要写成买几手、卖几手，没有仓时也要说清楚。"""
+    empty = describe_positions({}, 1000.5)
+    assert "没有持仓" in empty
+    assert "1000.50" in empty
+    text = describe_positions(
+        {
+            "bu2612": PositionView(long_today=2),
+            "fu2701": PositionView(long_today=1),
+        },
+        969948.55,
+    )
+    assert "bu2612 买 2 手" in text
+    assert "fu2701 买 1 手" in text
+    assert "969948.55" in text
 
 
 def test_book_mismatch_lists_the_symbol() -> None:
@@ -248,6 +458,42 @@ def test_corn_close_short_buys_yesterday() -> None:
     assert client.inserts[0]["direction"] == "0"
 
 
+def test_resting_close_must_be_cancelled_before_repricing() -> None:
+    """挂着的平今没撤掉时，改价再平会报平今不足。本机先拦住。"""
+    client = FakeClient()
+
+    def rest(listener, order):
+        listener.on_order_status(order["order_ref"], "3", 0, "未成交", "SHFE", "     13094")
+
+    client.on_insert = rest
+    gateway = CtpGateway(_settings(), client)
+    gateway.settings.auto_cancel_on_timeout = False
+    gateway.settings.order_wait_sec = 0.05
+    trader = CtpTrader({"dry_run": False}, gateway)
+    trader.connect()
+    gateway.positions["fu2701"] = PositionView(long_today=1)
+    gateway.positions_ready = True
+    first = trader.place_order(OrderRequest("fu2701", "close", 1, 4029, position_side="long"))
+    assert first.raw["working"] is True
+    second = trader.place_order(OrderRequest("fu2701", "close", 1, 4024, position_side="long"))
+    assert second.ok is False
+    assert "未成交委托" in second.message
+
+
+def test_fuel_oil_close_sends_close_today() -> None:
+    """燃油和沥青一样在上期所，平仓必须报平今，不能报普通平仓。"""
+    client = FakeClient()
+    gateway = CtpGateway(_settings(), client)
+    trader = CtpTrader({"dry_run": False}, gateway)
+    trader.connect()
+    gateway.positions["fu2701"] = PositionView(long_today=1)
+    gateway.positions_ready = True
+    result = trader.place_order(OrderRequest("fu2701", "close", 1, 4029, position_side="long"))
+    assert result.raw["filled"] is True
+    assert client.inserts[0]["offset"] == OFFSET_CLOSE_TODAY
+    assert client.inserts[0]["direction"] == "1"
+
+
 def test_reject_is_not_a_fill() -> None:
     client = FakeClient()
 
@@ -261,6 +507,28 @@ def test_reject_is_not_a_fill() -> None:
     result = trader.place_order(OrderRequest("bu2612", "sell_open", 1, 4500))
     assert result.raw["filled"] is False
     assert "拒单" in result.message
+
+
+def test_broker_funds_do_not_block_when_positions_match() -> None:
+    """资金数字和本地不一样时，按柜台改本地权益，持仓一致仍允许开仓。"""
+    client = FakeClient()
+    gateway = CtpGateway(_settings(), client)
+    trader = CtpTrader({"dry_run": False}, gateway)
+    trader.connect()
+    gateway.positions = {"bu2612": PositionView(long_today=1)}
+    gateway.positions_ready = True
+    gateway.available = 88000
+    gateway.account = {"balance": 123456.78, "available": 88000}
+    trader._last_query = time.time()
+    ok, note = trader.reconcile({"bu2612": 1})
+    assert ok is True
+    assert trader.blocks_new_opens() is False
+    assert trader.last_broker_equity == 123456.78
+    assert trader.last_broker_snapshot is not None
+    assert trader.last_broker_snapshot["user_id"]
+    assert abs(float(trader.last_broker_snapshot["balance"]) - 123456.78) < 0.01
+    assert abs(float(trader.last_broker_snapshot["available"]) - 88000) < 0.01
+    assert "停止开新仓" not in note
 
 
 def test_mismatch_stops_new_opens_until_books_match() -> None:
@@ -315,6 +583,7 @@ def test_working_order_blocks_another_open() -> None:
     client.on_insert = accept_only
     settings = _settings()
     settings.order_wait_sec = 0.05
+    settings.auto_cancel_on_timeout = False
     gateway = CtpGateway(settings, client)
     trader = CtpTrader({"dry_run": False}, gateway)
     trader.connect()
@@ -338,6 +607,83 @@ def test_reconnect_query_blocks_when_broker_still_has_a_working_order() -> None:
     trader.connect()
     assert trader.blocks_new_opens() is True
     assert "99" in gateway.unknown_working
+
+
+def test_reconnect_keeps_today_filled_orders() -> None:
+    """退出再登录，今天已经成交的委托也要出现在委托表。"""
+    client = FakeClient()
+
+    def query(_settings):
+        client.listener.on_query_order(
+            "13",
+            "0",
+            1,
+            "fu2701",
+            True,
+            price=4035.0,
+            volume=1,
+            direction="1",
+            offset="0",
+            insert_time="14:18:10",
+        )
+
+    client.query_orders = query
+    gateway = CtpGateway(_settings(), client)
+    trader = CtpTrader({"dry_run": False}, gateway)
+    trader.connect()
+    order = gateway.table.get("13")
+    assert order is not None
+    assert order.status == "filled"
+    assert order.symbol == "fu2701"
+    assert gateway.unknown_working == []
+    assert trader.has_working_order() is False
+
+
+def test_desk_session_allows_two_working_orders() -> None:
+    """交易台可同时挂两笔，方便华泰手撤和批量撤。常驻仍拦第二笔。"""
+
+    def rest(listener, order):
+        listener.on_order_status(order["order_ref"], "3", 0, "未成交", "SHFE", "     13094")
+
+    client = FakeClient()
+    client.on_insert = rest
+    gateway = CtpGateway(_settings(), client)
+    gateway.settings.desk_session = True
+    gateway.settings.auto_cancel_on_timeout = True
+    trader = CtpTrader({"dry_run": False}, gateway)
+    trader.connect()
+    first = trader.place_order(OrderRequest("fu2701", "buy_open", 1, 1000))
+    second = trader.place_order(OrderRequest("fu2701", "buy_open", 1, 1001))
+    assert first.ok is True
+    assert second.ok is True
+    assert "未成交委托" not in second.message
+
+
+def test_empty_close_is_sent_so_counter_can_reject() -> None:
+    """交易台空仓平仓要发给柜台，华泰第 8 项看柜台退回。"""
+    client = FakeClient()
+    gateway = CtpGateway(_settings(), client)
+    gateway.settings.desk_session = True
+    trader = CtpTrader({"dry_run": False}, gateway)
+    trader.connect()
+    gateway.positions_ready = True
+    result = trader.place_order(OrderRequest("fu2701", "close", 1, 4029, position_side="long"))
+    assert client.inserts
+    assert client.inserts[0]["offset"] == OFFSET_CLOSE_TODAY
+    assert "柜台没有" not in (result.message or "")
+
+
+def test_resident_skips_empty_close() -> None:
+    """常驻空仓不发平仓，避免挂机空打柜台。"""
+    client = FakeClient()
+    gateway = CtpGateway(_settings(), client)
+    trader = CtpTrader({"dry_run": False}, gateway)
+    trader.connect()
+    gateway.positions_ready = True
+    result = trader.place_order(OrderRequest("fu2701", "close", 1, 4029, position_side="long"))
+    assert result.ok is False
+    assert "未向柜台报平仓" in result.message
+    assert client.inserts == []
 
 
 def test_bad_orders_are_stopped_before_the_counter() -> None:
@@ -383,8 +729,8 @@ def test_sim_front_refuses_the_live_account() -> None:
 
 
 def test_cancel_uses_the_counter_id() -> None:
-    """有柜台编号才能撤。撤单笔数单独加一。"""
-    from src.trader.ctp_logic import TrackedOrder
+    """没有柜台号也能用 Front+Session 撤；有柜台号时要带上补齐空格的编号。"""
+    from src.trader.ctp_logic import TrackedOrder, keep_order_sys_id
 
     client = FakeClient()
     sent = []
@@ -393,14 +739,14 @@ def test_cancel_uses_the_counter_id() -> None:
     trader = CtpTrader({"dry_run": False}, gateway)
     order = TrackedOrder("7", "bu2612", "0", "0", 1, 4500.0, status="submitted")
     gateway.table.add(order)
-    refused = trader.cancel_latest("bu2612")
-    assert refused.ok is False
-    assert sent == []
+    first = trader.cancel_latest("bu2612")
+    assert first.ok is True
+    assert sent[0]["exchange_id"] == "SHFE"
     order.order_sys_id = "1001"
-    ok = trader.cancel_latest("bu2612")
-    assert ok.ok is True
-    assert sent[0]["order_sys_id"] == "1001"
-    assert gateway.activity.cancels == 1
+    second = trader.cancel_latest("bu2612")
+    assert second.ok is True
+    assert sent[1]["order_sys_id"] == keep_order_sys_id("1001")
+    assert gateway.activity.cancels == 2
 
 
 def test_missing_front_does_not_crash() -> None:
@@ -550,7 +896,7 @@ def test_timeout_auto_cancels_the_resting_order() -> None:
 
 
 def test_timeout_without_counter_id_keeps_blocking_new_orders() -> None:
-    """柜台一直不回编号时撤不了单，但也不能当成成交：仍要挡住后续开仓。"""
+    """没有柜台编号时仍会用 Front+Session 去撤；柜台若没回撤单，单子还算挂着。"""
     client = FakeClient()
     cancels: list[dict] = []
 
@@ -561,7 +907,7 @@ def test_timeout_without_counter_id_keeps_blocking_new_orders() -> None:
     client.cancel = lambda _settings, payload: cancels.append(dict(payload))
     gateway, trader = _auto_cancel_trader(client)
     result = trader.place_order(OrderRequest("bu2612", "buy_open", 1, 4569))
-    assert cancels == []
+    assert len(cancels) == 1
     assert result.raw["working"] is True
     assert gateway.table.get("1").status == "submitted"
     assert trader.has_working_order("bu2612") is True
@@ -818,3 +1164,113 @@ def test_duplicate_ctp_fill_report_is_not_booked_twice(tmp_path, monkeypatch) ->
     rows = [row for row in book["trades"] if str(row.get("fill_key") or "") == "9|buy_open|2"]
     assert len(rows) == 1
     assert bot.strategy.positions["bu2612"].volume == 2
+
+
+def test_sim_profile_does_not_use_ths_account() -> None:
+    """仿真账用 sim 小节，不会拿同花顺号去登录。"""
+    settings = CtpSettings.from_cfg(
+        {
+            "account": {"user_id": "20318052"},
+            "trade": {
+                "ctp": {
+                    "account_kind": "sim",
+                    "td_front": "tcp://old:1",
+                    "user_id": "top",
+                    "sim": {
+                        "td_front": "tcp://59.36.3.115:27226",
+                        "md_front": "tcp://59.36.3.115:27236",
+                        "user_id": "28077",
+                        "broker_id": "8080",
+                    },
+                    "live": {"td_front": "tcp://1.2.3.4:10130", "user_id": "99999"},
+                    "resolved_sim_password": "sim-pw",
+                    "resolved_live_password": "live-pw",
+                }
+            },
+        }
+    )
+    assert settings.account_kind == "sim"
+    assert settings.user_id == "28077"
+    assert settings.td_front.endswith("27226")
+    assert settings.password == "sim-pw"
+
+
+def test_live_profile_does_not_reuse_sim_front() -> None:
+    """真实账用资金账号和 live 前置，仿真前置和仿真密码都不会跟过去。"""
+    settings = CtpSettings.from_cfg(
+        {
+            "account": {"user_id": "20318052"},
+            "trade": {
+                "ctp": {
+                    "account_kind": "live",
+                    "td_front": "tcp://59.36.3.115:27226",
+                    "user_id": "28077",
+                    "sim": {"td_front": "tcp://59.36.3.115:27226", "user_id": "28077"},
+                    "live": {
+                        "td_front": "tcp://1.2.3.4:10130",
+                        "md_front": "tcp://1.2.3.4:10131",
+                        "broker_id": "8080",
+                    },
+                    "resolved_sim_password": "sim-pw",
+                    "resolved_live_password": "live-pw",
+                }
+            },
+        }
+    )
+    assert settings.account_kind == "live"
+    assert settings.user_id == "20318052"
+    assert "1.2.3.4" in settings.td_front
+    assert settings.md_front.endswith("10131")
+    assert settings.password == "live-pw"
+
+
+def test_live_profile_uses_fund_account_but_not_sim_front() -> None:
+    """真实账缺前置时登不上；资金账号跟配置页同一号，不会去用仿真前置。"""
+    settings = CtpSettings.from_cfg(
+        {
+            "account": {"user_id": "20318052", "resolved_password": "ths-pw"},
+            "trade": {
+                "ctp": {
+                    "account_kind": "live",
+                    "td_front": "tcp://59.36.3.115:27226",
+                    "user_id": "28077",
+                    "resolved_password": "sim-pw",
+                }
+            },
+        }
+    )
+    assert settings.user_id == "20318052"
+    assert settings.td_front == ""
+    assert settings.md_front == ""
+    assert settings.password == "ths-pw"
+    missing = settings.missing()
+    assert "资金账号" not in missing
+    assert "交易前置" in missing
+
+
+def test_strategy_factory_uses_same_ctp_trader() -> None:
+    """常驻执行通道选 ctp 时，策略拿到的就是测试窗口那一类柜台对象。"""
+    from src.trader.factory import create_trader
+
+    trader = create_trader(
+        {
+            "dry_run": True,
+            "trade": {
+                "executor": "ctp",
+                "ctp": {"account_kind": "sim", "user_id": "28077", "td_front": "tcp://59.36.3.115:27226"},
+            },
+        }
+    )
+    assert isinstance(trader, CtpTrader)
+    assert trader.settings.account_kind == "sim"
+    assert trader.settings.user_id == "28077"
+
+
+def test_desk_flatten_covers_locked_and_reverse_matches_strategy() -> None:
+    """交易台平仓要能平锁仓两边；反手方向和策略先平再反向开一致。"""
+    locked = PositionView(long_today=1, short_yesterday=2)
+    assert close_sides_for_view(locked) == ["long", "short"]
+    assert close_sides_for_view(PositionView()) == []
+    assert close_sides_for_view(None) == []
+    assert reverse_open_side("long") == "sell_open"
+    assert reverse_open_side("short") == "buy_open"

@@ -1,0 +1,53 @@
+# 多因子复合 CTA（加权打分，完整版，主推对照）
+name: multi_factor
+route: |
+  config.yaml → strategy.engine: multi_factor（短名 cta）
+  配置页策略下拉选「多因子CTA（加权打分）」。参数在 config.yaml 的 strategy.multi_factor。
+principle:
+  - 四个独立趋势因子：均线、唐奇安、布林、SAR，各打 -1 / -0.5 / 0 / +0.5 / +1
+  - 均线因子、布林中轨、日线方向都用 EMA（和同花顺 EXPMA 一类）
+  - 固定权重 0.30 / 0.25 / 0.25 / 0.20，加权总分过阈值才开
+  - 信号周期跟配置页公共项 strategy.timeframe，不写死 5 分钟
+  - 日线收盘相对 EMA 定方向（默认 60 日），和日线对着干的分数清零
+  - SAR 开不开关在本策略个性配置里；关掉后权重摊给剩下三个因子
+  - 因子分数差太大（默认 0.7）视为打架，不开新仓
+  - 出场：总分反向穿越阈值，或 2 倍 ATR 只往有利方向收的跟踪止损
+  - 本策略行情过滤：ADX / ATR 分位 / 因子分歧写在本小节 cta_filter，带总开关；弱趋势要更高总分并打成仓位
+  - 不走页面底下那张公共行情过滤，避免拦两次
+
+defaults:
+  ma_short: 20
+  ma_long: 60
+  channel: 20
+  boll_window: 20
+  boll_dev: 2.0
+  af_start: 0.02
+  af_step: 0.02
+  af_max: 0.2
+  threshold: 0.6
+  atr_period: 14
+  atr_stop_mult: 2.0
+  use_sar: true
+  disagree_max: 0.7
+  bias_ma: 60
+  trend_timeframe: D
+  weights: {ma: 0.30, turtle: 0.25, boll: 0.25, sar: 0.20}
+  flatten_at_close: true
+  cta_filter:
+    enabled: true
+    use_adx: true
+    use_atr: true
+    use_disagree: true
+    adx_period: 14
+    adx_flat: 20
+    adx_trend: 25
+    atr_lookback: 60
+    atr_low_pct: 0.2
+    weak_score: 0.75
+    weak_size: 0.5
+    weak_votes: 0
+
+notes:
+  - 对照策略：multi_vote（投票）、multi_hybrid（投票+打分）
+  - 权重不参与自动优化，避免四个数字把曲线拟合坏
+  - 天勤这一版没有日线时，方向过滤会拦住新开仓

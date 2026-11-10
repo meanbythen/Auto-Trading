@@ -3,8 +3,9 @@ CTP 执行通道。
 
 功能：给策略用的下单接口。内部完成登录、按合约报单、区分平今和平昨、接收回报、和柜台对账。
 原理：策略仍然只说买开、卖开或平仓。这一层把它翻译成柜台认的方向和开平。
-沥青、玉米先平昨再平今。其他品种用普通平仓。
+上期所、能源中心、大商所先平昨再平今。郑商所、中金所用普通平仓。
 和柜台净持仓不一致时，停止开新仓，平仓仍然允许。
+动态权益、可用资金以期货公司柜台为准，对不上就改本地账，不因此拦开仓。
 """
 
 from __future__ import annotations
@@ -22,8 +23,11 @@ from src.trader.ctp_logic import (
     PositionView,
     book_differences,
     check_order_instruction,
+    describe_positions,
+    describe_working_orders,
     close_direction,
     is_terminal,
+    needs_close_split,
     open_direction,
     plan_close,
     product_code,
@@ -42,8 +46,14 @@ class CtpTrader(TraderBase):
         self._books_match = False
         self._last_query = 0.0
         self._last_note = "还没有和柜台对过账"
+        self.last_broker_equity: float | None = None
+        # 最近一次柜台资金查询的完整数字，给常驻同步账号、可用、保证金、当日盈亏。
+        self.last_broker_snapshot: dict[str, Any] | None = None
         logger.info(
-            "CTP 通道已准备。AppID={}，平今平昨品种={}",
+            "CTP 通道已准备。操作账={} 账号={} 前置={} AppID={}，平今平昨品种={}",
+            "真实" if self.settings.account_kind == "live" else "仿真",
+            self.settings.user_id,
+            self.settings.td_front,
             self.settings.app_id,
             ",".join(self.settings.close_split),
         )
@@ -73,7 +83,7 @@ class CtpTrader(TraderBase):
         return False
 
     def blocks_new_opens(self) -> bool:
-        """对账没通过，或上一笔还没完，不允许开新仓。"""
+        """持仓对不上、或上一笔还没完，不允许开新仓。资金差额不拦。"""
         if self.has_working_order() or self.gateway.unknown_working:
             self._last_note = "有报单还没全部成交，先停止开新仓"
             return True
@@ -81,9 +91,10 @@ class CtpTrader(TraderBase):
 
     def reconcile(self, internal: dict[str, int]) -> tuple[bool, str]:
         """
-        查询柜台真实持仓和可用资金，和程序净持仓比较。
+        查询柜台真实持仓和资金。
 
-        对不上就记下失败。调用方看到失败后停止开新仓。
+        资金按期货公司数字改本地账，差额不拦开仓。
+        净持仓对不上才记下失败，调用方停止开新仓。
         查询间隔没到时，用上一次的柜台结果再比一次，避免频繁查询被柜台拒绝。
         """
         if self.cfg.get("dry_run", False):
@@ -102,22 +113,145 @@ class CtpTrader(TraderBase):
                 self._books_match = False
                 self._last_note = "查询柜台持仓或资金失败，先停止开新仓"
                 return False, self._last_note
+        self._capture_broker_equity()
+        extra = self._sync_signal_book()
         notes = book_differences(internal, self.gateway.positions)
         available = self.gateway.available
         money = f"{available:.2f}" if available is not None else "未知"
         if notes:
             self._books_match = False
-            self._last_note = "；".join(notes) + f"。可用资金 {money}。停止开新仓"
-            logger.warning("柜台对账不一致: {}", self._last_note)
+            self._last_note = "；".join(notes) + f"。可用资金 {money}。持仓对不上，停止开新仓"
+            if extra:
+                self._last_note = self._last_note + "。" + extra
+            logger.warning("柜台持仓不一致: {}", self._last_note)
             return False, self._last_note
         self._books_match = True
         self._last_note = f"持仓一致。可用资金 {money}"
+        if extra:
+            self._last_note = self._last_note + "。" + extra
         logger.info("柜台对账通过: {}", self._last_note)
         return True, self._last_note
 
+    def _capture_broker_equity(self) -> None:
+        """记下柜台刚查到的资金，给常驻同步账号、权益、可用和当日盈亏。"""
+        from src.trader.ctp_display import parse_account
+
+        raw_account = dict(getattr(self.gateway, "account", None) or {})
+        available = getattr(self.gateway, "available", None)
+        if available is not None and "available" not in raw_account:
+            raw_account["available"] = available
+        if "balance" not in raw_account and available is not None:
+            raw_account["balance"] = available
+        parsed = parse_account(raw_account)
+        settings = getattr(self.gateway, "settings", None)
+        broker_id = str(parsed.get("account_id") or getattr(settings, "user_id", "") or "")
+        parsed["user_id"] = broker_id
+        parsed["account_id"] = broker_id
+        self.last_broker_snapshot = parsed
+        try:
+            value = float(parsed.get("balance") or 0)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value <= 0:
+            try:
+                value = float(available) if available is not None else 0.0
+            except (TypeError, ValueError):
+                return
+        if value > 0:
+            self.last_broker_equity = value
+
+    def fetch_account_snapshot(self) -> tuple[bool, str]:
+        """向柜台查一遍持仓和可用资金，给仿真窗口对照无限易。"""
+        if not self.gateway.session.ready:
+            return False, "还没登录，不能查持仓"
+        ok = self.gateway.refresh()
+        if not ok:
+            return False, "查询持仓或资金超时，请过一两秒再点「查持仓」"
+        text = describe_positions(self.gateway.positions, self.gateway.available)
+        extra = self._sync_signal_book()
+        if extra:
+            text = text + " " + extra
+        logger.info("仿真持仓查询：{}", text)
+        return True, text
+
+    def _sync_signal_book(self) -> str:
+        """把柜台资金写进华泰仿真或华泰真实那本账，给账户分析看。"""
+        root = str(self.settings.project_root or "") or "."
+        try:
+            from src.account.ctp_sync import push_gateway_account
+
+            return push_gateway_account(root, self.gateway)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("柜台资金没写进账户分析: {}", exc)
+            return ""
+
+    def fetch_contracts(self, keyword: str) -> tuple[bool, str]:
+        """按代码或前缀查合约列表，给交易台合约页。"""
+        if not self.gateway.session.ready:
+            return False, "还没登录，不能查合约"
+        return self.gateway.query_contracts(keyword)
+
+    def fetch_contract_costs(self, symbol: str) -> tuple[bool, dict]:
+        """点中一行后补保证金和手续费。"""
+        if not self.gateway.session.ready:
+            return False, {}
+        return self.gateway.query_contract_costs(symbol)
+
+    def fetch_working_orders(self) -> tuple[bool, str]:
+        """向柜台查今天的委托（含已成交）。改价前先看还有没有未完成的。"""
+        if not self.gateway.session.ready:
+            return False, "还没登录，不能查委托"
+        ok, rows = self.gateway.query_working_orders()
+        if not ok:
+            return False, "查询委托超时，请过一两秒再点「查委托」"
+        text = describe_working_orders(rows)
+        logger.info("仿真委托查询：{}", text)
+        return True, text
+
+    def fetch_trades(self) -> tuple[bool, str]:
+        """向柜台查今天的成交。"""
+        if not self.gateway.session.ready:
+            return False, "还没登录，不能查成交"
+        ok, rows = self.gateway.query_trade_history()
+        if not ok:
+            return False, "查询成交超时，请过一两秒再点「刷新成交」"
+        if not rows:
+            text = "今天还没有成交。"
+        else:
+            text = f"今天成交 {len(rows)} 笔（窗口成交表会列出明细）"
+        logger.info("仿真成交查询：{}", text)
+        return True, text
+
+    def cancel_ref(self, order_ref: str) -> OrderResult:
+        """撤销指定编号。交易台「撤选中」和常驻超时撤单都走网关同一条撤单。"""
+        ref = str(order_ref or "").strip()
+        if not ref:
+            return OrderResult(ok=False, message="没有委托编号，不能撤", assumed_fill=False)
+        ok, message = self.gateway.cancel(ref)
+        return OrderResult(ok=ok, message=message, order_id=ref, assumed_fill=False)
+
+    def cancel_all_working(self, symbol: str = "") -> OrderResult:
+        """撤销还没完结的委托。可只撤当前合约。"""
+        self.fetch_working_orders()
+        targets = []
+        for order in self.gateway.table.orders.values():
+            if is_terminal(order.status):
+                continue
+            if symbol and symbol_key(order.symbol) != symbol_key(symbol):
+                continue
+            targets.append(order)
+        if not targets:
+            return OrderResult(ok=True, message="没有未成交委托", assumed_fill=False)
+        notes: list[str] = []
+        for order in targets:
+            ok, message = self.gateway.cancel(order.order_ref)
+            notes.append(message)
+            time.sleep(0.2)
+        return OrderResult(ok=True, message="；".join(notes), assumed_fill=False)
+
     def place_order(self, req: OrderRequest) -> OrderResult:
         """
-        提交报单。
+        提交报单。交易台按钮和常驻策略的唯一发单入口。
 
         开仓一笔。平仓在沥青、玉米上按今仓昨仓拆开，可能变成两笔。
         只有柜台确认全部成交才算 filled。点击成功不算成交。
@@ -141,6 +275,13 @@ class CtpTrader(TraderBase):
             return OrderResult(ok=False, message=blocked, assumed_fill=False)
         if self.gateway.trading_paused:
             text = "已暂停报单，本笔没有发到柜台"
+            logger.warning(text)
+            return OrderResult(ok=False, message=text, assumed_fill=False)
+        if not self.settings.desk_session and self.has_working_order(req.symbol):
+            text = (
+                f"{req.symbol} 还有未成交委托占着仓。"
+                "请先点「查委托」确认，再点「撤最近一笔」或「全撤未成交」，然后才能改价重报。"
+            )
             logger.warning(text)
             return OrderResult(ok=False, message=text, assumed_fill=False)
         if not self.gateway.session.ready or self.gateway.session.need_order_check:
@@ -216,6 +357,10 @@ class CtpTrader(TraderBase):
 
     def _close_plan(self, req: OrderRequest) -> tuple[list[Any], str, str]:
         """决定平仓方向，以及要不要拆成平今、平昨。返回 (拆分, 方向, 错误)。"""
+        split = needs_close_split(req.symbol) or product_code(req.symbol) in set(self.settings.close_split)
+        if split and not self.gateway.positions_ready:
+            if not self.gateway.refresh():
+                return [], "", "还没查到今仓和昨仓，先不报平仓"
         side = str(req.position_side or "").lower()
         view = self.gateway.positions.get(symbol_key(req.symbol), PositionView())
         if side not in {"long", "short"}:
@@ -224,12 +369,10 @@ class CtpTrader(TraderBase):
             today, yesterday = view.short_today, view.short_yesterday
         else:
             today, yesterday = view.long_today, view.long_yesterday
-        product = product_code(req.symbol)
-        if product in set(self.settings.close_split):
-            if not self.gateway.positions_ready:
-                return [], "", "还没查到今仓和昨仓，先不报平仓"
-            if today + yesterday <= 0:
-                return [], "", f"柜台没有 {req.symbol} 可平的{('空' if side == 'short' else '多')}仓"
+        held = int(today) + int(yesterday)
+        if not self.settings.desk_session and held <= 0:
+            return [], "", "没有可平仓位，未向柜台报平仓"
+        # 交易台空仓仍发平仓，好让华泰截到柜台「持仓不足」。
         slices = plan_close(
             req.symbol,
             int(req.volume),

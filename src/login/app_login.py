@@ -104,7 +104,6 @@ class AppLoginManager:
         self.dry_run = bool(cfg.get("dry_run", True))
         # 默认跳过自动填密码：你手动登录后挂机最稳；不知道密码也能用
         self.skip_auto_login = bool(self.account.get("skip_auto_login", True))
-        pyautogui.FAILSAFE = True
         pyautogui.PAUSE = 0.3
 
     def _title_key(self) -> str:
@@ -216,7 +215,8 @@ class AppLoginManager:
         说明：即使 dry_run=模拟下单，也会真实打开软件（方便你对照盘面）；
         模拟只影响「是否真点击下单」，不影响拉起期货通。
         """
-        if self.is_running() or self.window_exists():
+        # is_running 内部已经先查窗口，这里再 or window_exists 会把窗口枚举两遍。
+        if self.is_running():
             logger.info("软件已在运行（窗口或进程已存在），跳过启动")
             return True
 
@@ -240,7 +240,7 @@ class AppLoginManager:
         wait_sec = int(self.app_cfg.get("startup_wait_sec", 15))
         logger.info("等待软件加载 {} 秒...", wait_sec)
         time.sleep(wait_sec)
-        if self.window_exists() or self.is_running():
+        if self.is_running():
             logger.info("同花顺已拉起（检测到窗口或进程）")
         else:
             logger.warning(
@@ -371,19 +371,25 @@ class AppLoginManager:
             logger.info(message)
             if ok:
                 # 点完登录后，结算单窗口往往还要再等一两秒才出现。
-                self._dismiss_settlement(5)
+                # 这是当天唯一一次真正占用「已处理」额度的检查。
+                self._dismiss_settlement(5, mark_day=True)
             return ok
         except Exception as e:  # noqa: BLE001
             logger.exception("登录失败: {}", e)
             return False
 
-    def _dismiss_settlement(self, wait_sec: float) -> None:
-        """点掉「确认结算单」。出错只记日志，不让整个登录中断。"""
+    def _dismiss_settlement(self, wait_sec: float, *, mark_day: bool = False) -> None:
+        """
+        点掉「确认结算单」。出错只记日志，不让整个登录中断。
+
+        mark_day=True 表示这是登录完成后的那次检查，点掉或确认没有就把今天记为已处理；
+        登录前那一眼只检查、不记账，避免结算单还没弹出来就占掉当天的额度。
+        """
         if self.dry_run:
             return
         try:
             from src.login.ths_login import confirm_settlement_if_present
 
-            confirm_settlement_if_present(wait_sec=wait_sec)
+            confirm_settlement_if_present(wait_sec=wait_sec, mark_day=mark_day)
         except Exception as exc:  # noqa: BLE001
             logger.warning("确认结算单时出错，继续后面的步骤: {}", exc)

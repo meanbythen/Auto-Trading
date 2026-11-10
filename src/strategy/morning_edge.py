@@ -1,14 +1,13 @@
 """
-早盘定方向 + 浮盈保本 + 拿收盘（A/B 两套方向判定共用一套开平仓）。
+早盘定方向 + 浮盈保本 + 拿收盘（箱体突破定方向）。
 
 功能：开盘后半小时只观察；再往后一小时窗口开仓；方向本段只定一次；
      回踩箱体边界入场；初始止损在箱体另一侧外；浮盈达箱体高度比例后移损到成本保本；
      否则拿到本段收盘。每段最多两笔。假突破本段封仓。
 原理：开盘半小时是博弈陷阱区；半小时后脱离平衡区的一方是本段主方向。
-     日盘：09:00 观察起、09:30 定方向窗口起、10:30 停新开；清仓 14:55。
-     夜盘：21:00 / 21:30 / 22:30 一一对应；清仓 22:55（不是 23:00）。
-     临清仓 15 分钟不新开。
-     方案 A：箱体放量突破。方案 B：半小时高低递进。
+     日盘/夜盘开收跟品种表走；观察仍是开盘后半小时，开仓窗口仍是开盘后一个半小时。
+     清仓时刻也跟品种表走。临清仓 15 分钟不新开。
+     箱体放量突破定方向。
 """
 
 from __future__ import annotations
@@ -22,7 +21,15 @@ import pandas as pd
 from loguru import logger
 
 from .session_scope import scope_allows, scope_block_reason, scope_from_cfg
-from .types import PositionState, StrategyAction, StrategyDecision, config_flag
+from .types import (
+    STOP_MODE_TOUCH,
+    PositionState,
+    StrategyAction,
+    StrategyDecision,
+    config_flag,
+    stop_mode_from_cfg,
+    stop_triggered,
+)
 
 
 def _parse_hhmm(value: str) -> dtime:
@@ -102,28 +109,33 @@ class MorningEdgeBase(ABC):
         self.trail_timeframe = self.timeframe
         self.symbols: list[str] = list(st.get("symbols") or [trade.get("symbol", "bu2612")])
         self.volume = int(trade.get("volume", 1))
+        # 公共设置：止损触发方式（全策略共用）。收盘确认时调度层不会拼未收线那根。
+        self.stop_mode = stop_mode_from_cfg(cfg)
+        self.stop_on_touch = self.stop_mode == STOP_MODE_TOUCH
         # 公共设置：全时段 / 只做日盘 / 只做夜盘。只拦开新仓，持仓照旧。
         self.session_scope = scope_from_cfg(cfg)
+        self.cfg = cfg
 
-        # 日盘默认；可被配置覆盖
-        self.day_clock = _SessionClock(
-            kind="day",
-            label="日盘",
-            session_open=_parse_hhmm(str(box.get("session_open", "09:00"))),
-            observe_end=_parse_hhmm(str(box.get("observe_end", "09:30"))),
-            entry_end=_parse_hhmm(str(box.get("entry_end", "10:30"))),
-            session_close=_parse_hhmm(str(box.get("session_close", "15:00"))),
+        # 观察期、开仓窗口仍按「开盘后几分钟」，开收盘时刻一律读品种表。
+        self._observe_minutes = self._offset_minutes(
+            box.get("session_open", "09:00"), box.get("observe_end", "09:30"), 30
         )
-        # 夜盘：21:00≈09:00，21:30≈09:30，22:30≈10:30，23:00≈15:00
+        self._entry_minutes = self._offset_minutes(
+            box.get("session_open", "09:00"), box.get("entry_end", "10:30"), 90
+        )
+        self._night_observe_minutes = self._offset_minutes(
+            box.get("night_session_open", "21:00"),
+            box.get("night_observe_end", "21:30"),
+            30,
+        )
+        self._night_entry_minutes = self._offset_minutes(
+            box.get("night_session_open", "21:00"),
+            box.get("night_entry_end", "22:30"),
+            90,
+        )
         self.enable_night = config_flag(box.get("enable_night", True), default=True)
-        self.night_clock = _SessionClock(
-            kind="night",
-            label="夜盘",
-            session_open=_parse_hhmm(str(box.get("night_session_open", "21:00"))),
-            observe_end=_parse_hhmm(str(box.get("night_observe_end", "21:30"))),
-            entry_end=_parse_hhmm(str(box.get("night_entry_end", "22:30"))),
-            session_close=_parse_hhmm(str(box.get("night_session_close", "23:00"))),
-        )
+        live = self.symbols[0] if self.symbols else ""
+        self.day_clock, self.night_clock = self._clocks_from_table(live)
 
         # 临清仓（日盘 14:55 / 夜盘 22:55）前 N 分钟不新开
         self.no_new_before_close_minutes = max(
@@ -137,10 +149,10 @@ class MorningEdgeBase(ABC):
         self.be_box_mult = float(box.get("be_box_mult", 0.9))
         self.max_trades_per_day = max(1, int(box.get("max_trades_per_day", 2)))
 
-        # 强制平仓时刻：日盘 14:55、夜盘 22:55（夜盘不要用 23:00）
-        self.flatten_times = [
-            _parse_hhmm(x) for x in st.get("flatten_times", ["14:55", "22:55"])
-        ]
+        from src.utils.session_clock import flatten_clocks_for_symbol
+
+        # 清仓钟点跟品种表走（燃油 22:55，白银 02:25），不再写死。
+        self.flatten_times = flatten_clocks_for_symbol(cfg, live)
         self.flatten_at_close = config_flag(st.get("flatten_at_close", True), default=True)
 
         self.positions: dict[str, PositionState] = {
@@ -154,62 +166,119 @@ class MorningEdgeBase(ABC):
 
     # ------------------------------------------------------------------ 时段
 
-    def _resolve_clock(self, now: datetime) -> _SessionClock | None:
-        """
-        当前落在哪一段。
+    @staticmethod
+    def _offset_minutes(open_text: Any, later_text: Any, fallback: int) -> int:
+        """把「09:00 到 09:30」收成开盘后的分钟数，给品种表开盘当偏移用。"""
+        try:
+            start = _parse_hhmm(str(open_text))
+            later = _parse_hhmm(str(later_text))
+            base = datetime(2000, 1, 1, start.hour, start.minute)
+            edge = datetime(2000, 1, 1, later.hour, later.minute)
+            if edge < base:
+                edge += timedelta(days=1)
+            minutes = int((edge - base).total_seconds() // 60)
+            return minutes if minutes > 0 else int(fallback)
+        except Exception:  # noqa: BLE001
+            return int(fallback)
 
-        日盘：开盘～日盘收盘（含午后持仓到 15:00 前）。
-        夜盘：夜盘开盘～23:00。
-        两段之间（例如下午收盘后到 21:00 前）返回 None。
+    def _clocks_from_table(self, symbol: str) -> tuple[_SessionClock, _SessionClock | None]:
+        """按品种表拼日盘/夜盘钟点。观察、开仓窗口仍是开盘后 30/90 分钟。"""
+        from src.utils.session_clock import add_clock_minutes, bounds_for_symbol
+
+        bounds = bounds_for_symbol(self.cfg, symbol)
+        day_open = bounds.get("day_open") or dtime(9, 0)
+        day_close = bounds.get("day_close") or dtime(15, 0)
+        day = _SessionClock(
+            kind="day",
+            label="日盘",
+            session_open=day_open,
+            observe_end=add_clock_minutes(day_open, self._observe_minutes),
+            entry_end=add_clock_minutes(day_open, self._entry_minutes),
+            session_close=day_close,
+        )
+        night_open = bounds.get("night_open")
+        night_close = bounds.get("night_close")
+        night = None
+        if self.enable_night and night_open is not None and night_close is not None:
+            night = _SessionClock(
+                kind="night",
+                label="夜盘",
+                session_open=night_open,
+                observe_end=add_clock_minutes(night_open, self._night_observe_minutes),
+                entry_end=add_clock_minutes(night_open, self._night_entry_minutes),
+                session_close=night_close,
+            )
+        return day, night
+
+    def bind_symbol_sessions(self, symbol: str) -> None:
+        """常驻每轮按当前合约刷新日夜盘和清仓时刻。"""
+        from src.utils.session_clock import flatten_clocks_for_symbol
+
+        self.day_clock, self.night_clock = self._clocks_from_table(symbol)
+        self.flatten_times = flatten_clocks_for_symbol(self.cfg, symbol)
+
+    def _resolve_clock(self, now: datetime, symbol: str | None = None) -> _SessionClock | None:
         """
-        t = now.time().replace(second=0, microsecond=0)
-        if self.enable_night and self.night_clock.session_open <= t <= self.night_clock.session_close:
-            return self.night_clock
-        if self.day_clock.session_open <= t <= self.day_clock.session_close:
+        当前落在哪一段。开收盘读品种表，夜盘可以跨零点。
+
+        日盘：开盘～日盘收盘（午休仍算同一段，方便拿仓）。
+        夜盘：夜盘开盘～表里的结束（燃油 23:00，白银 02:30）。
+        两段之间返回 None。
+        """
+        if symbol:
+            self.day_clock, self.night_clock = self._clocks_from_table(symbol)
+        from src.utils.session_clock import in_clock_window
+
+        if self.enable_night and self.night_clock is not None:
+            if in_clock_window(
+                self.night_clock.session_open,
+                self.night_clock.session_close,
+                now,
+                grace_sec=0,
+            ):
+                return self.night_clock
+        if in_clock_window(
+            self.day_clock.session_open,
+            self.day_clock.session_close,
+            now,
+            grace_sec=0,
+        ):
             return self.day_clock
         return None
 
     def is_flatten_time(self, now: datetime | None = None) -> bool:
         if not self.flatten_at_close:
             return False
-        now = now or datetime.now()
-        t = now.time().replace(second=0, microsecond=0)
-        cur = datetime.combine(now.date(), t)
-        for ft in self.flatten_times:
-            start = datetime.combine(now.date(), ft)
-            end = start + timedelta(minutes=10)
-            if start <= cur <= end:
-                return True
-        return False
+        from src.utils.session_clock import in_flatten_window
+
+        return in_flatten_window(self.flatten_times, now or datetime.now())
 
     def _in_observe(self, clock: _SessionClock, now: datetime) -> bool:
-        t = now.time().replace(second=0, microsecond=0)
-        return clock.session_open <= t <= clock.observe_end
+        from src.utils.session_clock import in_clock_window
+
+        return in_clock_window(clock.session_open, clock.observe_end, now, grace_sec=0)
 
     def _in_entry_window(self, clock: _SessionClock, now: datetime) -> bool:
-        t = now.time().replace(second=0, microsecond=0)
-        return clock.observe_end < t <= clock.entry_end
+        from src.utils.session_clock import clock_reached, in_clock_window
+
+        if not clock_reached(now, clock.session_open, clock.observe_end):
+            return False
+        return in_clock_window(clock.session_open, clock.entry_end, now, grace_sec=0)
 
     def _near_flatten(self, now: datetime) -> bool:
-        """
-        临清仓前几分钟不新开。
+        """临清仓前几分钟不新开。钟点跟品种表走。"""
+        from src.utils.session_clock import near_flatten_window
 
-        日盘对照 14:55，夜盘对照 22:55。默认提前 15 分钟。
-        """
-        if self.no_new_before_close_minutes <= 0:
-            return False
-        t = now.time().replace(second=0, microsecond=0)
-        cur = datetime.combine(now.date(), t)
-        for ft in self.flatten_times:
-            close_at = datetime.combine(now.date(), ft)
-            begin = close_at - timedelta(minutes=self.no_new_before_close_minutes)
-            if begin <= cur < close_at:
-                return True
-        return False
+        return near_flatten_window(
+            self.flatten_times,
+            now,
+            lead_minutes=self.no_new_before_close_minutes,
+        )
 
     def _before_session_open(self, clock: _SessionClock, now: datetime) -> bool:
-        t = now.time().replace(second=0, microsecond=0)
-        return t < clock.session_open
+        from src.utils.session_clock import last_open_at
+
+        return now < last_open_at(now, clock.session_open)
 
     # ------------------------------------------------------------------ 成交
 
@@ -282,7 +351,7 @@ class MorningEdgeBase(ABC):
         bar_id = str(last.name)
         idx = len(df) - 1
 
-        clock = self._resolve_clock(now)
+        clock = self._resolve_clock(now, symbol)
 
         # 收盘清仓优先（日盘 14:55 / 夜盘 22:55）
         if pos.side != "flat" and self.is_flatten_time(now):
@@ -348,8 +417,9 @@ class MorningEdgeBase(ABC):
                 StrategyAction.HOLD, symbol, st.direction_text or "判定震荡，本段不做"
             )
         if st.direction == "pending":
-            t = now.time().replace(second=0, microsecond=0)
-            if t > clock.entry_end:
+            from src.utils.session_clock import cutoff_passed
+
+            if cutoff_passed(now, clock.session_open, clock.entry_end):
                 st.direction = "flat"
                 st.direction_text = f"{clock.label}窗口结束仍无有效突破，本段不做"
                 return StrategyDecision(StrategyAction.HOLD, symbol, st.direction_text)
@@ -378,10 +448,15 @@ class MorningEdgeBase(ABC):
         df: pd.DataFrame,
         now: datetime,
     ) -> _DayState:
+        from src.utils.session_clock import last_open_at
+
+        # 夜盘跨零点时，段的日期用开盘那天，不要用凌晨的日历日把箱体清掉。
+        session_day = last_open_at(now, clock.session_open).date()
+        del day
         cur = self._day.get(symbol)
-        if cur is None or cur.day != day or cur.kind != clock.kind:
+        if cur is None or cur.day != session_day or cur.kind != clock.kind:
             cur = _DayState(
-                day=day,
+                day=session_day,
                 kind=clock.kind,
                 session_open=clock.session_open,
                 observe_end=clock.observe_end,
@@ -396,12 +471,13 @@ class MorningEdgeBase(ABC):
     def _session_slice(
         self, df: pd.DataFrame, day: date, start: dtime, end: dtime
     ) -> pd.DataFrame:
-        day_ts = pd.Timestamp(day)
-        a = day_ts + pd.Timedelta(hours=start.hour, minutes=start.minute)
-        b = day_ts + pd.Timedelta(hours=end.hour, minutes=end.minute)
-        return df.loc[(df.index > a) & (df.index <= b)]
+        from src.utils.session_clock import slice_session_bars
+
+        return slice_session_bars(df, day, start, end)
 
     def _refresh_box(self, st: _DayState, df: pd.DataFrame, now: datetime) -> None:
+        from src.utils.session_clock import clock_reached
+
         window = self._session_slice(df, st.day, st.session_open, st.observe_end)
         if window.empty or not {"high", "low"}.issubset(window.columns):
             return
@@ -410,8 +486,7 @@ class MorningEdgeBase(ABC):
         if pd.isna(h) or pd.isna(l) or h <= l:
             return
         st.h30, st.l30 = h, l
-        t = now.time().replace(second=0, microsecond=0)
-        if t >= st.observe_end:
+        if clock_reached(now, st.session_open, st.observe_end):
             st.box_ready = True
 
     def _finalize_box(self, st: _DayState, df: pd.DataFrame, now: datetime) -> None:
@@ -542,7 +617,9 @@ class MorningEdgeBase(ABC):
                 logger.info("{} 多单浮盈达标，止损移到开仓价保本", symbol)
             stop = float(pos.entry_price if st.be_armed else pos.initial_stop)
             pos.trail_stop = stop
-            if low <= stop:
+            if stop_triggered(
+                side="long", stop=stop, close=close, high=high, low=low, mode=self.stop_mode
+            ):
                 kind = "保本" if st.be_armed else "初始止损"
                 return self._close_decision(symbol, pos, f"多单{kind}触发 stop={stop:.4f}")
         else:
@@ -558,7 +635,9 @@ class MorningEdgeBase(ABC):
                 logger.info("{} 空单浮盈达标，止损移到开仓价保本", symbol)
             stop = float(pos.entry_price if st.be_armed else pos.initial_stop)
             pos.trail_stop = stop
-            if high >= stop:
+            if stop_triggered(
+                side="short", stop=stop, close=close, high=high, low=low, mode=self.stop_mode
+            ):
                 kind = "保本" if st.be_armed else "初始止损"
                 return self._close_decision(symbol, pos, f"空单{kind}触发 stop={stop:.4f}")
 
@@ -593,12 +672,14 @@ class MorningEdgeBase(ABC):
         return avg > 0 and cur > avg
 
     def _in_entry_window_st(self, st: _DayState, now: datetime) -> bool:
-        t = now.time().replace(second=0, microsecond=0)
-        return st.observe_end < t <= st.entry_end
+        from src.utils.session_clock import clock_reached, in_clock_window
+
+        if not clock_reached(now, st.session_open, st.observe_end):
+            return False
+        return in_clock_window(st.session_open, st.entry_end, now, grace_sec=0)
 
 
 # ====================================================================== 方案 A
-
 
 class MorningBoxAStrategy(MorningEdgeBase):
     """方案A：开盘30分钟平衡箱体，放量收盘突破确认（日盘+夜盘）。"""
@@ -637,70 +718,3 @@ class MorningBoxAStrategy(MorningEdgeBase):
             logger.info("{} {}", self.scheme_name, st.direction_text)
             return
         st.direction_text = f"箱体[{st.l30:.2f},{st.h30:.2f}]内等待放量突破"
-
-
-# ====================================================================== 方案 B
-
-
-class MorningStructureBStrategy(MorningEdgeBase):
-    """方案B：开盘半小时高低点递进结构定方向（日盘+夜盘）。"""
-
-    config_key = "morning_structure_b"
-    scheme_name = "早盘结构B"
-
-    def _update_direction(
-        self,
-        symbol: str,
-        st: _DayState,
-        df: pd.DataFrame,
-        now: datetime,
-        idx: int,
-    ) -> None:
-        if st.direction in ("long", "short", "flat", "aborted"):
-            if st.direction in ("long", "short"):
-                close = float(df["close"].iloc[-1])
-                if st.direction == "long" and close < st.l30 and self._volume_ok(df):
-                    st.direction = "aborted"
-                    st.direction_text = "多头结构后反向跌破箱体，本段封仓"
-                elif st.direction == "short" and close > st.h30 and self._volume_ok(df):
-                    st.direction = "aborted"
-                    st.direction_text = "空头结构后反向升破箱体，本段封仓"
-            return
-
-        t = now.time().replace(second=0, microsecond=0)
-        if t < st.observe_end:
-            return
-        window = self._session_slice(df, st.day, st.session_open, st.observe_end)
-        side, text = _structure_bias(window)
-        if side == "long":
-            st.direction = "long"
-            st.direction_text = f"{st.label}{text}"
-            st.break_bar_index = idx
-            st.fake_check_left = 0
-        elif side == "short":
-            st.direction = "short"
-            st.direction_text = f"{st.label}{text}"
-            st.break_bar_index = idx
-            st.fake_check_left = 0
-        else:
-            st.direction = "flat"
-            st.direction_text = text or f"{st.label}半小时无递进结构，本段不做"
-        logger.info("{} {}", self.scheme_name, st.direction_text)
-
-
-def _structure_bias(window: pd.DataFrame) -> tuple[str, str]:
-    if window is None or len(window) < 4:
-        return "flat", "半小时K线太少，看不清结构"
-    n = len(window)
-    mid = max(2, n // 2)
-    first = window.iloc[:mid]
-    second = window.iloc[mid:]
-    f_hi = float(first["high"].max())
-    f_lo = float(first["low"].min())
-    s_hi = float(second["high"].max())
-    s_lo = float(second["low"].min())
-    if s_lo > f_lo and s_hi > f_hi:
-        return "long", "半小时低点抬高且高点抬高，本段只做多"
-    if s_hi < f_hi and s_lo < f_lo:
-        return "short", "半小时高点降低且低点降低，本段只做空"
-    return "flat", "半小时高低点穿插，判定震荡"

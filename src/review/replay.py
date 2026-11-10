@@ -30,21 +30,32 @@ ENGINE_BY_LABEL = {
     "趋势跟随": "trend_follow",
     "SuperTrend趋势": "supertrend",
     "SuperTrend": "supertrend",
-    "单均线系统": "single_ma",
     "双均线趋势": "dual_ma",
     "早盘箱体突破A": "morning_box_a",
-    "早盘高低递进B": "morning_structure_b",
+    "布林带突破": "bollinger",
+    "SAR波段趋势": "sar_trend",
+    "多因子CTA": "multi_factor",
+    "多因子CTA（加权打分）": "multi_factor",
+    "多因子CTA（自适应权重·对照）": "multi_factor_adapt",
+    "多因子投票": "multi_vote",
+    "多因子混合": "multi_hybrid",
     "长线趋势加减仓": "swing_trend",
+    "Jesse Casper（简化SMC）": "jesse_casper",
+    "Jesse Casper": "jesse_casper",
 }
 LABEL_BY_ENGINE = {v: k for k, v in ENGINE_BY_LABEL.items() if v}
 # 旧配置里的短名字，显示成同一套策略。
 LABEL_BY_ENGINE.update({
     "st": "SuperTrend趋势",
-    "Single_ma": "单均线系统",
-    "single_ma": "单均线系统",
     "ma_cross": "双均线趋势",
     "morning_a": "早盘箱体突破A",
-    "morning_b": "早盘高低递进B",
+    "boll": "布林带突破",
+    "bollinger_break": "布林带突破",
+    "sar": "SAR波段趋势",
+    "parabolic_sar": "SAR波段趋势",
+    "multi": "多因子CTA（加权打分）",
+    "cta": "多因子CTA（加权打分）",
+    "multi_factor": "多因子CTA（加权打分）",
 })
 
 
@@ -84,6 +95,16 @@ def label_for_engine(engine: str | None) -> str:
     if not engine:
         return "只看盘面（不套策略）"
     return LABEL_BY_ENGINE.get(engine, engine)
+
+
+def engine_from_label(label: str | None) -> str | None:
+    """界面中文名换成引擎。旧名字「加权打分·主推」仍认。"""
+    text = str(label or "").strip()
+    if text in ENGINE_BY_LABEL:
+        return ENGINE_BY_LABEL[text]
+    if text in {"多因子CTA（加权打分·主推）"}:
+        return "multi_factor"
+    return None
 
 
 def coarse_reason(reason: str) -> str:
@@ -247,7 +268,6 @@ def _walk(
         "src.strategy.daily_body",
         "src.strategy.trend_follow",
         "src.strategy.supertrend",
-        "src.strategy.single_ma",
         "src.strategy.dual_ma",
         "src.strategy.morning_edge",
         "src.strategy.swing_trend",

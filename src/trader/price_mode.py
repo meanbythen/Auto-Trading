@@ -202,6 +202,27 @@ def pick_price_menu_item(
     return chosen
 
 
+def _wait_menu_item(
+    panel: Any,
+    box: PriceBox,
+    own_panel: bool,
+    timeout: float = 0.35,
+) -> tuple[int, int, int, int] | None:
+    """
+    等下拉菜单渲染出来。
+
+    原来点完固定睡 0.35 秒，不管菜单是不是 50 毫秒就出来了。这里改成小步轮询：
+    菜单一出现立刻返回，最坏情况下的耗时和原来一样。
+    """
+    deadline = time.time() + timeout
+    while True:
+        items = panel.list_menu_items(box) if own_panel else panel.list_menu_items()
+        rect = pick_price_menu_item(items, box)
+        if rect is not None or time.time() >= deadline:
+            return rect
+        time.sleep(0.05)
+
+
 def ensure_opponent_price(
     cfg: dict[str, Any],
     panel: Any | None = None,
@@ -222,12 +243,6 @@ def ensure_opponent_price(
 
     own_panel = panel is None
     if own_panel:
-        # 下单流程刚看过结算单。这里只在启动时再看一次，避免下单途中又去点别的窗口。
-        if focus:
-            from src.login.ths_login import confirm_settlement_if_present
-
-            if not confirm_settlement_if_present(wait_sec=3):
-                return False, "「确认结算单」还挡在下单面板上，没有去改对手价。请先点掉这个窗口。"
         panel = _UiaPricePanel(int(point[0]), int(point[1]), cfg)
     try:
         # 测试用的假面板没有 focus 参数，真面板才按这次要不要激活来读。
@@ -242,11 +257,11 @@ def ensure_opponent_price(
 
     try:
         panel.open_dropdown(box)
-        rect = pick_price_menu_item(panel.list_menu_items(), box)
+        rect = _wait_menu_item(panel, box, own_panel)
         # 第一次点的是控件右边缘。标定的点如果在文字中间，箭头还要更靠右，再试一次。
         if rect is None and hasattr(panel, "nudge_dropdown"):
             panel.nudge_dropdown(box)
-            rect = pick_price_menu_item(panel.list_menu_items(), box)
+            rect = _wait_menu_item(panel, box, own_panel)
         if rect is None:
             panel.close_menu()
             return False, "下拉菜单里没有点到「对手价」。这次先不下单，下一笔信号还会再看一次价格框。"
@@ -299,25 +314,29 @@ class _UiaPricePanel:
         """点控件右边缘。那里一般是下拉箭头，点一下才会弹出排队价、对手价这些选项。"""
         import pyautogui
 
-        pyautogui.FAILSAFE = True
         mid_y = max(box.top + 4, (box.top + box.bottom) // 2)
         pyautogui.click(x=max(box.left + 4, box.right - 12), y=mid_y)
-        time.sleep(0.35)
+        # 只等点击落地，菜单渲染交给 list_menu_items 里的轮询，菜单快就不白等。
+        time.sleep(0.05)
 
     def nudge_dropdown(self, box: PriceBox) -> None:
         """右边缘没把菜单点开时，改点标定位置右边大约一个下拉箭头的距离。"""
         import pyautogui
 
-        pyautogui.FAILSAFE = True
         pyautogui.click(x=box.anchor_x + 46, y=box.anchor_y)
-        time.sleep(0.35)
+        time.sleep(0.05)
 
-    def list_menu_items(self) -> list[tuple[str, tuple[int, int, int, int]]]:
+    def list_menu_items(
+        self,
+        box: PriceBox | None = None,
+    ) -> list[tuple[str, tuple[int, int, int, int]]]:
         """
         只在价格框下方找「对手价」。
 
         以前把整个「同花顺期货通」翻一遍，要好几秒，菜单又常常不在那个窗口里，所以点不到。
         下拉打开后，选项就贴在价格框下面，往下读几个位置就够。
+        传入 box 时，一旦找到能点的「对手价」就停下，不再去遍历后面几个位置的父控件，
+        省掉大部分花在控件树上的时间。
         """
         import uiautomation as auto
 
@@ -337,6 +356,8 @@ class _UiaPricePanel:
                 continue
             for child, _depth in auto.WalkControl(parent, maxDepth=2):
                 self._collect_opponent(child, found, seen)
+            if box is not None and pick_price_menu_item(found, box) is not None:
+                break
         return found
 
     @staticmethod
@@ -361,14 +382,14 @@ class _UiaPricePanel:
 
         left, top, right, bottom = rect
         pyautogui.click(x=(left + right) // 2, y=(top + bottom) // 2)
-        time.sleep(0.15)
+        time.sleep(0.05)
 
     def close_menu(self) -> None:
         """没点到对手价时把下拉菜单关掉，免得它挡着后面的平仓按钮。"""
         import pyautogui
 
         pyautogui.press("esc")
-        time.sleep(0.1)
+        time.sleep(0.05)
 
     def _focus(self) -> None:
         """

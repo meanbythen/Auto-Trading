@@ -1,4 +1,4 @@
-"""早盘定方向两套：箱体突破 / 高低递进。"""
+"""早盘箱体突破 A。"""
 
 from __future__ import annotations
 
@@ -6,11 +6,7 @@ from datetime import datetime, timedelta
 
 import pandas as pd
 
-from src.strategy.morning_edge import (
-    MorningBoxAStrategy,
-    MorningStructureBStrategy,
-    _structure_bias,
-)
+from src.strategy.morning_edge import MorningBoxAStrategy
 from src.strategy.types import StrategyAction
 
 
@@ -47,10 +43,6 @@ def _bars_day(
 
 
 def _cfg(engine: str) -> dict:
-    section = {
-        "morning_box_a": "morning_box_a",
-        "morning_structure_b": "morning_structure_b",
-    }[engine]
     return {
         "strategy": {
             "engine": engine,
@@ -58,7 +50,7 @@ def _cfg(engine: str) -> dict:
             "symbols": ["bu2612"],
             "flatten_at_close": True,
             "flatten_times": ["14:55"],
-            section: {
+            "morning_box_a": {
                 "be_box_mult": 0.9,
                 "vol_confirm_bars": 3,
                 "fake_break_bars": 2,
@@ -70,22 +62,10 @@ def _cfg(engine: str) -> dict:
     }
 
 
-def test_factory_two_engines() -> None:
+def test_factory_morning_box_a() -> None:
     from src.strategy import create_strategy
 
     assert type(create_strategy(_cfg("morning_box_a"))).__name__ == "MorningBoxAStrategy"
-    assert type(create_strategy(_cfg("morning_structure_b"))).__name__ == "MorningStructureBStrategy"
-
-
-def test_structure_bias_long() -> None:
-    # 前半低、后半抬高
-    rows = []
-    t0 = datetime(2026, 10, 20, 9, 5)
-    for i, (h, l) in enumerate([(100, 98), (100.5, 98.2), (101, 99), (102, 100), (103, 100.5), (104, 101)]):
-        rows.append((t0 + timedelta(minutes=5 * i), l + 0.5, h, l, (h + l) / 2, 1000))
-    df = pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"]).set_index("ts")
-    side, _ = _structure_bias(df)
-    assert side == "long"
 
 
 def test_box_a_breakout_then_pullback_entry() -> None:
@@ -170,3 +150,26 @@ def test_night_flatten_at_2255_and_no_new_near_close() -> None:
     d = strat.evaluate("bu2612", df, now=datetime(2026, 10, 20, 22, 55))
     assert d.action == StrategyAction.CLOSE
     assert "清仓" in (d.reason or "")
+
+
+def test_morning_box_night_follows_symbol_table() -> None:
+    """品种表把白银夜盘写到 02:30 时，凌晨仍算夜盘，清仓用 02:25。"""
+    cfg = _cfg("morning_box_a")
+    cfg["strategy"]["symbols"] = ["ag2702"]
+    cfg["trade"]["symbol"] = "ag2702"
+    cfg["risk"] = {
+        "contracts": {
+            "ag": {
+                "trading_sessions": "09:00-11:30,13:30-15:00,21:00-02:30",
+                "flatten_times": "14:55,02:25",
+            }
+        }
+    }
+    strat = MorningBoxAStrategy(cfg)
+    clock = strat._resolve_clock(datetime(2026, 11, 10, 0, 37), "ag2702")
+    assert clock is not None
+    assert clock.kind == "night"
+    assert clock.session_close.hour == 2
+    assert clock.session_close.minute == 30
+    assert strat.is_flatten_time(datetime(2026, 11, 10, 2, 25))
+    assert not strat.is_flatten_time(datetime(2026, 11, 10, 22, 55))

@@ -44,6 +44,18 @@ def test_clean_config_drops_passwords() -> None:
     assert cleaned["strategy"]["daily_body"]["eth_minutes"] == 20
 
 
+def test_add_preset_can_use_custom_name(tmp_path: Path) -> None:
+    """切实盘前可以留下认得出的存档名。"""
+    saved = add_preset(
+        tmp_path,
+        {"strategy": {"engine": "daily_body", "symbols": ["fu2701"]}, "dry_run": True},
+        datetime(2026, 11, 8, 23, 0, 0),
+        name="切实盘前-fu2701-日内实体-2026-11-08 23:00:00",
+    )
+    assert saved["name"].startswith("切实盘前-")
+    assert get_preset(tmp_path, saved["id"])["name"] == saved["name"]
+
+
 def test_add_and_apply_keeps_switches_and_drops_password(tmp_path: Path) -> None:
     saved = add_preset(
         tmp_path,

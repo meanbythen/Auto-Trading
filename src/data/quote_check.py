@@ -2,8 +2,8 @@
 行情来源。
 
 一次只问一家。开仓前不再额外对另一家，避免下单前多等一次网络。
-新浪仍用原来的代码 akshare。东方财富用 eastmoney。天勤用 tq。
-三家的 K 线分开存放，换来源时不会把旧的那一家盖在同一根时间上。
+新浪仍用原来的代码 akshare。东方财富用 eastmoney。天勤用 tq。同花顺图用 ths，只给历史回测。
+各家的 K 线分开存放，换来源时不会把旧的那一家盖在同一根时间上。
 """
 
 from __future__ import annotations
@@ -14,14 +14,17 @@ import pandas as pd
 import requests
 
 # 界面上的名字，和配置文件里的代码。
+# 实盘只用前三家。同花顺图只出现在历史回测，读图会抢鼠标，不能拿去扫描下单。
 SOURCE_LABELS = ("新浪", "东方财富", "天勤")
-_CODE_BY_LABEL = {"新浪": "akshare", "东方财富": "eastmoney", "天勤": "tq"}
+BACKTEST_SOURCE_LABELS = ("新浪", "东方财富", "天勤", "同花顺图")
+_CODE_BY_LABEL = {"新浪": "akshare", "东方财富": "eastmoney", "天勤": "tq", "同花顺图": "ths"}
 _LABEL_BY_CODE = {
     "akshare": "新浪",
     "sina": "新浪",
     "eastmoney": "东方财富",
     "tq": "天勤",
     "tqsdk": "天勤",
+    "ths": "同花顺图",
 }
 
 # 东方财富期货市场编号。只用来找合约。
@@ -75,6 +78,8 @@ def normalize_source(value: str | None) -> str:
         return "eastmoney"
     if lowered in {"tq", "tqsdk", "tianqin", "shinny"}:
         return "tq"
+    if lowered in {"ths", "tonghuashun", "同花顺", "同花顺图"}:
+        return "ths"
     if lowered in {"csv", "demo"}:
         return lowered
     return "akshare"
@@ -86,18 +91,35 @@ def source_label(value: str | None) -> str:
     return _LABEL_BY_CODE.get(code, "新浪")
 
 
+def is_tq_source(value: str | None) -> bool:
+    """
+    现在是不是在用天勤拉行情。
+
+    只有这时才登录天勤账号。选新浪或东方财富时，即使填了天勤账号也不连。
+    """
+    return normalize_source(value) == "tq"
+
+
+def is_ths_source(value: str | None) -> bool:
+    """是不是从同花顺主图信息框读 K 线。只给历史回测。"""
+    return normalize_source(value) == "ths"
+
+
 def storage_symbol(symbol: str, source: str | None) -> str:
     """
     本地库存用的合约名。
 
     新浪仍是 bu2612，已经存下的文件不用搬家。
-    东方财富写成 bu2612@eastmoney，天勤写成 fu2701@tq，各家不会叠在同一根 K 线上。
+    东方财富写成 bu2612@eastmoney，天勤写成 fu2701@tq，
+    同花顺图写成 fu2701@ths，各家不会叠在同一根 K 线上。
     """
     code = normalize_source(source)
     if code == "eastmoney":
         return f"{symbol}@eastmoney"
     if code == "tq":
         return f"{symbol}@tq"
+    if code == "ths":
+        return f"{symbol}@ths"
     return str(symbol)
 
 

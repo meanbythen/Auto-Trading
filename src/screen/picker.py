@@ -357,21 +357,33 @@ def _attach_universe_contracts(risk: dict[str, Any]) -> None:
 SCREEN_STRATEGIES: list[tuple[str, str]] = [
     ("daily_body", "日内实体"),
     ("morning_box_a", "早盘箱体突破A"),
-    ("morning_structure_b", "早盘高低递进B"),
     ("trend_follow", "趋势跟随"),
     ("supertrend", "SuperTrend趋势"),
-    ("single_ma", "单均线系统"),
     ("dual_ma", "双均线趋势"),
+    ("bollinger", "布林带突破"),
+    ("sar_trend", "SAR波段趋势"),
+    ("multi_factor", "多因子CTA（加权打分）"),
+    ("multi_vote", "多因子投票"),
+    ("multi_hybrid", "多因子混合"),
     ("swing_trend", "长线趋势加减仓"),
+    ("jesse_casper", "Jesse Casper（简化SMC）"),
 ]
 
 # 配置里可能写着旧的短名字。交叉测试只认左边这一套，避免同一套跑两遍。
 _ENGINE_ALIAS = {
     "st": "supertrend",
-    "Single_ma": "single_ma",
     "ma_cross": "dual_ma",
+    "boll": "bollinger",
+    "bollinger_break": "bollinger",
+    "sar": "sar_trend",
+    "parabolic_sar": "sar_trend",
+    "multi": "multi_factor",
+    "cta": "multi_factor",
+    "vote": "multi_vote",
+    "hybrid": "multi_hybrid",
     "morning_a": "morning_box_a",
-    "morning_b": "morning_structure_b",
+    "casper": "jesse_casper",
+    "jesse": "jesse_casper",
 }
 
 
@@ -793,6 +805,10 @@ def screen_cross(
     spec.pop("engine", None)
     strategies = list(engines or SCREEN_STRATEGIES)
     items, skipped_thin = _without_thin(list(universe or MAIN_UNIVERSE))
+    # 每个品种只拉一次最新 K 线，给「当下行情」列用；和回测那份数据分开取，避免把回测末日当成现在。
+    from src.strategy.session_audit import make_bars_provider
+
+    bars_fn = make_bars_provider(cfg)
     rows: list[dict[str, Any]] = []
     stopped = False
     total = len(items) * len(strategies)
@@ -859,6 +875,19 @@ def screen_cross(
                 str(row.get("data_from") or ""),
                 str(row.get("data_to") or ""),
             )
+            try:
+                row.update(
+                    _market_snapshot(
+                        cfg,
+                        bars_fn,
+                        code,
+                        str((prepared.get("strategy") or {}).get("timeframe") or "5"),
+                        engine,
+                    )
+                )
+            except Exception:  # noqa: BLE001
+                # 附加信息，拿不到就留空，不能让它把整行回测结果带崩。
+                row.update({"market_score": None, "market_ok": None, "market_note": "取数失败"})
             row["better"] = []
             row["picked"] = "没测成" if row.get("error") else ""
             rows.append(row)
@@ -878,6 +907,89 @@ def screen_cross(
         "skipped_thin": skipped_thin,
         "ran_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+
+def _market_snapshot(
+    cfg: dict[str, Any],
+    bars_fn: Callable[[str, str, int], Any],
+    symbol: str,
+    timeframe: str,
+    engine: str,
+) -> dict[str, Any]:
+    """
+    交叉测试附带的「当下行情」：用这套引擎的过滤模式给现在这一刻打分。
+
+    口径和盘前审计一致；行情过滤开关关着也照算，分数只作参考，不影响回测成绩。
+    """
+    from dataclasses import replace
+
+    from src.data.periods import drop_forming_bar
+    from src.strategy.market_state import (
+        MarketFilterParams,
+        evaluate_market_state,
+        ENGINE_TREND_SECTION,
+        range_params_for_daily_body,
+        score_market_state,
+        trend_params_for_section,
+    )
+    from src.strategy.session_audit import CTA_OWN_FILTER, ENGINE_AUDIT_MODES
+
+    mode = ENGINE_AUDIT_MODES.get(engine)
+    if mode is None:
+        return {"market_score": None, "market_ok": None, "market_note": "未接入行情过滤"}
+
+    if engine in CTA_OWN_FILTER:
+        from src.strategy.cta_filter import CtaFilterParams, evaluate_cta_filter
+
+        kind = {"cta": "multi_factor", "vote": "multi_vote", "hybrid": "multi_hybrid"}.get(
+            engine, engine
+        )
+        st = cfg.get("strategy") or {}
+        box = st.get(kind) if isinstance(st.get(kind), dict) else {}
+        cta = CtaFilterParams.from_box(box, kind=kind)
+        need = max(cta.need_bars, cta.adx_period + 5)
+        bars = bars_fn(symbol, timeframe, need + 1)
+        closed = drop_forming_bar(bars) if bars is not None else None
+        if closed is None or len(closed) < need:
+            return {"market_score": None, "market_ok": None, "market_note": "K线不足"}
+        gate = evaluate_cta_filter(closed, cta)
+        score = min(100.0, max(0.0, gate.adx) + max(0.0, min(1.0, gate.atr_rank)) * 50.0)
+        return {
+            "market_score": round(float(score), 1),
+            "market_ok": bool(gate.ok),
+            "market_note": gate.describe() if gate.ok else gate.reason,
+        }
+
+    if engine == "daily_body":
+        params = range_params_for_daily_body(cfg)
+        if not params.enabled:
+            params = replace(params, enabled=True, mode="range")
+    else:
+        section = ENGINE_TREND_SECTION.get(engine)
+        if section:
+            base = trend_params_for_section(cfg, section)
+        else:
+            base = MarketFilterParams(enabled=True, mode=mode or "trend")
+        params = replace(base, enabled=True, mode=mode or "trend")
+    bars = bars_fn(symbol, timeframe, params.need_bars + 1)
+    closed = drop_forming_bar(bars) if bars is not None else None
+    if closed is None or len(closed) < params.need_bars:
+        return {"market_score": None, "market_ok": None, "market_note": "K线不足"}
+
+    state = evaluate_market_state(closed, params)
+    return {
+        "market_score": round(float(score_market_state(closed, params)), 1),
+        "market_ok": bool(state.ok),
+        "market_note": state.describe() if state.ok else state.reason,
+    }
+
+
+def _market_text(source: dict[str, Any]) -> str:
+    """结果表「当下行情」格子：分数 + 适配/不适配，没有数据就给原因。"""
+    score = source.get("market_score")
+    if score is None:
+        return str(source.get("market_note") or "—")
+    return f"{float(score):.0f} {'适配' if source.get('market_ok') else '不适配'}"
 
 
 def choice_labels(candidates: list[dict[str, Any]]) -> list[str]:
@@ -1003,6 +1115,7 @@ def list_rows(result: dict[str, Any]) -> list[dict[str, str]]:
                 "daily_avg": empty["daily_avg"],
                 "bars": "—",
                 "score": "—",
+                "market": _market_text(row),
                 "liquidity": str(row.get("liquidity") or "—"),
                 "picked": "没测成",
             })
@@ -1152,6 +1265,7 @@ def _display_row(
         "daily_avg": cover["daily_avg"],
         "bars": _bars_text(source, period),
         "score": _score(source.get("score")),
+        "market": _market_text(source),
         "liquidity": str(source.get("liquidity") or "—"),
         "picked": picked,
     }
@@ -1293,14 +1407,20 @@ def format_cover_lines(
 
 
 def _round_export(value: Any, places: int) -> Any:
-    """导出成数字。整数列尽量不带小数，方便在 Excel 里排序。"""
+    """导出成数字。整数列尽量不带小数；有小数时保留两位（和 Excel 读回来的数一致，避免同一笔被当成新行）。"""
     try:
         number = float(value)
     except (TypeError, ValueError):
         return ""
     if places <= 0:
-        return int(round(number)) if abs(number - round(number)) < 1e-9 else number
-    return round(number, places)
+        if abs(number - round(number)) < 1e-9:
+            return int(round(number))
+        # 金额列不是整数时保留两位小数；直接写原始浮点会带上 3524.6200000000003 这种尾巴。
+        rounded = round(number, 2)
+        return int(round(rounded)) if abs(rounded - round(rounded)) < 1e-9 else rounded
+    # 先按位数取整；取整后恰好是整数（如 3431.0）就写整数，不然保留小数。
+    rounded = round(number, places)
+    return int(round(rounded)) if abs(rounded - round(rounded)) < 1e-9 else rounded
 
 
 def actual_span(data_from: str, data_to: str) -> str:

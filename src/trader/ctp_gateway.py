@@ -24,6 +24,7 @@ from urllib.parse import urlparse
 from loguru import logger
 
 from src.trader.ctp_logic import (
+    CTP_KIND_SIM,
     OrderTable,
     PositionView,
     SessionTracker,
@@ -32,8 +33,11 @@ from src.trader.ctp_logic import (
     OrderActivity,
     apply_order_report,
     apply_trade,
+    ctp_exchange_id,
     ctp_instrument_id,
     is_terminal,
+    keep_order_sys_id,
+    overlay_ctp_profile,
     symbol_key,
     test_front_blocks_live_account,
 )
@@ -111,12 +115,17 @@ class CtpSettings:
     account_user_id: str = ""
     # 仿真报价走行情端口。空着时，华泰测试交易端口 27226 会配对到 27236。
     md_front: str = ""
+    # sim=仿真账号，live=真实账号。窗口和策略共用这一项。
+    account_kind: str = CTP_KIND_SIM
+    # 交易台会话：报单代码与常驻相同，但不因「已有挂单」拒单，也不超时自动撤。
+    desk_session: bool = False
 
     @classmethod
     def from_cfg(cls, cfg: dict[str, Any]) -> "CtpSettings":
         trade = cfg.get("trade") or {}
-        ctp = trade.get("ctp") or {}
         account = cfg.get("account") or {}
+        # 仿真用 28077；真实用配置页资金账号，前置只用 live 小节。
+        ctp = overlay_ctp_profile(trade.get("ctp") or {}, account=account)
         root = str(cfg.get("_project_root") or "")
         flow = str(ctp.get("flow_dir") or "data/ctp_flow")
         flow_path = Path(flow)
@@ -126,7 +135,7 @@ class CtpSettings:
         return cls(
             td_front=str(ctp.get("td_front") or "").strip(),
             broker_id=str(ctp.get("broker_id") or "").strip(),
-            user_id=str(ctp.get("user_id") or account.get("user_id") or "").strip(),
+            user_id=str(ctp.get("user_id") or "").strip(),
             password=str(ctp.get("resolved_password") or ""),
             app_id=str(ctp.get("app_id") or "client_AutoTrading_1.0").strip(),
             auth_code=str(ctp.get("resolved_auth_code") or ""),
@@ -144,7 +153,22 @@ class CtpSettings:
             cancel_wait_sec=float(ctp.get("cancel_wait_sec") or 3),
             account_user_id=str(account.get("user_id") or "").strip(),
             md_front=str(ctp.get("md_front") or "").strip(),
+            account_kind=str(ctp.get("account_kind") or CTP_KIND_SIM),
+            desk_session=_flag(ctp.get("desk_session"), False),
         )
+
+    def submit_wait_sec(self) -> float:
+        """常驻等到成交或超时；交易台只等回报进门，好让人接着点撤单。"""
+        wait = float(self.order_wait_sec)
+        if self.desk_session:
+            return min(wait, 1.5)
+        return wait
+
+    def submit_auto_cancel(self) -> bool:
+        """超时自动撤只给常驻。交易台挂单要留给华泰手撤和截图。"""
+        if self.desk_session:
+            return False
+        return bool(self.auto_cancel_on_timeout)
 
     def missing(self) -> list[str]:
         """还没填的必填项。不把密码和认证码本身算进说明文字。"""
@@ -177,13 +201,26 @@ class CtpGateway:
         # 重连后查到、但程序自己没有记住的未完成报单。有这种单就先不开新仓。
         self.unknown_working: list[str] = []
         self.available: float | None = None
+        self.account: dict[str, Any] = {}
+        self.contracts: list[dict[str, Any]] = []
         self.fill_handler: Callable[[dict[str, Any]], None] | None = None
+        self._last_quote_line = ""
         self._lock = threading.RLock()
         self._ready_event = threading.Event()
         self._pos_event = threading.Event()
         self._account_event = threading.Event()
         # 查涨跌停时等柜台把合约资料回完。和报单等待分开，避免两件事互相叫醒。
         self._instrument_event = threading.Event()
+        self._order_query_event = threading.Event()
+        self._trade_event = threading.Event()
+        self._contract_event = threading.Event()
+        self._margin_event = threading.Event()
+        self._commission_event = threading.Event()
+        self.trades: list[dict[str, Any]] = []
+        self._pending_contracts: list[dict[str, Any]] = []
+        self._margin_row: dict[str, Any] | None = None
+        self._commission_row: dict[str, Any] | None = None
+        self._trade_ids: set[str] = set()
         self._instrument: dict[str, Any] | None = None
         self._instrument_error = ""
         self._waiters: dict[str, threading.Event] = {}
@@ -346,22 +383,15 @@ class CtpGateway:
             logger.warning(note)
         else:
             logger.info(note)
-        waiter.wait(self.settings.order_wait_sec)
-        # 等不到终态还挂着：撤掉，再等撤单回报落地。过时委托留在柜台上，
-        # 行情反向时照样会成交，而策略这根 K 线的判断早就作废了。
-        if not is_terminal(order.status) and self.settings.auto_cancel_on_timeout:
+        waiter.wait(self.settings.submit_wait_sec())
+        # 常驻：等不到终态就撤，避免过时委托继续成交。
+        # 交易台：挂单留着，人才能点撤选中、测批量撤，华泰截图也能看到「已报」。
+        if not is_terminal(order.status) and self.settings.submit_auto_cancel():
             self._cancel_stale(order)
         return order
 
     def _cancel_stale(self, order: TrackedOrder) -> None:
         """撤掉等待超时还没结束的报单，并等柜台把终态回报送回来。"""
-        if not order.order_sys_id:
-            # 没有柜台编号，撤单报文柜台不认。至少不要把它当成成交。
-            logger.warning(
-                "报单 {} 等不到柜台编号，暂时无法撤单；后续开仓会先被这一笔挡住",
-                order.order_ref,
-            )
-            return
         ok, message = self.cancel(order.order_ref)
         if not ok:
             # 撤单前刚巧成交或撤掉时，这里会报「已经结束」，不用当成故障。
@@ -393,15 +423,13 @@ class CtpGateway:
                 return False, "没有这一笔报单"
             if is_terminal(order.status):
                 return False, f"报单 {order_ref} 已经结束，不用撤"
-            if not order.order_sys_id:
-                return False, "柜台编号还没回来，暂时不能撤"
             payload = {
                 "symbol": order.symbol,
                 "order_ref": order.order_ref,
                 "front_id": order.front_id or self.session.front_id,
                 "session_id": order.session_id or self.session.session_id,
-                "exchange_id": order.exchange_id,
-                "order_sys_id": order.order_sys_id,
+                "exchange_id": order.exchange_id or ctp_exchange_id(order.symbol),
+                "order_sys_id": keep_order_sys_id(order.order_sys_id),
             }
         try:
             self.client.cancel(self.settings, payload)
@@ -416,6 +444,24 @@ class CtpGateway:
             logger.info("已发送撤单 {}。{}", order_ref, note)
         return True, f"已发送撤单 {order_ref}"
 
+    def query_working_orders(self) -> tuple[bool, list[TrackedOrder]]:
+        """向柜台查今天的报单，返回还没完结的那些。"""
+        if not self.session.ready or self.client is None:
+            return False, []
+        if not hasattr(self.client, "query_orders"):
+            return False, []
+        self._order_query_event.clear()
+        try:
+            self.client.query_orders(self.settings)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("查询委托失败: {}", exc)
+            return False, []
+        if not self._order_query_event.wait(self.settings.login_timeout_sec):
+            return False, []
+        with self._lock:
+            live = [row for row in self.table.orders.values() if not is_terminal(row.status)]
+        return True, live
+
     def refresh(self) -> bool:
         """向柜台查一次持仓和可用资金。查持仓完成后再查资金，避免两次查询挤在一起被拒绝。"""
         if not self.session.ready or self.client is None:
@@ -429,6 +475,8 @@ class CtpGateway:
             return False
         if not self._pos_event.wait(self.settings.login_timeout_sec):
             return False
+        # 柜台要求两次查询隔开一点，否则会把查资金挡掉。
+        time.sleep(1.05)
         self._account_event.clear()
         try:
             self.client.query_account(self.settings)
@@ -490,12 +538,22 @@ class CtpGateway:
             logger.exception(self.session.last_error)
             self._ready_event.set()
 
-    def on_login(self, ok: bool, front_id: int, session_id: int, trading_day: str, message: str) -> None:
+    def on_login(
+        self,
+        ok: bool,
+        front_id: int,
+        session_id: int,
+        trading_day: str,
+        message: str,
+        max_order_ref: str = "",
+    ) -> None:
         step = self.session.on_logged_in(ok, front_id, session_id, trading_day, message)
         if step != "confirm":
             logger.error("CTP 登录失败: {}", message)
             self._ready_event.set()
             return
+        if max_order_ref:
+            self._note_ref(max_order_ref)
         logger.info(
             "CTP 登录成功。账号 {} AppID {} 交易日 {}",
             self.settings.user_id,
@@ -515,7 +573,7 @@ class CtpGateway:
             logger.error("结算单确认失败: {}", message)
             self._ready_event.set()
             return
-        logger.info("结算单已确认，先查询未完成报单")
+        logger.info("结算单已确认，先查询今日委托")
         self.unknown_working = []
         try:
             self.client.query_orders(self.settings)
@@ -544,20 +602,42 @@ class CtpGateway:
         order_sys_id: str = "",
         front_id: int = 0,
         session_id: int = 0,
+        detail: dict[str, Any] | None = None,
     ) -> None:
         with self._lock:
             order = self.table.get(order_ref)
+            extra = detail or {}
             if order is None:
-                self._note_foreign_report()
-                return
+                symbol = str(extra.get("symbol") or "")
+                if not symbol:
+                    self._note_foreign_report()
+                    return
+                order = TrackedOrder(
+                    order_ref,
+                    symbol,
+                    str(extra.get("direction") or ""),
+                    str(extra.get("offset") or ""),
+                    max(int(extra.get("volume") or 0), int(filled or 0), 1),
+                    float(extra.get("price") or 0),
+                )
+                self.table.add(order)
+            if extra.get("symbol") and not order.symbol:
+                order.symbol = str(extra.get("symbol") or "")
+            if extra.get("direction") and not order.direction:
+                order.direction = str(extra.get("direction") or "")
+            if extra.get("offset") and not order.offset:
+                order.offset = str(extra.get("offset") or "")
+            if extra.get("price") and not order.price:
+                order.price = float(extra.get("price") or 0)
             if exchange_id:
                 order.exchange_id = exchange_id
-            if order_sys_id:
-                order.order_sys_id = order_sys_id.strip()
+            if order_sys_id and str(order_sys_id).strip():
+                order.order_sys_id = keep_order_sys_id(order_sys_id)
             if front_id:
                 order.front_id = int(front_id)
             if session_id:
                 order.session_id = int(session_id)
+            self._stamp_order_meta(order, extra)
             apply_order_report(order, status_code=status_code, filled=filled, message=message)
             logger.info(
                 "报单 {} {} {}",
@@ -587,8 +667,10 @@ class CtpGateway:
         if self.foreign_reports == 1:
             logger.info("仿真公用账号上有别人的历史回报。那些单不是这次登录发出的，后面不再逐条显示。")
 
-    def on_trade(self, order_ref: str, price: float, volume: int) -> None:
+    def on_trade(self, order_ref: str, price: float, volume: int, detail: dict[str, Any] | None = None) -> None:
+        extra = detail or {}
         with self._lock:
+            self._remember_fill(order_ref, price, volume, extra)
             order = self.table.get(order_ref)
             if order is None:
                 self._note_foreign_report()
@@ -603,29 +685,133 @@ class CtpGateway:
             )
             self._finish_locked(order)
 
-    def on_query_order(self, order_ref: str, status_code: str, filled: int, symbol: str, is_last: bool) -> None:
-        """重连后的报单查询。认识的报单更新状态；不认识的只记下来，避免编号重复。"""
+    def on_query_trade(self, row: dict[str, Any] | None, is_last: bool) -> None:
+        with self._lock:
+            if row:
+                self._remember_fill(
+                    str(row.get("order_ref") or ""),
+                    float(row.get("price") or 0),
+                    int(row.get("volume") or 0),
+                    row,
+                )
+            if is_last:
+                self._trade_event.set()
+
+    def _remember_fill(self, order_ref: str, price: float, volume: int, extra: dict[str, Any]) -> None:
+        """同一笔成交号只记一次，推送和查询不会写成两行。"""
+        trade_id = str(extra.get("trade_id") or "").strip()
+        key = trade_id or f"{order_ref}|{price}|{volume}|{extra.get('time') or ''}"
+        if key in self._trade_ids:
+            return
+        self._trade_ids.add(key)
+        self.trades.append(
+            {
+                "order_ref": str(order_ref or "").strip(),
+                "trade_id": trade_id,
+                "symbol": symbol_key(str(extra.get("symbol") or "")),
+                "direction": str(extra.get("direction") or ""),
+                "offset": str(extra.get("offset") or ""),
+                "price": float(price or 0),
+                "volume": int(volume or 0),
+                "time": str(extra.get("time") or ""),
+                "exchange": str(extra.get("exchange") or ""),
+                "hedge": str(extra.get("hedge") or ""),
+                "order_sys_id": str(extra.get("order_sys_id") or "").strip(),
+                "commission": float(extra.get("commission") or 0),
+                "close_profit": float(extra.get("close_profit") or 0),
+            }
+        )
+        if len(self.trades) > 300:
+            dropped = self.trades[:-200]
+            self.trades = self.trades[-200:]
+            for old in dropped:
+                self._trade_ids.discard(str(old.get("trade_id") or "") or "")
+
+    def query_trade_history(self) -> tuple[bool, list[dict[str, Any]]]:
+        """向柜台查今天的成交。"""
+        if not self.session.ready or self.client is None:
+            return False, []
+        if not hasattr(self.client, "query_trades"):
+            return True, list(self.trades)
+        self._trade_event.clear()
+        try:
+            self.client.query_trades(self.settings)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("查询成交失败: {}", exc)
+            return False, []
+        if not self._trade_event.wait(self.settings.login_timeout_sec):
+            return False, list(self.trades)
+        with self._lock:
+            return True, list(self.trades)
+
+    def on_query_order(
+        self,
+        order_ref: str,
+        status_code: str,
+        filled: int,
+        symbol: str,
+        is_last: bool,
+        exchange_id: str = "",
+        order_sys_id: str = "",
+        front_id: int = 0,
+        session_id: int = 0,
+        price: float = 0.0,
+        volume: int = 0,
+        direction: str = "",
+        offset: str = "",
+        message: str = "",
+        insert_time: str = "",
+        hedge: str = "",
+        remaining: int = 0,
+    ) -> None:
+        """
+        重连或再登录后的报单查询。
+
+        今天已成交、已撤的也放进委托表，方便和成交页对照。
+        还没完结的另外记一笔，避免程序以为仓是空的又去开仓。
+        """
         with self._lock:
             if order_ref:
                 self._note_ref(order_ref)
                 order = self.table.get(order_ref)
                 if order is None:
-                    stranger = TrackedOrder(order_ref, symbol or "", "", "", max(int(filled or 0), 1), 0)
-                    apply_order_report(stranger, status_code=status_code, filled=filled)
-                    if not is_terminal(stranger.status):
+                    order = TrackedOrder(
+                        order_ref,
+                        symbol or "",
+                        direction,
+                        offset,
+                        max(int(volume or 0), int(filled or 0), 1),
+                        float(price or 0),
+                    )
+                    apply_order_report(order, status_code=status_code, filled=filled, message=message)
+                    self.table.add(order)
+                    if not is_terminal(order.status):
                         self.unknown_working.append(order_ref)
                         logger.warning(
-                            "柜台还有未完成报单 {} {}，程序没记住它。先停止开新仓。",
-                            order_ref,
+                            "柜台还有未完成报单 {} {}，已记入委托表，可点撤单。",
+                            str(order_ref).strip(),
                             symbol,
                         )
                 else:
-                    apply_order_report(order, status_code=status_code, filled=filled)
+                    apply_order_report(order, status_code=status_code, filled=filled, message=message)
                     self._finish_locked(order)
+                if exchange_id:
+                    order.exchange_id = exchange_id
+                if order_sys_id and str(order_sys_id).strip():
+                    order.order_sys_id = keep_order_sys_id(order_sys_id)
+                if front_id:
+                    order.front_id = int(front_id)
+                if session_id:
+                    order.session_id = int(session_id)
+                self._stamp_order_meta(
+                    order,
+                    {"insert_time": insert_time, "hedge": hedge, "remaining": remaining},
+                )
             if is_last:
                 self.session.on_orders_checked()
-                logger.info("未完成报单已核对")
+                logger.info("今日委托已核对，共 {} 笔", len(self.table.orders))
                 self._ready_event.set()
+                self._order_query_event.set()
 
     def on_position_row(self, row: dict[str, Any] | None, is_last: bool) -> None:
         if row:
@@ -673,7 +859,9 @@ class CtpGateway:
         band.update(view)
         name = str(band.get("symbol") or symbol)
         text = quote_line(band)
-        logger.info("柜台快照 {}", text)
+        if text != self._last_quote_line:
+            self._last_quote_line = text
+            logger.info("柜台快照 {}", text)
         if band.get("upper_text") == "—" and band.get("lower_text") == "—":
             return True, f"{name} 柜台这次没有给出涨停价和跌停价"
         return True, text
@@ -691,12 +879,111 @@ class CtpGateway:
         if is_last:
             self._instrument_event.set()
 
-    def on_account(self, available: float | None, is_last: bool) -> None:
-        if available is not None:
-            self.available = available
-            logger.info("柜台可用资金 {:.2f}", available)
+    def on_account(self, available: float | dict[str, Any] | None, is_last: bool) -> None:
+        """资金查询。新接口给一整行；旧测试只给可用金额，两种都认。"""
+        if isinstance(available, dict):
+            self.account = dict(available)
+            self.available = float(available.get("available") or 0)
+            logger.info(
+                "柜台可用资金 {:.2f}，动态权益 {:.2f}",
+                self.available,
+                float(available.get("balance") or 0),
+            )
+        elif available is not None:
+            self.available = float(available)
+            self.account["available"] = self.available
+            logger.info("柜台可用资金 {:.2f}", self.available)
         if is_last:
             self._account_event.set()
+
+    def on_contract_row(self, row: dict[str, Any] | None, is_last: bool) -> None:
+        if row and str(row.get("symbol") or "").strip():
+            if len(self._pending_contracts) < 250:
+                self._pending_contracts.append(row)
+        if is_last:
+            self.contracts = list(self._pending_contracts)
+            self._contract_event.set()
+
+    def on_margin_row(self, row: dict[str, Any] | None, is_last: bool) -> None:
+        if row:
+            self._margin_row = row
+        if is_last:
+            self._margin_event.set()
+
+    def on_commission_row(self, row: dict[str, Any] | None, is_last: bool) -> None:
+        if row:
+            self._commission_row = row
+        if is_last:
+            self._commission_event.set()
+
+    def query_contracts(self, keyword: str) -> tuple[bool, str]:
+        """按代码或前缀拉合约列表。一次最多留 250 行。"""
+        if not self.session.ready or self.client is None:
+            return False, "还没登录，不能查合约"
+        if not hasattr(self.client, "query_instruments"):
+            return False, "这条连接不能查合约"
+        self._pending_contracts = []
+        self._contract_event.clear()
+        try:
+            self.client.query_instruments(self.settings, keyword)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("查询合约失败: {}", exc)
+            return False, f"查询合约失败：{exc}"
+        if not self._contract_event.wait(self.settings.login_timeout_sec):
+            return False, "查询合约超时，请过一两秒再搜"
+        count = len(self.contracts)
+        if count <= 0:
+            return True, f"没有找到 {keyword or '合约'}。试完整代码，例如 ad2701。"
+        extra = "（已截断到 250 行，请把搜索写得更具体）" if count >= 250 else ""
+        return True, f"查到 {count} 个合约{extra}。点一行可看保证金和手续费，并填进上方合约框。"
+
+    def query_contract_costs(self, symbol: str) -> tuple[bool, dict[str, Any]]:
+        """点中一行后再查保证金和手续费，叠到同一条合约上。"""
+        name = symbol_key(symbol)
+        found = next((item for item in self.contracts if symbol_key(str(item.get("symbol") or "")) == name), {})
+        if not self.session.ready or self.client is None:
+            return False, dict(found)
+        merged = dict(found)
+        if hasattr(self.client, "query_margin_rate"):
+            self._margin_row = None
+            self._margin_event.clear()
+            try:
+                self.client.query_margin_rate(self.settings, symbol)
+                if self._margin_event.wait(self.settings.login_timeout_sec) and self._margin_row:
+                    merged.update({k: v for k, v in self._margin_row.items() if k != "symbol" or v})
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("查询保证金失败: {}", exc)
+        time.sleep(1.05)
+        if hasattr(self.client, "query_commission_rate"):
+            self._commission_row = None
+            self._commission_event.clear()
+            try:
+                self.client.query_commission_rate(self.settings, symbol)
+                if self._commission_event.wait(self.settings.login_timeout_sec) and self._commission_row:
+                    merged.update({k: v for k, v in self._commission_row.items() if k != "symbol" or v})
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("查询手续费失败: {}", exc)
+        for index, item in enumerate(self.contracts):
+            if symbol_key(str(item.get("symbol") or "")) == name:
+                self.contracts[index] = merged
+                break
+        else:
+            if merged:
+                self.contracts.append(merged)
+        return True, merged
+
+    def _stamp_order_meta(self, order: TrackedOrder, extra: dict[str, Any] | None = None) -> None:
+        """把委托时间、投保、剩余手数记到表上，给交易台显示。"""
+        payload = extra or {}
+        insert_time = str(payload.get("insert_time") or "")
+        if insert_time:
+            order.insert_time = insert_time
+        hedge = str(payload.get("hedge") or "")
+        if hedge:
+            order.hedge = hedge
+        remaining = payload.get("remaining")
+        if remaining:
+            order.remaining = int(remaining)
 
     def _begin_position_query(self) -> None:
         self._pending_positions = {}

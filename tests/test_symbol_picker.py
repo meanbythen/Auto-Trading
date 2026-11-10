@@ -529,10 +529,16 @@ def test_strategy_compare_keeps_one_symbol_and_ranks_each_engine() -> None:
     assert "mean_reversion" not in engines
     assert "sar_flip" not in engines
     assert "morning_gap_c" not in engines
-    # 含长线趋势加减仓；以后再加策略时这里要跟着 SCREEN_STRATEGIES 变。
+    # 含长线趋势加减仓和布林/SAR/多因子；以后再加策略时这里要跟着 SCREEN_STRATEGIES 变。
     assert "swing_trend" in engines
-    assert len(engines) == len(set(engines)) == 8
-    assert [item[0] for item in seen] == ["rb2701"] * 8
+    assert "bollinger" in engines
+    assert "sar_trend" in engines
+    assert "multi_factor" in engines
+    assert "multi_vote" in engines
+    assert "multi_hybrid" in engines
+    assert "jesse_casper" in engines
+    assert len(engines) == len(set(engines)) == 12
+    assert [item[0] for item in seen] == ["rb2701"] * 12
     assert [item[1] for item in seen] == engines
     shown = list_rows(result)
     assert shown[0]["symbol"] == "日内实体"
@@ -653,6 +659,41 @@ def test_clear_saved_picks_removes_the_file_the_window_would_redraw(tmp_path: Pa
     clear_saved_picks(target)
     assert not target.exists()
     clear_saved_picks(target)
+
+
+def test_market_snapshot_scores_by_engine_and_skips_unfiltered_ones() -> None:
+    """交叉测试的「当下行情」：接了过滤的引擎给分，没接的明确标未接入。"""
+    import pandas as pd
+
+    from src.screen.picker import _market_snapshot
+
+    idx = pd.date_range("2026-11-01 09:00", periods=140, freq="5min")
+    closes = [4000 + i + (6 if (i // 5) % 2 else 0) for i in range(140)]
+    bars = pd.DataFrame(
+        {
+            "open": [c - 0.5 for c in closes],
+            "high": [c + 1 for c in closes],
+            "low": [c - 1 for c in closes],
+            "close": closes,
+            "volume": [100] * 140,
+        },
+        index=idx,
+    )
+    # 开关关着也照算：分数只作参考，和回测配置无关。
+    cfg = {"strategy": {"market_filter": {"enabled": False, "mode": "trend"}}}
+
+    row = _market_snapshot(cfg, lambda symbol, tf, n: bars, "fu2701", "5", "multi_factor")
+    assert row["market_score"] is not None
+    assert 0 <= float(row["market_score"]) <= 100
+    assert isinstance(row["market_ok"], bool)
+    assert row["market_note"]
+
+    box = _market_snapshot(cfg, lambda symbol, tf, n: bars, "fu2701", "5", "morning_box_a")
+    assert box == {"market_score": None, "market_ok": None, "market_note": "未接入行情过滤"}
+
+    missing = _market_snapshot(cfg, lambda symbol, tf, n: None, "fu2701", "5", "multi_factor")
+    assert missing["market_score"] is None
+    assert missing["market_note"] == "K线不足"
 
 
 def test_window_only_draws_the_front_rows_when_there_are_too_many() -> None:

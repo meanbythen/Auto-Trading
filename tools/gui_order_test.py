@@ -8,7 +8,7 @@
 注意:
     - 会真实移动鼠标并点击（不受 config 里 dry_run 限制）
     - 请保持下单面板可见、窗口不要挪动
-    - 紧急停止：鼠标甩到屏幕左上角
+    - 真下单时请不要自己动鼠标；卡住可按 Ctrl+Alt+Delete
 """
 
 from __future__ import annotations
@@ -53,7 +53,8 @@ def _preview_moves(gui: dict) -> None:
 
 
 def main() -> None:
-    pyautogui.FAILSAFE = True
+    # 四角急停会跟填价格抢鼠标，试单和下单一样关掉。
+    pyautogui.FAILSAFE = False
     pyautogui.PAUSE = 0.25
 
     cfg = load_config()
@@ -66,7 +67,7 @@ def main() -> None:
     print("=" * 52)
     print("同花顺自动下单 · 模拟账户试跑")
     print("流程：预览坐标 → 倒计时 → 买多1手 → 等待 → 平仓")
-    print("紧急停止：鼠标甩到屏幕左上角")
+    print("真下单时请不要自己动鼠标；要停扫描用运行页「停止」")
     print("=" * 52)
 
     missing = [k for k, _ in PREVIEW_KEYS if not gui.get(k)]
@@ -110,9 +111,6 @@ def main() -> None:
 if __name__ == "__main__":
     try:
         main()
-    except pyautogui.FailSafeException:
-        print("\n已紧急停止（鼠标到了左上角）。")
-        sys.exit(2)
     except Exception as e:  # noqa: BLE001
         logger.exception("试单失败: {}", e)
         print(f"试单失败: {e}")

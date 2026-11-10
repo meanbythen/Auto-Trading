@@ -118,13 +118,14 @@ def test_main_contract_rejects_unknown_product() -> None:
 
 
 def test_period_seconds() -> None:
-    """周期换秒数；日线/周线天勤这轮不提供。"""
+    """分钟、小时、日线换成秒；周线不能直接要一周秒数。"""
     assert period_seconds("1") == 60
     assert period_seconds("5") == 300
     assert period_seconds("15分钟") == 900
     assert period_seconds("120") == 7200
-    with pytest.raises(ValueError, match="分钟线"):
-        period_seconds("D")
+    assert period_seconds("D") == 86400
+    with pytest.raises(ValueError, match="周线"):
+        period_seconds("W")
 
 
 def test_frame_turns_utc_start_time_into_beijing_right_label() -> None:
@@ -209,13 +210,79 @@ def test_provider_writes_tq_bars_to_their_own_name(tmp_path) -> None:
     assert provider.store.load("fu2701", "5") is None
 
 
-def test_provider_refuses_daily_for_tq(tmp_path) -> None:
-    """天勤这轮只有分钟线，日线要说清楚而不是悄悄换一家。"""
+def test_frame_daily_is_trading_day_midnight_not_plus_one_day() -> None:
+    """
+    日线 datetime 是交易日 00:00（北京）。
+
+    UTC 10-29 16:00 换北京是 10-30 00:00。如果再加 86400 秒会错成 10-31，多因子日线会对不上。
+    """
+    frame = frame_from_klines(_raw("2026-10-29 16:00", "2026-10-30 16:00"), 86400)
+    assert list(frame.index) == [
+        pd.Timestamp("2026-10-30 00:00"),
+        pd.Timestamp("2026-10-31 00:00"),
+    ]
+
+
+def test_fetch_frame_asks_86400_for_daily() -> None:
+    """日线问天勤 86400 秒，不换一家。"""
+    fake = _FakeApi(_raw("2026-10-29 16:00", "2026-10-30 16:00"))
+    frame = fetch_frame("fu2701", "D", limit=2, api=fake)
+    assert fake.calls == [("SHFE.fu2701", 86400, 10)]
+    assert frame.index[0] == pd.Timestamp("2026-10-30 00:00")
+
+
+def test_fetch_frame_weekly_aggregates_daily_not_604800() -> None:
+    """周线不直接要 604800，只用日线再收到周五。"""
+    days = pd.bdate_range("2026-10-12", "2026-10-30")
+    starts = [(pd.Timestamp(d) - pd.Timedelta(hours=8)).strftime("%Y-%m-%d %H:%M") for d in days]
+    fake = _FakeApi(_raw(*starts, close=2800.0))
+    frame = fetch_frame("fu2701", "W", limit=20, api=fake)
+    assert fake.calls == [("SHFE.fu2701", 86400, 80)]
+    assert all(pd.Timestamp(ts).weekday() == 4 for ts in frame.index)
+    assert len(frame) >= 2
+
+
+def test_provider_fetches_daily_from_tq(tmp_path) -> None:
+    """选天勤时日线走天勤，写进 fu2701@tq，不回头问新浪。"""
     provider = KlineProvider(
-        {"_project_root": str(tmp_path), "data": {"source": "tq", "cache_dir": "klines"}}
+        {"_project_root": str(tmp_path), "data": {"source": "tq", "cache_dir": "klines", "min_bars": 1}}
     )
-    with pytest.raises(RuntimeError, match="天勤只提供分钟K线"):
-        provider.fetch("fu2701", period="D")
+    daily = pd.DataFrame(
+        [{"open": 2700, "high": 2710, "low": 2690, "close": 2705, "volume": 10}],
+        index=pd.to_datetime(["2026-10-30 00:00"]),
+    )
+    provider._fetch_tq = lambda *_args, **_kwargs: daily  # type: ignore[method-assign]
+    provider._fetch_akshare = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("天勤日线不回头问新浪")
+    )  # type: ignore[method-assign]
+    got = provider.fetch("fu2701", period="D", max_bars=10)
+    assert float(got.iloc[-1]["close"]) == 2705.0
+    assert provider.store.load("fu2701@tq", "D") is not None
+
+
+def test_latest_price_asks_tianqin_not_sina(tmp_path) -> None:
+    """选天勤时，开仓滑点用的现价也必须问天勤，不能回头拉新浪。"""
+    provider = KlineProvider(
+        {
+            "_project_root": str(tmp_path),
+            "data": {"source": "tq", "cache_dir": "klines"},
+        }
+    )
+    asked: list[tuple[str, str]] = []
+
+    def _fake_tq(symbol: str, period: str, *, limit: int = 200):
+        asked.append((symbol, period))
+        return pd.DataFrame(
+            [{"open": 1, "high": 1, "low": 1, "close": 4712, "volume": 1}],
+            index=pd.to_datetime(["2026-11-06 21:01"]),
+        )
+
+    provider._fetch_tq = _fake_tq  # type: ignore[method-assign]
+    provider._recent_minutes = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("选天勤时 latest_price 不该去新浪")
+    )  # type: ignore[method-assign]
+    assert provider.latest_price("fu2701") == 4712.0
+    assert asked == [("fu2701", "1")]
 
 
 def test_provider_reads_tq_account_from_config(tmp_path) -> None:

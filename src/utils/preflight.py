@@ -119,18 +119,23 @@ def check_config(cfg: dict[str, Any], report: PreflightReport, log: LogFn | None
     elif executor == "sim":
         report.add("执行通道", True, "executor=sim（只模拟成交，不点同花顺）", "warn")
     elif executor == "ctp":
-        ctp = trade.get("ctp") or {}
+        from src.trader.ctp_logic import ctp_kind_label, overlay_ctp_profile
+
+        ctp = overlay_ctp_profile(trade.get("ctp") or {}, account=cfg.get("account"))
         missing = []
         if not str(ctp.get("td_front") or "").strip():
             missing.append("交易前置")
         if not str(ctp.get("broker_id") or "").strip():
             missing.append("BrokerID")
+        if not str(ctp.get("user_id") or "").strip():
+            missing.append("资金账号")
         if not str(ctp.get("resolved_auth_code") or "").strip():
             missing.append("认证码")
+        kind_txt = ctp_kind_label(ctp.get("account_kind"))
         if missing:
-            report.add("执行通道", False, "CTP 还缺：" + "、".join(missing) + "。填好前不要切换。")
+            report.add("执行通道", False, f"CTP {kind_txt}还缺：" + "、".join(missing) + "。填好前不要切换。")
         else:
-            report.add("执行通道", True, "executor=ctp（连接华泰柜台报单）")
+            report.add("执行通道", True, f"executor=ctp（{kind_txt}，连接华泰柜台报单）")
     else:
         report.add("执行通道", False, f"executor={executor}（不认识的执行通道）")
 
@@ -168,7 +173,14 @@ def check_config(cfg: dict[str, Any], report: PreflightReport, log: LogFn | None
         except Exception:  # noqa: BLE001
             pass
 
-    if gui.get("confirm_btn"):
+    confirm_times = int(gui.get("confirm_times", 0) or 0)
+    if confirm_times <= 0:
+        report.add(
+            "确认框",
+            True,
+            "点完买开/卖空/平仓即结束，不按回车（期货通无确认弹窗；能成交就成交，否则进委托单）",
+        )
+    elif gui.get("confirm_btn"):
         report.add("确认框坐标", True, f"已标定 confirm_btn={tuple(gui['confirm_btn'][:2])}")
     else:
         report.add(
@@ -250,7 +262,8 @@ def preview_coords(cfg: dict[str, Any], report: PreflightReport, log: LogFn | No
     """鼠标移到各标定坐标（不点击），方便肉眼确认。"""
     import pyautogui
 
-    pyautogui.FAILSAFE = True
+    # 预览也会划过屏幕，四角急停开着会自己把自己掐掉。
+    pyautogui.FAILSAFE = False
     gui = (cfg.get("trade") or {}).get("gui") or {}
     keys = [
         ("price_input", "价格框"),
@@ -311,14 +324,15 @@ def click_open_close_test(cfg: dict[str, Any], report: PreflightReport, log: Log
 
     from src.trader.gui_trader import GuiTrader
 
-    pyautogui.FAILSAFE = True
+    pyautogui.FAILSAFE = False
+
     cfg2 = dict(cfg)
     cfg2["dry_run"] = False
     trade = cfg2.setdefault("trade", {})
     trade["executor"] = "gui"
 
     _log("=== 点击实测：5秒后买开1手，再平仓 ===", log)
-    _log("紧急停止：鼠标甩到屏幕左上角", log)
+    _log("点同花顺时请不要自己动鼠标；要停扫描请用运行页「停止」", log)
     for i in range(5, 0, -1):
         _log(f"  {i}…", log)
         time.sleep(1)

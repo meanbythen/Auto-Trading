@@ -36,12 +36,15 @@ _KIND_NAME = {
     "settlement": "每日结算差额",
     "pnl": "交易盈亏",
     "commission": "手续费",
+    "ctp_equity": "柜台动态权益",
 }
 
 
 def book_path(root: str | Path) -> Path:
-    """当前账期放在 data/signal_account.json。"""
-    return Path(root) / "data" / "signal_account.json"
+    """当前选中的那本账。实盘仍是 data/signal_account.json，模拟账是另一份文件。"""
+    from src.account.workspace import book_file
+
+    return book_file(root)
 
 
 def multiplier_map(cfg: dict[str, Any] | None) -> dict[str, float]:
@@ -64,8 +67,10 @@ def change_kind_name(kind: Any) -> str:
 
 
 def periods_dir(root: str | Path) -> Path:
-    """每一本账期单独放在 data/signal_periods。旧账期留在这里，不再改。"""
-    return Path(root) / "data" / "signal_periods"
+    """当前账的旧账期文件夹。模拟账另放，不会盖掉实盘已经存档的账期。"""
+    from src.account.workspace import periods_folder
+
+    return periods_folder(root)
 
 
 def new_book(initial_capital: float, *, version: str, started_at: str | None = None) -> dict[str, Any]:
@@ -89,9 +94,30 @@ def new_book(initial_capital: float, *, version: str, started_at: str | None = N
     }
 
 
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    """把可能被手工改过的账本字段安全地转成 float。"""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def load_named_book(root: str | Path, account_id: Any) -> dict[str, Any] | None:
+    """读指定那一本账，不看当前下拉框。"""
+    from src.account.workspace import book_file
+
+    path = book_file(root, account_id)
+    return _read_book_file(path)
+
+
 def load_book(root: str | Path) -> dict[str, Any] | None:
     """读账本。还没有文件、或文件坏了，就返回空，调用方不要当成已经开始记账。"""
     path = book_path(root)
+    return _read_book_file(path)
+
+
+def _read_book_file(path: Path) -> dict[str, Any] | None:
+    """读一份账本文件。路径由调用方决定是哪一本。"""
     if not path.exists():
         return None
     try:
@@ -103,10 +129,144 @@ def load_book(root: str | Path) -> dict[str, Any] | None:
         return None
     data.setdefault("cashflows", [])
     data.setdefault("trades", [])
-    data["initial_capital"] = float(data.get("initial_capital") or 0)
+    # 账本文件可能被手工改过，或旧版本写进了非法字符串。这里一次性把所有数值字段清洗掉，
+    # 避免后面 float(row.get("amount")) 这类调用散落在各处时，一处坏数据把整个界面刷新链炸断。
+    data["initial_capital"] = _safe_float(data.get("initial_capital"), 0.0)
+    for section in ("changes", "cashflows"):
+        for row in data.get(section) or []:
+            if isinstance(row, dict):
+                for key in ("amount", "price", "stop_price"):
+                    if key in row and not isinstance(row[key], (int, float)):
+                        row[key] = _safe_float(row.get(key), 0.0)
+    data.setdefault("initial_capital", 0.0)
     # 1.8.0 的账本还没有逐笔变动。读出来时补上，余额和原来的算法一致。
     _ensure_changes(data)
     return data
+
+
+def save_named_book(root: str | Path, account_id: Any, book: dict[str, Any]) -> Path:
+    """把账本写到指定那一本的文件，不改当前下拉框选中的账。"""
+    from src.account.workspace import book_file
+
+    path = book_file(root, account_id)
+    book["account_id"] = str(account_id)
+    _write_json(path, book)
+    return path
+
+
+_CTP_HISTORY_MAX = 400
+_CTP_SNAP_KEYS = (
+    "pre_balance",
+    "balance",
+    "available",
+    "withdraw",
+    "deposit",
+    "withdraw_amt",
+    "margin",
+    "frozen",
+    "frozen_margin",
+    "frozen_cash",
+    "commission",
+    "close_profit",
+    "position_profit",
+    "usage",
+    "mortgage_in",
+    "mortgage_out",
+    "option_value",
+)
+
+
+def apply_ctp_equity(
+    book: dict[str, Any] | None,
+    snapshot: dict[str, Any] | None,
+    *,
+    user_id: str,
+    version: str,
+) -> tuple[float, dict[str, Any]]:
+    """
+    把期货公司资金查询原样写入华泰账。
+
+    不把柜台数字改成「本地差额」。账号优先用回报里的资金账号。
+    程序自己估的成交盈亏不会改这本账的余额。
+    """
+    from src.trader.ctp_display import parse_account
+
+    raw = dict(snapshot or {})
+    data = parse_account(raw)
+    broker_id = str(data.get("account_id") or raw.get("account_id") or user_id or "").strip()
+    target = round(float(data["balance"]), 2)
+    if book is None:
+        book = new_book(target, version=version)
+        book["changes"] = [
+            {
+                "time": _now(),
+                "kind": "initial",
+                "amount": target,
+                "note": f"CTP 柜台账户 {broker_id}，余额以期货公司回报为准",
+            }
+        ]
+    book["funding"] = "ctp"
+    book["ctp_user_id"] = broker_id
+    packed = {
+        "user_id": broker_id,
+        "account_id": broker_id,
+        "time": _now(),
+        "currency": str(data.get("currency") or ""),
+        "raw": raw,
+    }
+    for key in _CTP_SNAP_KEYS:
+        try:
+            packed[key] = float(data.get(key) or 0)
+        except (TypeError, ValueError):
+            packed[key] = 0.0
+    packed["balance"] = target
+    book["ctp_snapshot"] = packed
+    history = list(book.get("ctp_history") or [])
+    last = history[-1] if history else None
+    if last is None or _ctp_snap_changed(last, packed):
+        slim = {key: packed[key] for key in ("user_id", "account_id", "time", "currency", *_CTP_SNAP_KEYS)}
+        history.append(slim)
+        book["ctp_history"] = history[-_CTP_HISTORY_MAX:]
+    return target, book
+
+
+def _ctp_snap_changed(old: dict[str, Any], new: dict[str, Any]) -> bool:
+    """数字没变就不必再存一条历史，避免每轮扫描把文件写爆。"""
+    for key in _CTP_SNAP_KEYS:
+        try:
+            if abs(float(old.get(key) or 0) - float(new.get(key) or 0)) >= 0.005:
+                return True
+        except (TypeError, ValueError):
+            return True
+    return str(old.get("account_id") or old.get("user_id") or "") != str(
+        new.get("account_id") or new.get("user_id") or ""
+    )
+
+
+def ctp_history_equity(book: dict[str, Any] | None) -> list[tuple[str, float]]:
+    """柜台动态权益按查询时间排成一条线，给账户分析画图。"""
+    if not isinstance(book, dict):
+        return []
+    points: list[tuple[str, float]] = []
+    for row in book.get("ctp_history") or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            bal = float(row.get("balance") or 0)
+        except (TypeError, ValueError):
+            continue
+        points.append((str(row.get("time") or ""), bal))
+    snap = book.get("ctp_snapshot") if isinstance(book.get("ctp_snapshot"), dict) else None
+    if isinstance(snap, dict):
+        try:
+            bal = float(snap.get("balance") or 0)
+        except (TypeError, ValueError):
+            bal = 0.0
+        if bal > 0:
+            stamp = str(snap.get("time") or "")
+            if not points or points[-1][1] != bal or points[-1][0] != stamp:
+                points.append((stamp, bal))
+    return points
 
 
 def save_book(root: str | Path, book: dict[str, Any]) -> Path:
@@ -116,7 +276,11 @@ def save_book(root: str | Path, book: dict[str, Any]) -> Path:
     当前账期如果有自己的存档名，同一份内容也写进 data/signal_periods。
     那里是这一期的存档。上一期的文件不会在这里被盖掉。
     """
+    from src.account.workspace import profile_of
+
     path = book_path(root)
+    # 账本里记下这是哪一本，以后打开存档时能分清实盘和模拟。
+    book["account_id"] = profile_of(root=root)["id"]
     _write_json(path, book)
     _mirror_period(root, book)
     return path
@@ -288,6 +452,9 @@ def append_trade(
         }
     )
     moment = when or _now()
+    # 华泰账的余额只认柜台回报，程序成交只记交易记录，不改资金。
+    if str(book.get("funding") or "") == "ctp":
+        return True
     if fee > 0:
         _append_change(
             book,
@@ -311,12 +478,54 @@ def append_trade(
     return True
 
 
+def shown_equity(book: dict[str, Any] | None, multipliers: dict[str, float] | None = None) -> float:
+    """
+    界面和仓位计算看到的当前权益。
+
+    华泰账已经跟过柜台时，用柜台动态权益；同花顺账仍把资金变动加总。
+    """
+    if not isinstance(book, dict):
+        return 0.0
+    if str(book.get("funding") or "") == "ctp":
+        snap = book.get("ctp_snapshot") if isinstance(book.get("ctp_snapshot"), dict) else {}
+        try:
+            bal = float(snap.get("balance") or 0)
+        except (TypeError, ValueError):
+            bal = 0.0
+        if bal > 0:
+            return round(bal, 2)
+        try:
+            avail = float(snap.get("available") or 0)
+        except (TypeError, ValueError):
+            avail = 0.0
+        if avail > 0:
+            return round(avail, 2)
+    return balance_of(book, multipliers)
+
+
 def balance_of(book: dict[str, Any], multipliers: dict[str, float] | None = None) -> float:
     """当前余额。等于全部资金变动相加，未平仓的浮动盈亏不算进来。"""
     _ensure_changes(book)
     # multipliers 仍留给旧账补交易盈亏时使用。已经补过的账直接加变动。
     del multipliers
     return round(sum(float(row.get("amount") or 0) for row in book.get("changes") or []), 2)
+
+
+def equity_and_peak(book: dict[str, Any], multipliers: dict[str, float] | None = None) -> tuple[float, float]:
+    """
+    当前余额，以及这条余额曲线曾经到过的最高点。
+
+    入金会抬高峰值，出金会让余额掉下去，回撤百分比会变大。
+    和账户分析页同一条线，未平仓浮动盈亏不算。
+    """
+    points = _equity_points(book, multipliers)
+    if not points:
+        return 0.0, 0.0
+    last = float(points[-1][1])
+    peak = float(points[0][1])
+    for _moment, point in points:
+        peak = max(peak, float(point))
+    return last, peak
 
 
 def describe(book: dict[str, Any], multipliers: dict[str, float] | None = None) -> str:
@@ -352,7 +561,7 @@ def describe(book: dict[str, Any], multipliers: dict[str, float] | None = None) 
         lines.append(f"上一账期已存档  data/signal_periods/{book.get('previous_archive')}")
     lines.extend(
         [
-            "余额变动方式：初始资金、入金、出金、每日结算差额、交易盈亏、手续费。",
+            "余额变动方式：初始资金、入金、出金、每日结算差额、交易盈亏、手续费、柜台动态权益。",
             "开仓本身不改余额；手续费按品种表单扣。滑点可并进每日结算差额。",
             f"初始资金    {_money(_sum_kind(book, 'initial'))} 元",
             f"入金        {_money(cash_in)} 元",
@@ -360,6 +569,7 @@ def describe(book: dict[str, Any], multipliers: dict[str, float] | None = None) 
             f"每日结算差额  {_money(settle)} 元",
             f"交易盈亏    {_money(pnl)} 元",
             f"手续费合计  {_money(commission)} 元",
+            f"柜台动态权益  {_money(_sum_kind(book, 'ctp_equity'))} 元",
             f"当前余额    {_money(bal)} 元",
             f"已平仓      {len(closed)} 笔    胜率 {win_text}",
             f"最大回撤    {_money(max_dd)} 元（只看已进余额的钱，不含浮动盈亏）",
@@ -401,6 +611,46 @@ def describe(book: dict[str, Any], multipliers: dict[str, float] | None = None) 
             f"  {row.get('time')}  {row.get('offset')}  {row.get('direction')}  {row.get('symbol')}  "
             f"价格 {_money(row.get('price'))}  {row.get('volume')} 手"
         )
+    return "\n".join(lines)
+
+
+def describe_ctp_funds(book: dict[str, Any] | None) -> str:
+    """华泰账右边说明：只展示期货公司回报，不把程序估的盈亏写进去。"""
+    from src.trader.ctp_display import account_headline, account_pairs
+
+    if not isinstance(book, dict):
+        return (
+            "还没有期货公司资金回报。请先打开交易台，用这一本账对应的账号登录，"
+            "点「刷新持仓」或本页「从柜台刷新资金」。查到的数字会原样存到本地，不能手改。"
+        )
+    snap = book.get("ctp_snapshot") if isinstance(book.get("ctp_snapshot"), dict) else {}
+    if not snap or (
+        abs(float(snap.get("balance") or 0)) < 1e-9 and abs(float(snap.get("available") or 0)) < 1e-9
+    ):
+        return (
+            "还没有期货公司资金回报。请先打开交易台，用这一本账对应的账号登录，"
+            "点「刷新持仓」或本页「从柜台刷新资金」。查到的数字会原样存到本地，不能手改。"
+        )
+    lines = [
+        account_headline(snap),
+        f"资金账号 {snap.get('account_id') or snap.get('user_id') or '—'}",
+        f"更新于 {snap.get('time') or '—'}",
+        "",
+        "下面和交易台「资金」页是同一份柜台查询，原样保存：",
+    ]
+    for title, value in account_pairs(snap):
+        lines.append(f"{title}    {value}")
+    trades = list(book.get("trades") or [])
+    lines.append("")
+    lines.append("程序成交只作策略记录，不改上面的资金：")
+    if not trades:
+        lines.append("  还没有。")
+    else:
+        for row in trades[-30:]:
+            lines.append(
+                f"  {row.get('time')}  {row.get('offset')}  {row.get('direction')}  {row.get('symbol')}  "
+                f"价格 {_money(row.get('price'))}  {row.get('volume')} 手"
+            )
     return "\n".join(lines)
 
 
@@ -456,8 +706,11 @@ def record_program_trade(
             return None
         save_book(root, book)
         bal = balance_of(book)
+        from src.account.workspace import profile_of
+
         logger.info(
-            "信号账户 {} {} {} 价格 {} {} 手，余额 {} 元",
+            "信号账户[{}] {} {} {} 价格 {} {} 手，余额 {} 元",
+            profile_of(root=root)["short"],
             symbol,
             offset,
             direction,

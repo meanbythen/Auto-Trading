@@ -5,11 +5,11 @@
 ETH 走完后，收盘离开开盘区间才开。过了 10:30 或 22:15 不追。
 """
 
-from datetime import datetime
+from datetime import datetime, time as dtime, timedelta
 
 import pandas as pd
 
-from src.strategy.daily_body import DailyBodyStrategy, box_edge_stop
+from src.strategy.daily_body import DailyBodyStrategy, box_edge_stop, opening_box_levels
 from src.strategy.types import StrategyAction, StrategyDecision
 
 
@@ -22,8 +22,11 @@ def _cfg() -> dict:
             "symbols": ["bu2612"],
             "flatten_times": ["14:55", "22:55"],
             "flatten_at_close": True,
+            # 测试数据太短（通常只有几十根），ADX/ATR 分位会被区间过滤误拦。
+            "market_filter": {"enabled": False},
             "daily_body": {
                 "eth_minutes": 20,
+                "regime_filter": False,
             },
         },
         "trade": {"symbol": "bu2612", "volume": 1},
@@ -99,6 +102,24 @@ def _cfg5() -> dict:
     return cfg
 
 
+def _cfg_chase(chase: int = 5) -> dict:
+    """急破不追：收盘离破位超过 chase 跳就先等回抽。"""
+    cfg = _cfg5()
+    cfg["strategy"]["daily_body"]["max_chase_ticks"] = chase
+    return cfg
+
+
+def _next_bar(bars: pd.DataFrame, stamp: str, close: float) -> pd.DataFrame:
+    """在已收盘序列后面补一根，模拟信号周期的下一根收线。"""
+    row = bars.iloc[[-1]].copy()
+    row.index = pd.DatetimeIndex([pd.Timestamp(stamp)])
+    row["open"] = close
+    row["close"] = close
+    row["high"] = close + 0.2
+    row["low"] = close - 0.2
+    return pd.concat([bars, row])
+
+
 def _breakout(end: str, close: float, freq: str = "5min") -> pd.DataFrame:
     """
     从开盘前排到指定时刻。ETH 里的框是 99 到 101。
@@ -137,6 +158,17 @@ def _breakout(end: str, close: float, freq: str = "5min") -> pd.DataFrame:
     )
 
 
+def test_weekend_gap_is_not_close_window() -> None:
+    """周一早上拿到的最后一根还是周五 23:00：不能因此判成「已经到收盘时间」。"""
+    bars = _breakout("2026-10-30 23:00", 100.0)
+    decision = DailyBodyStrategy(_cfg()).evaluate(
+        "bu2612", bars, now=datetime(2026, 11, 2, 9, 10)
+    )
+    assert decision.action == StrategyAction.HOLD
+    assert "已经到收盘时间" not in decision.reason
+    assert "ETH" in decision.reason
+
+
 def test_waits_until_eth_finishes() -> None:
     """9:15 这根 15 分钟还有一段落在 ETH 里，即使收盘已经很高，也不开。"""
     bars = _breakout("2026-10-23 09:15", 110.0)
@@ -159,7 +191,8 @@ def test_five_minute_midbar_waits_for_the_fifteen_minute_close() -> None:
     bars = _breakout("2026-10-23 09:50", 110.0)
     decision = DailyBodyStrategy(_cfg()).evaluate("bu2612", bars, now=datetime(2026, 10, 23, 9, 50))
     assert decision.action == StrategyAction.HOLD
-    assert "15分钟还没走完" in decision.reason
+    assert decision.action != StrategyAction.BUY_OPEN
+    assert "站上开盘区间" not in decision.reason
 
 
 def test_five_minute_signal_opens_on_its_own_bar() -> None:
@@ -168,6 +201,66 @@ def test_five_minute_signal_opens_on_its_own_bar() -> None:
     decision = DailyBodyStrategy(_cfg5()).evaluate("bu2612", bars, now=datetime(2026, 10, 23, 9, 45))
     assert decision.action == StrategyAction.BUY_OPEN
     assert "5分钟" in decision.reason
+    assert "站上开盘区间" in decision.reason
+
+
+def test_far_breakout_does_not_open_immediately() -> None:
+    """收线离箱底 9 跳、超过 5 跳上限：当场不开，也不占这一段的名额。"""
+    strategy = DailyBodyStrategy(_cfg_chase())
+    decision = strategy.evaluate(
+        "bu2612", _breakout("2026-10-23 09:45", 90.0), now=datetime(2026, 10, 23, 9, 45)
+    )
+    assert decision.action == StrategyAction.HOLD
+    assert "急破不追" in decision.reason
+    assert strategy._used_session.get("bu2612", "") == ""
+
+
+def test_pullback_into_range_opens_in_the_same_direction() -> None:
+    """急破后回到箱底 3 跳内、收盘没有有效站上 EMA：按原信号做空。"""
+    strategy = DailyBodyStrategy(_cfg_chase())
+    bars = _breakout("2026-10-23 09:45", 90.0)
+    first = strategy.evaluate("bu2612", bars, now=datetime(2026, 10, 23, 9, 45))
+    assert first.action == StrategyAction.HOLD
+    second = strategy.evaluate(
+        "bu2612", _next_bar(bars, "2026-10-23 09:50", 96.0), now=datetime(2026, 10, 23, 9, 50)
+    )
+    assert second.action == StrategyAction.SELL_OPEN
+    assert "回抽确认" in second.reason
+
+
+def test_pullback_that_breaks_ema_invalidates_the_breakout() -> None:
+    """回抽到破位附近，但收盘已经有效站上 EMA：这次突破作废，不接刀。"""
+    cfg = _cfg_chase()
+    cfg["strategy"]["daily_body"]["ema_period"] = 3
+    cfg["strategy"]["daily_body"]["ema_buffer_ticks"] = 1
+    strategy = DailyBodyStrategy(cfg)
+    bars = _breakout("2026-10-23 09:45", 90.0)
+    first = strategy.evaluate("bu2612", bars, now=datetime(2026, 10, 23, 9, 45))
+    assert first.action == StrategyAction.HOLD
+    second = strategy.evaluate(
+        "bu2612", _next_bar(bars, "2026-10-23 09:50", 98.5), now=datetime(2026, 10, 23, 9, 50)
+    )
+    assert second.action == StrategyAction.HOLD
+    assert "作废" in second.reason
+
+
+def test_late_scan_still_uses_the_bar_that_just_closed() -> None:
+    """收线后 37 秒才扫到，也算这根：不能因为秒数不是 00 就把整根漏掉。"""
+    bars = _breakout("2026-10-23 09:45", 105.0)
+    decision = DailyBodyStrategy(_cfg()).evaluate(
+        "bu2612", bars, now=datetime(2026, 10, 23, 9, 45, 37)
+    )
+    assert decision.action == StrategyAction.BUY_OPEN
+    assert "站上开盘区间" in decision.reason
+
+
+def test_scan_more_than_one_minute_after_close_still_uses_the_bar() -> None:
+    """收线后 70 秒才扫到、数据才到，15 分钟线仍认这根，不能因为超过 60 秒就漏单。"""
+    bars = _breakout("2026-10-23 09:45", 105.0)
+    decision = DailyBodyStrategy(_cfg()).evaluate(
+        "bu2612", bars, now=datetime(2026, 10, 23, 9, 46, 10)
+    )
+    assert decision.action == StrategyAction.BUY_OPEN
     assert "站上开盘区间" in decision.reason
 
 
@@ -408,6 +501,8 @@ def test_big_gap_blocks_the_open() -> None:
     assert decision.action == StrategyAction.HOLD
     assert "跳空" in decision.reason
     assert "不追" in decision.reason
+    assert decision.meta.get("blocked") is True
+    assert decision.meta.get("side") == "long"
 
 
 def test_small_gap_still_opens() -> None:
@@ -461,6 +556,9 @@ def test_too_wide_box_blocks_the_open() -> None:
     assert decision.action == StrategyAction.HOLD
     assert "箱体" in decision.reason
     assert "宽 110" in decision.reason
+    # 标成「有信号但被过滤」，回测结果才能把这条和原因一起列出来。
+    assert decision.meta.get("blocked") is True
+    assert decision.meta.get("side") == "long"
 
 
 def test_narrow_box_still_opens() -> None:
@@ -672,3 +770,252 @@ def test_daily_body_is_standalone() -> None:
     made = DailyBodyStrategy(_cfg())
     assert type(made) is DailyBodyStrategy
     assert made.uses_trend_bars is False
+
+
+def test_signal_still_counts_within_sixty_seconds() -> None:
+    """数据源晚到：9:45 这根收线后 60 秒内仍按它定方向。"""
+    bars = _breakout("2026-10-23 09:45", 105.0)
+    decision = DailyBodyStrategy(_cfg()).evaluate(
+        "bu2612", bars, now=datetime(2026, 10, 23, 9, 45, 50)
+    )
+    assert decision.action == StrategyAction.BUY_OPEN
+
+
+def test_signal_expires_after_one_full_bar() -> None:
+    """过了整整一根信号周期再拿它开，就是过时信号（午休后也不用上午最后一根）。"""
+    bars = _breakout("2026-10-23 09:45", 105.0)
+    decision = DailyBodyStrategy(_cfg()).evaluate(
+        "bu2612", bars, now=datetime(2026, 10, 23, 10, 0, 1)
+    )
+    assert decision.action == StrategyAction.HOLD
+    assert "整整一根周期" in decision.reason
+
+
+def test_morning_last_bar_not_used_after_lunch() -> None:
+    """11:30 这根到了 13:31 已经过时，不能当下午的开仓信号。"""
+    cfg = _cfg()
+    cfg["strategy"]["daily_body"]["day_cutoff"] = "15:00"
+    bars = _breakout("2026-10-23 11:30", 105.0)
+    decision = DailyBodyStrategy(cfg).evaluate(
+        "bu2612", bars, now=datetime(2026, 10, 23, 13, 31)
+    )
+    assert decision.action == StrategyAction.HOLD
+    assert "整整一根周期" in decision.reason
+
+
+def test_flatten_window_crosses_midnight() -> None:
+    """清仓钟点设在 23:55 时，次日 00:01 仍应落在 10 分钟窗口里。"""
+    cfg = _cfg()
+    cfg["strategy"]["flatten_times"] = ["23:55"]
+    strategy = DailyBodyStrategy(cfg)
+    assert strategy.is_flatten_time(datetime(2026, 10, 23, 23, 56))
+    assert strategy.is_flatten_time(datetime(2026, 10, 24, 0, 1))
+    assert not strategy.is_flatten_time(datetime(2026, 10, 24, 0, 6))
+
+
+def test_stale_stop_pending_is_not_a_stop_exit() -> None:
+    """止损单一直没成交、挂起超时后手工平仓，这段不该多算一次「止损出场」。"""
+    strategy = DailyBodyStrategy(_cfg())
+    _open_long_at_0945(strategy)
+    strategy._pending_stop["bu2612"] = True
+    # 15 分钟周期最多等一根 K 线（15 分钟），挂起 30 分钟一定过期。
+    strategy._pending_stop_at["bu2612"] = datetime.now() - timedelta(minutes=30)
+    strategy.on_filled("bu2612", StrategyAction.CLOSE, 106.0, 1)
+    assert strategy._stop_closed["bu2612"] is False
+    again = strategy.evaluate(
+        "bu2612", _breakout("2026-10-23 10:00", 108.0), now=datetime(2026, 10, 23, 10, 0)
+    )
+    assert again.action == StrategyAction.HOLD
+    assert "不再开第二次" in again.reason
+
+
+def test_fresh_stop_pending_still_counts_as_a_stop_exit() -> None:
+    """成交回报很快回来时，仍按止损出场处理，日盘允许第二次。"""
+    strategy = DailyBodyStrategy(_cfg())
+    _open_long_at_0945(strategy)
+    strategy._pending_stop["bu2612"] = True
+    strategy._pending_stop_at["bu2612"] = datetime.now()
+    strategy.on_filled("bu2612", StrategyAction.CLOSE, 97.0, 1)
+    assert strategy._stop_closed["bu2612"] is True
+
+
+def test_held_position_without_stop_restores_the_box_edge() -> None:
+    """手工录入没填止损价：按这一段箱体补一个箱沿止损，补完就冻结。"""
+    strategy = DailyBodyStrategy(_cfg())
+    strategy.on_filled("bu2612", StrategyAction.BUY_OPEN, 105.0, 1, initial_stop=0.0)
+    assert strategy._effective_stop(strategy.positions["bu2612"]) == 0.0
+    decision = strategy.evaluate(
+        "bu2612", _breakout("2026-10-23 10:30", 105.0), now=datetime(2026, 10, 23, 10, 30)
+    )
+    assert decision.action == StrategyAction.HOLD
+    # _breakout 的 ETH 框是 99~101，多单箱底再减 1 跳 → 98
+    assert abs(strategy.positions["bu2612"].initial_stop - 98.0) < 1e-6
+    assert strategy.positions["bu2612"].trail_armed is True
+
+
+def test_restored_box_stop_still_exits_on_a_break() -> None:
+    """补出来的箱沿止损照样生效：跌破箱底就平，不用等到收盘。"""
+    strategy = DailyBodyStrategy(_cfg())
+    strategy.on_filled("bu2612", StrategyAction.BUY_OPEN, 105.0, 1, initial_stop=0.0)
+    strategy.evaluate(
+        "bu2612", _breakout("2026-10-23 10:30", 105.0), now=datetime(2026, 10, 23, 10, 30)
+    )
+    crash = _bars("2026-10-23 10:35", [105.0, 97.0])
+    decision = strategy.evaluate("bu2612", crash, now=datetime(2026, 10, 23, 10, 35))
+    assert decision.action == StrategyAction.CLOSE
+    assert "打破" in decision.reason
+
+
+def test_restored_stop_waits_while_eth_is_still_running() -> None:
+    """ETH 没走完时箱体是半截的，先不补止损，免得贴在太近的位置一开就被打。"""
+    cfg = _cfg()
+    cfg["strategy"]["daily_body"]["eth_minutes"] = 60
+    strategy = DailyBodyStrategy(cfg)
+    strategy.on_filled("bu2612", StrategyAction.BUY_OPEN, 105.0, 1, initial_stop=0.0)
+    decision = strategy.evaluate(
+        "bu2612", _breakout("2026-10-23 09:45", 105.0), now=datetime(2026, 10, 23, 9, 45)
+    )
+    assert decision.action == StrategyAction.HOLD
+    assert strategy._effective_stop(strategy.positions["bu2612"]) == 0.0
+
+
+def _wick_below_stop_but_closes_back() -> pd.DataFrame:
+    """09:50 这根影线打到 97（止损 98），收盘 104.5 又回到止损上方。"""
+    bars = _bars("2026-10-23 09:45", [100, 104.5])
+    bars.loc[bars.index[-1], "low"] = 97
+    return bars
+
+
+def test_touch_mode_stops_on_a_wick_that_closes_back() -> None:
+    """默认触及即止损：影线碰到箱底就走，不等这根收盘。"""
+    strategy = DailyBodyStrategy(_cfg())
+    _open_long_at_0945(strategy)
+    decision = strategy.evaluate(
+        "bu2612", _wick_below_stop_but_closes_back(), now=datetime(2026, 10, 23, 9, 50)
+    )
+    assert decision.action == StrategyAction.CLOSE
+    assert "打破" in decision.reason
+
+
+def test_close_mode_ignores_a_wick_that_closes_back() -> None:
+    """收盘价确认：影线刺穿箱底、收盘仍站在止损上方，继续拿。"""
+    cfg = _cfg()
+    cfg["strategy"]["stop_mode"] = "close"
+    strategy = DailyBodyStrategy(cfg)
+    assert strategy.stop_on_touch is False
+    _open_long_at_0945(strategy)
+    decision = strategy.evaluate(
+        "bu2612", _wick_below_stop_but_closes_back(), now=datetime(2026, 10, 23, 9, 50)
+    )
+    assert decision.action == StrategyAction.HOLD
+
+
+def test_close_mode_exits_when_the_bar_closes_below_the_stop() -> None:
+    """收盘价确认：收盘跌破箱底才平，理由写成「收盘跌破」。"""
+    cfg = _cfg()
+    cfg["strategy"]["stop_mode"] = "close"
+    strategy = DailyBodyStrategy(cfg)
+    _open_long_at_0945(strategy)
+    decision = strategy.evaluate(
+        "bu2612", _bars("2026-10-23 09:45", [100, 97.0]), now=datetime(2026, 10, 23, 9, 50)
+    )
+    assert decision.action == StrategyAction.CLOSE
+    assert "收盘跌破" in decision.reason
+
+
+def test_stop_mode_accepts_config_words_and_labels() -> None:
+    """配置里写 close 或配置页的中文标签，都认成收盘确认；默认仍是触及即止损。"""
+    from src.strategy.types import stop_mode_from_label, stop_mode_label
+
+    assert DailyBodyStrategy(_cfg()).stop_on_touch is True
+    cfg = _cfg()
+    cfg["strategy"]["stop_mode"] = "收盘价确认"
+    assert DailyBodyStrategy(cfg).stop_mode == "close"
+    assert stop_mode_from_label(stop_mode_label("close")) == "close"
+    assert stop_mode_from_label("触及即止损") == "touch"
+    # 旧配置写在 daily_body 里也认，升级后不必改 yaml。
+    legacy = _cfg()
+    legacy["strategy"]["daily_body"]["stop_mode"] = "close"
+    assert DailyBodyStrategy(legacy).stop_mode == "close"
+
+
+def test_daily_body_blocks_strong_trend_even_if_public_filter_off() -> None:
+    """公共过滤关掉时，强单边仍被日内实体自己的区间过滤拦住，不能开新仓。"""
+    import numpy as np
+
+    rng = np.random.default_rng(21)
+    closes = (100 + np.arange(160) * 0.8 + rng.normal(0, 1.0, 160)).tolist()
+    index = pd.date_range("2026-10-23 09:00", periods=len(closes), freq="5min")
+    close = np.array(closes, dtype=float)
+    bars = pd.DataFrame(
+        {
+            "open": close,
+            "high": close + 3.0,
+            "low": close - 3.0,
+            "close": close,
+            "volume": [100.0] * len(closes),
+        },
+        index=index,
+    )
+    cfg = _cfg()
+    cfg["strategy"]["market_filter"] = {"enabled": False}
+    cfg["strategy"]["daily_body"]["regime_filter"] = True
+    cfg["strategy"]["daily_body"]["filter_adx_upper"] = 30
+    decision = DailyBodyStrategy(cfg).evaluate("bu2612", bars, now=datetime(2026, 10, 23, 9, 45))
+    assert decision.action == StrategyAction.HOLD
+    assert "行情不匹配" in decision.reason or "强单边" in decision.reason
+
+
+def test_duplicate_close_column_does_not_raise_ambiguous() -> None:
+    """两列都叫 close 时仍能判断，不能弹出 array ambiguous。"""
+    bars = _breakout("2026-10-23 09:45:00", 103.0)
+    bars = pd.concat([bars, bars[["close"]]], axis=1)
+    decision = DailyBodyStrategy(_cfg5()).evaluate(
+        "bu2612", bars, now=datetime(2026, 10, 23, 9, 45)
+    )
+    assert decision.action in (StrategyAction.HOLD, StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN)
+
+
+def test_silver_night_after_midnight_still_counts_as_night() -> None:
+    """白银夜盘到凌晨：01:00 仍算 21:00 这一段，不会说还没开盘。"""
+    cfg = _cfg()
+    cfg["schedule"]["trading_sessions"] = [["09:00", "11:30"], ["13:30", "15:00"], ["21:00", "02:30"]]
+    strategy = DailyBodyStrategy(cfg)
+    evening = datetime(2026, 11, 9, 21, 40)
+    morning = datetime(2026, 11, 10, 1, 5)
+    assert strategy._anchor(morning) == dtime(21, 0)
+    assert strategy.in_entry_session(morning)
+    assert strategy._session_key(evening, dtime(21, 0)) == strategy._session_key(morning, dtime(21, 0))
+
+
+def test_opening_box_after_midnight_uses_yesterdays_night_open() -> None:
+    """凌晨画夜盘箱子，要用昨天 21:00 的 ETH，不能去找今天晚上还没走的 21:00。"""
+    index = pd.date_range("2026-11-09 21:05", periods=4, freq="5min")
+    bars = pd.DataFrame(
+        {
+            "open": [100.0, 100.0, 100.0, 100.0],
+            "high": [101.0, 102.0, 101.5, 101.0],
+            "low": [99.0, 99.5, 99.0, 99.2],
+            "close": [100.0, 101.0, 100.5, 100.2],
+            "volume": [100.0] * 4,
+        },
+        index=index,
+    )
+    high, low, wait = opening_box_levels(
+        bars, datetime(2026, 11, 10, 1, 5), dtime(21, 0), 20, "5"
+    )
+    assert wait == ""
+    assert high == 102.0
+    assert low == 99.0
+
+
+def test_night_cutoff_blocks_chase_after_midnight() -> None:
+    """夜盘截止仍是当晚 22:15 时，凌晨不要再开新仓。"""
+    cfg = _cfg()
+    cfg["schedule"]["trading_sessions"] = [["09:00", "11:30"], ["13:30", "15:00"], ["21:00", "02:30"]]
+    bars = _bars("2026-11-09 21:00", [100.0] * 50)
+    decision = DailyBodyStrategy(cfg).evaluate(
+        "bu2612", bars, now=datetime(2026, 11, 10, 1, 5)
+    )
+    assert decision.action == StrategyAction.HOLD
+    assert "不再追" in decision.reason or "过了" in decision.reason

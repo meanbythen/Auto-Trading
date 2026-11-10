@@ -8,11 +8,60 @@ from src.data.periods import (
     bars_from_minutes,
     canonical_period,
     drop_forming_bar,
+    fix_gap_spanning_bars,
     minute_base,
     overlay_minute_bars,
     resample_ohlc,
     ui_parts,
 )
+
+
+def test_fix_gap_spanning_bar_removes_last_session_high() -> None:
+    """跳空低开时，第一根K线的高点常被接口塞成上一段收盘价，要收回本段区间。"""
+    bars = pd.DataFrame(
+        [
+            # 11-04 夜盘最后一根：收盘 4486
+            {"open": 4489, "high": 4491, "low": 4481, "close": 4486, "volume": 1200},
+            # 11-05 跳空低开 4179，接口把昨晚收盘 4486 当成高点；低点 4105 是本段的
+            {"open": 4179, "high": 4486, "low": 4105, "close": 4163, "volume": 79776},
+        ],
+        index=pd.to_datetime(["2026-11-04 23:00:00", "2026-11-05 09:05:00"]),
+    )
+    fixed = fix_gap_spanning_bars(bars)
+    assert fixed is not None
+    assert float(fixed["high"].iloc[1]) == 4179  # max(open, close)，不再含 4486
+    assert float(fixed["low"].iloc[1]) == 4105  # 真实低点保留
+    # 夜盘那根不跳空，保持原样
+    assert float(fixed["high"].iloc[0]) == 4491
+
+
+def test_fix_gap_spanning_bar_raises_low_on_gap_up() -> None:
+    """跳空高开时反过来：低点被塞成上一段收盘价，要抬回本段区间。"""
+    bars = pd.DataFrame(
+        [
+            {"open": 4100, "high": 4110, "low": 4090, "close": 4105, "volume": 900},
+            {"open": 4300, "high": 4330, "low": 4105, "close": 4310, "volume": 5000},
+        ],
+        index=pd.to_datetime(["2026-11-05 15:00:00", "2026-11-05 21:05:00"]),
+    )
+    fixed = fix_gap_spanning_bars(bars)
+    assert fixed is not None
+    assert float(fixed["low"].iloc[1]) == 4300  # min(open, close)
+    assert float(fixed["high"].iloc[1]) == 4330
+
+
+def test_fix_gap_spanning_bar_leaves_normal_bars_alone() -> None:
+    """没有跳空、或者高点高于上一根收盘（确实打回去了）时不动。"""
+    bars = pd.DataFrame(
+        [
+            {"open": 100, "high": 101, "low": 99, "close": 100, "volume": 10},
+            {"open": 105, "high": 110, "low": 104, "close": 108, "volume": 12},
+        ],
+        index=pd.to_datetime(["2026-11-05 09:05:00", "2026-11-05 09:10:00"]),
+    )
+    fixed = fix_gap_spanning_bars(bars)
+    assert fixed is not None
+    assert float(fixed["high"].iloc[1]) == 110
 
 
 def test_daily_weekly_and_custom_minutes() -> None:
@@ -158,3 +207,20 @@ def test_drop_forming_still_drops_current_incomplete_bucket() -> None:
     kept = drop_forming_bar(bars, now=datetime(2026, 10, 27, 13, 38, 0))
     assert len(kept) == 1
     assert str(kept.index[-1]) == "2026-10-27 13:35:00"
+
+
+def test_fix_gap_with_duplicate_close_column_does_not_crash() -> None:
+    """同一张表有两列 close 时，不能再报 array ambiguous。"""
+    bars = pd.DataFrame(
+        [
+            {"open": 4489, "high": 4491, "low": 4481, "close": 4486, "volume": 1200},
+            {"open": 4179, "high": 4486, "low": 4105, "close": 4163, "volume": 79776},
+        ],
+        index=pd.to_datetime(["2026-11-04 23:00:00", "2026-11-05 09:05:00"]),
+    )
+    bars = pd.concat([bars, bars[["close"]]], axis=1)
+    assert bars.columns.duplicated().any()
+    fixed = fix_gap_spanning_bars(bars)
+    assert fixed is not None
+    assert not fixed.columns.duplicated().any()
+    assert float(fixed["high"].iloc[1]) == 4179

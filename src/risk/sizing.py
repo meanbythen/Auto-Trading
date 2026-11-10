@@ -80,6 +80,9 @@ class PositionSizer:
         self.mode = str(risk.get("sizing_mode", "risk_pct")).lower()
         self.fixed_volume = int(trade.get("volume", 1))
         self.capital = float(risk.get("capital", 1_000_000))
+        # 柜台「可用资金」。常驻 CTP 对账后写入；没写时仓位上限仍只看权益。
+        # 有数时：保证金预算再和可用资金取较小值，避免按本地估的占用重复扣一遍。
+        self.cash_available: float | None = None
         self.risk_pct = float(risk.get("risk_per_trade_pct", 0.5))
         self.min_volume = int(risk.get("min_volume", 1))
         # 每手保证金。0 表示品种表也没写时不看保证金。
@@ -287,6 +290,16 @@ class PositionSizer:
             used = abs(current_abs_position) * need
 
         remain = budget - used
+        # 期货公司回报的可用资金已经扣过真实保证金。再和本地估算取较小值，
+        # 不会因为两边各扣一次而少开；可用更紧时按柜台为准。
+        if self.cash_available is not None:
+            try:
+                avail = float(self.cash_available)
+            except (TypeError, ValueError):
+                avail = None
+            else:
+                remain = min(remain, avail)
+                note = note + f"，柜台可用{avail:.0f}元"
         if remain < need:
             return 0, need, note
         return int(remain // need), need, note

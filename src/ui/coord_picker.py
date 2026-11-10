@@ -97,7 +97,6 @@ class PickCoordsApp:
     """
 
     def __init__(self) -> None:
-        pyautogui.FAILSAFE = True
         self.captured: dict[str, list[int]] = {}
         self._busy = False
 

@@ -88,6 +88,19 @@ def test_backtest_margin_box_overrides_product_margin() -> None:
     assert cfg["risk"]["contracts"]["bu"]["margin"] == 0
 
 
+def test_ctp_available_caps_margin_without_double_count() -> None:
+    """柜台可用资金更紧时按可用封顶；没有可用时手数和以前一样。"""
+    free = PositionSizer(_cfg(10500, capital=21373, margin_usage_pct=100))
+    full = free.calc_open("fu2701", 5000, 4990)
+    assert full.volume == 2
+
+    capped = PositionSizer(_cfg(10500, capital=21373, margin_usage_pct=100))
+    capped.cash_available = 10500
+    sized = capped.calc_open("fu2701", 5000, 4990)
+    assert sized.volume == 1
+    assert "柜台可用" in sized.reason
+
+
 def test_margin_blocks_when_equity_cannot_buy_one_lot() -> None:
     sized = PositionSizer(_cfg(15000, mode="fixed")).calc_open("bu2612", 4585, 4575)
     assert sized.volume == 0

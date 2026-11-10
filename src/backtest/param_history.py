@@ -30,46 +30,175 @@ FACTORY_DEFAULT_SNAPSHOT: dict[str, Any] = {
     "symbols": ["bu2612"],
     "flatten_times": ["14:55", "22:55"],
     "flatten_at_close": True,
+    # 止损触发方式（全策略共用）：touch=触及即止损，close=收盘价确认。
+    "stop_mode": "touch",
+    # 开仓触发方式（全策略共用）：trigger=触发即开仓，close=收盘价确认。
+    "entry_mode": "close",
     "trend_follow": {
         "entry_bars": 36,
         "exit_bars": 12,
         "atr_period": 14,
         "atr_mult": 2.0,
         "flatten_at_close": False,
+        "filter_enabled": False,
+        "filter_adx_period": 14,
+        "filter_atr_period": 14,
+        "filter_lookback": 60,
+        "filter_adx_flat": 20,
+        "filter_atr_low_pct": 0.2,
     },
     "supertrend": {
         "atr_period": 10,
         "multiplier": 3.0,
         "reverse_on_flip": True,
         "flatten_at_close": False,
-    },
-    "single_ma": {
-        "ma_period": 20,
-        "reverse_on_cross": True,
+        "filter_enabled": False,
+        "filter_adx_period": 14,
+        "filter_atr_period": 14,
+        "filter_lookback": 60,
+        "filter_adx_flat": 20,
+        "filter_atr_low_pct": 0.2,
     },
     "dual_ma": {
         "short_period": 20,
         "long_period": 60,
         "reverse_on_cross": True,
+        "atr_period": 14,
+        "atr_stop_mult": 2.0,
+        "filter_enabled": False,
+        "filter_adx_period": 14,
+        "filter_atr_period": 14,
+        "filter_lookback": 60,
+        "filter_adx_flat": 20,
+        "filter_atr_low_pct": 0.2,
+    },
+    "bollinger": {
+        "boll_window": 20,
+        "boll_dev": 2.0,
+        "atr_period": 14,
+        "atr_stop_mult": 1.5,
+        "flatten_at_close": False,
+        "filter_enabled": False,
+        "filter_adx_period": 14,
+        "filter_atr_period": 14,
+        "filter_lookback": 60,
+        "filter_adx_flat": 20,
+        "filter_atr_low_pct": 0.2,
+    },
+    "sar_trend": {
+        "af_start": 0.02,
+        "af_step": 0.02,
+        "af_max": 0.2,
+        "ma_filter": 20,
+        "flatten_at_close": False,
+        "filter_enabled": False,
+        "filter_adx_period": 14,
+        "filter_atr_period": 14,
+        "filter_lookback": 60,
+        "filter_adx_flat": 20,
+        "filter_atr_low_pct": 0.2,
+    },
+    "multi_factor": {
+        "ma_short": 20,
+        "ma_long": 60,
+        "channel": 20,
+        "boll_window": 20,
+        "boll_dev": 2.0,
+        "af_start": 0.02,
+        "af_step": 0.02,
+        "af_max": 0.2,
+        "threshold": 0.6,
+        "atr_period": 14,
+        "atr_stop_mult": 2.0,
+        "use_sar": True,
+        "disagree_max": 0.7,
+        "bias_ma": 60,
+        "trend_timeframe": "D",
+        "flatten_at_close": True,
+        "cta_filter": {
+            "enabled": True,
+            "use_adx": True,
+            "use_atr": True,
+            "use_disagree": True,
+            "adx_period": 14,
+            "adx_flat": 20.0,
+            "adx_trend": 25.0,
+            "atr_lookback": 60,
+            "atr_low_pct": 0.2,
+            "weak_score": 0.75,
+            "weak_size": 0.5,
+            "weak_votes": 0,
+        },
+    },
+    "multi_vote": {
+        "min_votes": 2,
+        "min_vote_diff": 2,
+        "disagree_max": 0.7,
+        "atr_stop_mult": 2.0,
+        "use_sar": True,
+        "flatten_at_close": True,
+        "cta_filter": {
+            "enabled": True,
+            "use_adx": True,
+            "use_atr": True,
+            "use_disagree": True,
+            "adx_period": 14,
+            "adx_flat": 20.0,
+            "adx_trend": 25.0,
+            "atr_lookback": 60,
+            "atr_low_pct": 0.2,
+            "weak_score": 0.0,
+            "weak_size": 1.0,
+            "weak_votes": 3,
+        },
+    },
+    "multi_hybrid": {
+        "min_votes": 2,
+        "min_vote_diff": 2,
+        "threshold": 0.6,
+        "min_position_ratio": 0.5,
+        "max_position_ratio": 1.0,
+        "disagree_max": 0.7,
+        "atr_stop_mult": 2.0,
+        "use_sar": True,
+        "flatten_at_close": True,
+        "cta_filter": {
+            "enabled": True,
+            "use_adx": True,
+            "use_atr": True,
+            "use_disagree": True,
+            "adx_period": 14,
+            "adx_flat": 20.0,
+            "adx_trend": 25.0,
+            "atr_lookback": 60,
+            "atr_low_pct": 0.2,
+            "weak_score": 0.75,
+            "weak_size": 0.5,
+            "weak_votes": 3,
+        },
     },
     "daily_body": {
         "eth_minutes": 20,
         "eth_minutes2": 30,
         "stop_extra_ticks": 1,
+        "skip_gap_ticks": 50,
+        "max_box_ticks": 100,
+        "max_chase_ticks": 20,
+        "ema_period": 20,
+        "ema_buffer_ticks": 2,
         "day_cutoff": "10:30",
         "night_cutoff": "22:15",
+        "filter_enabled": True,
+        "filter_adx_period": 14,
+        "filter_atr_period": 14,
+        "filter_lookback": 60,
+        "filter_adx_upper": 30.0,
+        "filter_atr_high_pct": 0.8,
     },
     "morning_box_a": {
         "be_box_mult": 0.9,
         "vol_confirm_bars": 3,
         "fake_break_bars": 2,
-        "max_trades_per_day": 2,
-        "stop_buffer_ticks": 2,
-        "enable_night": True,
-        "no_new_before_close_minutes": 15,
-    },
-    "morning_structure_b": {
-        "be_box_mult": 0.9,
         "max_trades_per_day": 2,
         "stop_buffer_ticks": 2,
         "enable_night": True,
@@ -91,6 +220,34 @@ FACTORY_DEFAULT_SNAPSHOT: dict[str, Any] = {
         "min_core_units": 1,
         "stop_atr": 2.0,
         "flatten_at_close": False,
+        "filter_enabled": False,
+        "filter_adx_period": 14,
+        "filter_atr_period": 14,
+        "filter_lookback": 60,
+        "filter_adx_flat": 20,
+        "filter_atr_low_pct": 0.2,
+    },
+    "jesse_casper": {
+        "trend_timeframe": "15",
+        "lookback_liq": 20,
+        "vol_ma_len": 20,
+        "vol_mult": 1.2,
+        "displacement_body_ratio": 0.5,
+        "min_rr": 3.0,
+        "price_tick": 1.0,
+        "va_pct": 0.70,
+        "use_va": True,
+        "use_kill_zone": True,
+        "use_daily_halt": True,
+        "max_losses_day": 2,
+        "max_wins_day": 1,
+        "kill_day_start": "09:00",
+        "kill_day_end": "10:00",
+        "kill_night_start": "21:00",
+        "kill_night_end": "22:30",
+        "setup_wait_bars": 16,
+        "target_lookback": 40,
+        "flatten_at_close": True,
     },
     "trade_symbol": "bu2612",
 }
@@ -105,16 +262,29 @@ _ENGINE_SECTION = {
     "trend_follow": "trend_follow",
     "supertrend": "supertrend",
     "st": "supertrend",
-    "single_ma": "single_ma",
-    "Single_ma": "single_ma",
     "dual_ma": "dual_ma",
     "ma_cross": "dual_ma",
+    "bollinger": "bollinger",
+    "boll": "bollinger",
+    "bollinger_break": "bollinger",
+    "sar_trend": "sar_trend",
+    "sar": "sar_trend",
+    "parabolic_sar": "sar_trend",
+    "multi_factor": "multi_factor",
+    "multi": "multi_factor",
+    "cta": "multi_factor",
+    "multi_factor_adapt": "multi_factor_adapt",
+    "multi_vote": "multi_vote",
+    "vote": "multi_vote",
+    "multi_hybrid": "multi_hybrid",
+    "hybrid": "multi_hybrid",
     "daily_body": "daily_body",
     "morning_box_a": "morning_box_a",
     "morning_a": "morning_box_a",
-    "morning_structure_b": "morning_structure_b",
-    "morning_b": "morning_structure_b",
     "swing_trend": "swing_trend",
+    "jesse_casper": "jesse_casper",
+    "casper": "jesse_casper",
+    "jesse": "jesse_casper",
 }
 # 自己起的名字最长这么多字，避免下拉菜单被一行撑爆。
 MAX_NAME_LENGTH = 60
@@ -263,13 +433,21 @@ def extract_strategy_snapshot(cfg: dict[str, Any]) -> dict[str, Any]:
         "symbols": list(st.get("symbols") or ([trade.get("symbol")] if trade.get("symbol") else [])),
         "flatten_times": st.get("flatten_times"),
         "flatten_at_close": st.get("flatten_at_close", True),
+        "stop_mode": st.get("stop_mode"),
+        "entry_mode": st.get("entry_mode"),
+        # 通用止损（独立于策略自身止损），和 stop_mode 一样属于公共设置。
+        "generic_stop": st.get("generic_stop") or {},
         "trend_follow": st.get("trend_follow") or {},
         "supertrend": st.get("supertrend") or {},
-        "single_ma": st.get("single_ma") or {},
         "dual_ma": st.get("dual_ma") or {},
+        "bollinger": st.get("bollinger") or {},
+        "sar_trend": st.get("sar_trend") or {},
+        "multi_factor": st.get("multi_factor") or {},
+        "multi_factor_adapt": st.get("multi_factor_adapt") or {},
+        "multi_vote": st.get("multi_vote") or {},
+        "multi_hybrid": st.get("multi_hybrid") or {},
         "daily_body": st.get("daily_body") or {},
         "morning_box_a": st.get("morning_box_a") or {},
-        "morning_structure_b": st.get("morning_structure_b") or {},
         "swing_trend": st.get("swing_trend") or {},
         "trade_symbol": trade.get("symbol"),
         "data_source": (cfg.get("data") or {}).get("source") or "akshare",
@@ -289,6 +467,9 @@ def apply_snapshot_to_config(cfg: dict[str, Any], snap: dict[str, Any]) -> dict[
         "symbols",
         "flatten_times",
         "flatten_at_close",
+        "stop_mode",
+        "entry_mode",
+        "generic_stop",
     ):
         if key in snap and snap[key] is not None:
             st[key] = copy.deepcopy(snap[key])
@@ -297,17 +478,24 @@ def apply_snapshot_to_config(cfg: dict[str, Any], snap: dict[str, Any]) -> dict[
         st["trend_follow"] = copy.deepcopy(snap["trend_follow"])
     if snap.get("supertrend") is not None:
         st["supertrend"] = copy.deepcopy(snap["supertrend"])
-    if snap.get("single_ma") is not None:
-        st["single_ma"] = copy.deepcopy(snap["single_ma"])
-        st.pop("ma20_trend", None)
     if snap.get("dual_ma") is not None:
         st["dual_ma"] = copy.deepcopy(snap["dual_ma"])
+    if snap.get("bollinger") is not None:
+        st["bollinger"] = copy.deepcopy(snap["bollinger"])
+    if snap.get("sar_trend") is not None:
+        st["sar_trend"] = copy.deepcopy(snap["sar_trend"])
+    if snap.get("multi_factor") is not None:
+        st["multi_factor"] = copy.deepcopy(snap["multi_factor"])
+    if snap.get("multi_factor_adapt") is not None:
+        st["multi_factor_adapt"] = copy.deepcopy(snap["multi_factor_adapt"])
+    if snap.get("multi_vote") is not None:
+        st["multi_vote"] = copy.deepcopy(snap["multi_vote"])
+    if snap.get("multi_hybrid") is not None:
+        st["multi_hybrid"] = copy.deepcopy(snap["multi_hybrid"])
     if snap.get("daily_body") is not None:
         st["daily_body"] = copy.deepcopy(snap["daily_body"])
     if snap.get("morning_box_a") is not None:
         st["morning_box_a"] = copy.deepcopy(snap["morning_box_a"])
-    if snap.get("morning_structure_b") is not None:
-        st["morning_structure_b"] = copy.deepcopy(snap["morning_structure_b"])
     if snap.get("swing_trend") is not None:
         st["swing_trend"] = copy.deepcopy(snap["swing_trend"])
     if snap.get("trade_symbol"):
@@ -339,12 +527,19 @@ def apply_engine_snapshot(cfg: dict[str, Any], snap: dict[str, Any], engine: str
     # 收盘清仓是总开关。只有听这个开关的策略回溯时才把它带回去，趋势跟随不碰。
     if section in (
         "daily_body",
-        "single_ma",
         "dual_ma",
         "morning_box_a",
-        "morning_structure_b",
     ) and (snap or {}).get("flatten_at_close") is not None:
         st["flatten_at_close"] = bool(snap.get("flatten_at_close"))
+    # 止损触发方式是全策略公共设置；日内实体把它当优化参数，回溯这一套时一并带回。
+    if section == "daily_body" and (snap or {}).get("stop_mode") is not None:
+        st["stop_mode"] = snap["stop_mode"]
+    # 通用止损是公共设置：回溯任何一套策略时都按快照恢复，保证结果可复现。
+    if (snap or {}).get("generic_stop"):
+        st["generic_stop"] = copy.deepcopy(snap["generic_stop"])
+    # 开仓触发方式同样属于公共设置，回溯时一并带回。
+    if (snap or {}).get("entry_mode") is not None:
+        st["entry_mode"] = snap["entry_mode"]
     return out
 
 

@@ -21,6 +21,7 @@ from src.backtest.param_excel import collect_export_versions, merged_param_frame
 from src.backtest.param_history import strategy_display_name
 from src.export.book import (
     SHEET_BACKTEST,
+    SHEET_BACKTEST_SIGNALS,
     SHEET_BACKTEST_TRADES,
     SHEET_CHANGES,
     SHEET_CROSS,
@@ -66,6 +67,7 @@ BACKTEST_SUMMARY_COLUMNS = [
 BACKTEST_TRADE_COLUMNS = [
     "回测时间",
     "品种",
+    "策略",
     "方向",
     "开仓时间",
     "平仓时间",
@@ -75,6 +77,17 @@ BACKTEST_TRADE_COLUMNS = [
     "盈亏",
     "开仓原因",
     "平仓原因",
+]
+# 回测信号：出现了开仓信号、但被策略过滤或风控挡回去的。回测页结果区也列这些。
+BACKTEST_SIGNAL_COLUMNS = [
+    "回测时间",
+    "品种",
+    "信号时间",
+    "方向",
+    "信号价",
+    "止损价",
+    "拦截层",
+    "原因",
 ]
 
 # 和交叉测试页上的结果表同一套列，前面加测试时间，后面记下这一轮用的手数、开仓限制和止损周期。
@@ -113,7 +126,9 @@ CROSS_COLUMNS = [
 
 # 优化结果：最优 + 靠前尝试；检验相关字段跟策略优化页结论对齐。
 # 盈利覆盖等和交叉测试同一算法，方便对照各组参数。
+# 第一列「测试时间」是这次优化跑完的时刻，同一次的行时间相同，用来分清是哪一次。
 OPTIMIZE_COLUMNS = [
+    "测试时间",
     "名次",
     "得分",
     "成交笔数",
@@ -128,6 +143,7 @@ OPTIMIZE_COLUMNS = [
     "天数",
     "日均",
     "参数JSON",
+    "参数说明",
     "品种",
     "策略",
     "区间",
@@ -155,7 +171,8 @@ def export_backtest(root: Path | str, excel_path: Path | str | None = None) -> t
     两张表的第一列都是「回测时间」，同一次回测共用这个时间，用来分清前后几次导出。
     表里已经有的行留着。回测时间和其他列都相同的行不重复写。
     以前导出、还没有回测时间、但内容和这次完全一样的行，会补上这次的时间，不另起一行。
-    只改这两张表，优化参数、账户成交等其他表保持原样。
+    「回测信号」也按同样口径追加，把没做成的信号和原因留在文件里。
+    只改这两张回测表和信号表，优化参数、账户成交等其他表保持原样。
 
     返回 (文件路径, 摘要新增行数, 成交新增行数, 摘要总行数, 成交总行数)。
     还没跑过回测时抛出 ValueError，避免把「还没有」写进正式文件。
@@ -168,8 +185,19 @@ def export_backtest(root: Path | str, excel_path: Path | str | None = None) -> t
     summary, trades = _backtest_frames(root_path)
     summary_all, summary_added = _append_backtest_sheet(path, SHEET_BACKTEST, summary, list(summary.columns))
     trades_all, trades_added = _append_backtest_sheet(path, SHEET_BACKTEST_TRADES, trades, list(trades.columns))
+    signals = _backtest_signal_frame(root_path)
+    signals_all, _signals_added = _append_backtest_sheet(
+        path, SHEET_BACKTEST_SIGNALS, signals, list(signals.columns)
+    )
     write_sheet(path, SHEET_BACKTEST, summary_all)
     write_sheet(path, SHEET_BACKTEST_TRADES, trades_all)
+    write_sheet(path, SHEET_BACKTEST_SIGNALS, signals_all)
+    try:
+        from src.export.cta_decay import write_decay_from_backtest
+
+        write_decay_from_backtest(root_path, payload)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("多因子衰减表没有写上: {}", exc)
     return path, summary_added, trades_added, int(len(summary_all)), int(len(trades_all))
 
 
@@ -179,7 +207,7 @@ def export_all(root: Path | str, excel_path: Path | str | None = None) -> tuple[
 
     返回 (文件路径, 每张表的数据行数)。
     优化参数会保留这本 Excel 里已经追加过、但程序内已删掉的旧版本。
-    回测摘要/成交、交叉测试也会把本文件里以前追加的行接上。
+    回测摘要/成交、交叉测试、优化结果也会把本文件里以前追加的行接上。
     若回测摘要、交叉测试或优化结果还是旧表头（缺盈利覆盖等列），整本按新表重建，不再硬接旧列。
     """
     root_path = Path(root)
@@ -191,8 +219,9 @@ def export_all(root: Path | str, excel_path: Path | str | None = None) -> tuple[
     fills, changes = _account_frames(root_path)
     reviews = _reviews_frame(root_path)
     summary, trades = _appended_backtest_frames(root_path, path)
+    signals = _appended_backtest_signals(root_path, path)
     cross = _appended_cross_frame(root_path, path)
-    optimize = _optimize_frame(root_path)
+    optimize = _appended_optimize_frame(root_path, path)
     sheets = {
         SHEET_PARAMS: params,
         SHEET_FILLS: fills,
@@ -200,6 +229,7 @@ def export_all(root: Path | str, excel_path: Path | str | None = None) -> tuple[
         SHEET_REVIEWS: reviews,
         SHEET_BACKTEST: summary,
         SHEET_BACKTEST_TRADES: trades,
+        SHEET_BACKTEST_SIGNALS: signals,
         SHEET_CROSS: cross,
         SHEET_OPTIMIZE: optimize,
     }
@@ -269,6 +299,7 @@ def rebuild_workbook(root: Path | str, excel_path: Path | str | None = None) -> 
     fills, changes = _account_frames(root_path)
     reviews = _reviews_frame(root_path)
     summary, trades = _backtest_frames(root_path)
+    signals = _backtest_signal_frame(root_path)
     cross = _cross_frame(root_path)
     optimize = _optimize_frame(root_path)
     sheets = {
@@ -278,6 +309,7 @@ def rebuild_workbook(root: Path | str, excel_path: Path | str | None = None) -> 
         SHEET_REVIEWS: reviews,
         SHEET_BACKTEST: summary,
         SHEET_BACKTEST_TRADES: trades,
+        SHEET_BACKTEST_SIGNALS: signals,
         SHEET_CROSS: cross,
         SHEET_OPTIMIZE: optimize,
     }
@@ -294,8 +326,50 @@ def _append_backtest_sheet(
 ) -> tuple[pd.DataFrame, int]:
     """读出这张回测表里已有的行，再把这次的新行接上去。"""
     existing = read_sheet(path, sheet) if path.exists() else pd.DataFrame()
+    if sheet == SHEET_BACKTEST_TRADES:
+        existing = _fill_trade_strategy(path, existing)
     # 回测时间参与去重：同一时刻再导出不重复；另一次回测即使成交看起来一样，也会另起一组。
     return append_frames(existing, fresh, columns, stamp_column="回测时间")
+
+
+def _fill_trade_strategy(path: Path, existing: pd.DataFrame) -> pd.DataFrame:
+    """
+    旧版导出的「回测成交」没有「策略」列。
+
+    同一次回测在「回测摘要」里写着策略名，按回测时间对回去补上，
+    这样升级表头后旧成交不会被整张丢掉。
+    """
+    if existing is None or existing.empty or "策略" in existing.columns:
+        return existing
+    out = existing.copy()
+    out["策略"] = ""
+    summary = read_sheet(path, SHEET_BACKTEST) if path.exists() else pd.DataFrame()
+    if summary is None or summary.empty:
+        return out
+    if "回测时间" not in summary.columns or "策略" not in summary.columns:
+        return out
+    names: dict[str, str] = {}
+    for _, row in summary.iterrows():
+        key = _stamp_key(row.get("回测时间"))
+        if key:
+            names[key] = str(row.get("策略") or "").strip()
+    out["策略"] = out["回测时间"].map(lambda value: names.get(_stamp_key(value), ""))
+    return out
+
+
+def _stamp_key(value: Any) -> str:
+    """把回测时间统一成「2026-11-05 20:36:30」，方便两张表按时间对上。"""
+    if value is None:
+        return ""
+    try:
+        if pd.isna(value):
+            return ""
+    except TypeError:
+        pass
+    try:
+        return pd.Timestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+    except (ValueError, TypeError, OverflowError):
+        return str(value).strip()
 
 
 def _appended_backtest_frames(root: Path, path: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -304,6 +378,15 @@ def _appended_backtest_frames(root: Path, path: Path) -> tuple[pd.DataFrame, pd.
     summary_all, _added = _append_backtest_sheet(path, SHEET_BACKTEST, summary, list(summary.columns))
     trades_all, _added_trades = _append_backtest_sheet(path, SHEET_BACKTEST_TRADES, trades, list(trades.columns))
     return summary_all, trades_all
+
+
+def _appended_backtest_signals(root: Path, path: Path) -> pd.DataFrame:
+    """回测信号同样接上以前导出的行，旧文件没有这张表时自动新建。"""
+    signals = _backtest_signal_frame(root)
+    merged, _added = _append_backtest_sheet(
+        path, SHEET_BACKTEST_SIGNALS, signals, list(signals.columns)
+    )
+    return merged
 
 
 def export_cross(root: Path | str, excel_path: Path | str | None = None) -> tuple[Path, int, int]:
@@ -323,6 +406,26 @@ def export_cross(root: Path | str, excel_path: Path | str | None = None) -> tupl
         raise ValueError("还没有交叉测试结果。请先点「开始交叉测试」，完成后再导出。")
     merged, added = _append_cross_sheet(path, fresh)
     write_sheet(path, SHEET_CROSS, merged)
+    return path, added, int(len(merged))
+
+
+def export_optimize(root: Path | str, excel_path: Path | str | None = None) -> tuple[Path, int, int]:
+    """
+    把最近一次策略优化追加进统一 Excel 的「优化结果」表，不盖掉以前的优化。
+
+    第一列「测试时间」是这次优化跑完的时刻，同一次的行时间相同。
+    同一次再导出不重复写，别的表不动。
+
+    返回 (文件路径, 这次新增行数, 表里总行数)。
+    还没跑过策略优化时抛出 ValueError。
+    """
+    root_path = Path(root)
+    path = Path(excel_path) if excel_path else default_workbook_path(root_path)
+    fresh = _optimize_frame(root_path)
+    if fresh.empty or str(fresh.iloc[0].get("测试时间") or "").startswith("还没有"):
+        raise ValueError("还没有策略优化结果。请先点「开始策略优化」，完成后再导出。")
+    merged, added = _append_optimize_sheet(path, fresh)
+    write_sheet(path, SHEET_OPTIMIZE, merged)
     return path, added, int(len(merged))
 
 
@@ -626,7 +729,12 @@ def _blank_or(value: Any, places: int = 0) -> Any:
     except (TypeError, ValueError):
         return ""
     if places <= 0:
-        return int(round(number)) if abs(number - round(number)) < 1e-9 else number
+        if abs(number - round(number)) < 1e-9:
+            return int(round(number))
+        # 金额不是整数时保留两位小数；直接写原始浮点会带 3431.1000000000004 这种尾巴，
+        # 读回来对不上，同一轮会被当成新行再写一次。
+        rounded = round(number, 2)
+        return int(round(rounded)) if abs(rounded - round(rounded)) < 1e-9 else rounded
     return round(number, places)
 
 
@@ -640,6 +748,21 @@ def _appended_cross_frame(root: Path, path: Path) -> pd.DataFrame:
     """导出全部时保留以前各轮交叉测试，再把最近一轮接上去。还没有结果时留一句说明。"""
     fresh = _cross_frame(root)
     merged, _added = _append_cross_sheet(path, fresh)
+    if merged.empty:
+        return fresh
+    return merged
+
+
+def _append_optimize_sheet(path: Path, fresh: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """把这次优化接到已有表后面。测试时间相同且内容相同的行不再写第二次。"""
+    existing = read_sheet(path, SHEET_OPTIMIZE) if path.exists() else pd.DataFrame()
+    return append_frames(existing, fresh, OPTIMIZE_COLUMNS, stamp_column="测试时间")
+
+
+def _appended_optimize_frame(root: Path, path: Path) -> pd.DataFrame:
+    """导出全部时保留以前各次优化结果，再把最近一次接上去。还没有结果时留一句说明。"""
+    fresh = _optimize_frame(root)
+    merged, _added = _append_optimize_sheet(path, fresh)
     if merged.empty:
         return fresh
     return merged
@@ -702,6 +825,7 @@ def _backtest_frames(root: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
             {
                 "回测时间": ran_at,
                 "品种": item.get("symbol"),
+                "策略": strategy_display_name(engine) if engine else "",
                 "方向": _side_cn(item.get("side")),
                 "开仓时间": item.get("entry_time"),
                 "平仓时间": item.get("exit_time"),
@@ -721,13 +845,60 @@ def _backtest_frames(root: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     return summary, trade_df
 
 
+def _backtest_signal_frame(root: Path) -> pd.DataFrame:
+    """最近一次回测里「有开仓信号但没做」的记录。旧的结果文件没有这一项时给一句话说明。"""
+    report_path = root / "data" / "backtest_last.json"
+    payload = _read_json(report_path)
+    if not payload:
+        return _empty(BACKTEST_SIGNAL_COLUMNS, "还没有回测结果。到「历史回测」页跑一次后再导出。")
+    ran_at = _backtest_ran_at(payload, report_path)
+    rows = []
+    for item in payload.get("rejected") or []:
+        rows.append(
+            {
+                "回测时间": ran_at,
+                "品种": item.get("symbol") or payload.get("symbol") or "",
+                "信号时间": str(item.get("time") or "").replace("T", " "),
+                "方向": item.get("side") or "",
+                "信号价": item.get("price") if item.get("price") is not None else "",
+                "止损价": item.get("stop") if item.get("stop") is not None else "",
+                "拦截层": item.get("stage") or "",
+                "原因": item.get("reason") or "",
+            }
+        )
+    if not rows:
+        return _empty(
+            BACKTEST_SIGNAL_COLUMNS,
+            "这次回测每个开仓信号都成交了，没有被拒绝的记录。",
+        )
+    return pd.DataFrame(rows, columns=BACKTEST_SIGNAL_COLUMNS)
+
+
+def _optimize_ran_at(payload: dict[str, Any], report_path: Path) -> str:
+    """
+    取出这次优化跑完的时间，格式固定成「2026-10-19 14:59:12」。
+
+    优先用跑完时写进结果文件的 finished_at，这样同一份结果导出两次，时间不变，不会被当成新的一次。
+    更早的结果文件没有这个字段时，改用该文件的保存时间。
+    """
+    raw = str(payload.get("finished_at") or "").strip().replace("T", " ")
+    if raw:
+        return raw[:19] if len(raw) >= 19 else raw
+    if report_path.exists():
+        return datetime.fromtimestamp(report_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
 def _optimize_frame(root: Path) -> pd.DataFrame:
     """最近一次优化：第一行是最优，后面是得分靠前的尝试。检验字段跟策略优化页对齐。"""
+    from src.backtest.optimizer import describe_params
     from src.screen.picker import cover_export_cells
 
-    payload = _read_json(root / "data" / "optimize_last.json")
+    report_path = root / "data" / "optimize_last.json"
+    payload = _read_json(report_path)
     if not payload:
         return _empty(OPTIMIZE_COLUMNS, "还没有优化结果。到「策略优化」页跑一次后再导出。")
+    ran_at = _optimize_ran_at(payload, report_path)
     rows: list[dict[str, Any]] = []
     best_perf = payload.get("best_performance") or {}
     train_perf = payload.get("train_performance") or best_perf
@@ -769,7 +940,9 @@ def _optimize_frame(root: Path) -> pd.DataFrame:
         train_end,
     )
     # 最优行带完整检验结论；后面的尝试行只填名次和这组参数的训练成绩。
+    # 同一次优化的所有行共用同一个「测试时间」，Excel 里按这一列筛选就能只看这一次。
     meta = {
+        "测试时间": ran_at,
         "品种": payload.get("symbol"),
         "策略": strategy_name,
         "区间": span,
@@ -798,10 +971,12 @@ def _optimize_frame(root: Path) -> pd.DataFrame:
             "最大回撤": best_perf.get("max_drawdown"),
             **best_cover,
             "参数JSON": json.dumps(payload.get("best_params") or {}, ensure_ascii=False),
+            "参数说明": describe_params(payload.get("best_params") or {}),
             **meta,
         }
     )
     blank_meta = {key: "" for key in meta}
+    blank_meta["测试时间"] = meta["测试时间"]
     blank_meta["品种"] = meta["品种"]
     blank_meta["策略"] = meta["策略"]
     blank_meta["区间"] = meta["区间"]
@@ -828,6 +1003,7 @@ def _optimize_frame(root: Path) -> pd.DataFrame:
                 "最大回撤": perf.get("max_drawdown"),
                 **trial_cover,
                 "参数JSON": json.dumps(trial.get("params") or {}, ensure_ascii=False),
+                "参数说明": describe_params(trial.get("params") or {}),
                 **blank_meta,
             }
         )

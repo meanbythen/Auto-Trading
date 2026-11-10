@@ -71,5 +71,12 @@ def create_trader(cfg: dict[str, Any]) -> TraderBase:
         factory = REGISTRY[DEFAULT_EXECUTOR]
 
     trader = factory(cfg)
-    logger.info("执行通道已加载: executor={} class={}", name, type(trader).__name__)
+    from src.trader.go_live import current_stage_from_cfg, stage_label
+
+    logger.info(
+        "执行通道已加载: executor={} class={} 上线阶段={}",
+        name,
+        type(trader).__name__,
+        stage_label(current_stage_from_cfg(cfg)),
+    )
     return trader

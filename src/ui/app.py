@@ -14,10 +14,14 @@ from __future__ import annotations
 
 import copy
 import os
+import queue
 import subprocess
 import sys
 import threading
-from datetime import date
+import time
+import tkinter as tk
+from tkinter import messagebox
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
@@ -52,39 +56,60 @@ ENGINE_LABELS = {
     "daily_body": "日内实体（主推）",
     "morning_box_a": "早盘箱体突破A",
     "morning_a": "早盘箱体突破A",
-    "morning_structure_b": "早盘高低递进B",
-    "morning_b": "早盘高低递进B",
     "trend_follow": "趋势跟随",
     "supertrend": "SuperTrend趋势",
     "st": "SuperTrend趋势",
-    "Single_ma": "单均线系统",
-    "single_ma": "单均线系统",
     "dual_ma": "双均线趋势",
     "ma_cross": "双均线趋势",
+    "bollinger": "布林带突破",
+    "boll": "布林带突破",
+    "sar_trend": "SAR波段趋势",
+    "parabolic_sar": "SAR波段趋势",
+    "multi_factor": "多因子CTA（加权打分）",
+    "cta": "多因子CTA（加权打分）",
+    "multi_factor_adapt": "多因子CTA（自适应权重·对照）",
+    "multi_vote": "多因子投票",
+    "vote": "多因子投票",
+    "multi_hybrid": "多因子混合",
+    "hybrid": "多因子混合",
     "swing_trend": "长线趋势加减仓",
+    "jesse_casper": "Jesse Casper（简化SMC）",
+    "casper": "Jesse Casper（简化SMC）",
+    "jesse": "Jesse Casper（简化SMC）",
 }
 
 # 界面下拉统一用这一份（主推在前）。
 ENGINE_CHOICES = [
+    "multi_factor",
+    "multi_factor_adapt",
+    "multi_vote",
+    "multi_hybrid",
     "daily_body",
     "morning_box_a",
-    "morning_structure_b",
     "trend_follow",
     "supertrend",
-    "Single_ma",
     "dual_ma",
+    "bollinger",
+    "sar_trend",
     "swing_trend",
+    "jesse_casper",
 ]
 
 # 旧配置里的短名字。下拉框用完整名字，打开时换成同一套策略。
 _ENGINE_ALIASES = {
     "st": "supertrend",
-    "single_ma": "Single_ma",
-    "ma20_trend": "Single_ma",
-    "ma20": "Single_ma",
     "ma_cross": "dual_ma",
     "morning_a": "morning_box_a",
-    "morning_b": "morning_structure_b",
+    "boll": "bollinger",
+    "bollinger_break": "bollinger",
+    "sar": "sar_trend",
+    "parabolic_sar": "sar_trend",
+    "multi": "multi_factor",
+    "cta": "multi_factor",
+    "vote": "multi_vote",
+    "hybrid": "multi_hybrid",
+    "casper": "jesse_casper",
+    "jesse": "jesse_casper",
 }
 
 # 精简时删掉的策略；旧配置读到这些名字时回到日内实体。
@@ -111,6 +136,12 @@ _REMOVED_ENGINES: set[str] = {
     "sar_flip",
     "sar",
     "mean_reversion",
+    "single_ma",
+    "Single_ma",
+    "ma20_trend",
+    "ma20",
+    "morning_structure_b",
+    "morning_b",
 }
 
 
@@ -172,12 +203,24 @@ def _same_contract(left: object, right: object) -> bool:
     return product_a == product_b and a[-3:] == b[-3:]
 
 
+def _duration_text(seconds: float) -> str:
+    """秒数写成「12秒」「3分05秒」「1小时20分」，给进度提示和预计剩余时间用。"""
+    sec = int(max(0.0, seconds))
+    if sec < 60:
+        return f"{sec}秒"
+    minutes, sec = divmod(sec, 60)
+    if minutes < 60:
+        return f"{minutes}分{sec:02d}秒"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}小时{minutes:02d}分"
+
+
 # 周期下拉。分钟、日线、周线都在这里。选「自定义」后，右边填分钟数，例如 120 就是 2 小时。
 # 1 分钟用来测试更细的信号；公开分钟线大约只有最近一千根，1 分钟只能覆盖最近几天。
 
 
 class QueueLogHandler:
-    """把 loguru 日志推到界面回调。"""
+    """把 loguru 日志放进线程安全队列；界面在主线程里取，避免跨线程调用 Tk。"""
 
     def __init__(self, emit: Any) -> None:
         self._emit = emit
@@ -221,14 +264,26 @@ class AutoTradingApp(ctk.CTk):
         self._skip_next_bot_login = False
         # 正在点击同花顺时先攒着的日志。点击结束前不写进窗口，避免把本程序拉到前面。
         self._held_logs: list[str] = []
+        # 后台线程写日志只进队列，主线程定时取出，避免跨线程调用 Tk。
+        self._log_queue: queue.Queue[str] = queue.Queue()
+        # 定时刷新的 after id。关窗口时先 after_cancel，避免窗口销毁后回调还在跑。
+        self._closing = False
+        self._tick_after_id: str | None = None
+        self._log_after_id: str | None = None
+        self._login_tick_after_id: str | None = None
+        # 运行日志最多留这么多行，长时间挂机不会把文本框越撑越大。
+        self._LOG_MAX_LINES = 2000
 
         self._init_vars()
         self._build()
         self._hook_logger()
         self._refresh_status_cards()
-        self.after(800, self._tick)
-        self.after(5000, self._tick_login_schedule)
+        self._tick_after_id = self.after(800, self._tick)
+        self._login_tick_after_id = self.after(5000, self._tick_login_schedule)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self._ths_scraping = False
+        # 读同花顺图时焦点在期货通上，窗口快捷键可能收不到；工作线程还会另外查 ESC。
+        self.bind_all("<Escape>", self._on_escape_key)
 
     # ---------- 变量 ----------
     def _init_vars(self) -> None:
@@ -242,6 +297,29 @@ class AutoTradingApp(ctk.CTk):
 
         self.engine_var = ctk.StringVar(value=_ui_engine(st.get("engine", "daily_body")))
         self.exec_var = ctk.StringVar(value=str(trade.get("executor", "sim")))
+        from src.trader.ctp_logic import CTP_KIND_LABELS, ctp_kind_label
+
+        ctp_box = trade.get("ctp") or {}
+        live_box = ctp_box.get("live") if isinstance(ctp_box.get("live"), dict) else {}
+        self.ctp_kind_var = ctk.StringVar(value=ctp_kind_label(ctp_box.get("account_kind")))
+        self.ctp_kind_choices = list(CTP_KIND_LABELS.values())
+        self.ctp_live_td_var = ctk.StringVar(value=str(live_box.get("td_front") or ""))
+        self.ctp_live_md_var = ctk.StringVar(value=str(live_box.get("md_front") or ""))
+        from src.trader.go_live import STAGE_LABELS, current_stage_from_cfg, load_state as load_go_live
+        from src.trader.go_live import stage_hint, stage_label
+
+        go_state = load_go_live(self.root_dir)
+        yaml_stage = ((trade.get("go_live") or {}) if isinstance(trade.get("go_live"), dict) else {}).get("stage")
+        stage_now = go_state.get("stage") or yaml_stage or current_stage_from_cfg(self.cfg)
+        self.go_live_choices = list(STAGE_LABELS.values())
+        self.go_live_var = ctk.StringVar(value=stage_label(stage_now))
+        self.go_live_hint_var = ctk.StringVar(value=stage_hint(stage_now))
+        from src.trader.go_live import allows_strategy_orders, apply_stage_to_cfg, account_kind_for_stage
+
+        apply_stage_to_cfg(self.cfg, stage_now)
+        if allows_strategy_orders(stage_now):
+            self.exec_var.set("ctp")
+        self.ctp_kind_var.set(ctp_kind_label(account_kind_for_stage(stage_now)))
         from src.data.quote_check import source_label
 
         quote_label = source_label((self.cfg.get("data") or {}).get("source"))
@@ -264,6 +342,8 @@ class AutoTradingApp(ctk.CTk):
         self._pick_running = False
         self._pick_cancel = threading.Event()
         self.volume_var = ctk.StringVar(value=str(trade.get("volume", 1)))
+        self.max_slip_var = ctk.StringVar(value=str(trade.get("max_entry_slip_atr", 0.5)))
+        self.max_slip_points_var = ctk.StringVar(value=str(trade.get("max_entry_slip_points", 0)))
         self.sizing_mode_var = ctk.StringVar(value=str(risk.get("sizing_mode", "risk_pct")))
         self.capital_var = ctk.StringVar(value=str(risk.get("capital", 1000000)))
         self.risk_pct_var = ctk.StringVar(value=str(risk.get("risk_per_trade_pct", 0.5)))
@@ -273,6 +353,14 @@ class AutoTradingApp(ctk.CTk):
             value=str(risk.get("margin_usage_pct", DEFAULT_MARGIN_USAGE_PCT))
         )
         self.margin_var = ctk.StringVar(value=str(risk.get("margin_per_lot", 0) or 0))
+        from src.risk.dynamic import DynamicExposure
+
+        _dyn = DynamicExposure.from_config(self.cfg)
+        self.dyn_enabled_var = ctk.BooleanVar(value=bool(_dyn.enabled))
+        self.dyn_dd_half_var = ctk.StringVar(value=str(_dyn.dd_half_pct))
+        self.dyn_dd_pause_var = ctk.StringVar(value=str(_dyn.dd_pause_pct))
+        self.dyn_atr_half_var = ctk.StringVar(value=str(_dyn.atr_half_mult))
+        self.dyn_atr_pause_var = ctk.StringVar(value=str(_dyn.atr_pause_mult))
         # 关注合约+保证金只认总表；margin_map_var 给回测页抄「当前品种保证金」用。
         from src.risk.universe_table import DEFAULT_REL_PATH, summarize_universe
 
@@ -295,7 +383,6 @@ class AutoTradingApp(ctk.CTk):
         body_box = st.get("daily_body") or {}
         trend_box = st.get("trend_follow") or {}
         st_box = st.get("supertrend") or {}
-        ma_box = st.get("single_ma") or {}
         dual_box = st.get("dual_ma") or {}
         # 箱沿外再让几跳：多单箱底外、空单箱顶外。默认 1。
         self.body_stop_ticks_var = ctk.StringVar(value=str(body_box.get("stop_extra_ticks", 1)))
@@ -303,20 +390,93 @@ class AutoTradingApp(ctk.CTk):
         self.body_skip_gap_var = ctk.StringVar(value=str(body_box.get("skip_gap_ticks", 50)))
         # 开盘箱体最高-最低超过几跳就不开；0=关闭。箱体越宽，箱沿止损离进场价越远。
         self.body_max_box_var = ctk.StringVar(value=str(body_box.get("max_box_ticks", 100)))
+        # 急破箱体不追：收盘离破位超过几跳就先等回抽；0=关闭。
+        self.body_max_chase_var = ctk.StringVar(value=str(body_box.get("max_chase_ticks", 20)))
+        # 回抽时看哪条 EMA；以及收盘超过它几跳才算有效打穿。
+        self.body_ema_period_var = ctk.StringVar(value=str(body_box.get("ema_period", 20)))
+        self.body_ema_buffer_var = ctk.StringVar(value=str(body_box.get("ema_buffer_ticks", 2)))
         # 开仓截止钟点：过了这个钟点，日盘/夜盘这一段不再开新仓。默认沿用旧版 10:30 / 22:15。
         self.body_day_cutoff_var = ctk.StringVar(value=str(body_box.get("day_cutoff", "10:30")))
         self.body_night_cutoff_var = ctk.StringVar(value=str(body_box.get("night_cutoff", "22:15")))
         self.body_eth2_var = ctk.StringVar(value=str(body_box.get("eth_minutes2", 30)))
+        from src.strategy.market_state import range_params_for_daily_body
+
+        body_rp = range_params_for_daily_body(self.cfg)
+        self.body_filter_enabled_var = ctk.BooleanVar(value=bool(body_rp.enabled))
+        self.body_filter_adx_period_var = ctk.StringVar(value=str(body_rp.adx_period))
+        self.body_filter_atr_period_var = ctk.StringVar(value=str(body_rp.atr_period))
+        self.body_filter_lookback_var = ctk.StringVar(value=str(body_rp.lookback))
+        self.body_filter_adx_upper_var = ctk.StringVar(value=f"{body_rp.adx_upper:g}")
+        body_atr_high_ui = 0 if body_rp.atr_high_pct >= 0.999 else body_rp.atr_high_pct * 100
+        self.body_filter_atr_high_var = ctk.StringVar(value=f"{body_atr_high_ui:g}")
+        # 止损触发方式（全策略共用）：触及即止损（实时看影线）/ 收盘价确认（等这根K线收完）。
+        from src.strategy.types import (
+            entry_mode_from_cfg,
+            entry_mode_label,
+            stop_mode_from_cfg,
+            stop_mode_label,
+        )
+
+        self.stop_mode_var = ctk.StringVar(value=stop_mode_label(stop_mode_from_cfg(self.cfg)))
+        self.entry_mode_var = ctk.StringVar(value=entry_mode_label(entry_mode_from_cfg(self.cfg)))
+        # 通用止损（独立于策略自身止损）：关闭 / SAR / 前高低点 / ATR 吊灯。
+        from src.strategy.generic_stop import generic_stop_from_cfg, generic_stop_label
+
+        gs_cfg = generic_stop_from_cfg(self.cfg)
+        self.generic_stop_var = ctk.StringVar(value=generic_stop_label(gs_cfg.kind))
+        self.generic_stop_lookback_var = ctk.StringVar(value=str(gs_cfg.lookback))
+        self.generic_stop_sar_start_var = ctk.StringVar(value=f"{gs_cfg.sar_af_start:g}")
+        self.generic_stop_sar_step_var = ctk.StringVar(value=f"{gs_cfg.sar_af_step:g}")
+        self.generic_stop_sar_max_var = ctk.StringVar(value=f"{gs_cfg.sar_af_max:g}")
+        self.generic_stop_atr_period_var = ctk.StringVar(value=str(gs_cfg.atr_period))
+        self.generic_stop_atr_mult_var = ctk.StringVar(value=f"{gs_cfg.atr_mult:g}")
+        self.generic_stop_be_atr_var = ctk.StringVar(value=f"{gs_cfg.be_atr_mult:g}")
+        # 趋势策略各自的行情过滤（ADX 没趋势或 ATR 波动压缩时不开新仓）。
+        self._init_trend_filter_vars()
         self.trend_entry_bars_var = ctk.StringVar(value=str(trend_box.get("entry_bars", 36)))
         self.trend_atr_mult_var = ctk.StringVar(value=str(trend_box.get("atr_mult", 2.0)))
         self.st_atr_period_var = ctk.StringVar(value=str(st_box.get("atr_period", 10)))
         self.st_multiplier_var = ctk.StringVar(value=str(st_box.get("multiplier", 3.0)))
-        self.ma_period_var = ctk.StringVar(value=str(ma_box.get("ma_period", 20)))
-        # 收盘反向穿越均线时反手开新仓（开）还是只平仓（关）。
-        self.ma_reverse_var = ctk.BooleanVar(value=bool(ma_box.get("reverse_on_cross", True)))
         self.dual_short_var = ctk.StringVar(value=str(dual_box.get("short_period", 20)))
         self.dual_long_var = ctk.StringVar(value=str(dual_box.get("long_period", 60)))
         self.dual_reverse_var = ctk.BooleanVar(value=bool(dual_box.get("reverse_on_cross", True)))
+        boll_box = st.get("bollinger") or {}
+        self.boll_window_var = ctk.StringVar(value=str(boll_box.get("boll_window", 20)))
+        self.boll_dev_var = ctk.StringVar(value=str(boll_box.get("boll_dev", 2.0)))
+        self.boll_atr_mult_var = ctk.StringVar(value=str(boll_box.get("atr_stop_mult", 1.5)))
+        sar_box = st.get("sar_trend") or {}
+        self.sar_ma_filter_var = ctk.StringVar(value=str(sar_box.get("ma_filter", 20)))
+        self.sar_af_step_var = ctk.StringVar(value=str(sar_box.get("af_step", 0.02)))
+        multi_box = st.get("multi_factor") or {}
+        self.multi_threshold_var = ctk.StringVar(value=str(multi_box.get("threshold", 0.6)))
+        self.multi_ma_short_var = ctk.StringVar(value=str(multi_box.get("ma_short", 20)))
+        self.multi_ma_long_var = ctk.StringVar(value=str(multi_box.get("ma_long", 60)))
+        self.multi_channel_var = ctk.StringVar(value=str(multi_box.get("channel", 20)))
+        self.multi_atr_mult_var = ctk.StringVar(value=str(multi_box.get("atr_stop_mult", 2.0)))
+        self.multi_disagree_var = ctk.StringVar(value=str(multi_box.get("disagree_max", 0.7)))
+        self.multi_use_sar_var = ctk.BooleanVar(value=bool(multi_box.get("use_sar", True)))
+        vote_box = st.get("multi_vote") or {}
+        hybrid_box = st.get("multi_hybrid") or {}
+        adapt_box = st.get("multi_factor_adapt") or {}
+        self.adapt_enabled_var = ctk.BooleanVar(value=bool(adapt_box.get("adapt_enabled", True)))
+        self.adapt_lookback_var = ctk.StringVar(value=str(adapt_box.get("lookback_trades", 20)))
+        self.adapt_min_w_var = ctk.StringVar(value=str(adapt_box.get("min_weight", 0.05)))
+        self.adapt_max_w_var = ctk.StringVar(value=str(adapt_box.get("max_weight", 0.40)))
+        self.adapt_mix_var = ctk.StringVar(value=str(adapt_box.get("recent_mix", 0.30)))
+        self.adapt_step_var = ctk.StringVar(value=str(adapt_box.get("max_step", 0.03)))
+        self.multi_min_votes_var = ctk.StringVar(
+            value=str(vote_box.get("min_votes", hybrid_box.get("min_votes", 2)))
+        )
+        self.multi_vote_diff_var = ctk.StringVar(
+            value=str(vote_box.get("min_vote_diff", hybrid_box.get("min_vote_diff", 2)))
+        )
+        self.hybrid_min_ratio_var = ctk.StringVar(
+            value=str(hybrid_box.get("min_position_ratio", 0.5))
+        )
+        self.hybrid_max_ratio_var = ctk.StringVar(
+            value=str(hybrid_box.get("max_position_ratio", 1.0))
+        )
+        self._init_cta_filter_vars(multi_box, vote_box, hybrid_box, adapt_box)
         swing_box = st.get("swing_trend") or {}
         from src.strategy.swing_trend import DEFAULT_SCALE, SCALE_LABELS, resolve_scale_pair, scale_label
 
@@ -331,6 +491,14 @@ class AutoTradingApp(ctk.CTk):
         self.swing_max_adds_var = ctk.StringVar(value=str(swing_box.get("max_adds", 2)))
         self.swing_add_atr_var = ctk.StringVar(value=str(swing_box.get("add_min_atr", 1.0)))
         self.swing_reduce_atr_var = ctk.StringVar(value=str(swing_box.get("reduce_extend_atr", 2.5)))
+        jesse_box = st.get("jesse_casper") or {}
+        self.jesse_lookback_var = ctk.StringVar(value=str(jesse_box.get("lookback_liq", 20)))
+        self.jesse_vol_mult_var = ctk.StringVar(value=str(jesse_box.get("vol_mult", 1.2)))
+        self.jesse_min_rr_var = ctk.StringVar(value=str(jesse_box.get("min_rr", 3.0)))
+        self.jesse_tick_var = ctk.StringVar(value=str(jesse_box.get("price_tick", 1.0)))
+        self.jesse_use_va_var = ctk.BooleanVar(value=bool(jesse_box.get("use_va", True)))
+        self.jesse_use_kill_var = ctk.BooleanVar(value=bool(jesse_box.get("use_kill_zone", True)))
+        self.jesse_use_halt_var = ctk.BooleanVar(value=bool(jesse_box.get("use_daily_halt", True)))
         self.flatten_var = ctk.StringVar(
             value=",".join(str(x) for x in st.get("flatten_times", ["14:55", "22:55"]))
         )
@@ -378,6 +546,8 @@ class AutoTradingApp(ctk.CTk):
         default_start = self._initial_start_date(bt.get("start_date", ""))
         self.bt_start_var = ctk.StringVar(value=default_start)
         self.bt_end_var = ctk.StringVar(value=str(bt.get("end_date", "")))
+        ths_chart = ((self.cfg.get("data") or {}).get("ths_chart") or {})
+        self.bt_ths_bars_var = ctk.StringVar(value=str(ths_chart.get("max_bars", 800)))
         # 成交近似：下一根开盘成交与滑点跳数，只影响回测。配置页和历史回测页共用这一组。
         self.bt_fill_next_open_var = ctk.BooleanVar(value=bool(bt.get("fill_on_next_open", True)))
         self.bt_slippage_var = ctk.StringVar(value=str(bt.get("slippage_ticks", 1)))
@@ -400,6 +570,11 @@ class AutoTradingApp(ctk.CTk):
         self.bt_limits_on_var = ctk.BooleanVar(value=True)
         # 打开程序时先跟配置页一致。之后可以在回测页单独改，点「按配置页重新填入」再抄回来。
         self.bt_flatten_var = ctk.BooleanVar(value=bool(st.get("flatten_at_close", True)))
+        # 按主力合约表的时段自动换月。默认开，让历史回测跟实盘一样换月日仍用旧合约、次日切新主力。
+        self.bt_rollover_var = ctk.BooleanVar(value=bool(bt.get("rollover_main", True)))
+        # 换月分段的资金口径。默认每段同一份起始资金，便于和单合约回测对照；
+        # 打开后上一段结束的权益接到下一段（真实账户口径）。
+        self.bt_rollover_chain_var = ctk.BooleanVar(value=False)
         # 交叉测试不再跟某一次回测比。周期和手数用本页自己的数字，策略会把每一套都测。
         self.pk_engine_var = ctk.StringVar(value=self.bt_engine_var.get())
         # 交叉测试自己的行情来源。打开时跟配置页一样，之后可以单独改。
@@ -439,6 +614,12 @@ class AutoTradingApp(ctk.CTk):
         self.opt_holdout_pct_var = ctk.StringVar(value=str(bt.get("optimize_holdout_pct", 30)))
         self.opt_mode_var = ctk.StringVar(value=str(bt.get("optimize_mode", "一次切断")))
         self.opt_walk_steps_var = ctk.StringVar(value=str(bt.get("optimize_walk_steps", 3)))
+        # 写入第几组：1=训练最优；填其它编号会先按检验段重新复核再写。
+        self.opt_write_index_var = ctk.StringVar(value="1")
+        # 打开＝衰减重跑：搜完对照正在用的参数，默认不写配置。
+        self.opt_compare_var = ctk.BooleanVar(value=False)
+        # 写入时额外留一份整页配置存档（配置页可一键应用）。和下面参数版本不是同一份。
+        self.opt_save_preset_var = ctk.BooleanVar(value=True)
         self._last_opt_params: dict = {}
         self._last_opt_engine: str = ""
         # 后一段验收过了才是 True。没过时参数仍显示在结果里，但不能写入配置。
@@ -446,6 +627,13 @@ class AutoTradingApp(ctk.CTk):
         self._last_opt_reason: str = ""
         self._last_opt_start: str = ""
         self._last_opt_end: str = ""
+        # 这次优化的全部打分行和运行设置，供「写入第几组」复核用。
+        self._last_opt_trials: list[dict] = []
+        self._last_opt_ctx: dict = {}
+        # 对照结果：打开「对照正在用的参数」跑完后才有。全面更好时写入按钮改成切实盘。
+        self._last_evolve_better: bool = False
+        self._last_evolve_reason: str = ""
+        self._last_opt_compared: bool = False
 
         # 复盘页：日期默认今天；策略对照默认跟配置里正在用的那一套，也可以改成「只看盘面」
         from datetime import date as _date
@@ -472,6 +660,26 @@ class AutoTradingApp(ctk.CTk):
         self._ac_cal = futures_trading_day().replace(day=1)
         self._ac_report = None
         self._signal_book_mtime = 0.0
+        # 资金表控件还没建好时，刷新说明不能去读这个字典（Tk 会当成窗口属性报错）。
+        self._ac_fund_values: dict[str, Any] = {}
+        # 账户分析换账时，下拉框改回去不要再弹一次确认。
+        self._account_switch_busy = False
+        from src.account.workspace import display_label, load_active_id, profile_of
+
+        self.ac_account_var = ctk.StringVar(value=display_label(load_active_id(self.root_dir), self.root_dir))
+
+        # 规律候选：只扫统计关系，不下单。日期默认跟回测页同一套，改这里不会改回测。
+        self.rs_source_var = ctk.StringVar(value=quote_label)
+        self.rs_symbol_var = ctk.StringVar(value=str(default_sym))
+        self.rs_tf_var = ctk.StringVar(value=tf_label)
+        self.rs_tf_custom_var = ctk.StringVar(value=tf_custom)
+        self.rs_range_var = ctk.StringVar(value=str(bt.get("range_preset", "全部可用")))
+        self.rs_start_var = ctk.StringVar(value=default_start)
+        self.rs_end_var = ctk.StringVar(value=str(bt.get("end_date", "")))
+        self.rs_scope_var = ctk.StringVar(value="扫关注名单全部")
+        self.rs_cross_var = ctk.BooleanVar(value=True)
+        self._rs_busy = False
+        self._rs_check_vars: dict[str, ctk.BooleanVar] = {}
 
     # ---------- 搭建 ----------
     def _build(self) -> None:
@@ -480,13 +688,15 @@ class AutoTradingApp(ctk.CTk):
         ctk.CTkLabel(
             hero, text=f"Auto-Trading {__version__}", font=T.FONT_DISPLAY, text_color=T.ACCENT, anchor="w"
         ).pack(anchor="w")
-        ctk.CTkLabel(
+        # 副标题按当前券商、关注品种和模拟开关生成，不再写死某几个品种。
+        self.hero_sub = ctk.CTkLabel(
             hero,
-            text="华泰期货 · 沥青 / 玉米 · 配置可改 · 默认模拟",
+            text="-",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             anchor="w",
-        ).pack(anchor="w", pady=(2, 0))
+        )
+        self.hero_sub.pack(anchor="w", pady=(2, 0))
 
         # 状态卡。五列按固定比例分同一行：窗口变宽时一起变，不会再被某一句长文字单独撑开。
         self.status_row = ctk.CTkFrame(self, fg_color=T.BG)
@@ -504,6 +714,19 @@ class AutoTradingApp(ctk.CTk):
         # 持仓句子可能写成「bu2612 空1手 @4662 止损4700」，用小一号字，避免一有仓就把整排撑高。
         self.card_position.configure(font=T.FONT_BODY)
         self.status_row.bind("<Configure>", self._fit_status_card_text)
+        # 告警 / 健康 / 动态减仓：三句经常很长，不挤成一行。行距压紧，没字的行收起来。
+        self.status_notes = ctk.CTkFrame(self, fg_color="transparent")
+        self.status_notes.pack(fill="x", padx=28, pady=(0, 4))
+        note_kw = {
+            "font": T.FONT_SMALL,
+            "anchor": "w",
+            "justify": "left",
+            "height": 18,
+        }
+        self.alert_line = ctk.CTkLabel(self.status_notes, text="", text_color=T.DANGER, **note_kw)
+        self.health_line = ctk.CTkLabel(self.status_notes, text="", text_color=T.TEXT_DIM, **note_kw)
+        self.dyn_line = ctk.CTkLabel(self.status_notes, text="", text_color=T.TEXT_DIM, **note_kw)
+        self.status_notes.bind("<Configure>", self._fit_status_note_wrap)
 
         self.tabs = ctk.CTkTabview(
             self,
@@ -524,6 +747,7 @@ class AutoTradingApp(ctk.CTk):
         self.tabs.add("策略优化")
         self.tabs.add("复盘")
         self.tabs.add("账户分析")
+        self.tabs.add("规律候选")
 
         self._build_run_tab(self.tabs.tab("运行"))
         self._build_config_tab(self.tabs.tab("配置"))
@@ -532,9 +756,112 @@ class AutoTradingApp(ctk.CTk):
         self._build_optimize_tab(self.tabs.tab("策略优化"))
         self._build_review_tab(self.tabs.tab("复盘"))
         self._build_account_tab(self.tabs.tab("账户分析"))
+        self._build_research_tab(self.tabs.tab("规律候选"))
         self._load_saved_picks()
         # 打开程序先看一眼当前关注合约是不是主力，非主力时在配置页亮提示。
         self.after(300, self._refresh_main_contract_hint)
+
+    def _build_research_tab(self, tab: ctk.CTkFrame) -> None:
+        """
+        规律候选：在历史 K 线上扫因子和后面涨跌的关系，过关的写进候选池。
+
+        这里不下单。勾选只表示你觉得这条逻辑说得通，不会改现在哪根 K 线开仓。
+        """
+        tab.grid_columnconfigure(0, weight=1)
+        tab.grid_columnconfigure(1, weight=2)
+        tab.grid_rowconfigure(0, weight=1)
+
+        left = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+        left.grid(row=0, column=0, sticky="nsew", padx=(8, 8), pady=8)
+
+        ctk.CTkLabel(left, text="规律候选", font=T.FONT_TITLE, text_color=T.TEXT).pack(
+            anchor="w", padx=4, pady=(4, 2)
+        )
+        ctk.CTkLabel(
+            left,
+            text="程序在一份写清经济学逻辑的因子清单上，看它们和后面几根涨跌是否稳。两段时间都显著才进池，再看分段里大部分时间是否同向。说明书开头会写更像趋势、突破、震荡还是波段，只是倾向，不会自动换策略，也不会下单。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w", padx=4, pady=(0, 10))
+
+        box = self._card(left)
+        from src.data.quote_check import SOURCE_LABELS
+
+        self._option_row(box, "行情数据源", self.rs_source_var, list(SOURCE_LABELS), width=160)
+        symbol_values = list(self._watch_symbols) or ["（还没有）"]
+        if self.rs_symbol_var.get() not in symbol_values:
+            self.rs_symbol_var.set(symbol_values[0])
+        self.rs_symbol_menu = self._option_row(box, "品种", self.rs_symbol_var, symbol_values, width=160)
+        self._option_row(
+            box,
+            "扫哪些",
+            self.rs_scope_var,
+            ["只扫当前这个", "扫关注名单全部"],
+            width=180,
+        )
+        self._timeframe_row(box, "K线周期", self.rs_tf_var, self.rs_tf_custom_var, width=140)
+        self._option_row(
+            box,
+            "时间段",
+            self.rs_range_var,
+            ["全部可用", "最近3天", "最近7天", "最近14天", "自定义"],
+            width=160,
+        )
+        self._date_row(box, "开始日期", self.rs_start_var, hint="点日历选择，默认当年1月1日", allow_empty=False)
+        self._date_row(box, "结束日期", self.rs_end_var, hint="点日历；清空=到最新")
+        ctk.CTkCheckBox(
+            box,
+            text="多个品种时，至少两个合约都过关才进池",
+            variable=self.rs_cross_var,
+            font=T.FONT_SMALL,
+            text_color=T.TEXT,
+        ).pack(anchor="w", pady=(6, 4))
+
+        ctk.CTkButton(
+            left,
+            text="开始扫描规律",
+            height=44,
+            fg_color=T.ACCENT,
+            hover_color=T.ACCENT_HOVER,
+            text_color=T.ACCENT_ON,
+            command=self._on_research_scan,
+        ).pack(fill="x", padx=4, pady=(12, 6))
+        ctk.CTkButton(
+            left,
+            text="保存勾选（仍不下单）",
+            height=34,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_save_research_picks,
+        ).pack(fill="x", padx=4, pady=(0, 8))
+        ctk.CTkLabel(
+            left,
+            text="过关条目（勾选=我认可这条逻辑，还要另写成开平规则才能当策略）",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w", padx=4, pady=(0, 4))
+        self.rs_pick_frame = ctk.CTkScrollableFrame(left, fg_color=T.BG_ELEVATED, height=220)
+        self.rs_pick_frame.pack(fill="both", expand=True, padx=4, pady=(0, 8))
+
+        right = ctk.CTkFrame(tab, fg_color=T.BG_PANEL, corner_radius=12)
+        right.grid(row=0, column=1, sticky="nsew", padx=(0, 8), pady=8)
+        right.grid_rowconfigure(1, weight=1)
+        right.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(right, text="规律说明书", font=T.FONT_TITLE, text_color=T.TEXT).grid(
+            row=0, column=0, sticky="w", padx=12, pady=(12, 6)
+        )
+        self.rs_result_box = ctk.CTkTextbox(
+            right, font=T.FONT_MONO, fg_color=T.BG, text_color=T.TEXT, corner_radius=10, wrap="word"
+        )
+        self.rs_result_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        self._refresh_research_picks()
 
     def _make_stat_card(self, parent: ctk.CTkFrame, col: int, title: str, value: str) -> ctk.CTkLabel:
         """做顶部的一张状态卡。宽度由列的比例决定，文字在卡片里面换行，不把旁边的卡片挤窄。"""
@@ -601,7 +928,7 @@ class AutoTradingApp(ctk.CTk):
         tab.grid_columnconfigure(1, weight=3)
         tab.grid_rowconfigure(0, weight=1)
 
-        # 可滚动：窗口较矮时，紧急清仓下面的导出和保存仍能滚出来，不会被裁掉。
+        # 可滚动：窗口较矮时，手工单录入下面的导出和保存仍能滚出来，不会被裁掉。
         left = ctk.CTkScrollableFrame(
             tab,
             fg_color="transparent",
@@ -620,7 +947,7 @@ class AutoTradingApp(ctk.CTk):
             text_color=T.TEXT_DIM,
         ).pack(anchor="w", padx=8, pady=(0, 8))
 
-        # 只留顶部状态栏没有的内容：信号周期、止损周期，以及流动性耗尽的两个开关。
+        # 只留顶部状态栏没有的内容：信号周期、止损周期。
         route = ctk.CTkFrame(left, fg_color=T.BG_ELEVATED, corner_radius=10, border_width=1, border_color=T.BORDER)
         route.pack(fill="x", padx=8, pady=(0, 8))
         self.route_summary = ctk.CTkLabel(
@@ -646,7 +973,7 @@ class AutoTradingApp(ctk.CTk):
 
         btn_row = ctk.CTkFrame(left, fg_color="transparent")
         btn_row.pack(fill="x", padx=8, pady=(6, 8))
-        # 启动：待命=蓝底白字（可点）；运行中=灰底浅字（不可点）
+        # 启动常驻 / 跑着时变成停止常驻（结束扫描循环）。暂停报单不停扫描。
         self.btn_start = ctk.CTkButton(
             btn_row,
             text="启动常驻",
@@ -658,34 +985,70 @@ class AutoTradingApp(ctk.CTk):
             command=self._on_start,
         )
         self.btn_start.pack(side="left", expand=True, fill="x", padx=(0, 6))
-        # 停止：待命=灰底浅字（不可点）；运行中=红底白字（可点）
         self.btn_stop = ctk.CTkButton(
             btn_row,
-            text="停止",
+            text="暂停报单",
             height=38,
             fg_color=T.DANGER_MUTED,
             hover_color=T.DANGER_HOVER,
             text_color=T.DANGER_TEXT,
             text_color_disabled=T.DANGER_TEXT_DISABLED,
-            command=self._on_stop,
+            command=self._on_pause_orders,
             state="disabled",
         )
         self.btn_stop.pack(side="left", expand=True, fill="x", padx=(6, 0))
+        # 对账确认：程序若在「点击下单」和「记账」之间崩溃，下次启动会熔断等人工核对。
+        self.btn_confirm = ctk.CTkButton(
+            btn_row,
+            text="对账确认",
+            width=86,
+            height=38,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            text_color=T.TEXT_DIM,
+            command=self._on_confirm_positions,
+        )
+        self.btn_confirm.pack(side="left", padx=(10, 0))
+
 
         ctk.CTkLabel(
             left,
-            text="点「启动常驻」会先打开同花顺、登录、确认下单界面，并把价格改成对手价。这几步不点买卖。都成功后才开始扫描。",
+            text="「暂停报单」后扫描还在跑，开平仓、止损、清仓都不会发出去。要结束常驻请点「停止常驻」。交易台只给人测开平撤；③④再启动常驻由策略接管。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=420,
             justify="left",
         ).pack(anchor="w", padx=8, pady=(0, 8))
 
-        btn_ctp = ctk.CTkFrame(left, fg_color="transparent")
-        btn_ctp.pack(fill="x", padx=8, pady=(0, 8))
+        ctk.CTkLabel(
+            left,
+            text="CTP 上线四步（手工和策略同一套接口）",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            anchor="w",
+        ).pack(anchor="w", padx=8, pady=(4, 0))
+        self.go_live_menu = ctk.CTkOptionMenu(
+            left,
+            variable=self.go_live_var,
+            values=self.go_live_choices,
+            command=lambda _v: self._on_go_live_change(),
+            width=360,
+            height=32,
+        )
+        self.go_live_menu.pack(fill="x", padx=8, pady=(4, 0))
+        ctk.CTkLabel(
+            left,
+            textvariable=self.go_live_hint_var,
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=420,
+            justify="left",
+        ).pack(anchor="w", padx=8, pady=(4, 4))
+        stage_btns = ctk.CTkFrame(left, fg_color="transparent")
+        stage_btns.pack(fill="x", padx=8, pady=(0, 8))
         ctk.CTkButton(
-            btn_ctp,
-            text="仿真柜台测试",
+            stage_btns,
+            text="打开交易台",
             height=36,
             fg_color=T.BG_ELEVATED,
             hover_color=T.BORDER,
@@ -693,7 +1056,18 @@ class AutoTradingApp(ctk.CTk):
             border_color=T.BORDER,
             text_color=T.TEXT,
             command=self._on_ctp_probe,
-        ).pack(fill="x")
+        ).pack(side="left", expand=True, fill="x", padx=(0, 4))
+        ctk.CTkButton(
+            stage_btns,
+            text="本阶段完成",
+            height=36,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.ACCENT,
+            text_color=T.ACCENT,
+            command=self._on_go_live_done,
+        ).pack(side="left", expand=True, fill="x", padx=(4, 0))
 
         # 试跑一轮 / 点击下单 / 完整自检收进一个入口，避免三个按钮挤在一起。
         self.btn_test_tools = ctk.CTkButton(
@@ -720,27 +1094,18 @@ class AutoTradingApp(ctk.CTk):
 
         ctk.CTkButton(
             left,
-            text="紧急清仓（平掉程序记录的持仓）",
-            height=36,
-            fg_color=T.DANGER,
-            hover_color=T.DANGER_HOVER,
-            text_color=T.DANGER_TEXT,
-            command=self._on_emergency_flatten,
-        ).pack(fill="x", padx=8, pady=(0, 8))
-        ctk.CTkButton(
-            left,
-            text="按实际价格平账",
+            text="手工单录入",
             height=36,
             fg_color=T.BG_ELEVATED,
             hover_color=T.BORDER,
             border_width=1,
-            border_color=T.BORDER,
-            text_color=T.TEXT,
-            command=self._on_book_actual_close,
+            border_color=T.ACCENT,
+            text_color=T.ACCENT,
+            command=self._on_manual_trade,
         ).pack(fill="x", padx=8, pady=(0, 4))
         ctk.CTkLabel(
             left,
-            text="交易软件里已经平掉、程序还记着仓时用。填写实际成交价。只改程序的账，不会去点同花顺。",
+            text="手动在同花顺上开仓/平仓后，在这里录入。品种、价格、手数 + 买多/卖空/平仓。只改程序的账，不会去点同花顺。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=420,
@@ -761,7 +1126,7 @@ class AutoTradingApp(ctk.CTk):
 
         self.btn_save_dry = ctk.CTkButton(
             left,
-            text="保存模拟开关到配置文件",
+            text="保存全部配置到文件",
             height=34,
             fg_color="transparent",
             hover_color=T.BG_ELEVATED,
@@ -818,9 +1183,23 @@ class AutoTradingApp(ctk.CTk):
         box = self._card(left)
         engines = list(ENGINE_CHOICES)
         self._option_row(box, "策略引擎", self.bt_engine_var, engines, width=240)
-        from src.data.quote_check import SOURCE_LABELS
+        from src.data.quote_check import BACKTEST_SOURCE_LABELS
 
-        self._option_row(box, "行情数据源", self.bt_source_var, list(SOURCE_LABELS), width=160)
+        self._option_row(box, "行情数据源", self.bt_source_var, list(BACKTEST_SOURCE_LABELS), width=160)
+        self.bt_source_hint = ctk.CTkLabel(
+            box,
+            text="",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=340,
+            justify="left",
+        )
+        self.bt_source_hint.pack(anchor="w", pady=(0, 4))
+        try:
+            self.bt_source_var.trace_add("write", lambda *_: self._refresh_bt_source_hint())
+        except Exception:  # noqa: BLE001
+            pass
+        self._refresh_bt_source_hint()
         # 和配置页关注品种用同一份合约。先放进下拉，避免打开时选中的合约不在列表里。
         symbol_values = list(self._watch_symbols) or ["（还没有）"]
         if self.bt_symbol_var.get() not in symbol_values:
@@ -848,8 +1227,8 @@ class AutoTradingApp(ctk.CTk):
             ["全部可用", "最近3天", "最近7天", "最近14天", "自定义"],
             width=160,
         )
-        self._entry_row(box, "开始日期", self.bt_start_var, hint="默认当年1月1日，可改", width=160)
-        self._entry_row(box, "结束日期", self.bt_end_var, hint="填了就按这天停，空着=到最新", width=160)
+        self._date_row(box, "开始日期", self.bt_start_var, hint="点日历选择，默认当年1月1日", allow_empty=False)
+        self._date_row(box, "结束日期", self.bt_end_var, hint="点日历；清空=到最新")
         flat_row = ctk.CTkFrame(box, fg_color="transparent")
         flat_row.pack(fill="x", pady=4)
         ctk.CTkLabel(
@@ -874,6 +1253,96 @@ class AutoTradingApp(ctk.CTk):
             wraplength=340,
             justify="left",
         ).pack(anchor="w", pady=(0, 6))
+
+        roll_row = ctk.CTkFrame(box, fg_color="transparent")
+        roll_row.pack(fill="x", pady=4)
+        ctk.CTkLabel(
+            roll_row,
+            text="主力合约换月",
+            font=T.FONT_BODY,
+            text_color=T.TEXT_DIM,
+            width=140,
+            anchor="w",
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkSwitch(
+            roll_row,
+            text="",
+            variable=self.bt_rollover_var,
+            progress_color=T.OK,
+        ).pack(side="left")
+        ctk.CTkLabel(
+            box,
+            text="开=按「主力时段」分段回测，换月日当天仍用旧合约、下一交易日起切新主力，旧仓段末按收盘价结算；关=只测当前选的合约。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=340,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 4))
+        chain_row = ctk.CTkFrame(box, fg_color="transparent")
+        chain_row.pack(fill="x", pady=(0, 2))
+        ctk.CTkLabel(
+            chain_row,
+            text="真实账户口径",
+            font=T.FONT_BODY,
+            text_color=T.TEXT_DIM,
+            width=140,
+            anchor="w",
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkSwitch(
+            chain_row,
+            text="",
+            variable=self.bt_rollover_chain_var,
+            progress_color=T.OK,
+        ).pack(side="left")
+        ctk.CTkLabel(
+            box,
+            text="开=上一段剩余的权益接到下一段，前面亏多了后面可能开不了仓；关=每段同一份起始资金，便于和单合约对照。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=340,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 6))
+
+        table_row = ctk.CTkFrame(box, fg_color="transparent")
+        table_row.pack(fill="x", pady=(0, 4))
+        self.bt_table_btn = ctk.CTkButton(
+            table_row,
+            text="更新主力合约表",
+            width=150,
+            height=30,
+            command=self._on_update_main_table,
+        )
+        self.bt_table_btn.pack(side="left", padx=(148, 8))
+        self.bt_table_open_btn = ctk.CTkButton(
+            table_row,
+            text="打开表格",
+            width=84,
+            height=30,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.ACCENT_HOVER,
+            text_color=T.TEXT,
+            border_width=1,
+            border_color=T.BORDER,
+            command=self._on_open_main_table,
+        )
+        self.bt_table_open_btn.pack(side="left", padx=(0, 8))
+        ctk.CTkLabel(
+            box,
+            text="表只在点「更新」时重算。要改某品种的换月：点「打开表格」，在「手动修正」页加行，更新时该行保留。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=340,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 2))
+        self.bt_table_state = ctk.CTkLabel(
+            box,
+            text="",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            anchor="w",
+        )
+        self.bt_table_state.pack(anchor="w", padx=(148, 0), pady=(0, 6))
+        self._refresh_main_table_state()
 
         fill_row = ctk.CTkFrame(box, fg_color="transparent")
         fill_row.pack(fill="x", pady=4)
@@ -906,6 +1375,25 @@ class AutoTradingApp(ctk.CTk):
             hint="0=不加滑点；每跳价格优先用品种表的「每跳价格」",
             width=160,
         )
+        ctk.CTkButton(
+            box,
+            text="用实盘滑点建议填入",
+            height=28,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_apply_slippage_hint,
+        ).pack(anchor="w", padx=(148, 0), pady=(0, 6))
+        ctk.CTkLabel(
+            box,
+            text="从成交滑点记录算出建议跳数，点一下才填进上面的框，不会自动改。没有真实成交时请不要用。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=340,
+            justify="left",
+        ).pack(anchor="w", padx=(148, 0), pady=(0, 6))
 
         self._pack_open_limits(left)
 
@@ -950,7 +1438,132 @@ class AutoTradingApp(ctk.CTk):
         ).pack(fill="x", padx=4, pady=(0, 4))
         ctk.CTkLabel(
             left,
-            text="导出追加到「回测摘要」和「回测成交」。两张表第一列是回测时间，同一次的行时间相同，用来分清是哪一次。",
+            text="导出追加到「回测摘要」「回测成交」「回测信号」。第一列都是回测时间，同一次的行时间相同，用来分清是哪一次。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w", padx=4, pady=(0, 6))
+        ctk.CTkButton(
+            left,
+            text="画出因子衰减图",
+            height=34,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_plot_factor_decay,
+        ).pack(fill="x", padx=4, pady=(0, 4))
+        ctk.CTkLabel(
+            left,
+            text="用最近一次回测和模拟盘平仓记录，画出四个因子最近 20 笔滚动盈亏。只画图，不会改开平仓。没有多因子分数的成交不会进图。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w", padx=4, pady=(0, 6))
+        inv_row = ctk.CTkFrame(left, fg_color="transparent")
+        inv_row.pack(fill="x", padx=4, pady=(0, 4))
+        ctk.CTkButton(
+            inv_row,
+            text="查看本地K线库存",
+            height=34,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_show_kline_inventory,
+        ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ctk.CTkButton(
+            inv_row,
+            text="删除本地K线",
+            height=34,
+            width=120,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_purge_local_klines,
+        ).pack(side="left")
+        ctk.CTkButton(
+            left,
+            text="查看这根K线",
+            height=34,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_inspect_local_kline,
+        ).pack(fill="x", padx=4, pady=(0, 4))
+        ctk.CTkLabel(
+            left,
+            text="库存表直接打开 Excel。抽查某一根：选数据源、合约、周期、日期和时间，对照同花顺开高低收。对应 CSV 可用 Excel 打开；sqlite 请用文件夹入口，不要拿 Excel 硬开。某一家质量差时，可按数据源、合约、时间段删掉再重新拉。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w", padx=4, pady=(0, 6))
+        ctk.CTkButton(
+            left,
+            text="检查行情质量",
+            height=34,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_check_quote_quality,
+        ).pack(fill="x", padx=4, pady=(0, 4))
+        ctk.CTkLabel(
+            left,
+            text="先换新浪、东方财富、天勤各拉一次；同花顺图请点下面「从同花顺图读取K线」。再点这里生成 Excel：总览、问题K线、各家开高低收可筛选。只读本地、不下单。同花顺图不会进实盘。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w", padx=4, pady=(0, 6))
+        self._entry_row(
+            left,
+            "同花顺图读几根",
+            self.bt_ths_bars_var,
+            hint="默认 800，最多 5000。点按钮后先等 3 秒。",
+            width=80,
+        )
+        ths_row = ctk.CTkFrame(left, fg_color="transparent")
+        ths_row.pack(fill="x", padx=4, pady=(0, 4))
+        self.bt_ths_scrape_btn = ctk.CTkButton(
+            ths_row,
+            text="从同花顺图读取K线",
+            height=34,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_scrape_ths_chart,
+        )
+        self.bt_ths_scrape_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        self.bt_ths_stop_btn = ctk.CTkButton(
+            ths_row,
+            text="停止读图",
+            height=34,
+            width=96,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_stop_ths_chart,
+            state="disabled",
+        )
+        self.bt_ths_stop_btn.pack(side="left")
+        ctk.CTkLabel(
+            left,
+            text="打开期货通，主图选好合约和周期。点按钮后先等几秒再接管鼠标。读的时候按 ESC 或点「停止读图」可停，已读到的会先存下来。存到 @ths，只给回测。不会点买卖。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=360,
@@ -1030,7 +1643,7 @@ class AutoTradingApp(ctk.CTk):
         ).pack(side="left", padx=(8, 0))
         ctk.CTkLabel(
             parent,
-            text="下拉是当前启用的合约。添加/移出会同步进「品种与合约」总表。保证金、乘数、手续费请在总表里改；同品种必须填成一样。",
+            text="下拉是当前启用的合约。添加/移出会同步进「品种与合约」总表。保证金、乘数、手续费、交易时段、清仓时刻请在总表里改；同品种必须填成一样。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=520,
@@ -1077,10 +1690,14 @@ class AutoTradingApp(ctk.CTk):
             wraplength=340,
             justify="left",
         ).pack(anchor="w", pady=(0, 6))
-        self._entry_row(box, "每笔风险%", self.pk_risk_pct_var, hint="跟配置页一致，开跑前对齐", width=160)
-        self._entry_row(box, "持仓手数", self.pk_volume_var, hint="跟配置页一致；各组合同手数", width=160)
-        self._entry_row(box, "开仓最小间隔秒", self.pk_interval_var, hint="跟配置页一致", width=160)
-        self._entry_row(box, "每天最多开仓", self.pk_max_orders_var, hint="跟配置页一致", width=160)
+        self._entry_row(
+            box, "每笔风险%", self.pk_risk_pct_var, hint="跟配置页一致，开跑前对齐", width=160, readonly=True
+        )
+        self._entry_row(
+            box, "持仓手数", self.pk_volume_var, hint="跟配置页一致；各组合同手数", width=160, readonly=True
+        )
+        self._entry_row(box, "开仓最小间隔秒", self.pk_interval_var, hint="跟配置页一致", width=160, readonly=True)
+        self._entry_row(box, "每天最多开仓", self.pk_max_orders_var, hint="跟配置页一致", width=160, readonly=True)
         ctk.CTkButton(
             box,
             text="按配置页重新填入",
@@ -1157,8 +1774,8 @@ class AutoTradingApp(ctk.CTk):
             ["全部可用", "最近3天", "最近7天", "最近14天", "自定义"],
             width=160,
         )
-        self._entry_row(box, "开始日期", self.pk_start_var, hint="默认当年1月1日，可改", width=160)
-        self._entry_row(box, "结束日期", self.pk_end_var, hint="空着=到最新", width=160)
+        self._date_row(box, "开始日期", self.pk_start_var, hint="点日历选择，默认当年1月1日", allow_empty=False)
+        self._date_row(box, "结束日期", self.pk_end_var, hint="点日历；清空=到最新")
         self._pick_switch_row(box, "收盘清仓", self.pk_flatten_var)
         ctk.CTkLabel(
             box,
@@ -1247,8 +1864,9 @@ class AutoTradingApp(ctk.CTk):
         # 表头固定，下面的品种行可以上下滚动。列多了以后，这一块还可以左右拖，避免「结果」被挤出窗口。
         # 宽度和表头、数据行共用。实际测试时段要放下「2026-10-01 ~ 2026-10-22」。
         # 列顺序和导出「交叉测试」表一致：净盈亏后是盈利覆盖；交易频率后是笔数、每笔；时段后是起止、天数、日均。
+        # 「当下行情」只在这里显示（这一轮跑的时候现算），不写进导出表。
         self._pick_col_widths = (
-            108, 132, 48, 64, 72, 72, 72, 64, 120, 40, 72, 176, 88, 88, 40, 72, 72, 48, 52, 64,
+            108, 132, 48, 64, 72, 72, 72, 64, 120, 40, 72, 176, 88, 88, 40, 72, 72, 48, 96, 52, 64,
         )
         self._pick_headers = [
             "品种",
@@ -1269,6 +1887,7 @@ class AutoTradingApp(ctk.CTk):
             "日均",
             "K线根数",
             "得分",
+            "当下行情",
             "流动性",
             "结果",
         ]
@@ -1323,7 +1942,7 @@ class AutoTradingApp(ctk.CTk):
         ).pack(anchor="w", padx=4, pady=(0, 10))
 
         box = self._card(left)
-        self._entry_row(box, "复盘日期", self.rv_date_var, hint="YYYY-MM-DD，默认今天", width=160)
+        self._date_row(box, "复盘日期", self.rv_date_var, hint="点日历选择，默认今天", allow_empty=False)
         # 和配置页关注品种用同一份合约，不用再手填代码。
         symbol_values = list(self._watch_symbols) or ["（还没有）"]
         if self.rv_symbol_var.get() not in symbol_values:
@@ -1439,32 +2058,104 @@ class AutoTradingApp(ctk.CTk):
             left, text="当前余额  —", font=T.FONT_TITLE, text_color=T.ACCENT, anchor="w"
         )
         self.ac_balance_label.pack(anchor="w", padx=4, pady=(0, 6))
+        switch_box = self._card(left)
+        switch_row = ctk.CTkFrame(switch_box, fg_color="transparent")
+        switch_row.pack(fill="x", pady=4)
+        ctk.CTkLabel(
+            switch_row, text="当前账", font=T.FONT_BODY, text_color=T.TEXT_DIM, width=80, anchor="w"
+        ).pack(side="left", padx=(0, 8))
+        from src.account.workspace import labels as account_labels
 
-        box = self._card(left)
+        account_menu = self._option(switch_row, self.ac_account_var, account_labels(self.root_dir), width=280)
+        account_menu.pack(side="left")
+        account_menu.configure(command=self._on_account_switch)
+        self.ac_account_hint = ctk.CTkLabel(
+            switch_box,
+            text="",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=390,
+            justify="left",
+        )
+        self.ac_account_hint.pack(anchor="w", pady=(4, 0))
+
+        self.ac_ths_panel = self._card(left)
         self._account_action_row(
-            box, "初始资金", self.ac_capital_var, [("初始化", self._on_signal_initial, True)]
+            self.ac_ths_panel, "初始资金", self.ac_capital_var, [("初始化", self._on_signal_initial, True)]
         )
         self._account_action_row(
-            box,
+            self.ac_ths_panel,
             "金额",
             self.ac_cash_var,
             [("入金", self._on_signal_deposit, False), ("出金", self._on_signal_withdraw, False)],
         )
         self._account_action_row(
-            box, "实际余额", self.ac_settle_var, [("每日结算", self._on_signal_settle, True)]
+            self.ac_ths_panel, "实际余额", self.ac_settle_var, [("每日结算", self._on_signal_settle, True)]
         )
         ctk.CTkLabel(
-            box,
-            text="初始化会先把旧账存档，再从现在另记一本。入金、出金填正数。红字是赚，绿字是亏。",
+            self.ac_ths_panel,
+            text="同花顺点单账可以手改。初始化会先把旧账存档，再从现在另记一本。入金、出金填正数。红字是赚，绿字是亏。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=390,
             justify="left",
         ).pack(anchor="w", pady=(6, 0))
+
+        self.ac_ctp_panel = self._card(left)
+        ctk.CTkLabel(
+            self.ac_ctp_panel,
+            text="CTP 柜台资金（与交易台「资金」页同一份回报）",
+            font=T.FONT_BODY,
+            text_color=T.TEXT,
+        ).pack(anchor="w", pady=(0, 4))
+        self.ac_ctp_user_label = ctk.CTkLabel(
+            self.ac_ctp_panel, text="资金账号  —", font=T.FONT_BODY, text_color=T.ACCENT, anchor="w"
+        )
+        self.ac_ctp_user_label.pack(anchor="w")
+        self.ac_ctp_time_label = ctk.CTkLabel(
+            self.ac_ctp_panel, text="还没有查询记录", font=T.FONT_SMALL, text_color=T.TEXT_DIM, anchor="w"
+        )
+        self.ac_ctp_time_label.pack(anchor="w", pady=(0, 6))
+        fund_grid = ctk.CTkFrame(self.ac_ctp_panel, fg_color="transparent")
+        fund_grid.pack(fill="x")
+        self._ac_fund_values: dict[str, Any] = {}
+        from src.trader.ctp_display import account_pairs
+
+        for index, (title, _value) in enumerate(account_pairs({})):
+            row, col = divmod(index, 2)
+            ctk.CTkLabel(
+                fund_grid, text=title, font=T.FONT_SMALL, text_color=T.TEXT_DIM, width=88, anchor="e"
+            ).grid(row=row, column=col * 2, sticky="e", padx=(0, 6), pady=2)
+            value_label = ctk.CTkLabel(
+                fund_grid, text="—", font=T.FONT_SMALL, text_color=T.TEXT, width=110, anchor="w"
+            )
+            value_label.grid(row=row, column=col * 2 + 1, sticky="w", pady=2)
+            self._ac_fund_values[title] = value_label
         ctk.CTkButton(
+            self.ac_ctp_panel,
+            text="从柜台刷新资金",
+            height=32,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_ctp_refresh_funds,
+        ).pack(fill="x", pady=(8, 0))
+        ctk.CTkLabel(
+            self.ac_ctp_panel,
+            text="数字原样来自期货公司，本地只保存、不改。同花顺点单请换到上面的同花顺账。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=390,
+            justify="left",
+        ).pack(anchor="w", pady=(6, 0))
+
+        self.ac_common_refresh = ctk.CTkButton(
             left, text="刷新", height=32, fg_color=T.BG_ELEVATED, hover_color=T.BORDER,
             border_width=1, border_color=T.BORDER, text_color=T.TEXT, command=self._refresh_signal_view,
-        ).pack(fill="x", padx=4, pady=(8, 4))
+        )
+        self.ac_common_refresh.pack(fill="x", padx=4, pady=(8, 4))
         # 这两张表和「导出全部」里的「交易记录」「资金变动记录」是同一份内容，只单独写出一张。
         ctk.CTkButton(
             left, text="导出交易记录", height=32, fg_color=T.BG_ELEVATED, hover_color=T.BORDER,
@@ -1476,25 +2167,28 @@ class AutoTradingApp(ctk.CTk):
             border_width=1, border_color=T.BORDER, text_color=T.TEXT,
             command=lambda: self._on_export_account_part("changes"),
         ).pack(fill="x", padx=4, pady=(0, 8))
-        ctk.CTkButton(
+        self.ac_ths_manual = ctk.CTkButton(
             left,
-            text="按实际价格平账",
+            text="手工单录入",
             height=36,
             fg_color=T.BG_ELEVATED,
             hover_color=T.BORDER,
             border_width=1,
             border_color=T.ACCENT,
             text_color=T.ACCENT,
-            command=self._on_book_actual_close,
-        ).pack(fill="x", padx=4, pady=(0, 4))
-        ctk.CTkLabel(
+            command=self._on_manual_trade,
+        )
+        self.ac_ths_manual.pack(fill="x", padx=4, pady=(0, 4))
+        self.ac_ths_manual_note = ctk.CTkLabel(
             left,
-            text="交易软件里已经平掉、程序还记着仓时用。填写实际成交价。只改程序的账，不会去点同花顺。",
+            text="手动在同花顺上开仓/平仓后，在这里录入。品种、价格、手数 + 买多/卖空/平仓。只改程序的账，不会去点同花顺。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=390,
             justify="left",
-        ).pack(anchor="w", padx=4, pady=(0, 8))
+        )
+        self.ac_ths_manual_note.pack(anchor="w", padx=4, pady=(0, 8))
+        self._sync_account_mode()
 
         right = ctk.CTkFrame(tab, fg_color=T.BG_ELEVATED, corner_radius=12)
         right.grid(row=0, column=1, sticky="nsew", padx=(4, 8), pady=8)
@@ -1599,7 +2293,7 @@ class AutoTradingApp(ctk.CTk):
         ctk.CTkLabel(left, text="策略优化", font=T.FONT_TITLE, text_color=T.TEXT).pack(anchor="w", padx=4, pady=(4, 2))
         ctk.CTkLabel(
             left,
-            text="训练段挑参数，检验段只验收，检验比例可手调。可选「滚动前进」：走一步再验一步。打分不看胜率。检验段或其它关注品种上把赚变成大亏的，不能写入。滚动前进会更久。",
+            text="训练段挑参数，检验段只验收。第一次选旋钮：直接开始优化。已经在用、后来衰减了：打开「对照正在用的参数」再搜，默认不改实盘。写入前会备份这一套策略的参数版本；需要整页还原时再留配置存档。两份不是同一本账。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=360,
@@ -1635,8 +2329,8 @@ class AutoTradingApp(ctk.CTk):
             ["全部可用", "最近3天", "最近7天", "最近14天", "自定义"],
             width=160,
         )
-        self._entry_row(box, "开始日期", self.opt_start_var, hint="默认当年1月1日，可改", width=160)
-        self._entry_row(box, "结束日期", self.opt_end_var, hint="填了就按这天停，空着=到最新", width=160)
+        self._date_row(box, "开始日期", self.opt_start_var, hint="点日历选择，默认当年1月1日", allow_empty=False)
+        self._date_row(box, "结束日期", self.opt_end_var, hint="点日历；清空=到最新")
         self._option_row(
             box,
             "搜索深度",
@@ -1644,11 +2338,31 @@ class AutoTradingApp(ctk.CTk):
             ["精简", "标准", "完整"],
             width=160,
         )
+        file_row = ctk.CTkFrame(box, fg_color="transparent")
+        file_row.pack(fill="x", padx=4, pady=(0, 8))
+        ctk.CTkButton(
+            file_row,
+            text="打开优化参数表",
+            width=140,
+            height=28,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT_DIM,
+            command=self._open_optimizer_file,
+        ).pack(side="left")
+        ctk.CTkLabel(
+            file_row,
+            text="config/优化参数.xlsx：改网格档位和中文名，保存后下次优化生效",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+        ).pack(side="left", padx=(8, 0))
         self._entry_row(
             box,
             "最多试几组",
             self.opt_trials_var,
-            hint="标准含Pin定义等；完整组合更多会随机抽",
+            hint="理论组合超过这个数就随机抽；没超过就全跑",
             width=100,
         )
         self._entry_row(
@@ -1683,18 +2397,57 @@ class AutoTradingApp(ctk.CTk):
 
         self._pack_open_limits(left)
 
+        run = self._card(left)
+        ctk.CTkLabel(run, text="开始优化", font=T.FONT_BODY, text_color=T.TEXT).pack(anchor="w", pady=(0, 4))
+        self._pick_switch_row(run, "对照正在用的参数", self.opt_compare_var)
+        ctk.CTkLabel(
+            run,
+            text="关掉：第一次选旋钮，只出搜索成绩。打开：衰减后重跑，多和现在这套对照，跑完不自动写。两种都用同一套搜索。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=320,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
         ctk.CTkButton(
-            left,
-            text="开始策略优化（基于历史回测打分）",
+            run,
+            text="开始策略优化",
             height=44,
             fg_color=T.ACCENT,
             hover_color=T.ACCENT_HOVER,
             text_color=T.ACCENT_ON,
             command=self._on_optimize,
-        ).pack(fill="x", padx=4, pady=(12, 6))
-        ctk.CTkButton(
-            left,
-            text="把最优参数写入配置",
+        ).pack(fill="x")
+
+        write = self._card(left)
+        ctk.CTkLabel(write, text="写入配置", font=T.FONT_BODY, text_color=T.TEXT).pack(anchor="w", pady=(0, 4))
+        pick = ctk.CTkFrame(write, fg_color="transparent")
+        pick.pack(fill="x", pady=(0, 6))
+        ctk.CTkLabel(pick, text="写入第几组", font=T.FONT_SMALL, text_color=T.TEXT_DIM).pack(side="left")
+        ctk.CTkEntry(
+            pick,
+            textvariable=self.opt_write_index_var,
+            width=54,
+            height=28,
+            justify="center",
+        ).pack(side="left", padx=(6, 6))
+        ctk.CTkLabel(
+            pick,
+            text="1=训练最优；其它组会先复核检验",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+        ).pack(side="left")
+        self._pick_switch_row(write, "同时留下整页配置存档", self.opt_save_preset_var)
+        ctk.CTkLabel(
+            write,
+            text="整页存档在配置页「配置存档」里，可一键换回策略、品种、模拟开关。对照全面更好时，按钮会写成「写入并切实盘」，并且一定会留这份存档。没更好仍可写入，会多问一次。常驻在跑时不能写。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=320,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+        self.opt_write_btn = ctk.CTkButton(
+            write,
+            text="把所选参数写入配置",
             height=36,
             fg_color=T.BG_ELEVATED,
             hover_color=T.BORDER,
@@ -1702,19 +2455,20 @@ class AutoTradingApp(ctk.CTk):
             border_color=T.ACCENT,
             text_color=T.ACCENT,
             command=self._on_apply_opt_params,
-        ).pack(fill="x", padx=4, pady=(0, 8))
+        )
+        self.opt_write_btn.pack(fill="x")
 
-        # —— 参数版本回溯：防止过度优化改坏 ——
+        # —— 参数版本回溯：只还原这一套策略的旋钮，不是整页配置存档 ——
         hist = self._card(left)
         ctk.CTkLabel(
             hist,
-            text="参数版本历史（防过度优化）",
+            text="参数版本历史（只还原这一套旋钮）",
             font=T.FONT_BODY,
             text_color=T.TEXT,
         ).pack(anchor="w", pady=(0, 4))
         ctk.CTkLabel(
             hist,
-            text="列表只显示上面选中的那一套策略。写入、回溯、重置都只改这一套，不改正在用的策略、品种、周期，也不改另外几套的参数。不想要的历史版本可以删除，出厂默认不能删。",
+            text="和上面的整页配置存档不是同一份。这里只改当前选中的这一套策略参数，不改正在用的策略名、品种、周期，也不改另外几套。写入、切实盘、回溯前都会自动加一条。出厂默认不能删，用来重置初始。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=320,
@@ -1834,7 +2588,7 @@ class AutoTradingApp(ctk.CTk):
         ).pack(side="left", expand=True, fill="x", padx=(4, 0))
         ctk.CTkLabel(
             hist,
-            text="程序内只留最近30条。导出写进 data/Auto-Trading导出.xlsx 的「优化参数」表，和其他功能共用这一个文件。",
+            text="程序内只留最近30条。导出会同时写「优化参数」表（参数版本）和「优化结果」表（最近一次的完整成绩，第一列测试时间分清是哪一次），都在 data/Auto-Trading导出.xlsx。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=320,
@@ -1843,19 +2597,35 @@ class AutoTradingApp(ctk.CTk):
 
         right = ctk.CTkFrame(tab, fg_color=T.BG_ELEVATED, corner_radius=12)
         right.grid(row=0, column=1, sticky="nsew", padx=(8, 8), pady=8)
-        right.grid_rowconfigure(1, weight=1)
+        right.grid_rowconfigure(3, weight=1)
         right.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(right, text="策略优化结果", font=T.FONT_TITLE, text_color=T.TEXT).grid(
             row=0, column=0, sticky="w", padx=12, pady=(12, 6)
         )
+        # 进度条 + 一行文字：第几组/共几组、已用时间、预计还要多久。
+        self.opt_progress_label = ctk.CTkLabel(
+            right,
+            text="尚未开始",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            anchor="w",
+            justify="left",
+        )
+        self.opt_progress_label.grid(row=1, column=0, sticky="ew", padx=12, pady=(0, 4))
+        self.opt_progress = ctk.CTkProgressBar(right, height=10, progress_color=T.ACCENT)
+        self.opt_progress.grid(row=2, column=0, sticky="ew", padx=12, pady=(0, 8))
+        self.opt_progress.set(0)
+        self._opt_started_at: float | None = None
+        self._opt_progress_at = 0.0
         self.opt_result_box = ctk.CTkTextbox(
             right, font=T.FONT_MONO, fg_color=T.BG, text_color=T.TEXT, corner_radius=10, wrap="word"
         )
-        self.opt_result_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        self.opt_result_box.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 12))
         self.opt_result_box.insert(
             "end",
-            "点左侧「开始策略优化」。完成后可点「把最优参数写入配置」。\n"
-            "写入前会自动备份；若新参数不好，用下方历史列表回溯。\n",
+            "点左侧「开始策略优化」。第一次选旋钮：开关关掉即可。\n"
+            "衰减后打开「对照正在用的参数」再搜，默认不改实盘。\n"
+            "全面更好时，写入按钮会变成「写入并切实盘」。切坏了用下方回溯或重置出厂。\n",
         )
         # 打开界面时刷新一次历史下拉
         self.after(200, self._refresh_opt_history)
@@ -1883,7 +2653,7 @@ class AutoTradingApp(ctk.CTk):
         if not panels:
             return
         current = _ui_engine(self.engine_var.get())
-        # 别名都指到同一块面板（如 Single_ma / single_ma）。
+        # 别名都指到同一块面板（如 morning_a / morning_box_a）。
         show = panels.get(current)
         if show is None:
             show = panels.get("daily_body")
@@ -1908,11 +2678,40 @@ class AutoTradingApp(ctk.CTk):
         except Exception:  # noqa: BLE001
             self._sync_strategy_param_wrap()
 
+    def _refresh_generic_stop_param_panel(self, *_args: object) -> None:
+        """
+        通用止损：左边选方式，右边只显示这种方式要填的参数。
+
+        和策略引擎一样，各方式的面板一开始就建好并绑在 StringVar 上；
+        切换时只 pack / pack_forget，不销毁控件，其它方式的数值也不会丢。
+        """
+        panels = getattr(self, "_generic_stop_detail_panels", None) or {}
+        if not panels:
+            return
+        from src.strategy.generic_stop import generic_stop_from_label
+
+        kind = generic_stop_from_label(self.generic_stop_var.get())
+        show = panels.get(kind) or panels.get("off")
+        meta = getattr(self, "_generic_stop_detail_meta", {}) or {}
+        title, note = meta.get(kind, ("通用止损参数", ""))
+        try:
+            self._generic_stop_detail_title.configure(text=title)
+            self._generic_stop_detail_note.configure(text=note)
+        except Exception:  # noqa: BLE001
+            pass
+        for panel in panels.values():
+            try:
+                panel.pack_forget()
+            except Exception:  # noqa: BLE001
+                pass
+        if show is not None:
+            show.pack(fill="x", anchor="n")
+
     def _sync_strategy_param_wrap(self) -> None:
         """
-        按右侧参数框当前实际宽度，刷新标题说明的换行。
+        按右侧参数框当前实际宽度，刷新整段说明的换行。
 
-        只改文字换行，不改控件宽高，避免 Tk 用非法尺寸画背景图时报 CreateDIBSection。
+        只改 wraplength，不改控件宽高，避免 Tk 用非法尺寸画背景图时报 CreateDIBSection。
         """
         shell = getattr(self, "_strategy_detail_shell", None)
         if shell is None:
@@ -1926,8 +2725,9 @@ class AutoTradingApp(ctk.CTk):
                 w = min_w
             # 防止异常超大宽度把 wraplength 撑爆。
             w = min(w, 1600)
-            wrap = max(200, w - 40)
-            self._strategy_param_hint_wrap = max(140, w - 300)
+            # 说明文字固定不超过 420，避免窗口一拉宽就把字画出蓝框。
+            wrap = max(200, min(420, w - 40))
+            self._strategy_param_hint_wrap = 200
             try:
                 self._strategy_detail_note.configure(wraplength=wrap)
             except Exception:  # noqa: BLE001
@@ -2094,17 +2894,57 @@ class AutoTradingApp(ctk.CTk):
                 hint_lbl.configure(wraplength=int(hint_wrap))
             hint_lbl.pack(side="left", padx=8)
 
+    def _date_row(
+        self,
+        parent: ctk.CTkFrame,
+        label: str,
+        var: ctk.StringVar,
+        hint: str = "",
+        allow_empty: bool = True,
+    ) -> None:
+        """一行：标签 + 日历选日期。选完仍是 2026-01-01 这种字，后面逻辑不用改。"""
+        from src.ui.datetime_pickers import DateField
+
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", pady=5)
+        ctk.CTkLabel(
+            row, text=label, font=T.FONT_BODY, text_color=T.TEXT_DIM, width=140, anchor="w"
+        ).pack(side="left", padx=(0, 8))
+        DateField(row, var, allow_empty=allow_empty).frame.pack(side="left")
+        if hint:
+            ctk.CTkLabel(
+                row,
+                text=hint,
+                font=T.FONT_SMALL,
+                text_color=T.TEXT_DIM,
+                justify="left",
+                anchor="w",
+            ).pack(side="left", padx=8)
+
     def _toggle_password(self) -> None:
         self.pwd_entry.configure(show="" if self._show_password.get() else "*")
 
     def _toggle_tq_password(self) -> None:
         self.tq_pwd_entry.configure(show="" if self._show_tq_password.get() else "*")
 
+    def _refresh_bt_source_hint(self) -> None:
+        """选同花顺图时说明怎么读、为什么不能实盘用。"""
+        label = getattr(self, "bt_source_hint", None)
+        if label is None:
+            return
+        from src.data.quote_check import is_ths_source
+
+        if is_ths_source(self.bt_source_var.get()):
+            label.configure(
+                text="同花顺图：回测只用已经点「从同花顺图读取K线」存进本地的那一份，"
+                "不会再去期货通抢鼠标。没有库存时请先读图。只给历史回测，不会拿去扫描下单。"
+            )
+        else:
+            label.configure(text="")
+
     def _refresh_tq_hint(self) -> None:
         """
-        天勤只给分钟K线。选了日线/周线，或选了固定用日线的长线趋势，就在配置页直接说清楚。
-
-        不在这里拦着不让保存：用户可能只是先改一半。真正拉行情时行情层仍会报错。
+        选天勤时说明能拉什么周期。日线原生可用；周线用日线合成，不是直接要一周。
         """
         label = getattr(self, "tq_hint_label", None)
         if label is None:
@@ -2114,32 +2954,63 @@ class AutoTradingApp(ctk.CTk):
         if normalize_source(self.source_var.get()) != "tq":
             label.configure(text="", text_color=T.TEXT_DIM)
             return
-        codes = [
-            self._period_code(self.tf_var, self.tf_custom_var),
-            self._period_code(self.trail_var, self.trail_custom_var),
-        ]
-        # 长线趋势内部固定用日线定方向，跟上面选的信号周期无关。
-        if _ui_engine(self.engine_var.get()) == "swing_trend":
-            codes.append("D")
-        bad = [c for c in codes if c in {"D", "W"}]
-        if bad:
-            label.configure(
-                text=(
-                    "天勤只提供分钟K线，当前要用"
-                    + "、".join("日线" if c == "D" else "周线" for c in bad)
-                    + "，会拉不到行情。请把周期改成分钟，或把行情来源换回新浪/东方财富。"
-                ),
-                text_color=T.DANGER,
-            )
-            return
-        label.configure(text="天勤只提供分钟K线，账号密码填在上面「账号与登录」。", text_color=T.TEXT_DIM)
+        label.configure(
+            text="天勤免费接口：分钟、小时、日线可直接拉；周线用日线合成。多因子的日线方向也能用。账号密码填在上面「账号与登录」。",
+            text_color=T.TEXT_DIM,
+        )
 
     # ---------- 日志 ----------
     def _hook_logger(self) -> None:
         def emit(text: str) -> None:
-            self.after(0, lambda t=text: self._append_log(t))
+            # 后台线程只入队，不碰 Tk。
+            self._log_queue.put_nowait(text)
 
         logger.add(QueueLogHandler(emit).write, format="{time:HH:mm:ss} | {level} | {message}", level="INFO")
+        self._log_after_id = self.after(100, self._drain_logs)
+
+    def _drain_logs(self) -> None:
+        """主线程定时把队列里的日志写进运行页。内部任何一步异常都不能让日志泵断掉。"""
+        if self._closing:
+            return
+        try:
+            try:
+                while True:
+                    text = self._log_queue.get_nowait()
+                    self._append_log(text)
+            except queue.Empty:
+                pass
+            from src.trader.gui_trader import order_click_in_progress
+
+            if not order_click_in_progress():
+                self._flush_held_logs()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("日志刷新跳过一轮: {}", exc)
+        finally:
+            if not self._closing:
+                try:
+                    self._log_after_id = self.after(100, self._drain_logs)
+                except Exception:  # noqa: BLE001
+                    pass
+
+    def _flush_held_logs(self) -> None:
+        """把点击期间攒下的日志一次性补上。"""
+        pending = self._held_logs
+        self._held_logs = []
+        for line in pending:
+            self.log_box.insert("end", line + "\n")
+        if pending:
+            self.log_box.see("end")
+            self._trim_log_box()
+
+    def _trim_log_box(self) -> None:
+        """运行日志只留最近若干行，避免长时间挂机把文本框和内存越撑越大。"""
+        try:
+            total = int(self.log_box.index("end-1c").split(".")[0])
+            if total <= self._LOG_MAX_LINES:
+                return
+            self.log_box.delete("1.0", f"{total - self._LOG_MAX_LINES}.0")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("运行日志裁剪跳过: {}", exc)
 
     def _append_log(self, text: str) -> None:
         """
@@ -2153,14 +3024,172 @@ class AutoTradingApp(ctk.CTk):
         if order_click_in_progress():
             self._held_logs.append(text)
             return
-        pending = self._held_logs
-        self._held_logs = []
-        for line in pending:
-            self.log_box.insert("end", line + "\n")
+        self._flush_held_logs()
         self.log_box.insert("end", text + "\n")
         self.log_box.see("end")
+        self._trim_log_box()
 
     # ---------- 配置读写 ----------
+    def _init_cta_filter_vars(
+        self, multi_box: dict, vote_box: dict, hybrid_box: dict, adapt_box: dict | None = None
+    ) -> None:
+        """多因子各套各自一份行情闸门控件，互不影响。"""
+        from src.strategy.cta_filter import CtaFilterParams
+
+        self._cta_filter_vars = {}
+        for kind, box in (
+            ("multi_factor", multi_box),
+            ("multi_factor_adapt", adapt_box or {}),
+            ("multi_vote", vote_box),
+            ("multi_hybrid", hybrid_box),
+        ):
+            p = CtaFilterParams.from_box(box if isinstance(box, dict) else {}, kind=kind)
+            self._cta_filter_vars[kind] = {
+                "enabled": ctk.BooleanVar(value=p.enabled),
+                "use_adx": ctk.BooleanVar(value=p.use_adx),
+                "use_atr": ctk.BooleanVar(value=p.use_atr),
+                "use_disagree": ctk.BooleanVar(value=p.use_disagree),
+                "adx_flat": ctk.StringVar(value=f"{p.adx_flat:g}"),
+                "adx_trend": ctk.StringVar(value=f"{p.adx_trend:g}"),
+                "atr_lookback": ctk.StringVar(value=str(p.atr_lookback)),
+                "atr_low_pct": ctk.StringVar(value=f"{p.atr_low_pct * 100:g}"),
+                "weak_score": ctk.StringVar(value=f"{p.weak_score:g}"),
+                "weak_size": ctk.StringVar(value=f"{p.weak_size:g}"),
+                "weak_votes": ctk.StringVar(value=str(p.weak_votes)),
+            }
+
+    def _fill_cta_filter_vars(
+        self, multi_box: dict, vote_box: dict, hybrid_box: dict, adapt_box: dict | None = None
+    ) -> None:
+        """从配置重新灌进各套闸门控件。"""
+        from src.strategy.cta_filter import CtaFilterParams
+
+        boxes = {
+            "multi_factor": multi_box,
+            "multi_factor_adapt": adapt_box or {},
+            "multi_vote": vote_box,
+            "multi_hybrid": hybrid_box,
+        }
+        for kind, box in boxes.items():
+            p = CtaFilterParams.from_box(box if isinstance(box, dict) else {}, kind=kind)
+            vars_ = self._cta_filter_vars[kind]
+            vars_["enabled"].set(p.enabled)
+            vars_["use_adx"].set(p.use_adx)
+            vars_["use_atr"].set(p.use_atr)
+            vars_["use_disagree"].set(p.use_disagree)
+            vars_["adx_flat"].set(f"{p.adx_flat:g}")
+            vars_["adx_trend"].set(f"{p.adx_trend:g}")
+            vars_["atr_lookback"].set(str(p.atr_lookback))
+            vars_["atr_low_pct"].set(f"{p.atr_low_pct * 100:g}")
+            vars_["weak_score"].set(f"{p.weak_score:g}")
+            vars_["weak_size"].set(f"{p.weak_size:g}")
+            vars_["weak_votes"].set(str(p.weak_votes))
+
+    def _write_cta_filter_vars(self, box: dict, kind: str) -> None:
+        """把界面上的闸门写回这一套策略小节。"""
+        from src.strategy.cta_filter import default_cta_filter
+
+        vars_ = self._cta_filter_vars[kind]
+        seed = default_cta_filter(kind)
+        try:
+            adx_flat = min(90.0, max(5.0, float(vars_["adx_flat"].get())))
+        except ValueError:
+            adx_flat = float(seed["adx_flat"])
+        try:
+            adx_trend = min(90.0, max(adx_flat, float(vars_["adx_trend"].get())))
+        except ValueError:
+            adx_trend = float(seed["adx_trend"])
+        try:
+            lookback = max(10, int(vars_["atr_lookback"].get()))
+        except ValueError:
+            lookback = int(seed["atr_lookback"])
+        try:
+            atr_low = min(90.0, max(1.0, float(vars_["atr_low_pct"].get()))) / 100.0
+        except ValueError:
+            atr_low = float(seed["atr_low_pct"])
+        try:
+            weak_score = min(0.95, max(0.0, float(vars_["weak_score"].get())))
+        except ValueError:
+            weak_score = float(seed["weak_score"])
+        try:
+            weak_size = min(1.0, max(0.1, float(vars_["weak_size"].get())))
+        except ValueError:
+            weak_size = float(seed["weak_size"])
+        try:
+            weak_votes = max(0, int(vars_["weak_votes"].get()))
+        except ValueError:
+            weak_votes = int(seed["weak_votes"])
+        box["cta_filter"] = {
+            "enabled": bool(vars_["enabled"].get()),
+            "use_adx": bool(vars_["use_adx"].get()),
+            "use_atr": bool(vars_["use_atr"].get()),
+            "use_disagree": bool(vars_["use_disagree"].get()),
+            "adx_period": 14,
+            "adx_flat": adx_flat,
+            "adx_trend": adx_trend,
+            "atr_lookback": lookback,
+            "atr_low_pct": atr_low,
+            "weak_score": weak_score,
+            "weak_size": weak_size,
+            "weak_votes": weak_votes,
+        }
+
+    def _init_trend_filter_vars(self) -> None:
+        """海龟、SuperTrend、双均线、布林、SAR、长线各自一份趋势过滤控件。"""
+        from src.strategy.market_state import TREND_FILTER_SECTIONS, trend_params_for_section
+
+        self._trend_filter_vars = {}
+        for section in TREND_FILTER_SECTIONS:
+            p = trend_params_for_section(self.cfg, section)
+            self._trend_filter_vars[section] = {
+                "enabled": ctk.BooleanVar(value=bool(p.enabled)),
+                "adx_period": ctk.StringVar(value=str(p.adx_period)),
+                "atr_period": ctk.StringVar(value=str(p.atr_period)),
+                "lookback": ctk.StringVar(value=str(p.lookback)),
+                "adx_flat": ctk.StringVar(value=f"{p.adx_flat:g}"),
+                "atr_low_pct": ctk.StringVar(value=f"{p.atr_low_pct * 100:g}"),
+            }
+
+    def _fill_trend_filter_vars(self) -> None:
+        """从配置重新灌进趋势策略各自的过滤控件。"""
+        from src.strategy.market_state import TREND_FILTER_SECTIONS, trend_params_for_section
+
+        for section in TREND_FILTER_SECTIONS:
+            p = trend_params_for_section(self.cfg, section)
+            vars_ = self._trend_filter_vars[section]
+            vars_["enabled"].set(bool(p.enabled))
+            vars_["adx_period"].set(str(p.adx_period))
+            vars_["atr_period"].set(str(p.atr_period))
+            vars_["lookback"].set(str(p.lookback))
+            vars_["adx_flat"].set(f"{p.adx_flat:g}")
+            vars_["atr_low_pct"].set(f"{p.atr_low_pct * 100:g}")
+
+    def _write_trend_filter_vars(self, box: dict, section: str) -> None:
+        """把界面上的趋势过滤写回这一套策略小节。"""
+        vars_ = self._trend_filter_vars[section]
+        box["filter_enabled"] = bool(vars_["enabled"].get())
+        try:
+            box["filter_adx_period"] = max(2, min(200, int(vars_["adx_period"].get())))
+        except ValueError:
+            box["filter_adx_period"] = 14
+        try:
+            box["filter_atr_period"] = max(2, min(200, int(vars_["atr_period"].get())))
+        except ValueError:
+            box["filter_atr_period"] = 14
+        try:
+            box["filter_lookback"] = max(10, min(500, int(vars_["lookback"].get())))
+        except ValueError:
+            box["filter_lookback"] = 60
+        try:
+            box["filter_adx_flat"] = min(60.0, max(5.0, float(vars_["adx_flat"].get())))
+        except ValueError:
+            box["filter_adx_flat"] = 20.0
+        try:
+            atr_ui = min(90.0, max(5.0, float(vars_["atr_low_pct"].get())))
+        except ValueError:
+            atr_ui = 20.0
+        box["filter_atr_low_pct"] = atr_ui / 100.0
+
     def _parse_list(self, raw: str) -> list[str]:
         return [x.strip() for x in raw.replace("，", ",").split(",") if x.strip()]
 
@@ -2176,6 +3205,21 @@ class AutoTradingApp(ctk.CTk):
 
         self.engine_var.set(_ui_engine(st.get("engine", "daily_body")))
         self.exec_var.set(str(trade.get("executor", "sim")))
+        from src.trader.ctp_logic import ctp_kind_label
+
+        ctp_box = trade.get("ctp") or {}
+        live_box = ctp_box.get("live") if isinstance(ctp_box.get("live"), dict) else {}
+        self.ctp_kind_var.set(ctp_kind_label(ctp_box.get("account_kind")))
+        self.ctp_live_td_var.set(str(live_box.get("td_front") or ""))
+        self.ctp_live_md_var.set(str(live_box.get("md_front") or ""))
+        from src.trader.go_live import load_state as load_go_live, stage_hint, stage_label
+
+        go_state = load_go_live(self.root_dir)
+        yaml_stage = ((trade.get("go_live") or {}) if isinstance(trade.get("go_live"), dict) else {}).get("stage")
+        stage_now = go_state.get("stage") or yaml_stage
+        if stage_now:
+            self.go_live_var.set(stage_label(stage_now))
+            self.go_live_hint_var.set(stage_hint(stage_now))
         from src.data.quote_check import source_label
 
         self.source_var.set(source_label((self.cfg.get("data") or {}).get("source")))
@@ -2192,6 +3236,8 @@ class AutoTradingApp(ctk.CTk):
         # 这是从文件读回来，不要再写一遍，免得把刚读到的名单覆盖掉。
         self._set_watch_codes(self._parse_list(self.symbols_var.get()), save=False)
         self.volume_var.set(str(trade.get("volume", 1)))
+        self.max_slip_var.set(str(trade.get("max_entry_slip_atr", 0.5)))
+        self.max_slip_points_var.set(str(trade.get("max_entry_slip_points", 0)))
         self.sizing_mode_var.set(str(risk.get("sizing_mode", "risk_pct")))
         self.capital_var.set(str(risk.get("capital", 1000000)))
         self.risk_pct_var.set(str(risk.get("risk_per_trade_pct", 0.5)))
@@ -2221,23 +3267,87 @@ class AutoTradingApp(ctk.CTk):
         body_box = st.get("daily_body") or {}
         trend_box = st.get("trend_follow") or {}
         st_box = st.get("supertrend") or {}
-        ma_box = st.get("single_ma") or {}
         dual_box = st.get("dual_ma") or {}
         self.body_stop_ticks_var.set(str(body_box.get("stop_extra_ticks", 1)))
         self.body_skip_gap_var.set(str(body_box.get("skip_gap_ticks", 50)))
         self.body_max_box_var.set(str(body_box.get("max_box_ticks", 100)))
+        self.body_max_chase_var.set(str(body_box.get("max_chase_ticks", 20)))
+        self.body_ema_period_var.set(str(body_box.get("ema_period", 20)))
+        self.body_ema_buffer_var.set(str(body_box.get("ema_buffer_ticks", 2)))
         self.body_day_cutoff_var.set(str(body_box.get("day_cutoff", "10:30")))
         self.body_night_cutoff_var.set(str(body_box.get("night_cutoff", "22:15")))
         self.body_eth2_var.set(str(body_box.get("eth_minutes2", 30)))
+        from src.strategy.market_state import range_params_for_daily_body
+
+        body_rp = range_params_for_daily_body(self.cfg)
+        self.body_filter_enabled_var.set(bool(body_rp.enabled))
+        self.body_filter_adx_period_var.set(str(body_rp.adx_period))
+        self.body_filter_atr_period_var.set(str(body_rp.atr_period))
+        self.body_filter_lookback_var.set(str(body_rp.lookback))
+        self.body_filter_adx_upper_var.set(f"{body_rp.adx_upper:g}")
+        body_atr_high_ui = 0 if body_rp.atr_high_pct >= 0.999 else body_rp.atr_high_pct * 100
+        self.body_filter_atr_high_var.set(f"{body_atr_high_ui:g}")
+        from src.strategy.types import (
+            entry_mode_from_cfg,
+            entry_mode_label,
+            stop_mode_from_cfg,
+            stop_mode_label,
+        )
+
+        self.stop_mode_var.set(stop_mode_label(stop_mode_from_cfg(self.cfg)))
+        self.entry_mode_var.set(entry_mode_label(entry_mode_from_cfg(self.cfg)))
+        from src.strategy.generic_stop import generic_stop_from_cfg, generic_stop_label
+
+        gs_cfg = generic_stop_from_cfg(self.cfg)
+        self.generic_stop_var.set(generic_stop_label(gs_cfg.kind))
+        self.generic_stop_lookback_var.set(str(gs_cfg.lookback))
+        self.generic_stop_sar_start_var.set(f"{gs_cfg.sar_af_start:g}")
+        self.generic_stop_sar_step_var.set(f"{gs_cfg.sar_af_step:g}")
+        self.generic_stop_sar_max_var.set(f"{gs_cfg.sar_af_max:g}")
+        self.generic_stop_atr_period_var.set(str(gs_cfg.atr_period))
+        self.generic_stop_atr_mult_var.set(f"{gs_cfg.atr_mult:g}")
+        self.generic_stop_be_atr_var.set(f"{gs_cfg.be_atr_mult:g}")
+        self._fill_trend_filter_vars()
         self.trend_entry_bars_var.set(str(trend_box.get("entry_bars", 36)))
         self.trend_atr_mult_var.set(str(trend_box.get("atr_mult", 2.0)))
         self.st_atr_period_var.set(str(st_box.get("atr_period", 10)))
         self.st_multiplier_var.set(str(st_box.get("multiplier", 3.0)))
-        self.ma_period_var.set(str(ma_box.get("ma_period", 20)))
-        self.ma_reverse_var.set(bool(ma_box.get("reverse_on_cross", True)))
         self.dual_short_var.set(str(dual_box.get("short_period", 20)))
         self.dual_long_var.set(str(dual_box.get("long_period", 60)))
         self.dual_reverse_var.set(bool(dual_box.get("reverse_on_cross", True)))
+        boll_box = st.get("bollinger") or {}
+        self.boll_window_var.set(str(boll_box.get("boll_window", 20)))
+        self.boll_dev_var.set(str(boll_box.get("boll_dev", 2.0)))
+        self.boll_atr_mult_var.set(str(boll_box.get("atr_stop_mult", 1.5)))
+        sar_box = st.get("sar_trend") or {}
+        self.sar_ma_filter_var.set(str(sar_box.get("ma_filter", 20)))
+        self.sar_af_step_var.set(str(sar_box.get("af_step", 0.02)))
+        multi_box = st.get("multi_factor") or {}
+        self.multi_threshold_var.set(str(multi_box.get("threshold", 0.6)))
+        self.multi_ma_short_var.set(str(multi_box.get("ma_short", 20)))
+        self.multi_ma_long_var.set(str(multi_box.get("ma_long", 60)))
+        self.multi_channel_var.set(str(multi_box.get("channel", 20)))
+        self.multi_atr_mult_var.set(str(multi_box.get("atr_stop_mult", 2.0)))
+        self.multi_disagree_var.set(str(multi_box.get("disagree_max", 0.7)))
+        self.multi_use_sar_var.set(bool(multi_box.get("use_sar", True)))
+        vote_box = st.get("multi_vote") or {}
+        hybrid_box = st.get("multi_hybrid") or {}
+        adapt_box = st.get("multi_factor_adapt") or {}
+        self.adapt_enabled_var.set(bool(adapt_box.get("adapt_enabled", True)))
+        self.adapt_lookback_var.set(str(adapt_box.get("lookback_trades", 20)))
+        self.adapt_min_w_var.set(str(adapt_box.get("min_weight", 0.05)))
+        self.adapt_max_w_var.set(str(adapt_box.get("max_weight", 0.40)))
+        self.adapt_mix_var.set(str(adapt_box.get("recent_mix", 0.30)))
+        self.adapt_step_var.set(str(adapt_box.get("max_step", 0.03)))
+        self.multi_min_votes_var.set(
+            str(vote_box.get("min_votes", hybrid_box.get("min_votes", 2)))
+        )
+        self.multi_vote_diff_var.set(
+            str(vote_box.get("min_vote_diff", hybrid_box.get("min_vote_diff", 2)))
+        )
+        self.hybrid_min_ratio_var.set(str(hybrid_box.get("min_position_ratio", 0.5)))
+        self.hybrid_max_ratio_var.set(str(hybrid_box.get("max_position_ratio", 1.0)))
+        self._fill_cta_filter_vars(multi_box, vote_box, hybrid_box, adapt_box)
         swing_box = st.get("swing_trend") or {}
         from src.strategy.swing_trend import DEFAULT_SCALE, resolve_scale_pair, scale_label
 
@@ -2248,6 +3358,14 @@ class AutoTradingApp(ctk.CTk):
         self.swing_max_adds_var.set(str(swing_box.get("max_adds", 2)))
         self.swing_add_atr_var.set(str(swing_box.get("add_min_atr", 1.0)))
         self.swing_reduce_atr_var.set(str(swing_box.get("reduce_extend_atr", 2.5)))
+        jesse_box = st.get("jesse_casper") or {}
+        self.jesse_lookback_var.set(str(jesse_box.get("lookback_liq", 20)))
+        self.jesse_vol_mult_var.set(str(jesse_box.get("vol_mult", 1.2)))
+        self.jesse_min_rr_var.set(str(jesse_box.get("min_rr", 3.0)))
+        self.jesse_tick_var.set(str(jesse_box.get("price_tick", 1.0)))
+        self.jesse_use_va_var.set(bool(jesse_box.get("use_va", True)))
+        self.jesse_use_kill_var.set(bool(jesse_box.get("use_kill_zone", True)))
+        self.jesse_use_halt_var.set(bool(jesse_box.get("use_daily_halt", True)))
         self.flatten_var.set(",".join(str(x) for x in st.get("flatten_times", ["14:55", "22:55"])))
         self.flatten_at_close_var.set(bool(st.get("flatten_at_close", True)))
         rt = self.cfg.get("runtime") or {}
@@ -2265,7 +3383,60 @@ class AutoTradingApp(ctk.CTk):
         self.max_loss_var.set(str(risk.get("max_daily_loss", 1000)))
         self.min_interval_var.set(str(risk.get("min_order_interval_sec", 60)))
         self.max_orders_var.set(str(risk.get("max_orders_per_day", 20)))
+        from src.risk.dynamic import DynamicExposure
+
+        _dyn = DynamicExposure.from_config(self.cfg)
+        self.dyn_enabled_var.set(bool(_dyn.enabled))
+        self.dyn_dd_half_var.set(str(_dyn.dd_half_pct))
+        self.dyn_dd_pause_var.set(str(_dyn.dd_pause_pct))
+        self.dyn_atr_half_var.set(str(_dyn.atr_half_mult))
+        self.dyn_atr_pause_var.set(str(_dyn.atr_pause_mult))
         self._copy_risk_to_backtest()
+
+    def _dynamic_cfg_from_ui(self) -> dict[str, Any]:
+        """配置页动态减仓几个框收成一段配置。数字填错就用默认。"""
+        from src.risk.dynamic import DynamicExposure
+
+        fallback = DynamicExposure()
+        try:
+            dd_half = float(self.dyn_dd_half_var.get() or fallback.dd_half_pct)
+        except ValueError:
+            dd_half = fallback.dd_half_pct
+        try:
+            dd_pause = float(self.dyn_dd_pause_var.get() or fallback.dd_pause_pct)
+        except ValueError:
+            dd_pause = fallback.dd_pause_pct
+        try:
+            atr_half = max(1.01, float(self.dyn_atr_half_var.get() or fallback.atr_half_mult))
+        except ValueError:
+            atr_half = fallback.atr_half_mult
+        try:
+            atr_pause = max(1.01, float(self.dyn_atr_pause_var.get() or fallback.atr_pause_mult))
+        except ValueError:
+            atr_pause = fallback.atr_pause_mult
+        return {
+            "enabled": bool(self.dyn_enabled_var.get()),
+            "dd_half_pct": dd_half,
+            "dd_pause_pct": dd_pause,
+            "atr_half_mult": atr_half,
+            "atr_pause_mult": atr_pause,
+            "atr_period": fallback.atr_period,
+            "atr_lookback": fallback.atr_lookback,
+            "reduce_held": True,
+        }
+
+    def _scan_interval_value(self) -> int:
+        """
+        扫描间隔秒。
+
+        读界面上的值并夹在 5~600 秒：太小会把行情源打到限流（下载失败会退化成收盘判止损），
+        太大则止损发现明显滞后。空着或写错按 30 秒。
+        """
+        try:
+            value = int(str(self.scan_var.get()).strip())
+        except (TypeError, ValueError):
+            value = 30
+        return max(5, min(600, value))
 
     def _apply_ui_to_cfg(self) -> dict[str, Any]:
         """把表单写回内存 cfg，并处理密码。"""
@@ -2274,6 +3445,9 @@ class AutoTradingApp(ctk.CTk):
 
         data = self.cfg.setdefault("data", {})
         data["source"] = normalize_source(self.source_var.get())
+        if data["source"] == "ths":
+            # 同花顺图不能当实盘来源。误选时退回新浪，避免扫描去抢鼠标。
+            data["source"] = "akshare"
         data.pop("quote_check", None)
         # 天勤账号进主配置；密码不写这里，保存时进 secrets.local.yaml。
         tq_box = data.get("tq") if isinstance(data.get("tq"), dict) else {}
@@ -2306,15 +3480,66 @@ class AutoTradingApp(ctk.CTk):
             body["max_box_ticks"] = max(0, int(self.body_max_box_var.get()))
         except ValueError:
             body["max_box_ticks"] = 100
+        try:
+            body["max_chase_ticks"] = max(0, int(self.body_max_chase_var.get()))
+        except ValueError:
+            body["max_chase_ticks"] = 20
+        try:
+            body["ema_period"] = max(0, int(self.body_ema_period_var.get()))
+        except ValueError:
+            body["ema_period"] = 20
+        try:
+            body["ema_buffer_ticks"] = max(0, int(self.body_ema_buffer_var.get()))
+        except ValueError:
+            body["ema_buffer_ticks"] = 2
         body["day_cutoff"] = _clock_text(self.body_day_cutoff_var.get(), "10:30")
         body["night_cutoff"] = _clock_text(self.body_night_cutoff_var.get(), "22:15")
         try:
             body["eth_minutes2"] = max(0, int(self.body_eth2_var.get()))
         except ValueError:
             body["eth_minutes2"] = 30
+        from src.strategy.types import entry_mode_from_label, stop_mode_from_label
+
+        # 止损/开仓触发方式都是全策略公共设置，写在 strategy 根。
+        st["stop_mode"] = stop_mode_from_label(self.stop_mode_var.get())
+        st["entry_mode"] = entry_mode_from_label(self.entry_mode_var.get())
+        # 通用止损：独立于策略自身止损，写在 strategy.generic_stop。
+        from src.strategy.generic_stop import generic_stop_from_label
+
+        gs = st.setdefault("generic_stop", {})
+        if not isinstance(gs, dict):
+            gs = {}
+            st["generic_stop"] = gs
+        gs["kind"] = generic_stop_from_label(self.generic_stop_var.get())
+
+        def _num(var, default: float, low: float, high: float) -> float:
+            """界面参数统一收口：填错就用默认值，超范围夹到边界。"""
+            try:
+                value = float(var.get())
+            except (TypeError, ValueError):
+                return default
+            return max(low, min(high, value))
+
+        gs["lookback"] = int(_num(self.generic_stop_lookback_var, 20.0, 2.0, 200.0))
+        gs["sar_af_start"] = _num(self.generic_stop_sar_start_var, 0.02, 0.001, 0.5)
+        gs["sar_af_step"] = _num(self.generic_stop_sar_step_var, 0.02, 0.001, 0.5)
+        gs["sar_af_max"] = _num(self.generic_stop_sar_max_var, 0.2, 0.05, 0.9)
+        gs["atr_period"] = int(_num(self.generic_stop_atr_period_var, 14.0, 2.0, 200.0))
+        gs["atr_mult"] = _num(self.generic_stop_atr_mult_var, 3.0, 0.1, 10.0)
+        gs["be_atr_mult"] = _num(self.generic_stop_be_atr_var, 1.0, 0.1, 10.0)
+        body["filter_enabled"] = bool(self.body_filter_enabled_var.get())
+        body["filter_adx_period"] = int(_num(self.body_filter_adx_period_var, 14.0, 2.0, 200.0))
+        body["filter_atr_period"] = int(_num(self.body_filter_atr_period_var, 14.0, 2.0, 200.0))
+        body["filter_lookback"] = int(_num(self.body_filter_lookback_var, 60.0, 10.0, 500.0))
+        body["filter_adx_upper"] = _num(self.body_filter_adx_upper_var, 30.0, 0.0, 90.0)
+        body_high_raw = _num(self.body_filter_atr_high_var, 80.0, 0.0, 100.0)
+        body["filter_atr_high_pct"] = 0.0 if body_high_raw <= 1 else body_high_raw / 100.0
+        st.pop("market_filter", None)
         # 旧版 ATR 底线 / 回撤止损已取消，保存时清掉，避免配置里还留着误导人。
         body.pop("initial_atr_mult", None)
         body.pop("reverse_atr_mult", None)
+        # 止损触发方式已挪到 strategy 根，旧键顺手清掉。
+        body.pop("stop_mode", None)
 
         trend_box = st.setdefault("trend_follow", {})
         try:
@@ -2336,12 +3561,6 @@ class AutoTradingApp(ctk.CTk):
         except ValueError:
             st_box["multiplier"] = 3.0
 
-        ma_box = st.setdefault("single_ma", {})
-        try:
-            ma_box["ma_period"] = max(2, int(self.ma_period_var.get()))
-        except ValueError:
-            ma_box["ma_period"] = 20
-        ma_box["reverse_on_cross"] = bool(self.ma_reverse_var.get())
         dual_box = st.setdefault("dual_ma", {})
         try:
             dual_box["short_period"] = max(2, int(self.dual_short_var.get()))
@@ -2352,6 +3571,129 @@ class AutoTradingApp(ctk.CTk):
         except ValueError:
             dual_box["long_period"] = 60
         dual_box["reverse_on_cross"] = bool(self.dual_reverse_var.get())
+        boll_box = st.setdefault("bollinger", {})
+        try:
+            boll_box["boll_window"] = max(10, int(self.boll_window_var.get()))
+        except ValueError:
+            boll_box["boll_window"] = 20
+        try:
+            boll_box["boll_dev"] = max(0.5, float(self.boll_dev_var.get()))
+        except ValueError:
+            boll_box["boll_dev"] = 2.0
+        try:
+            boll_box["atr_stop_mult"] = max(0.1, float(self.boll_atr_mult_var.get()))
+        except ValueError:
+            boll_box["atr_stop_mult"] = 1.5
+        sar_box = st.setdefault("sar_trend", {})
+        try:
+            sar_box["ma_filter"] = max(2, int(self.sar_ma_filter_var.get()))
+        except ValueError:
+            sar_box["ma_filter"] = 20
+        try:
+            sar_box["af_step"] = max(0.005, float(self.sar_af_step_var.get()))
+        except ValueError:
+            sar_box["af_step"] = 0.02
+        multi_box = st.setdefault("multi_factor", {})
+        try:
+            multi_box["threshold"] = min(0.95, max(0.1, float(self.multi_threshold_var.get())))
+        except ValueError:
+            multi_box["threshold"] = 0.6
+        try:
+            multi_box["ma_short"] = max(2, int(self.multi_ma_short_var.get()))
+        except ValueError:
+            multi_box["ma_short"] = 20
+        try:
+            multi_box["ma_long"] = max(3, int(self.multi_ma_long_var.get()))
+        except ValueError:
+            multi_box["ma_long"] = 60
+        if multi_box["ma_long"] <= multi_box["ma_short"]:
+            multi_box["ma_long"] = multi_box["ma_short"] * 2
+        try:
+            multi_box["channel"] = max(5, int(self.multi_channel_var.get()))
+        except ValueError:
+            multi_box["channel"] = 20
+        try:
+            multi_box["atr_stop_mult"] = max(0.1, float(self.multi_atr_mult_var.get()))
+        except ValueError:
+            multi_box["atr_stop_mult"] = 2.0
+        try:
+            multi_box["disagree_max"] = max(0.1, float(self.multi_disagree_var.get()))
+        except ValueError:
+            multi_box["disagree_max"] = 0.7
+        multi_box["use_sar"] = bool(self.multi_use_sar_var.get())
+        vote_box = st.setdefault("multi_vote", {})
+        hybrid_box = st.setdefault("multi_hybrid", {})
+        try:
+            vote_box["min_votes"] = max(1, int(self.multi_min_votes_var.get()))
+        except ValueError:
+            vote_box["min_votes"] = 2
+        try:
+            vote_box["min_vote_diff"] = max(0, int(self.multi_vote_diff_var.get()))
+        except ValueError:
+            vote_box["min_vote_diff"] = 2
+        hybrid_box["min_votes"] = vote_box["min_votes"]
+        hybrid_box["min_vote_diff"] = vote_box["min_vote_diff"]
+        hybrid_box["threshold"] = multi_box["threshold"]
+        hybrid_box["use_sar"] = multi_box["use_sar"]
+        try:
+            hybrid_box["min_position_ratio"] = min(
+                1.0, max(0.1, float(self.hybrid_min_ratio_var.get()))
+            )
+        except ValueError:
+            hybrid_box["min_position_ratio"] = 0.5
+        try:
+            hybrid_box["max_position_ratio"] = min(
+                1.0, max(hybrid_box["min_position_ratio"], float(self.hybrid_max_ratio_var.get()))
+            )
+        except ValueError:
+            hybrid_box["max_position_ratio"] = 1.0
+        self._write_cta_filter_vars(multi_box, "multi_factor")
+        self._write_cta_filter_vars(vote_box, "multi_vote")
+        self._write_cta_filter_vars(hybrid_box, "multi_hybrid")
+        adapt_box = st.setdefault("multi_factor_adapt", {})
+        for key in (
+            "ma_short",
+            "ma_long",
+            "channel",
+            "boll_window",
+            "boll_dev",
+            "af_start",
+            "af_step",
+            "af_max",
+            "threshold",
+            "atr_period",
+            "atr_stop_mult",
+            "use_sar",
+            "disagree_max",
+            "bias_ma",
+            "trend_timeframe",
+            "weights",
+            "flatten_at_close",
+        ):
+            if key in multi_box:
+                adapt_box[key] = copy.deepcopy(multi_box[key]) if key == "weights" else multi_box[key]
+        adapt_box["adapt_enabled"] = bool(self.adapt_enabled_var.get())
+        try:
+            adapt_box["lookback_trades"] = max(5, int(float(self.adapt_lookback_var.get())))
+        except ValueError:
+            adapt_box["lookback_trades"] = 20
+        try:
+            adapt_box["min_weight"] = min(0.2, max(0.0, float(self.adapt_min_w_var.get())))
+        except ValueError:
+            adapt_box["min_weight"] = 0.05
+        try:
+            adapt_box["max_weight"] = min(0.8, max(adapt_box["min_weight"] + 0.01, float(self.adapt_max_w_var.get())))
+        except ValueError:
+            adapt_box["max_weight"] = 0.40
+        try:
+            adapt_box["recent_mix"] = min(0.5, max(0.0, float(self.adapt_mix_var.get())))
+        except ValueError:
+            adapt_box["recent_mix"] = 0.30
+        try:
+            adapt_box["max_step"] = min(0.1, max(0.0, float(self.adapt_step_var.get())))
+        except ValueError:
+            adapt_box["max_step"] = 0.03
+        self._write_cta_filter_vars(adapt_box, "multi_factor_adapt")
         swing_box = st.setdefault("swing_trend", {})
         from src.strategy.swing_trend import DEFAULT_SCALE, SCALE_PAIRS
 
@@ -2384,6 +3726,34 @@ class AutoTradingApp(ctk.CTk):
         except ValueError:
             swing_box["reduce_extend_atr"] = 2.5
         swing_box.setdefault("flatten_at_close", False)
+        self._write_trend_filter_vars(trend_box, "trend_follow")
+        self._write_trend_filter_vars(st_box, "supertrend")
+        self._write_trend_filter_vars(dual_box, "dual_ma")
+        self._write_trend_filter_vars(boll_box, "bollinger")
+        self._write_trend_filter_vars(sar_box, "sar_trend")
+        self._write_trend_filter_vars(swing_box, "swing_trend")
+        jesse_box = st.setdefault("jesse_casper", {})
+        try:
+            jesse_box["lookback_liq"] = max(5, int(self.jesse_lookback_var.get()))
+        except ValueError:
+            jesse_box["lookback_liq"] = 20
+        try:
+            jesse_box["vol_mult"] = max(0.1, float(self.jesse_vol_mult_var.get()))
+        except ValueError:
+            jesse_box["vol_mult"] = 1.3
+        try:
+            jesse_box["min_rr"] = max(1.0, float(self.jesse_min_rr_var.get()))
+        except ValueError:
+            jesse_box["min_rr"] = 3.0
+        try:
+            jesse_box["price_tick"] = max(0.01, float(self.jesse_tick_var.get()))
+        except ValueError:
+            jesse_box["price_tick"] = 1.0
+        jesse_box["use_va"] = bool(self.jesse_use_va_var.get())
+        jesse_box["use_kill_zone"] = bool(self.jesse_use_kill_var.get())
+        jesse_box["use_daily_halt"] = bool(self.jesse_use_halt_var.get())
+        jesse_box.setdefault("flatten_at_close", True)
+        jesse_box.setdefault("trend_timeframe", "15")
         # 保存前清掉已删策略残留，并补齐现有策略缺的默认键。
         from src.strategy.factory import sanitize_strategy_config
 
@@ -2400,13 +3770,71 @@ class AutoTradingApp(ctk.CTk):
             bt["slippage_ticks"] = max(0.0, float(self.bt_slippage_var.get() or 0))
         except (TypeError, ValueError):
             bt["slippage_ticks"] = 1.0
+        # 策略优化页的搜索设置：写进配置，下次打开还是上次的样子，不再关窗口就回默认。
+        depth = self.opt_depth_var.get().strip()
+        bt["optimize_depth"] = depth if depth in ("精简", "标准", "完整") else "标准"
+        mode = self.opt_mode_var.get().strip()
+        bt["optimize_mode"] = mode if mode in ("一次切断", "滚动前进") else "一次切断"
+        try:
+            bt["optimize_holdout_pct"] = min(80, max(0, int(float(self.opt_holdout_pct_var.get() or 30))))
+        except (TypeError, ValueError):
+            bt["optimize_holdout_pct"] = 30
+        try:
+            bt["optimize_walk_steps"] = min(10, max(1, int(float(self.opt_walk_steps_var.get() or 3))))
+        except (TypeError, ValueError):
+            bt["optimize_walk_steps"] = 3
+        try:
+            bt["max_trials"] = max(5, int(float(self.opt_trials_var.get() or 80)))
+        except (TypeError, ValueError):
+            bt["max_trials"] = 80
 
         trade = self.cfg.setdefault("trade", {})
         trade["executor"] = self.exec_var.get()
+        from src.trader.go_live import apply_stage_to_cfg, normalize_stage
+
+        apply_stage_to_cfg(self.cfg, normalize_stage(self.go_live_var.get()))
+
+        ctp_box = trade.setdefault("ctp", {})
+        if not isinstance(ctp_box, dict):
+            ctp_box = {}
+            trade["ctp"] = ctp_box
+        from src.trader.go_live import account_kind_for_stage
+        from src.trader.ctp_logic import ctp_kind_label
+
+        # 账号种类以上线阶段为准，手工台和策略始终对同一本账。
+        ctp_box["account_kind"] = account_kind_for_stage(self.go_live_var.get())
+        self.ctp_kind_var.set(ctp_kind_label(ctp_box["account_kind"]))
+        live_box = ctp_box.setdefault("live", {})
+        if not isinstance(live_box, dict):
+            live_box = {}
+            ctp_box["live"] = live_box
+        # 真实资金账号跟「资金账号」同一格，保存时抄一份到 live，界面不再单独填。
+        live_box["user_id"] = str(self.user_var.get() or "").strip()
+        live_box["td_front"] = str(self.ctp_live_td_var.get() or "").strip()
+        live_box["md_front"] = str(self.ctp_live_md_var.get() or "").strip()
+        if not str(live_box.get("broker_id") or "").strip():
+            live_box["broker_id"] = str(ctp_box.get("broker_id") or "8080")
+        sim_box = ctp_box.setdefault("sim", {})
+        if not isinstance(sim_box, dict):
+            sim_box = {}
+            ctp_box["sim"] = sim_box
+        # 顶层仍留给旧配置和仿真窗口。有值时同步进 sim 小节，避免两处对不上。
+        for key in ("td_front", "md_front", "user_id", "broker_id"):
+            top = str(ctp_box.get(key) or "").strip()
+            if top and not str(sim_box.get(key) or "").strip():
+                sim_box[key] = top
         try:
             trade["volume"] = int(self.volume_var.get())
         except ValueError:
             trade["volume"] = 1
+        try:
+            trade["max_entry_slip_atr"] = max(0.0, float(self.max_slip_var.get()))
+        except ValueError:
+            trade["max_entry_slip_atr"] = 0.5
+        try:
+            trade["max_entry_slip_points"] = max(0.0, float(self.max_slip_points_var.get()))
+        except ValueError:
+            trade["max_entry_slip_points"] = 0.0
         if st["symbols"]:
             trade["symbol"] = st["symbols"][0]
 
@@ -2445,10 +3873,7 @@ class AutoTradingApp(ctk.CTk):
         risk_pre.pop("apply_limits", None)
 
         sch = self.cfg.setdefault("schedule", {})
-        try:
-            sch["scan_interval_sec"] = int(self.scan_var.get())
-        except ValueError:
-            sch["scan_interval_sec"] = 30
+        sch["scan_interval_sec"] = self._scan_interval_value()
         from src.strategy.session_scope import scope_code
 
         sch["session_scope"] = scope_code(self.session_scope_var.get())
@@ -2481,6 +3906,7 @@ class AutoTradingApp(ctk.CTk):
                 pass
         # 已废弃「最大持仓手数」：保存时从配置里删掉，仓位只靠仓位上限%和日最大亏损。
         risk.pop("max_position", None)
+        risk["dynamic"] = self._dynamic_cfg_from_ui()
 
         # 密码：写入本地密钥 + 当前进程环境
         pwd = self.password_var.get()
@@ -2529,31 +3955,112 @@ class AutoTradingApp(ctk.CTk):
         if current in ("", "（还没有）"):
             current = self._watch_symbols[0] if self._watch_symbols else "-"
         self.card_symbols.configure(text=current)
+        if hasattr(self, "hero_sub"):
+            broker = str((self.cfg.get("account") or {}).get("broker") or "期货公司").strip()
+            syms = self._watch_symbols
+            sym_txt = " / ".join(syms[:3]) + (f" 等{len(syms)}个" if len(syms) > 3 else "")
+            dry_txt = "模拟" if self.dry_var.get() else "实盘"
+            from src.account.workspace import profile_of
+
+            book_txt = profile_of(root=self.root_dir)["banner"]
+            self.hero_sub.configure(
+                text=f"{broker} · {sym_txt or '未选品种'} · 当前{dry_txt}（开关在下方控制台） · {book_txt}"
+            )
         position_text = self._position_card_text(snap if running else None)
         self.card_position.configure(
             text=position_text,
             text_color=T.TEXT if position_text == "空仓" else T.OK,
         )
-        # 启停成对：可点用鲜色，不可点统一变灰，一眼知道现在能点哪个
+        if hasattr(self, "alert_line"):
+            alert = snap.get("last_alert") if running else None
+            if not isinstance(alert, dict):
+                try:
+                    from src.ops.alerts import last_alert
+
+                    alert = last_alert(self.root_dir)
+                except Exception:  # noqa: BLE001
+                    alert = None
+            if isinstance(alert, dict) and alert.get("message"):
+                text = f"最近告警 {alert.get('ts', '')}  {alert.get('message')}"
+                # 告警是当时写下的字，不会跟着配置页改。日亏限额已经调大时，避免误以为现在还是 50。
+                if str(alert.get("code") or "") == "halt":
+                    try:
+                        now_limit = float(self.max_loss_var.get())
+                    except (TypeError, ValueError):
+                        now_limit = None
+                    if now_limit is not None and f"{now_limit:.0f}" not in str(alert.get("message") or ""):
+                        text += f"（旧记录，现限额 {now_limit:.0f} 元）"
+                alert_text = text
+            else:
+                alert_text = ""
+        else:
+            alert_text = ""
+        health_text = ""
+        health_tone = T.TEXT_DIM
+        if hasattr(self, "health_line"):
+            health = snap.get("health") if running else None
+            if not isinstance(health, dict):
+                try:
+                    from src.ops.health import evaluate_health
+
+                    health = evaluate_health(self.root_dir).as_dict()
+                except Exception:  # noqa: BLE001
+                    health = None
+            if isinstance(health, dict) and health.get("message"):
+                health_text = str(health.get("message") or "")
+                health_tone = T.DANGER if health.get("status") == "watch" else T.TEXT_DIM
+        dyn_text = ""
+        if hasattr(self, "dyn_line"):
+            note = snap.get("dynamic") if running else None
+            if not note:
+                try:
+                    from src.risk.dynamic import describe_status, live_equity_and_peak
+
+                    preview = dict(self.cfg)
+                    preview_risk = dict(preview.get("risk") or {})
+                    preview_risk["dynamic"] = self._dynamic_cfg_from_ui()
+                    preview["risk"] = preview_risk
+                    equity, peak = live_equity_and_peak(self.root_dir)
+                    note = describe_status(preview, equity=equity, peak=peak)
+                except Exception:  # noqa: BLE001
+                    note = ""
+            dyn_text = str(note or "")
+        flow = str(snap.get("ctp_flow") or "") if running else ""
+        if flow:
+            dyn_text = f"{flow}\n{dyn_text}" if dyn_text else flow
+        if running and snap.get("orders_paused"):
+            alert_text = (alert_text + "  " if alert_text else "") + "已暂停报单，开平仓不会发出去"
+        self._show_status_notes(alert_text, health_text, health_tone, dyn_text)
+        # 跑着：左边停止常驻，右边暂停/恢复报单。没跑：只能点启动。
         if running:
+            paused = bool(snap.get("orders_paused"))
             self.btn_start.configure(
-                state="disabled",
-                fg_color=T.ACCENT_MUTED,
-                text_color_disabled=T.ACCENT_TEXT_DISABLED,
+                state="normal",
+                text="停止常驻",
+                fg_color=T.DANGER,
+                hover_color=T.DANGER_HOVER,
+                text_color=T.DANGER_TEXT,
+                command=self._on_halt_resident,
             )
             self.btn_stop.configure(
                 state="normal",
-                fg_color=T.DANGER,
-                text_color=T.DANGER_TEXT,
+                text="恢复报单" if paused else "暂停报单",
+                fg_color=T.ACCENT if paused else T.DANGER,
+                hover_color=T.ACCENT_HOVER if paused else T.DANGER_HOVER,
+                text_color=T.ACCENT_ON if paused else T.DANGER_TEXT,
             )
         else:
             self.btn_start.configure(
                 state="normal",
+                text="启动常驻",
                 fg_color=T.ACCENT,
+                hover_color=T.ACCENT_HOVER,
                 text_color=T.ACCENT_ON,
+                command=self._on_start,
             )
             self.btn_stop.configure(
                 state="disabled",
+                text="暂停报单",
                 fg_color=T.DANGER_MUTED,
                 text_color_disabled=T.DANGER_TEXT_DISABLED,
             )
@@ -2564,6 +4071,47 @@ class AutoTradingApp(ctk.CTk):
                 f"止损{period_label(self._period_code(self.trail_var, self.trail_custom_var))}",
             ]
             self.route_summary.configure(text=" · ".join(bits))
+
+    def _fit_status_note_wrap(self, _event: Any = None) -> None:
+        """窗口拉宽时，三行提示跟着折行，避免字跑出右边缘。"""
+        box = getattr(self, "status_notes", None)
+        if box is None:
+            return
+        width = max(240, int(box.winfo_width() or 0) - 4)
+        for name in ("alert_line", "health_line", "dyn_line"):
+            label = getattr(self, name, None)
+            if label is not None:
+                label.configure(wraplength=width)
+
+    def _show_status_notes(
+        self,
+        alert_text: str,
+        health_text: str,
+        health_tone: str,
+        dyn_text: str,
+    ) -> None:
+        """
+        有字才占一行。三句都可能很长，不并成一行，免得挤成看不清的一段。
+        """
+        if not hasattr(self, "alert_line"):
+            return
+        width = 900
+        box = getattr(self, "status_notes", None)
+        if box is not None:
+            width = max(240, int(box.winfo_width() or 0) - 4) or 900
+        rows = (
+            (self.alert_line, (alert_text or "").strip(), T.DANGER),
+            (self.health_line, (health_text or "").strip(), health_tone or T.TEXT_DIM),
+            (self.dyn_line, (dyn_text or "").strip(), T.TEXT_DIM),
+        )
+        for label, _, _ in rows:
+            label.pack_forget()
+        for label, text, color in rows:
+            if not text:
+                label.configure(text="")
+                continue
+            label.configure(text=text, text_color=color, wraplength=width, height=18)
+            label.pack(fill="x", pady=0)
 
     def _position_card_text(self, snap: dict[str, Any] | None) -> str:
         """
@@ -2577,15 +4125,31 @@ class AutoTradingApp(ctk.CTk):
         positions = (snap or {}).get("positions") if snap else None
         if positions is None:
             try:
-                positions = load_state(self.root_dir / "data" / "bot_state.json").get("positions") or {}
+                from src.utils.state_store import default_state_path
+
+                positions = load_state(default_state_path(self.root_dir)).get("positions") or {}
             except Exception:  # noqa: BLE001
                 positions = {}
         return format_position_text(positions)
 
     def _tick(self) -> None:
-        self._refresh_status_cards()
-        self._pull_signal_balance()
-        self.after(800, self._tick)
+        """每 800ms 刷状态卡和账户余额。内部任何一步异常都不能让心跳链断掉。"""
+        if self._closing:
+            return
+        try:
+            self._refresh_status_cards()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("状态卡刷新跳过一轮: {}", exc)
+        try:
+            self._pull_signal_balance()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("账户余额刷新跳过一轮: {}", exc)
+        finally:
+            if not self._closing:
+                try:
+                    self._tick_after_id = self.after(800, self._tick)
+                except Exception:  # noqa: BLE001
+                    pass
 
     # ---------- 按钮 ----------
     def _merge_disk_gui_coords(self, cfg: dict[str, Any]) -> dict[str, Any]:
@@ -2632,13 +4196,59 @@ class AutoTradingApp(ctk.CTk):
             )
         return cfg
 
+    def _sync_bt_periods_after_save(
+        self, old_tf: str, old_trail: str, cur_tf: str, cur_trail: str, cfg: dict[str, Any]
+    ) -> None:
+        """
+        配置页保存后，把回测页还跟着旧配置的信号/止损周期一起换过来。
+
+        回测页有自己的周期选择器（故意和实盘分开）。只有它当前值还是配置页上一次
+        的值——也就是没在回测页单独改过——才跟着换，免得把特意选的周期冲掉。
+        """
+        st = cfg.get("strategy") or {}
+        pairs = (
+            ("信号周期", old_tf, cur_tf, str(st.get("timeframe") or ""),
+             self.bt_tf_var, self.bt_tf_custom_var),
+            ("止损周期", old_trail, cur_trail, str(st.get("trail_timeframe") or ""),
+             self.bt_trail_var, self.bt_trail_custom_var),
+        )
+        for name, old, cur, new, var, custom in pairs:
+            if new and old and cur == old and new != old:
+                self._set_period_vars(new, var, custom)
+                self._append_log(f"回测页{name}跟着配置页改成 {period_label(new)}。")
+
     def _on_save(self) -> None:
+        # 记下配置页和回测页各自的信号/止损周期，保存后把「还跟着配置页」的那项一起换掉。
+        old_st = self.cfg.get("strategy") or {}
+        old_tf = str(old_st.get("timeframe") or "")
+        old_trail = str(old_st.get("trail_timeframe") or "")
+        cur_tf = self._period_code(self.bt_tf_var, self.bt_tf_custom_var)
+        cur_trail = self._period_code(self.bt_trail_var, self.bt_trail_custom_var)
         # 保存前用最新余额填上账户权益。这个数不能在配置页手改。
         self._pull_signal_balance()
+        # 扫描间隔夹到 5~600 秒，并把夹过的值显示回输入框，避免界面和配置对不上。
+        self.scan_var.set(str(self._scan_interval_value()))
         cfg = self._merge_disk_gui_coords(self._apply_ui_to_cfg())
         path = save_config(cfg)
+        self._sync_bt_periods_after_save(old_tf, old_trail, cur_tf, cur_trail, cfg)
         self._status = "已保存"
         self._append_log(f"配置已保存: {path}")
+        # 常驻正在跑时，把新间隔推给它：主循环每轮都读这个属性，不用重启就能生效。
+        bot = getattr(self.worker, "bot", None)
+        if bot is not None and bool(getattr(bot, "is_running", False)):
+            bot.scan_interval = int((cfg.get("schedule") or {}).get("scan_interval_sec") or 30)
+            if hasattr(bot, "cfg"):
+                bot.cfg.setdefault("schedule", {})["trading_sessions"] = list(
+                    (cfg.get("schedule") or {}).get("trading_sessions") or []
+                )
+                risk_box = (cfg.get("risk") or {}).get("contracts")
+                if isinstance(risk_box, dict):
+                    bot.cfg.setdefault("risk", {})["contracts"] = risk_box
+            if hasattr(bot, "_refresh_sessions"):
+                bot._refresh_sessions()
+            self._append_log(
+                f"扫描间隔已改为 {bot.scan_interval} 秒；当前合约时段已同步，下一轮扫描起生效。"
+            )
         if self.password_var.get():
             self._append_log("密码已写入 config/secrets.local.yaml（本地私密）")
         try:
@@ -2695,7 +4305,7 @@ class AutoTradingApp(ctk.CTk):
         if self.worker.running:
             messagebox.showwarning(
                 "请先停止常驻",
-                "程序正在跑，不会自己换成新开关。\n请先点停止，再一键应用，然后重新启动。",
+                "程序正在跑，不会自己换成新开关。\n请先点「停止常驻」，再一键应用，然后重新启动。",
             )
             return
         entry = get_preset(self.root_dir, vid)
@@ -2821,7 +4431,7 @@ class AutoTradingApp(ctk.CTk):
             messagebox.showwarning("还没有坐标", "请先标定并点「保存当前坐标」。")
             return
         if self.worker.running:
-            messagebox.showwarning("请先停止常驻", "程序正在跑，不会中途换点击位置。\n请先点停止，再选用坐标，然后重新启动。")
+            messagebox.showwarning("请先停止常驻", "程序正在跑，不会中途换点击位置。\n请先点「停止常驻」，再选用坐标，然后重新启动。")
             return
         entry = get_coord_preset(self.root_dir, vid) or {}
         coords = entry.get("coords")
@@ -2892,10 +4502,92 @@ class AutoTradingApp(ctk.CTk):
         self._refresh_status_cards()
 
     def _on_ctp_probe(self) -> None:
-        """打开仿真柜台测试窗口。不改当前执行通道，也不碰同花顺。"""
+        """打开 CTP 交易窗口。不改当前执行通道，也不碰同花顺。"""
         from src.ui.ctp_probe import open_ctp_probe
 
         open_ctp_probe(self)
+
+    def _on_go_live_change(self) -> None:
+        """换上线阶段。没走完前一步时退回原来的选择。"""
+        from tkinter import messagebox
+
+        from src.trader.go_live import (
+            apply_stage_to_cfg,
+            load_state as load_go_live,
+            normalize_stage,
+            save_state,
+            stage_hint,
+            stage_label,
+            why_cannot_enter,
+        )
+
+        target = normalize_stage(self.go_live_var.get())
+        state = load_go_live(self.root_dir)
+        if target == normalize_stage(state.get("stage")):
+            apply_stage_to_cfg(self.cfg, target)
+            self.go_live_hint_var.set(stage_hint(target))
+            return
+        blocked = why_cannot_enter(state, target)
+        if blocked:
+            messagebox.showwarning("还不能进入这一步", blocked)
+            self.go_live_var.set(stage_label(state.get("stage")))
+            self.go_live_hint_var.set(stage_hint(state.get("stage")))
+            return
+        state["stage"] = target
+        save_state(self.root_dir, state)
+        apply_stage_to_cfg(self.cfg, target)
+        self.exec_var.set(str((self.cfg.get("trade") or {}).get("executor", self.exec_var.get())))
+        from src.trader.ctp_logic import ctp_kind_label
+
+        self.ctp_kind_var.set(ctp_kind_label(((self.cfg.get("trade") or {}).get("ctp") or {}).get("account_kind")))
+        self.go_live_hint_var.set(stage_hint(target))
+        self._append_log(f"上线阶段已改为{stage_label(target)}")
+
+    def _on_go_live_done(self) -> None:
+        """勾选当前阶段完成，能进下一步就问要不要换过去。"""
+        from tkinter import messagebox
+
+        from src.trader.go_live import (
+            apply_stage_to_cfg,
+            load_state as load_go_live,
+            mark_stage_passed,
+            next_stage,
+            normalize_stage,
+            save_state,
+            stage_hint,
+            stage_label,
+            why_cannot_enter,
+        )
+
+        current = normalize_stage(self.go_live_var.get())
+        state = load_go_live(self.root_dir)
+        ok, message = mark_stage_passed(state, current)
+        if not ok:
+            messagebox.showwarning("还不能勾完成", message)
+            return
+        state["stage"] = current
+        save_state(self.root_dir, state)
+        self._append_log(message)
+        nxt = next_stage(current)
+        if not nxt:
+            messagebox.showinfo("上线流程", "四步都已走到策略自动真实账户。请确认真实前置和资金账号后再启动常驻。")
+            return
+        if why_cannot_enter(state, nxt):
+            messagebox.showinfo("本阶段已勾完成", message)
+            return
+        if messagebox.askyesno("进入下一步？", f"{message}\n\n要进入{stage_label(nxt)}吗？"):
+            state["stage"] = nxt
+            save_state(self.root_dir, state)
+            apply_stage_to_cfg(self.cfg, nxt)
+            self.go_live_var.set(stage_label(nxt))
+            self.go_live_hint_var.set(stage_hint(nxt))
+            self.exec_var.set(str((self.cfg.get("trade") or {}).get("executor", self.exec_var.get())))
+            from src.trader.ctp_logic import ctp_kind_label
+
+            self.ctp_kind_var.set(
+                ctp_kind_label(((self.cfg.get("trade") or {}).get("ctp") or {}).get("account_kind"))
+            )
+            self._append_log(f"已进入{stage_label(nxt)}")
 
     def _on_start(self) -> None:
         from tkinter import messagebox
@@ -2904,10 +4596,74 @@ class AutoTradingApp(ctk.CTk):
             messagebox.showwarning("正在准备", "同花顺还在登录或改价格。这几步做完之前不会启动常驻。")
             return
         if self.worker.running:
+            self._on_halt_resident()
             return
 
+        from src.trader.go_live import (
+            allows_strategy_orders,
+            apply_stage_to_cfg,
+            load_state as load_go_live,
+            normalize_stage,
+            stage_label,
+            why_cannot_enter,
+        )
+
+        stage_now = normalize_stage(self.go_live_var.get())
+        apply_stage_to_cfg(self.cfg, stage_now)
+        if allows_strategy_orders(stage_now):
+            self.exec_var.set("ctp")
+        if self.exec_var.get() == "ctp" and not allows_strategy_orders(stage_now):
+            messagebox.showinfo(
+                "这一步请用交易台",
+                f"当前是{stage_label(stage_now)}。请点「打开交易台」手工下单。\n"
+                "策略自动下单要等到③策略自动仿真或④策略自动真实账户。",
+            )
+            return
+        if allows_strategy_orders(stage_now):
+            blocked = why_cannot_enter(load_go_live(self.root_dir), stage_now)
+            if blocked:
+                messagebox.showerror("还不能让策略自动下单", blocked)
+                return
         if self.exec_var.get() == "ctp":
-            self._append_log("执行通道是 CTP：会连接交易前置。前置、BrokerID 或认证码没填好时不会发单。")
+            from src.account.ctp_sync import resident_book_guard
+
+            book_block = resident_book_guard(self.root_dir, self.cfg)
+            if book_block:
+                messagebox.showerror("先核对账户", book_block)
+                self._append_log("未启动常驻：" + book_block)
+                return
+            from src.trader.go_live import STAGE_AUTO_LIVE
+
+            if stage_now == STAGE_AUTO_LIVE:
+                if not messagebox.askyesno(
+                    "真实资金",
+                    "策略将用和交易台同一套接口，向真实资金账户报单。\n确认前置、资金账号都填对了吗？",
+                ):
+                    return
+        if self.exec_var.get() == "ctp":
+            from src.trader.ctp_logic import ctp_kind_label
+
+            kind_txt = ctp_kind_label(self.ctp_kind_var.get())
+            self._append_log(
+                f"上线阶段{stage_label(stage_now)}。策略走和交易台同一套 CTP 接口（{kind_txt}）。"
+            )
+            if self.dry_var.get():
+                choice = messagebox.askyesnocancel(
+                    "模拟模式还开着",
+                    "执行通道已经是 CTP，但「模拟模式」还开着：策略不会向柜台发单。\n\n"
+                    "是 = 关掉模拟，允许策略用当前操作账报单\n"
+                    "否 = 继续只监测、不报单\n"
+                    "取消 = 不启动",
+                )
+                if choice is None:
+                    self._skip_next_bot_login = False
+                    self._append_log("已取消启动。")
+                    return
+                if choice:
+                    self.dry_var.set(False)
+                    self._append_log("已关闭模拟模式，策略将向 CTP 报单。")
+                else:
+                    self._append_log("保持模拟模式：只监测，不向柜台发单。")
 
         # 启动时若仍开着模拟，而通道是 gui：明确问要不要真下单
         # 原理：点启动会把界面开关写回 config；开关忘关就会又变成 dry_run=True
@@ -2939,6 +4695,23 @@ class AutoTradingApp(ctk.CTk):
 
     def _launch_resident(self) -> None:
         """真正启动常驻扫描。调用前，准备动作应该已经做完。"""
+        try:
+            self._launch_resident_inner()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("启动常驻失败")
+            from tkinter import messagebox
+
+            messagebox.showerror(
+                "启动常驻失败",
+                str(exc) + "\n\n请检查配置（保证金表、品种、风险参数等），或看日志定位。",
+            )
+            self._status = "待命"
+            try:
+                self._refresh_status_cards()
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _launch_resident_inner(self) -> None:
         cfg = self._cfg_for_live_scan()
         if self._skip_next_bot_login:
             # 准备阶段已经登录过。这个标记只留在内存副本里，不写进配置文件。
@@ -2957,12 +4730,15 @@ class AutoTradingApp(ctk.CTk):
         self._refresh_status_cards()
 
         def on_stopped() -> None:
-            self.after(0, self._after_stopped)
+            self._post_to_main(self._after_stopped)
 
         self.worker.start(cfg, on_stopped=on_stopped)
         self._refresh_status_cards()
         mode = "模拟(不点单)" if cfg.get("dry_run") else "实盘点击"
-        self._append_log(f"已启动常驻扫描 | dry_run={cfg.get('dry_run')} | {mode}")
+        from src.account.workspace import profile_of
+
+        book_name = profile_of(root=self.root_dir)["label"]
+        self._append_log(f"已启动常驻扫描 | dry_run={cfg.get('dry_run')} | {mode} | {book_name}")
         if cfg.get("_startup_login_done"):
             self._append_log("刚才已经登录过，常驻不再登录第二次。只再看一眼对手价。")
         else:
@@ -3041,7 +4817,7 @@ class AutoTradingApp(ctk.CTk):
                 else:
                     self._on_start()
 
-            self.after(0, _done)
+            self._post_to_main(_done)
 
         threading.Thread(target=_work, name="ths-prepare", daemon=True).start()
 
@@ -3052,11 +4828,14 @@ class AutoTradingApp(ctk.CTk):
         常驻已经在跑时，不在这里再开一次。正在跑的程序会在下一轮扫描前自己登录，
         登录过程中不会同时点买卖。
         """
+        if self._closing:
+            return
         try:
             self._maybe_start_at_login_time()
         except Exception as exc:  # noqa: BLE001
             logger.warning("检查定时登录失败: {}", exc)
-        self.after(20000, self._tick_login_schedule)
+        if not self._closing:
+            self._login_tick_after_id = self.after(20000, self._tick_login_schedule)
 
     def _maybe_start_at_login_time(self) -> None:
         """当前这一分钟如果写在 login_times 里，而且今天还没触发过，就去准备并启动。"""
@@ -3096,10 +4875,74 @@ class AutoTradingApp(ctk.CTk):
         self._status = "已停止"
         self._refresh_status_cards()
 
-    def _on_stop(self) -> None:
+    def _on_confirm_positions(self) -> None:
+        """人工核对同花顺持仓后，清掉遗留委托意图并解除对应熔断。"""
+        from tkinter import messagebox
+
+        bot = getattr(self.worker, "bot", None)
+        if bot is None:
+            messagebox.showinfo("对账确认", "常驻没有在跑，没有待核对的委托记录。")
+            return
+        if not messagebox.askyesno(
+            "对账确认",
+            "请先在同花顺里核对实际持仓与委托。\n"
+            "如果这笔其实已成交，先用「手工单录入」把仓位补进程序账，再回来点这里。\n\n"
+            "确认无误后解除熔断并继续扫描？",
+        ):
+            return
+        ok, msg = bot.confirm_positions_reviewed()
+        if ok:
+            messagebox.showinfo("对账确认", msg)
+        else:
+            messagebox.showwarning("对账确认", msg)
+
+
+    def _maybe_release_intent_halt(
+        self, bot: object, symbol: str, side: str, volume: int
+    ) -> None:
+        """
+        手工录入的这笔如果正好是上次没核对完的委托，顺手问一句要不要解除熔断。
+
+        只在品种、方向、手数都对得上时提示；用户点「否」就保持熔断。
+        """
+        from tkinter import messagebox
+
+        if bot is None:
+            return
+        matcher = getattr(bot, "pending_intent_matches", None)
+        if matcher is None:
+            return
+        intent = matcher(symbol, side, volume)
+        if not intent:
+            return
+        side_cn = {"buy_open": "买开", "sell_open": "卖开", "close": "平仓"}.get(side, side)
+        if not messagebox.askyesno(
+            "顺带解除熔断",
+            "这笔和上次没核对完的委托一致：\n"
+            f"{intent.get('symbol')} {side_cn} {intent.get('volume')} 手（{intent.get('ts')}）\n\n"
+            "现在把它标记为已核对，并解除熔断吗？",
+        ):
+            return
+        ok, msg = bot.confirm_positions_reviewed()
+        self._append_log(("已解除熔断：" if ok else "解除熔断失败：") + msg)
+        self._refresh_status_cards()
+        if ok:
+            messagebox.showinfo("已解除熔断", msg)
+
+    def _on_halt_resident(self) -> None:
+        """结束常驻主循环。暂停报单不够时用这个：扫描、清仓钟点、防休眠都会停。"""
         self.worker.stop()
-        self._status = "正在停止…"
-        self._append_log("已发送停止请求…")
+        self._status = "正在停止常驻…"
+        self._append_log("已发送停止常驻请求…")
+        self._refresh_status_cards()
+
+    def _on_pause_orders(self) -> None:
+        """拨交易台同一套暂停标志。扫描不停。"""
+        if not self.worker.running:
+            return
+        paused = not self.worker.orders_paused()
+        self.worker.set_orders_paused(paused)
+        self._append_log("已暂停报单，开平仓不会发出去。" if paused else "已恢复报单。")
         self._refresh_status_cards()
 
     def _on_test_tools(self) -> None:
@@ -3123,40 +4966,16 @@ class AutoTradingApp(ctk.CTk):
 
         def _run() -> None:
             code = subprocess.call([sys.executable, str(script)])
-            self.after(0, lambda: self._append_log(f"完整自检结束，exit={code}"))
+            self._post_to_main(lambda: self._append_log(f"完整自检结束，exit={code}"))
 
         threading.Thread(target=_run, daemon=True).start()
 
-    def _on_emergency_flatten(self) -> None:
-        """Kill switch：立刻对策略内持仓发平仓点击。"""
-        from tkinter import messagebox
-
-        if not messagebox.askyesno(
-            "紧急清仓",
-            "将按程序内部持仓记录，对同花顺点击平仓。\n"
-            "请确认下单面板合约正确。\n\n确定继续？",
-        ):
-            return
-        # 若未启动常驻，临时建一个 bot 执行
-        if self.worker.bot is None:
-            from src.scheduler import TradingBot
-
-            bot = TradingBot(self._clone_cfg())
-            logs = bot.emergency_flatten()
-        else:
-            logs = self.worker.emergency_flatten()
-        for line in logs:
-            self._append_log(f"[紧急清仓] {line}")
-        if not logs:
-            self._append_log("[紧急清仓] 策略内无持仓记录")
-        messagebox.showinfo("紧急清仓", "\n".join(logs) if logs else "无持仓可平")
-
-    def _on_book_actual_close(self) -> None:
+    def _on_manual_trade(self) -> None:
         """
-        按你填的成交价，把程序账上的仓平掉。
+        统一的手工单录入：弹窗里填品种、价格、手数，按「买多」「卖空」或「平仓」。
 
-        交易软件里已经平过、程序还记着时用。不点同花顺，也不发单。
-        顶部持仓和账户分析里没平的那一笔都会清掉，盈亏按这个价格算进余额。
+        完全仿照真实下单，只是把动作记进程序的账，不会去点同花顺。
+        用于你手动在同花顺上开仓/平仓后，把这笔回填进程序的持仓和信号账户。
         """
         from tkinter import messagebox
 
@@ -3169,12 +4988,15 @@ class AutoTradingApp(ctk.CTk):
             format_position_text,
             load_state,
             manual_close_without_bot,
+            manual_open_without_bot,
             open_position_rows,
         )
 
         bot = getattr(self.worker, "bot", None)
+
+        # 先读程序当前账上的仓位，弹窗里会显示"程序已记的仓位：xxx"
         if bot is not None and getattr(bot, "strategy", None) is not None:
-            rows = open_position_rows(
+            pos_rows = open_position_rows(
                 {
                     sym: {
                         "side": getattr(pos, "side", "flat"),
@@ -3186,69 +5008,325 @@ class AutoTradingApp(ctk.CTk):
             )
         else:
             state = load_state(default_state_path(self.root_dir))
-            rows = open_position_rows(state.get("positions") or {})
-        if not rows:
-            messagebox.showinfo("已经是空仓", "程序账上没有还开着的仓。")
+            pos_rows = open_position_rows(state.get("positions") or {})
+
+        pos_text = (
+            "程序账上："
+            + "、".join(
+                f"{r['symbol']} {'多' if r['side']=='long' else '空'}{r['volume']}手@{r['entry_price']:g}"
+                for r in pos_rows
+            )
+            if pos_rows
+            else "程序账上目前是空仓"
+        )
+
+        # 弹窗：品种、价格、手数 + 买多/卖空/平仓三个按钮
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("手工单录入")
+        dialog.geometry("420x520")
+        dialog.transient(self)
+        dialog.grab_set()
+
+        ctk.CTkLabel(
+            dialog,
+            text="手动在同花顺上开/平仓后，在这里录入。只改程序的账，不会去点同花顺。",
+            justify="left",
+            text_color=T.TEXT_DIM,
+        ).pack(padx=16, pady=(16, 4))
+        ctk.CTkLabel(
+            dialog,
+            text=pos_text,
+            text_color=T.ACCENT,
+            font=T.FONT_SMALL,
+        ).pack(padx=16, pady=(0, 12))
+
+        ctk.CTkLabel(dialog, text="品种（如 fu2701）").pack(anchor="w", padx=16)
+        symbol_entry = ctk.CTkEntry(dialog, height=32, placeholder_text="fu2701")
+        symbol_entry.pack(fill="x", padx=16, pady=(0, 6))
+        symbol_entry.focus_set()
+
+        ctk.CTkLabel(dialog, text="价格（成交价）").pack(anchor="w", padx=16)
+        price_entry = ctk.CTkEntry(dialog, height=32, placeholder_text="4960")
+        price_entry.pack(fill="x", padx=16, pady=(0, 6))
+
+        ctk.CTkLabel(dialog, text="手数").pack(anchor="w", padx=16)
+        volume_entry = ctk.CTkEntry(dialog, height=32, placeholder_text="1")
+        volume_entry.pack(fill="x", padx=16, pady=(0, 6))
+
+        ctk.CTkLabel(
+            dialog,
+            text="止损价（可选，开仓后策略按此自动止损；留空只靠反向信号和收盘清仓）",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+        ).pack(anchor="w", padx=16)
+        stop_entry = ctk.CTkEntry(dialog, height=32, placeholder_text="留空=只靠反向信号和收盘清仓")
+        stop_entry.pack(fill="x", padx=16, pady=(0, 2))
+
+        rec_label = ctk.CTkLabel(
+            dialog, text="", font=T.FONT_SMALL, text_color=T.TEXT_DIM,
+        )
+        rec_label.pack(anchor="w", padx=16, pady=(0, 16))
+
+        # --- 止损价推荐：品种填完后自动算一次 ---
+        rec_stops: dict[str, float] = {}  # {"long": X, "short": Y}
+
+        def _refresh_stop_rec(*_args: object) -> None:
+            sym = symbol_entry.get().strip().lower()
+            if not sym or len(sym) < 4:
+                rec_label.configure(text="")
+                rec_stops.clear()
+                return
+
+            def _worker() -> None:
+                try:
+                    from src.strategy.daily_body import suggest_stop_both
+                    bot_now = bot if bot is not None and getattr(bot, "kline", None) is not None else None
+                    if bot_now is None:
+                        # 常驻没跑，临时建一个 kline provider
+                        from src.data import KlineProvider
+                        kp = KlineProvider(self.cfg)
+                        bars = kp.fetch(sym, period="5")
+                        price_tick = float(
+                            ((self.cfg.get("trade") or {}).get("ctp") or {}).get("price_tick", 1)
+                            or (self.cfg.get("trade") or {}).get("price_tick", 1)
+                            or 1
+                        )
+                        stop_extra_ticks = 1
+                        eth_minutes = 30
+                        session_open_h = 9
+                    else:
+                        bars = bot_now.kline.fetch(sym, period=str(bot_now.strategy.timeframe))
+                        price_tick = float(getattr(bot_now.strategy, "price_tick", 1) or 1)
+                        stop_extra_ticks = int(getattr(bot_now.strategy, "stop_extra_ticks", 1) or 1)
+                        eth_minutes = int(getattr(bot_now.strategy, "eth_minutes", 30) or 30)
+                        from src.strategy.daily_body import _parse_hhmm
+                        so_raw = getattr(bot_now.strategy, "session_open", None)
+                        session_open_h = _parse_hhmm(str(so_raw)).hour if so_raw else 9
+
+                    from datetime import time as _dtime
+                    long_stop, short_stop = suggest_stop_both(
+                        bars or (),
+                        price_tick=price_tick,
+                        stop_extra_ticks=stop_extra_ticks,
+                        eth_minutes=eth_minutes,
+                        timeframe=str(getattr(bot_now.strategy, "timeframe", "5") if bot_now else "5"),
+                        session_open=_dtime(session_open_h, 0),
+                    )
+                    rec_stops.clear()
+                    parts = []
+                    if long_stop is not None:
+                        rec_stops["long"] = float(long_stop)
+                        parts.append(f"买多建议 {long_stop:g}")
+                    if short_stop is not None:
+                        rec_stops["short"] = float(short_stop)
+                        parts.append(f"卖空建议 {short_stop:g}")
+                    hint = "  |  ".join(parts) if parts else "（暂无推荐，可留空）"
+                    self._post_to_main(lambda: rec_label.configure(text=hint))
+                except Exception:
+                    self._post_to_main(lambda: rec_label.configure(text="（暂无推荐，可留空）"))
+
+            import threading
+            threading.Thread(target=_worker, daemon=True).start()
+
+        symbol_entry.bind("<FocusOut>", _refresh_stop_rec)
+        symbol_entry.bind("<Return>", _refresh_stop_rec)
+        price_entry.bind("<FocusOut>", _refresh_stop_rec)
+        price_entry.bind("<Return>", _refresh_stop_rec)
+
+        # --- 点击买多/卖空时，如果止损空着，自动填入推荐值 ---
+        def _fill_stop_if_empty(side_key: str) -> None:
+            if stop_entry.get().strip():
+                return
+            rec = rec_stops.get(side_key)
+            if rec is not None:
+                stop_entry.insert(0, f"{rec:g}")
+
+        ctk.CTkLabel(
+            dialog,
+            text="选择操作：",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+        ).pack(anchor="w", padx=16, pady=(0, 4))
+
+        action_taken: dict[str, str] = {}
+
+        def _take(action: str) -> None:
+            action_taken["action"] = action
+            action_taken["symbol"] = symbol_entry.get().strip()
+            action_taken["price"] = price_entry.get().strip()
+            action_taken["volume"] = volume_entry.get().strip()
+            action_taken["stop"] = stop_entry.get().strip()
+            dialog.destroy()
+
+        btn_frame = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_frame.pack(fill="x", padx=16, pady=(0, 16))
+        btn_w = 110
+        ctk.CTkButton(
+            btn_frame, text="买多", width=btn_w, height=44,
+            fg_color="#E53935", hover_color="#F44336", text_color="#FFFFFF",
+            command=lambda: (_fill_stop_if_empty("long"), _take("买多")),
+        ).pack(side="left", expand=True, fill="x", padx=(0, 4))
+        ctk.CTkButton(
+            btn_frame, text="卖空", width=btn_w, height=44,
+            fg_color="#2ECC8A", hover_color="#3ED99A", text_color="#FFFFFF",
+            command=lambda: (_fill_stop_if_empty("short"), _take("卖空")),
+        ).pack(side="left", expand=True, fill="x", padx=4)
+        ctk.CTkButton(
+            btn_frame, text="平仓", width=btn_w, height=44,
+            fg_color=T.ACCENT, hover_color=T.ACCENT_HOVER, text_color=T.ACCENT_ON,
+            command=lambda: _take("平仓"),
+        ).pack(side="left", expand=True, fill="x", padx=(4, 0))
+
+        ctk.CTkButton(dialog, text="取消", command=dialog.destroy, height=32).pack(padx=16, pady=(0, 16))
+
+        # 按内容实际需要的高度定窗口。写死 520 在 125%/150% 缩放下控件被放大，取消按钮会被压扁。
+        dialog.update_idletasks()
+        dlg_w = max(420, dialog.winfo_reqwidth())
+        dlg_h = max(520, dialog.winfo_reqheight())
+        dialog.geometry(f"{dlg_w}x{dlg_h}")
+
+        self.wait_window(dialog)
+        if not action_taken:
             return
 
+        symbol = action_taken["symbol"]
+        if not symbol:
+            messagebox.showerror("品种不对", "请填写品种代码，例如 fu2701。")
+            return
+
+        try:
+            price = float(action_taken["price"])
+        except ValueError:
+            messagebox.showerror("价格不对", "请填写数字，例如 4960。")
+            return
+        if price <= 0:
+            messagebox.showerror("价格不对", "价格要大于 0。")
+            return
+
+        try:
+            volume = int(action_taken["volume"])
+        except ValueError:
+            messagebox.showerror("手数不对", "请填写整数，例如 1。")
+            return
+        if volume <= 0:
+            messagebox.showerror("手数不对", "手数要大于 0。")
+            return
+
+        action = action_taken["action"]
         sizer = PositionSizer(self.cfg)
-        for row in rows:
-            word = "多" if row["side"] == "long" else "空"
-            desc = f"{row['symbol']} {word}{row['volume']}手，开仓价 {row['entry_price']:g}"
-            dialog = ctk.CTkInputDialog(
-                text=f"程序还记着 {desc}。\n填写实际成交价。只改程序的账，不会去点同花顺。",
-                title="按实际价格平账",
-            )
-            typed = str(dialog.get_input() or "").strip()
-            if not typed:
-                return
+        multiplier = float(sizer.multiplier_for(symbol))
+
+        stop_price = 0.0
+        stop_raw = action_taken.get("stop", "").strip()
+        if stop_raw:
             try:
-                exit_price = float(typed)
+                stop_price = float(stop_raw)
             except ValueError:
-                messagebox.showerror("价格不对", "请填写数字，例如 4800。")
+                messagebox.showerror("止损价不对", "请填写数字，或留空。")
                 return
-            if exit_price <= 0:
-                messagebox.showerror("价格不对", "平仓价要大于 0。")
+            if stop_price < 0:
+                messagebox.showerror("止损价不对", "止损价不能是负数。")
                 return
+
+        if action in ("买多", "卖空"):
+            side = "long" if action == "买多" else "short"
+            side_word = "多" if side == "long" else "空"
+
+            stop_hint = f"，策略止损 {stop_price:g}" if stop_price > 0 else "（不填止损，只靠反向信号和收盘清仓）"
             if not messagebox.askyesno(
-                "确认平账",
-                f"按 {exit_price:g} 把 {desc} 记成已平。\n不会去点同花顺。\n\n确定？",
+                "确认手工开仓",
+                f"手工录入：{symbol} {side_word}{volume}手，开仓价 {price:g}{stop_hint}。\n不会去点同花顺。\n\n确定？",
             ):
                 return
-            multiplier = float(sizer.multiplier_for(row["symbol"]))
+
             if bot is not None and getattr(bot, "strategy", None) is not None:
-                closed, balance = bot.manual_close(row["symbol"], exit_price)
+                opened, balance = bot.manual_open(
+                    symbol, side, volume, price, initial_stop=stop_price,
+                )
             else:
-                closed, balance = manual_close_without_bot(
+                opened, balance = manual_open_without_bot(
                     self.root_dir,
-                    symbol=row["symbol"],
-                    exit_price=exit_price,
+                    symbol=symbol,
+                    side=side,
+                    volume=volume,
+                    entry_price=price,
                     multiplier=multiplier,
                     initial_capital=float(self.cfg.get("risk", {}).get("capital") or 0),
+                    initial_stop=stop_price,
                 )
-            if closed is None:
-                messagebox.showinfo("已经是空仓", f"{row['symbol']} 已经没有仓了。")
-                continue
-            direction = "多" if closed["side"] == "long" else "空"
-            sign = 1.0 if closed["side"] == "long" else -1.0
-            pnl = (exit_price - float(closed["entry_price"])) * sign * multiplier * int(closed["volume"])
+
+            if opened is None:
+                messagebox.showerror(
+                    "录入失败",
+                    f"{symbol} 不在程序关注列表里，或已有同方向仓位。\n请先清掉程序账上的旧仓再录入。",
+                )
+                return
+
             if balance is not None:
-                # 常驻路径的余额已由 manual_close 内部的记账入口写回；只有没常驻时在这里补一次。
                 if bot is None or getattr(bot, "strategy", None) is None:
                     write_capital_to_config(balance)
                 self._apply_book_balance(balance)
+
+            self._refresh_signal_view()
+            self._refresh_status_cards()
+            shown = self._position_card_text(None if bot is None else bot.status_snapshot())
+            stop_note = f"，策略止损 {stop_price:g}" if stop_price > 0 else ""
+            self._append_log(
+                f"手工录入开仓：{symbol} {side_word}{volume}手，开仓价 {price:g}{stop_note}。当前持仓：{shown}"
+            )
+            messagebox.showinfo(
+                "已录入",
+                f"已把 {symbol} {side_word} {volume} 手记成开仓，开仓价 {price:g}{stop_note}。\n没有去点同花顺。",
+            )
+            self._maybe_release_intent_halt(
+                bot, symbol, "buy_open" if side == "long" else "sell_open", volume
+            )
+
+        elif action == "平仓":
+            if not messagebox.askyesno(
+                "确认手工平仓",
+                f"手工录入平仓：{symbol}，平仓价 {price:g}。\n"
+                f"会按程序账上 {symbol} 的持仓手数平仓，盈亏按开仓价算。\n不会去点同花顺。\n\n确定？",
+            ):
+                return
+
+            if bot is not None and getattr(bot, "strategy", None) is not None:
+                closed, balance = bot.manual_close(symbol, price)
+            else:
+                closed, balance = manual_close_without_bot(
+                    self.root_dir,
+                    symbol=symbol,
+                    exit_price=price,
+                    multiplier=multiplier,
+                    initial_capital=float(self.cfg.get("risk", {}).get("capital") or 0),
+                )
+
+            if closed is None:
+                messagebox.showinfo("已经是空仓", f"{symbol} 在程序账上已经没有仓了。")
+                return
+
+            direction = "多" if closed["side"] == "long" else "空"
+            sign = 1.0 if closed["side"] == "long" else -1.0
+            pnl = (price - float(closed["entry_price"])) * sign * multiplier * int(closed["volume"])
+
+            if balance is not None:
+                if bot is None or getattr(bot, "strategy", None) is None:
+                    write_capital_to_config(balance)
+                self._apply_book_balance(balance)
+
             self._refresh_signal_view()
             self._refresh_status_cards()
             shown = self._position_card_text(None if bot is None else bot.status_snapshot())
             self._append_log(
-                f"已按 {exit_price:g} 把 {closed['symbol']} {direction}{closed['volume']}手平账，"
+                f"手工录入平仓：{symbol} {direction}{closed['volume']}手，平仓价 {price:g}，"
                 f"盈亏 {pnl:+.0f} 元。当前持仓：{shown or format_position_text({})}"
             )
             messagebox.showinfo(
-                "已平账",
-                f"已按 {exit_price:g} 把 {closed['symbol']} {direction} {closed['volume']} 手记成已平。\n"
+                "已录入",
+                f"已按 {price:g} 把 {symbol} {direction} {closed['volume']} 手记成平仓。\n"
                 f"这笔盈亏 {pnl:+.0f} 元。没有去点同花顺。",
             )
+            self._maybe_release_intent_halt(bot, symbol, "close", int(closed["volume"]))
 
     def _resolve_date_range(self, preset: str, start_raw: str, end_raw: str) -> tuple[str | None, str | None]:
         """
@@ -3316,7 +5394,12 @@ class AutoTradingApp(ctk.CTk):
         self.opt_range_var.set(self.bt_range_var.get())
         self.opt_start_var.set(self.bt_start_var.get())
         self.opt_end_var.set(self.bt_end_var.get())
-        self.opt_source_var.set(self.bt_source_var.get())
+        from src.data.quote_check import is_ths_source
+
+        if is_ths_source(self.bt_source_var.get()):
+            self.opt_source_var.set(self.source_var.get())
+        else:
+            self.opt_source_var.set(self.bt_source_var.get())
         # 下拉框用代码改策略名时，不会自己刷新历史列表，这里补一次。
         if hasattr(self, "opt_hist_menu"):
             self._refresh_opt_history()
@@ -3332,6 +5415,46 @@ class AutoTradingApp(ctk.CTk):
     def _set_result_text(self, box: ctk.CTkTextbox, text: str) -> None:
         box.delete("1.0", "end")
         box.insert("end", text)
+
+    def _show_opt_progress(self, done: int, total: int, phase: str = "", *, force: bool = False) -> None:
+        """
+        策略优化进度：第几组 / 共几组、百分比、已用时间、预计还要多久。
+
+        进度只是提示，不能影响优化。默认 0.4 秒最多刷一次，避免几百组时把界面刷爆。
+        """
+        if not hasattr(self, "opt_progress"):
+            return
+        total = max(1, int(total))
+        done = max(0, min(int(done), total))
+        now = time.monotonic()
+        if not force and now - self._opt_progress_at < 0.4:
+            return
+        self._opt_progress_at = now
+        started = self._opt_started_at or now
+        elapsed = max(0.0, now - started)
+        self.opt_progress.set(done / total)
+        if done <= 0:
+            self.opt_progress_label.configure(text=f"{phase}… 已用 {_duration_text(elapsed)}")
+            return
+        percent = done / total * 100.0
+        eta = ""
+        if done < total:
+            eta = f"，预计还要 {_duration_text(elapsed / done * (total - done))}"
+        self.opt_progress_label.configure(
+            text=f"{phase} {done}/{total}（{percent:.0f}%），已用 {_duration_text(elapsed)}{eta}"
+        )
+
+    def _finish_opt_progress(self, *, ok: bool) -> None:
+        """优化结束：进度条收尾，并写一句总用时。"""
+        if not hasattr(self, "opt_progress"):
+            return
+        elapsed = time.monotonic() - (self._opt_started_at or time.monotonic())
+        self.opt_progress.set(1.0 if ok else 0.0)
+        self.opt_progress_label.configure(
+            text=(f"完成，用时 {_duration_text(elapsed)}" if ok else f"失败，用时 {_duration_text(elapsed)}")
+        )
+        self._opt_started_at = None
+        self._opt_progress_at = 0.0
 
     def _pack_open_limits(self, parent) -> None:
         """
@@ -3371,13 +5494,16 @@ class AutoTradingApp(ctk.CTk):
             variable=self.bt_limits_on_var,
             progress_color=T.OK,
         ).pack(side="left")
-        self._option_row(box_risk, "仓位模式", self.bt_sizing_var, ["risk_pct", "fixed"], width=160)
+        menu = self._option_row(box_risk, "仓位模式", self.bt_sizing_var, ["risk_pct", "fixed"], width=160)
+        # 开跑前会按配置页覆盖，这里不让改，避免白填一遍。
+        menu.configure(state="disabled")
         self._entry_row(
             box_risk,
             "账户权益(元)",
             self.bt_capital_var,
             hint="跟配置页一致，开跑前自动对齐",
             width=160,
+            readonly=True,
         )
         self._entry_row(
             box_risk,
@@ -3385,20 +5511,37 @@ class AutoTradingApp(ctk.CTk):
             self.bt_margin_var,
             hint="跟品种与合约表一致，开跑前自动对齐。0=不限制",
             width=160,
+            readonly=True,
         )
-        self._entry_row(box_risk, "每笔风险%", self.bt_risk_pct_var, hint="2 表示权益的 2%", width=160)
+        self._entry_row(
+            box_risk,
+            "每笔风险%",
+            self.bt_risk_pct_var,
+            hint="跟配置页一致，2 表示权益的 2%",
+            width=160,
+            readonly=True,
+        )
         self._entry_row(
             box_risk,
             "仓位上限%",
             self.bt_margin_usage_pct_var,
             hint="跟配置页一致；权益×此比例内交保证金",
             width=160,
+            readonly=True,
         )
-        self._entry_row(box_risk, "固定手数", self.bt_volume_var, hint="仓位模式=fixed 时使用", width=160)
-        self._entry_row(box_risk, "最少手数", self.bt_min_vol_var, hint="算出来比这个少就不开", width=160)
-        self._entry_row(box_risk, "日最大亏损(元)", self.bt_max_loss_var, hint="当天亏到这里就停开", width=160)
-        self._entry_row(box_risk, "开仓最小间隔秒", self.bt_interval_var, width=160)
-        self._entry_row(box_risk, "每天最多开仓", self.bt_max_orders_var, hint="次数，换日清零", width=160)
+        self._entry_row(
+            box_risk, "固定手数", self.bt_volume_var, hint="跟配置页一致", width=160, readonly=True
+        )
+        self._entry_row(
+            box_risk, "最少手数", self.bt_min_vol_var, hint="跟配置文件 risk.min_volume 一致", width=160, readonly=True
+        )
+        self._entry_row(
+            box_risk, "日最大亏损(元)", self.bt_max_loss_var, hint="跟配置页一致，当天亏到这里就停开", width=160, readonly=True
+        )
+        self._entry_row(box_risk, "开仓最小间隔秒", self.bt_interval_var, hint="跟配置页一致", width=160, readonly=True)
+        self._entry_row(
+            box_risk, "每天最多开仓", self.bt_max_orders_var, hint="跟配置页一致，次数换日清零", width=160, readonly=True
+        )
         ctk.CTkButton(
             box_risk,
             text="按配置页重新填入",
@@ -3469,7 +5612,7 @@ class AutoTradingApp(ctk.CTk):
         """
         品种与合约总表：路径 + 打开 + 重新读取 + 摘要。
 
-        一张表管关注合约和保证金/乘数；同品种保证金必须相同。
+        一张表管关注合约、保证金/乘数，以及每个品种自己的交易时段和清仓时刻。
         """
         row = ctk.CTkFrame(parent, fg_color="transparent")
         row.pack(fill="x", pady=5)
@@ -3511,6 +5654,16 @@ class AutoTradingApp(ctk.CTk):
             border_color=T.BORDER,
             command=lambda: self._reload_margin_table(silent=False),
         ).pack(side="left", padx=(8, 0))
+        ctk.CTkButton(
+            row,
+            text="刷新全市场主力",
+            width=132,
+            height=32,
+            fg_color=T.OK,
+            hover_color=T.ACCENT_HOVER,
+            text_color=T.ACCENT_ON,
+            command=self._refresh_universe_from_tq,
+        ).pack(side="left", padx=(8, 0))
         self.margin_table_summary = ctk.CTkLabel(
             parent,
             text="",
@@ -3532,6 +5685,58 @@ class AutoTradingApp(ctk.CTk):
         risk["universe_table"] = rel
         risk["margin_table"] = rel
         return resolve_universe_path(self.cfg)
+
+    def _refresh_universe_from_tq(self) -> None:
+        """从天勤刷新全市场 81 个主力合约；独立线程跑，不卡界面。"""
+        import threading
+
+        def _thread() -> None:
+            try:
+                from tools.refresh_universe import refresh_universe_table
+
+                rows = refresh_universe_table(dry_run=False)
+
+                # 主线程弹结果
+                def _on_done() -> None:
+                    total = len(rows)
+                    enabled = sum(1 for r in rows if r.get("enabled", True))
+                    if hasattr(self, "margin_table_summary"):
+                        self._reload_margin_table(silent=True)
+                    ctk.CTkMessagebox.show_info(
+                        master=self,
+                        title="主力合约刷新完成",
+                        message=(
+                            f"天勤主力查询 {total} 个品种全部成功。\n"
+                            f"启用={enabled}（沿用原有关注品种），停用={total - enabled}。\n\n"
+                            f"如果某个月分主力变了，品种代码已自动更新。\n"
+                            f"想启用新品种，在 Excel 里把「启用」改成「是」即可。"
+                        ),
+                    )
+
+                self.after(0, _on_done)
+            except Exception as exc:  # noqa: BLE001
+                logger.error("刷新全市场主力失败: {}", exc)
+
+                def _on_fail() -> None:
+                    ctk.CTkMessagebox.show_error(
+                        master=self,
+                        title="刷新失败",
+                        message=(
+                            f"{exc}\n\n"
+                            f"可能原因：天勤 tqsdk 未安装（pip install tqsdk），"
+                            f"或账号密码没填（配置页 → 账号与登录 → 天勤行情账号/密码）。"
+                        ),
+                    )
+
+                self.after(0, _on_fail)
+
+        threading.Thread(target=_thread, name="UniverseRefresh", daemon=True).start()
+        ctk.CTkMessagebox.show_info(
+            master=self,
+            title="正在刷新",
+            message="正在问天勤查询 81 个品种的当前主力合约，约 10-20 秒…\n"
+            "窗口卡住是正常的，完成后会自动弹结果。",
+        )
 
     def _refresh_margin_table_summary(self) -> None:
         """刷新总表说明文字；并刷新上方关注下拉（不罗列全部合约）。"""
@@ -3702,7 +5907,10 @@ class AutoTradingApp(ctk.CTk):
         engine = _ui_engine(self.bt_engine_var.get())
         tf_code = self._period_code(self.bt_tf_var, self.bt_tf_custom_var)
         trail_code = self._period_code(self.bt_trail_var, self.bt_trail_custom_var)
+        from src.data.quote_check import is_ths_source
+
         source_label = (self.bt_source_var.get() or "").strip()
+        live_keeps_source = is_ths_source(source_label)
         flatten_on = bool(self.bt_flatten_var.get())
 
         try:
@@ -3728,7 +5936,7 @@ class AutoTradingApp(ctk.CTk):
             f"策略  {ENGINE_LABELS.get(engine, engine)}\n"
             f"品种  {symbol}\n"
             f"信号周期  {period_label(tf_code)}    止损周期  {period_label(trail_code)}\n"
-            f"行情来源  {source_label or '（空）'}\n"
+            f"行情来源  {'不同花顺图写入实盘（配置页仍用现在的那一家）' if live_keeps_source else (source_label or '（空）')}\n"
             f"收盘清仓  {on_off(flatten_on)}\n\n"
             f"仓位模式  {sizing}\n"
             f"每笔风险  {risk_pct}%\n"
@@ -3747,7 +5955,7 @@ class AutoTradingApp(ctk.CTk):
         self.engine_var.set(engine)
         self._set_period_vars(tf_code, self.tf_var, self.tf_custom_var)
         self._set_period_vars(trail_code, self.trail_var, self.trail_custom_var)
-        if source_label:
+        if source_label and not live_keeps_source:
             self.source_var.set(source_label)
         self.flatten_at_close_var.set(flatten_on)
 
@@ -3776,8 +5984,9 @@ class AutoTradingApp(ctk.CTk):
         cfg.setdefault("risk", {})["margin_per_lot"] = margin
         cfg.setdefault("risk", {})["margin_usage_pct"] = margin_usage
         cfg.setdefault("risk", {}).pop("max_position", None)
-        # 行情来源以回测页为准（_apply_ui_to_cfg 已从 source_var 写入）
-        if source_label:
+        # 回测页的新浪/东财/天勤可以写入实盘。同花顺图不能写进 data.source，
+        # 否则下次启动扫描会去抢鼠标，整轮拉K失败，一单也开不出。
+        if source_label and not live_keeps_source:
             cfg.setdefault("data", {})["source"] = normalize_source(source_label)
         path = save_config(cfg)
         self.cfg = cfg
@@ -3786,7 +5995,7 @@ class AutoTradingApp(ctk.CTk):
             "历史回测本页参数已写入配置页并保存："
             f"策略 {ENGINE_LABELS.get(engine, engine)}，品种 {symbol}，"
             f"周期 {period_label(tf_code)}/{period_label(trail_code)}，"
-            f"来源 {source_label or '-'}，"
+            f"来源 {'仍用配置页当前这家（同花顺图不写实盘）' if live_keeps_source else (source_label or '-')}，"
             f"清仓{on_off(flatten_on)} | {path}"
         )
         self._refresh_status_cards()
@@ -3973,6 +6182,115 @@ class AutoTradingApp(ctk.CTk):
             self.bt_end_var.set(end)
         return cfg, symbol, start, end
 
+    def _ths_bar_limit(self) -> int:
+        """读图根数。写错数字时用 800，最少 10，最多 5000。"""
+        raw = (self.bt_ths_bars_var.get() or "").strip() or "800"
+        try:
+            n = int(float(raw))
+        except ValueError:
+            n = 800
+        return max(10, min(5000, n))
+
+    def _set_ths_scraping(self, busy: bool) -> None:
+        """读图进行中：禁止再点读取，允许点停止。"""
+        self._ths_scraping = bool(busy)
+        scrape = getattr(self, "bt_ths_scrape_btn", None)
+        stop = getattr(self, "bt_ths_stop_btn", None)
+        if scrape is not None:
+            scrape.configure(state="disabled" if busy else "normal")
+        if stop is not None:
+            stop.configure(state="normal" if busy else "disabled")
+
+    def _on_escape_key(self, _event=None):
+        """读同花顺图时 ESC 当停止。其它时候不拦。"""
+        if self._ths_scraping:
+            self._on_stop_ths_chart()
+            return "break"
+        return None
+
+    def _on_stop_ths_chart(self) -> None:
+        """点停止或按 ESC：读图循环下一拍就停，已读到的会存盘。"""
+        from src.data.ths_chart import request_ths_stop
+
+        if not self._ths_scraping:
+            return
+        request_ths_stop()
+        self._append_log("已请求停止读图。按 ESC 也可以。已读到的会先存下来。")
+
+    def _confirm_ths_chart(self) -> bool:
+        """读图前请用户确认期货通已经打开。取消就不读。"""
+        from tkinter import messagebox
+
+        n = self._ths_bar_limit()
+        return bool(
+            messagebox.askokcancel(
+                "从同花顺图读K线",
+                "请先打开期货通，主图选好这个合约和这个周期。\n"
+                f"点确定后先等 3 秒，再开始读，最多 {n} 根。\n"
+                "读的时候请不要动鼠标键盘。按 ESC 或点「停止读图」可停。\n"
+                "信息框顶部是这根K线的结束时间。不会点买卖。\n\n继续？",
+            )
+        )
+
+    def _on_scrape_ths_chart(self) -> None:
+        """只把同花顺图读进本地库，不跑策略。方便再点检查行情质量。"""
+        import threading
+        from tkinter import messagebox
+
+        from src.data.kline import KlineProvider
+        from src.data.ths_chart import ThsScrapeStopped
+
+        symbol = (self.bt_symbol_var.get() or "").strip()
+        if not symbol or symbol == "（还没有）":
+            messagebox.showwarning("还没有品种", "请先在配置页的关注品种里添加合约。")
+            return
+        if self._ths_scraping:
+            messagebox.showinfo("正在读图", "正在读同花顺图。要停请按 ESC 或点「停止读图」。")
+            return
+        period = self._period_code(self.bt_tf_var, self.bt_tf_custom_var)
+        limit = self._ths_bar_limit()
+        if not self._confirm_ths_chart():
+            return
+        self._set_ths_scraping(True)
+        self._append_log(
+            f"准备从同花顺图读取 {symbol} {period}，最多 {limit} 根。"
+            "3 秒后开始，请把主图放到前面。按 ESC 可取消。"
+        )
+
+        def work() -> None:
+            try:
+                cfg = self._clone_cfg()
+                data = cfg.setdefault("data", {})
+                data["source"] = "ths"
+                ths_cfg = dict(data.get("ths_chart") or {})
+                ths_cfg["max_bars"] = limit
+                ths_cfg.setdefault("ready_sec", 3)
+                data["ths_chart"] = ths_cfg
+                provider = KlineProvider(cfg)
+                # 直接读图再入库。回测 fetch 只用本地库，不会再抢鼠标。
+                frame = provider.import_ths_chart(symbol, period, limit=limit)
+                n = 0 if frame is None else len(frame)
+                last = "" if frame is None or n == 0 else str(frame.index[-1])
+                self.after(
+                    0,
+                    lambda n=n, last=last: self._append_log(
+                        f"同花顺图已存 {n} 根，最新 {last or '无'}（@ths）"
+                    ),
+                )
+            except ThsScrapeStopped as exc:
+                err = str(exc)
+                self.after(0, lambda m=err: self._append_log(m))
+                self.after(0, lambda m=err: messagebox.showinfo("已停止", m))
+            except Exception as exc:  # noqa: BLE001
+                # Python 3.12 结束后会清掉 except 里的 exc，after 里再 str(exc) 会变成 NameError。
+                err = str(exc)
+                logger.exception("从同花顺图读取失败")
+                self.after(0, lambda m=err: messagebox.showerror("没读到", m))
+            finally:
+                self.after(0, lambda: self._set_ths_scraping(False))
+
+        threading.Thread(target=work, daemon=True).start()
+
     def _on_backtest(self) -> None:
         """后台跑历史回测，结果写本页 + data/backtest_last.json。"""
         prepared = self._prepare_backtest_run()
@@ -3984,7 +6302,8 @@ class AutoTradingApp(ctk.CTk):
         self._append_log(
             f"开始历史回测… engine={st['engine']} symbol={symbol} "
             f"行情={self.bt_source_var.get()} "
-            f"区间={start or '起'}~{end or '止'}"
+            f"区间={start or '起'}~{end or '止'} "
+            f"换月={'按主力时段' if self.bt_rollover_var.get() else '否'}"
         )
         self.tabs.set("历史回测")
         if hasattr(self, "bt_result_box"):
@@ -3996,12 +6315,26 @@ class AutoTradingApp(ctk.CTk):
         def _run() -> None:
             try:
                 from src.backtest.engine import run_backtest, save_backtest_report
+                from src.backtest.rollover import run_backtest_rollover, format_rollover_lines
 
-                result = run_backtest(cfg, symbol=symbol, start_date=start, end_date=end, engine=st["engine"])
+                if self.bt_rollover_var.get():
+                    result = run_backtest_rollover(
+                        cfg,
+                        symbol=symbol,
+                        start_date=start,
+                        end_date=end,
+                        engine=st["engine"],
+                        chain_capital=bool(self.bt_rollover_chain_var.get()),
+                    )
+                else:
+                    result = run_backtest(
+                        cfg, symbol=symbol, start_date=start, end_date=end, engine=st["engine"]
+                    )
                 path = self.root_dir / "data" / "backtest_last.json"
                 save_backtest_report(result, path)
                 p = result.performance
                 snap = result.params_snapshot or {}
+                rollover_text = format_rollover_lines(snap)
                 note = ""
                 if p.trades < 3:
                     note = (
@@ -4024,9 +6357,13 @@ class AutoTradingApp(ctk.CTk):
                     f"行情能给的  {str(snap.get('available_from', ''))[:16]}  →  {str(snap.get('available_to', ''))[:16]}",
                     f"实际区间    {str(snap.get('data_from', ''))[:16]}  →  {str(snap.get('data_to', ''))[:16]}",
                     str(snap.get("coverage_note") or "").strip(),
+                    *([rollover_text] if rollover_text else []),
                     str(snap.get("fill_note") or "").strip(),
                     f"K线根数   {result.bars}",
                     f"成交      {p.trades} 笔（赢{p.wins} / 亏{p.losses}）",
+                    f"没开成    {len(result.rejected)} 条开仓信号（被策略过滤或风控挡住，明细在下面）"
+                    if result.rejected
+                    else "没开成    无（每个开仓信号都成交了）",
                     f"胜率      {p.win_rate:.0%}",
                     f"净盈亏    {p.net_pnl:.0f} 元",
                     f"盈利因子  {p.profit_factor:.2f}",
@@ -4049,22 +6386,159 @@ class AutoTradingApp(ctk.CTk):
                         f"{t.entry_price:.1f}->{t.exit_price:.1f} "
                         f"pnl={t.pnl:.0f} | {t.reason_exit[:40]}"
                     )
+                if result.rejected:
+                    lines.append("")
+                    lines.append(
+                        f"—— 有开仓信号但没做（同一交易时段同类原因只记一次，共 "
+                        f"{len(result.rejected)} 条，最多显示最近 20 条）——"
+                    )
+                    for item in result.rejected[-20:]:
+                        price = f"{item.price:.2f}" if item.price else "—"
+                        stop = f"{item.stop:.2f}" if item.stop else "—"
+                        lines.append(
+                            f"{item.time[:16]} {item.side} 价{price} 止损{stop} "
+                            f"| {item.stage}：{item.reason[:80]}"
+                        )
                 text = "\n".join(x for x in lines if x is not None)
-                self.after(0, lambda: self._append_log(
+                self._post_to_main(lambda: self._append_log(
                     f"历史回测完成 {result.symbol} | {result.bars}根 | "
                     f"{p.trades}笔 胜率{p.win_rate:.0%} 净盈亏{p.net_pnl:.0f}"
                 ))
                 if hasattr(self, "bt_result_box"):
-                    self.after(0, lambda t=text: self._set_result_text(self.bt_result_box, t))
+                    self._post_to_main(lambda t=text: self._set_result_text(self.bt_result_box, t))
             except Exception as e:  # noqa: BLE001
                 logger.exception("历史回测失败")
                 err = str(e)
-                self.after(0, lambda: self._append_log(f"历史回测失败: {err}"))
+                self._post_to_main(lambda: self._append_log(f"历史回测失败: {err}"))
                 if hasattr(self, "bt_result_box"):
-                    self.after(0, lambda m=err: self._set_result_text(self.bt_result_box, f"历史回测失败:\n{m}"))
-                self.after(0, lambda m=err: messagebox.showerror("历史回测失败", m))
+                    self._post_to_main(lambda m=err: self._set_result_text(self.bt_result_box, f"历史回测失败:\n{m}"))
+                self._post_to_main(lambda m=err: messagebox.showerror("历史回测失败", m))
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _main_table_path(self) -> Path:
+        """当前回测会用的主力合约表路径。"""
+        from src.backtest.rollover import resolve_main_table
+
+        found = resolve_main_table({"_project_root": str(self.root_dir)})
+        return found if found else (self.root_dir / "config" / "主力合约表.xlsx")
+
+    def _refresh_main_table_state(self) -> None:
+        """按钮旁显示表的最后更新时间，方便确认表是不是旧的。"""
+        if not hasattr(self, "bt_table_state"):
+            return
+        path = self._main_table_path()
+        if path.exists():
+            stamp = datetime.fromtimestamp(path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+            self.bt_table_state.configure(text=f"更新于 {stamp}")
+        else:
+            self.bt_table_state.configure(text="还没有表，点「更新」生成")
+
+    def _on_open_main_table(self) -> None:
+        """用系统默认程序打开主力合约表，方便直接改「手动修正」页。"""
+        from tkinter import messagebox
+
+        path = self._main_table_path()
+        if not path.exists():
+            messagebox.showinfo(
+                "还没有主力合约表",
+                "先点「更新主力合约表」生成，再打开。\n生成后请在「手动修正」页里加行。",
+            )
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("无法打开", f"打不开主力合约表。\n\n{exc}")
+
+    def _on_update_main_table(self) -> None:
+        """手动更新主力合约表：只有点这个按钮才会重新拉行情，平时不会自动更新。"""
+        from tkinter import messagebox
+
+        if getattr(self, "_main_table_busy", False):
+            return
+        path = self._main_table_path()
+        if not messagebox.askyesno(
+            "更新主力合约表",
+            f"现在重新下载日行情并重算主力时段？\n\n输出：{path}\n\n"
+            "「手动修正」页会原样保留，不会被覆盖。\n"
+            "大商所品种要逐个合约拉日线，会慢一些，期间可以切到其它页面。",
+        ):
+            return
+        self._main_table_busy = True
+        if hasattr(self, "bt_table_btn"):
+            self.bt_table_btn.configure(state="disabled", text="更新中…")
+        if hasattr(self, "bt_table_state"):
+            self.bt_table_state.configure(text="正在更新，请稍候…")
+        self._append_log("开始更新主力合约表（手动触发）…")
+        start = f"{date.today().year}-01-01"
+
+        def _progress(msg: str) -> None:
+            self._post_to_main(lambda m=msg: self._append_log(m))
+
+        def _run() -> None:
+            ok = False
+            try:
+                from src.backtest.main_table import update_table
+
+                summary = update_table(self.root_dir, start=start, out=path, progress=_progress)
+                self._post_to_main(lambda s=summary: self._append_log(
+                    f"主力合约表已更新：{s['products']} 个品种、{s['periods']} 段 | "
+                    f"区间 {s['start']}~{s['end']}"
+                ))
+                ok = True
+            except Exception as e:  # noqa: BLE001
+                logger.exception("主力合约表更新失败")
+                err = str(e)
+                if isinstance(e, PermissionError):
+                    err = f"写不进表，文件正被占用。请先关闭 Excel 里打开的{path.name}再更新。\n（{e}）"
+                self._post_to_main(lambda m=err: self._append_log(f"主力合约表更新失败: {m}"))
+                self._post_to_main(lambda m=err: messagebox.showerror("主力合约表更新失败", m))
+            finally:
+                self._post_to_main(lambda good=ok: self._finish_main_table_update(good))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _finish_main_table_update(self, ok: bool) -> None:
+        """恢复按钮，并刷新表的时间戳。"""
+        self._main_table_busy = False
+        if hasattr(self, "bt_table_btn"):
+            self.bt_table_btn.configure(state="normal", text="更新主力合约表")
+        if not ok and hasattr(self, "bt_table_state"):
+            self.bt_table_state.configure(text="更新失败，表没有改动")
+            return
+        self._refresh_main_table_state()
+
+    def _on_apply_slippage_hint(self) -> None:
+        """把实盘滑点 70 分位建议填进回测滑点框。要点确认，不会自己改。"""
+        from tkinter import messagebox
+
+        from src.account.slippage_log import summarize
+
+        info = summarize(self.root_dir)
+        if not info["n"]:
+            messagebox.showinfo(
+                "实盘滑点",
+                "还没有滑点记录。有真实成交（尤其是 CTP 回报）之后才会给出建议。",
+            )
+            return
+        suggested = float(info["suggested"] or 0)
+        scope = "真实成交" if info["used_real"] else "全部记录（含点击假定成交，仅供参考）"
+        if not messagebox.askyesno(
+            "填入回测滑点",
+            f"样本 {info['n']} 笔（{scope}）。\n"
+            f"中位 {info['median']:+.2f} 跳，70分位 {info['p70']:+.2f} 跳。\n"
+            f"建议回测填 {suggested:g} 跳。\n\n"
+            "只改历史回测页这个数字，不改开平仓规则。要填入吗？",
+        ):
+            return
+        self.bt_slippage_var.set(str(suggested))
+        self.cfg.setdefault("backtest", {})["slippage_ticks"] = suggested
+        self._append_log(f"回测滑点已改成建议值 {suggested:g} 跳（未自动保存配置文件）")
 
     def _on_slippage_scan(self) -> None:
         """滑点灵敏度：同一份K线换几档滑点重跑，看利润边缘和盈亏分水岭。"""
@@ -4108,16 +6582,16 @@ class AutoTradingApp(ctk.CTk):
                     tick=FillModel.from_cfg(cfg, symbol).price_tick,
                     mult=PositionSizer(cfg).multiplier_for(symbol),
                 )
-                self.after(0, lambda: self._append_log(f"滑点灵敏度完成 {symbol}"))
+                self._post_to_main(lambda: self._append_log(f"滑点灵敏度完成 {symbol}"))
                 if hasattr(self, "bt_result_box"):
-                    self.after(0, lambda t=text: self._set_result_text(self.bt_result_box, t))
+                    self._post_to_main(lambda t=text: self._set_result_text(self.bt_result_box, t))
             except Exception as e:  # noqa: BLE001
                 logger.exception("滑点灵敏度失败")
                 err = str(e)
-                self.after(0, lambda: self._append_log(f"滑点灵敏度失败: {err}"))
+                self._post_to_main(lambda: self._append_log(f"滑点灵敏度失败: {err}"))
                 if hasattr(self, "bt_result_box"):
-                    self.after(0, lambda m=err: self._set_result_text(self.bt_result_box, f"滑点灵敏度失败:\n{m}"))
-                self.after(0, lambda m=err: messagebox.showerror("滑点灵敏度失败", m))
+                    self._post_to_main(lambda m=err: self._set_result_text(self.bt_result_box, f"滑点灵敏度失败:\n{m}"))
+                self._post_to_main(lambda m=err: messagebox.showerror("滑点灵敏度失败", m))
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -4153,6 +6627,8 @@ class AutoTradingApp(ctk.CTk):
         for index, text in enumerate(texts):
             color = T.TEXT_DIM if header else T.TEXT
             if not header and text == "偏少":
+                color = T.WARN
+            elif not header and "不适配" in text:
                 color = T.WARN
             elif not header and index == len(texts) - 1:
                 color = picked_color if picked != "未入选" else T.TEXT_DIM
@@ -4212,6 +6688,7 @@ class AutoTradingApp(ctk.CTk):
                     item.get("daily_avg") or "—",
                     item.get("bars") or "—",
                     item.get("score") or "—",
+                    item.get("market") or "—",
                     item.get("liquidity") or "—",
                     item.get("picked") or "—",
                 ],
@@ -4390,7 +6867,7 @@ class AutoTradingApp(ctk.CTk):
         self._render_pick_board("正在用最近优化参数做多品种验收…", [])
 
         def _run() -> None:
-            from src.backtest.optimizer import format_perf_block, validate_params_on_symbols
+            from src.backtest.optimizer import describe_params, format_perf_block, validate_params_on_symbols
             from src.screen.picker import save_picks
 
             try:
@@ -4409,7 +6886,7 @@ class AutoTradingApp(ctk.CTk):
                         self._pick_running = False
                         self._render_pick_board("多品种验收已停止。表里是已经测完的部分。", [])
 
-                    self.after(0, _stopped)
+                    self._post_to_main(_stopped)
                     return
                 # 这里只展示各品种成绩，不替用户决定能不能写入配置，所以不拿训练净盈亏去卡。
                 reason = "各品种成绩已列出。要不要写入配置，仍以策略优化页的检验结论为准。"
@@ -4475,7 +6952,7 @@ class AutoTradingApp(ctk.CTk):
                     )
                 lines = [
                     f"多品种验收完成（策略 {engine}）",
-                    f"参数  {params}",
+                    f"参数  {describe_params(params)}",
                     f"区间  {start or '不限'} ~ {end or '不限'}",
                     "说明  参数不再重搜，这是样本外多品种验收，不是交叉测试对照筛选。",
                     "",
@@ -4517,7 +6994,7 @@ class AutoTradingApp(ctk.CTk):
                     )
                     self._append_log(f"多品种验收完成，测了 {len(rows)} 个合约")
 
-                self.after(0, _done)
+                self._post_to_main(_done)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("多品种验收失败")
                 err = str(exc)
@@ -4528,7 +7005,7 @@ class AutoTradingApp(ctk.CTk):
                     self._append_log(f"多品种验收失败: {err}")
                     messagebox.showerror("多品种验收失败", err)
 
-                self.after(0, _fail)
+                self._post_to_main(_fail)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -4572,7 +7049,7 @@ class AutoTradingApp(ctk.CTk):
 
             def on_progress(index: int, total: int, label: str) -> None:
                 # 每测一个组合刷新一次，让人知道没有卡住。
-                self.after(0, lambda i=index, n=total, name=label: self._show_pick_progress(i, n, name))
+                self._post_to_main(lambda i=index, n=total, name=label: self._show_pick_progress(i, n, name))
 
             try:
                 result = screen_cross(
@@ -4606,7 +7083,7 @@ class AutoTradingApp(ctk.CTk):
                         f"交叉测试完成，测了 {len(result.get('rows') or [])} 个组合，较好 {better} 个"
                     )
 
-                self.after(0, _done)
+                self._post_to_main(_done)
             except Exception as exc:  # noqa: BLE001
                 logger.exception("交叉测试失败")
                 err = str(exc)
@@ -4617,7 +7094,7 @@ class AutoTradingApp(ctk.CTk):
                     self._render_pick_board(f"交叉测试失败：{err}", [])
                     messagebox.showerror("交叉测试失败", err)
 
-                self.after(0, _fail)
+                self._post_to_main(_fail)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -4812,13 +7289,19 @@ class AutoTradingApp(ctk.CTk):
 
         主力合约向天勤的主连要（按成交量和持仓量挑），不在本地猜月份。
         查询放在后台线程，慢也不会卡住界面；换合约后旧结果直接丢掉。
+        只有行情来源选「天勤」才登录天勤；选新浪/东方财富时不连。
         """
         label = getattr(self, "main_contract_hint", None)
         if label is None:
             return
+        from src.data.quote_check import is_tq_source
+
         code = (symbol or self._config_symbol_now()).strip()
         self._main_contract_seq = getattr(self, "_main_contract_seq", 0) + 1
         seq = self._main_contract_seq
+        if not is_tq_source(self.source_var.get()):
+            self._set_main_contract_hint("")
+            return
         if not code or code == "（还没有）" or not any(ch.isdigit() for ch in code):
             self._set_main_contract_hint("")
             return
@@ -4838,7 +7321,7 @@ class AutoTradingApp(ctk.CTk):
                 logger.debug("查询主力合约失败 {}: {}", code, exc)
                 found = ""
             try:
-                self.after(0, lambda: self._apply_main_contract_result(seq, code, found))
+                self._post_to_main(lambda: self._apply_main_contract_result(seq, code, found))
             except Exception:  # noqa: BLE001
                 pass
 
@@ -4901,6 +7384,7 @@ class AutoTradingApp(ctk.CTk):
         """
         self._sync_symbol_choice("opt_symbol_menu", self.opt_symbol_var, prefer=prefer, force=force)
         self._sync_symbol_choice("rv_symbol_menu", self.rv_symbol_var, prefer=prefer, force=force)
+        self._sync_symbol_choice("rs_symbol_menu", self.rs_symbol_var, prefer=prefer, force=force)
 
     def _fill_review_from_config(self) -> None:
         """把配置页当前合约和周期抄到复盘页。不改复盘日期，也不写文件。"""
@@ -4915,6 +7399,168 @@ class AutoTradingApp(ctk.CTk):
         shown = self.rv_symbol_var.get().strip() or "（还没有）"
         self._refresh_review_sources_hint()
         self._append_log(f"已按配置页填好复盘的品种和周期，品种 {shown}")
+
+    def _research_symbols(self) -> list[str]:
+        """这次扫描要看哪些合约：当前一个，或关注名单全部。"""
+        if self.rs_scope_var.get().strip() == "只扫当前这个":
+            one = (self.rs_symbol_var.get() or "").strip()
+            if not one or one == "（还没有）":
+                return []
+            return [one]
+        return [item for item in self._watch_symbols if item and item != "（还没有）"]
+
+    def _refresh_research_picks(self) -> None:
+        """按候选池文件画出勾选框。文件没有时给一句说明。"""
+        frame = getattr(self, "rs_pick_frame", None)
+        if frame is None:
+            return
+        for child in frame.winfo_children():
+            child.destroy()
+        from src.research.pool import load_pool
+
+        pool = load_pool(self.root_dir)
+        items = pool.get("items") or []
+        self._rs_check_vars = {}
+        if not items:
+            ctk.CTkLabel(
+                frame,
+                text="还没有过关的规律。点上面「开始扫描规律」。",
+                font=T.FONT_SMALL,
+                text_color=T.TEXT_DIM,
+                wraplength=320,
+                justify="left",
+            ).pack(anchor="w", padx=6, pady=8)
+            return
+        for item in items:
+            key = str(item.get("id") or "")
+            if not key:
+                continue
+            var = ctk.BooleanVar(value=bool(item.get("selected")))
+            self._rs_check_vars[key] = var
+            title = str(item.get("title") or key)
+            horizon = item.get("horizon")
+            label = f"{title} · 往后{horizon}根"
+            ctk.CTkCheckBox(
+                frame,
+                text=label,
+                variable=var,
+                font=T.FONT_SMALL,
+                text_color=T.TEXT,
+            ).pack(anchor="w", padx=6, pady=3)
+
+    def _on_save_research_picks(self) -> None:
+        """只把勾选写回候选池，不启动扫描，也不下单。"""
+        from tkinter import messagebox
+
+        from src.research.pool import mark_selected
+
+        chosen = {key for key, var in self._rs_check_vars.items() if var.get()}
+        mark_selected(self.root_dir, chosen)
+        self._append_log(f"已保存规律勾选 {len(chosen)} 条（仍不下单）")
+        messagebox.showinfo("已保存勾选", "勾选已写入候选池。这不会改开平仓，也不会下单。")
+
+    def _on_research_scan(self) -> None:
+        """后台拉 K 线、扫规律、写入候选池。主线程只更新说明和勾选框。"""
+        from tkinter import messagebox
+
+        if self._rs_busy:
+            messagebox.showinfo("正在扫描", "上一轮规律扫描还没结束。")
+            return
+        symbols = self._research_symbols()
+        if not symbols:
+            messagebox.showwarning("还没有品种", "请先在配置页的关注品种里添加合约。")
+            return
+        try:
+            start, end = self._resolve_date_range(
+                self.rs_range_var.get(), self.rs_start_var.get(), self.rs_end_var.get()
+            )
+        except ValueError as exc:
+            messagebox.showerror("日期不对", str(exc))
+            return
+        if self.rs_range_var.get() == "全部可用" and (start or end):
+            self.rs_range_var.set("自定义")
+        period = self._period_code(self.rs_tf_var, self.rs_tf_custom_var)
+        from src.data.quote_check import normalize_source
+
+        source = normalize_source(self.rs_source_var.get())
+        require_cross = bool(self.rs_cross_var.get())
+        cfg = self._clone_cfg()
+        cfg.setdefault("data", {})["source"] = source
+        self._rs_busy = True
+        self._set_result_text(self.rs_result_box, "正在扫描规律，请稍候。这不会下单。")
+        self._append_log(f"开始扫描规律 品种={','.join(symbols)} 周期={period}")
+
+        def _run() -> None:
+            import pandas as pd
+
+            from src.data import KlineProvider
+            from src.data.periods import drop_forming_bar
+            from src.research.pool import load_pool, save_pool
+            from src.research.scan import format_scan_report, scan_regularities
+            from src.research.styles import advise_styles, format_style_section
+
+            try:
+                skipped: list[str] = []
+                bars_by_symbol: dict[str, Any] = {}
+                counts: dict[str, int] = {}
+                kp = KlineProvider(cfg)
+                for symbol in symbols:
+                    try:
+                        df = kp.fetch(symbol, period, keep_history=True, start=start, end=end)
+                        df = drop_forming_bar(df)
+                        if df is None or len(df) == 0:
+                            skipped.append(f"{symbol}：没有 K 线")
+                            continue
+                        if start:
+                            df = df[df.index >= pd.Timestamp(start)]
+                        if end:
+                            df = df[df.index < pd.Timestamp(end) + pd.Timedelta(days=1)]
+                        if df is None or len(df) == 0:
+                            skipped.append(f"{symbol}：这段日期没有 K 线")
+                            continue
+                        bars_by_symbol[symbol] = df
+                        counts[symbol] = int(len(df))
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("规律扫描拉行情失败 {}: {}", symbol, exc)
+                        skipped.append(f"{symbol}：{exc}")
+                previous = load_pool(self.root_dir).get("items") or []
+                items = scan_regularities(
+                    bars_by_symbol,
+                    require_cross_symbol=require_cross,
+                    previous=previous,
+                )
+                # 只给倾向，不改开平仓。分段不稳的条不会拿来投票。
+                advice = advise_styles(items)
+                path = save_pool(self.root_dir, items, extra={"style_advice": advice.to_dict()})
+                text = format_scan_report(
+                    items,
+                    symbols=symbols,
+                    bars=counts,
+                    skipped=skipped,
+                    style_text=format_style_section(advice),
+                )
+                text += f"\n候选池  {path}"
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("规律扫描失败")
+                err = str(exc)
+
+                def _fail() -> None:
+                    self._rs_busy = False
+                    self._set_result_text(self.rs_result_box, f"规律扫描失败:\n{err}")
+                    self._append_log(f"规律扫描失败: {err}")
+
+                self._post_to_main(_fail)
+                return
+
+            def _done() -> None:
+                self._rs_busy = False
+                self._set_result_text(self.rs_result_box, text)
+                self._refresh_research_picks()
+                self._append_log(f"规律扫描完成 过关{len(items)}条")
+
+            self._post_to_main(_done)
+
+        threading.Thread(target=_run, name="research-scan", daemon=True).start()
 
     def _refresh_review_sources_hint(self) -> None:
         """
@@ -5038,7 +7684,7 @@ class AutoTradingApp(ctk.CTk):
         )
 
     def _on_export_backtest(self) -> None:
-        """把最近一次回测追加到统一 Excel 的「回测摘要」「回测成交」，不盖掉以前的行。"""
+        """把最近一次回测追加到统一 Excel 的「回测摘要」「回测成交」「回测信号」，不盖掉以前的行。"""
         from tkinter import filedialog, messagebox
 
         from src.export.book import default_workbook_path
@@ -5069,22 +7715,408 @@ class AutoTradingApp(ctk.CTk):
             return
         messagebox.showinfo(
             "已导出",
-            f"已追加到两张表，原来的记录还在：\n"
+            f"已追加到三张表，原来的记录还在：\n"
             f"回测摘要 新增 {summary_added} 行，合计 {summary_total} 行\n"
             f"回测成交 新增 {trade_added} 行，合计 {trade_total} 行\n"
-            f"第一列「回测时间」相同、而且内容也相同的一行不会重复写。\n\n"
+            f"回测信号 已追加本次没开成的信号和原因\n"
+            f"第一列「回测时间」相同、而且内容也相同的一行不会重复写。\n"
+            f"多因子还会在 data 里另存一份「多因子衰减监控-策略-时间.xlsx」，不覆盖以前的。\n\n"
             f"文件：\n{out}",
         )
         self._append_log(
             f"历史回测已追加到 {out} | 摘要新增{summary_added}合计{summary_total} | 成交新增{trade_added}合计{trade_total}"
         )
 
+    def _on_plot_factor_decay(self) -> None:
+        """按资料第二节的思路画衰减图：只读已有成交，不改开平仓。"""
+        from tkinter import messagebox
+
+        from src.export.factor_decay_plot import factor_summary, write_factor_decay_plot
+
+        try:
+            path, df = write_factor_decay_plot(self.root_dir)
+        except ImportError as e:
+            messagebox.showwarning("还不能画图", str(e))
+            return
+        except ValueError as e:
+            messagebox.showwarning("还不能画图", str(e))
+            return
+        except Exception as e:  # noqa: BLE001
+            logger.exception("画出因子衰减图失败")
+            messagebox.showerror("画图失败", str(e))
+            return
+        lines = [f"已保存 {path}", f"一共 {len(df)} 笔带四因子分数的成交。"]
+        summary = factor_summary(df)
+        for row in summary.to_dict(orient="records"):
+            lines.append(
+                f"{row['因子']}：总盈亏 {row['总盈亏']:.2f}，有分摊 {row['交易次数']} 笔，"
+                f"赚钱 {row['盈利次数']} 笔"
+            )
+        messagebox.showinfo("因子衰减图", "\n".join(lines))
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("打不开衰减图 {}: {}", path, exc)
+        self._append_log(f"已画出因子衰减图 {path} | {len(df)} 笔")
+
+    def _open_local_file(self, path) -> bool:
+        """用系统默认程序打开刚写好的文件。成功返回 True。"""
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+            return True
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("打不开文件 {}: {}", path, exc)
+            return False
+
+    def _on_show_kline_inventory(self) -> None:
+        """写出并直接打开 Excel 统计表，成功时不再弹提示框。"""
+        from tkinter import messagebox
+
+        from src.data.inventory import collect_kline_inventory, inventory_message, write_kline_inventory
+
+        try:
+            book = collect_kline_inventory(self.root_dir)
+            path = write_kline_inventory(self.root_dir, book)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("查看本地K线库存失败")
+            messagebox.showerror("打不开库存", str(exc))
+            return
+        opened = self._open_local_file(path)
+        self._append_log(f"本地K线库存 {inventory_message(book)} | {path}")
+        if not opened:
+            messagebox.showerror(
+                "打不开统计表",
+                f"表已经写好，但系统没能打开 Excel。\n请自己打开：\n{path}",
+            )
+
+    def _on_purge_local_klines(self) -> None:
+        """弹出删除窗口：可按数据源、合约、周期、时间段删，先数再删。"""
+        from tkinter import messagebox
+
+        from src.data.periods import PERIOD_MENU, canonical_period
+        from src.data.quote_check import BACKTEST_SOURCE_LABELS, normalize_source
+        from src.data.inventory import preview_purge, purge_klines
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("删除本地K线")
+        dialog.geometry("520x760")
+        dialog.minsize(480, 640)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        ctk.CTkLabel(
+            dialog,
+            text="某一家质量差时，只删这一家，再重新拉。不会点买卖。\n"
+            "至少选一个数据源，或填一个合约。时间段留空表示这一组全部时间。\n"
+            "若 CSV 正用 Excel 打开，请先关掉，否则清洗库删了还会被旧表补回来。",
+            justify="left",
+            text_color=T.TEXT_DIM,
+            wraplength=420,
+        ).pack(anchor="w", padx=16, pady=(16, 10))
+
+        source_var = ctk.StringVar(value="不限")
+        ctk.CTkLabel(dialog, text="数据源").pack(anchor="w", padx=16)
+        ctk.CTkOptionMenu(
+            dialog, variable=source_var, values=["不限", *list(BACKTEST_SOURCE_LABELS)], width=240
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        ctk.CTkLabel(dialog, text="合约（如 fu2701，留空=该数据源全部合约）").pack(anchor="w", padx=16)
+        symbol_entry = ctk.CTkEntry(dialog, height=32, placeholder_text="fu2701")
+        symbol_entry.pack(fill="x", padx=16, pady=(0, 8))
+        current = (self.bt_symbol_var.get() or "").strip()
+        if current and current != "（还没有）":
+            symbol_entry.insert(0, current)
+
+        period_var = ctk.StringVar(value="不限")
+        ctk.CTkLabel(dialog, text="周期").pack(anchor="w", padx=16)
+        ctk.CTkOptionMenu(
+            dialog, variable=period_var, values=["不限", *[x for x in PERIOD_MENU if x != "自定义"]], width=240
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        from src.ui.datetime_pickers import DateTimeField
+
+        ctk.CTkLabel(dialog, text="从（可空：日历选日期，时分可选）").pack(anchor="w", padx=16)
+        from_field = DateTimeField(dialog)
+        from_field.frame.pack(anchor="w", padx=16, pady=(0, 8))
+        ctk.CTkLabel(dialog, text="到（可空）").pack(anchor="w", padx=16)
+        to_field = DateTimeField(dialog)
+        to_field.frame.pack(anchor="w", padx=16, pady=(0, 8))
+
+        layer_var = ctk.StringVar(value="两份都删")
+        ctk.CTkLabel(dialog, text="删哪一份").pack(anchor="w", padx=16)
+        ctk.CTkOptionMenu(
+            dialog,
+            variable=layer_var,
+            values=["两份都删", "只删清洗后（开仓看的）", "只删接口原样"],
+            width=260,
+        ).pack(anchor="w", padx=16, pady=(0, 10))
+
+        hint = ctk.CTkLabel(dialog, text="", text_color=T.TEXT_DIM, wraplength=420, justify="left")
+        hint.pack(anchor="w", padx=16, pady=(0, 8))
+
+        def _args() -> dict:
+            src_label = source_var.get().strip()
+            source = None if src_label in {"", "不限"} else normalize_source(src_label)
+            period_label = period_var.get().strip()
+            period = None if period_label in {"", "不限"} else canonical_period(period_label)
+            layer_label = layer_var.get()
+            layers = "both"
+            if "清洗" in layer_label:
+                layers = "clean"
+            elif "原样" in layer_label:
+                layers = "raw"
+            return {
+                "source": source,
+                "symbol": symbol_entry.get().strip() or None,
+                "period": period,
+                "ts_from": from_field.get() or None,
+                "ts_to": to_field.get() or None,
+                "layers": layers,
+            }
+
+        def _preview() -> None:
+            try:
+                seen = preview_purge(self.root_dir, **_args())
+            except Exception as exc:  # noqa: BLE001
+                hint.configure(text=str(exc))
+                return
+            hint.configure(
+                text=f"将删除清洗后 {seen['clean_n']} 根、接口原样 {seen['raw_n']} 根。"
+                "确认后不可恢复，请再点下面的删除。"
+            )
+
+        def _do_delete() -> None:
+            try:
+                seen = preview_purge(self.root_dir, **_args())
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("还不能删", str(exc), parent=dialog)
+                return
+            if seen["clean_n"] + seen["raw_n"] <= 0:
+                messagebox.showinfo("没有可删的", "按现在的条件，库里没有匹配的K线。", parent=dialog)
+                return
+            if not messagebox.askokcancel(
+                "确认删除",
+                f"将删除清洗后 {seen['clean_n']} 根、接口原样 {seen['raw_n']} 根。\n"
+                "删完若要再用，请重新拉这一家。不可恢复。",
+                parent=dialog,
+            ):
+                return
+            try:
+                result = purge_klines(self.root_dir, **_args())
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("删除本地K线失败")
+                messagebox.showerror("删除失败", str(exc), parent=dialog)
+                return
+            msg = (
+                f"已删除清洗后 {result['clean_deleted']} 根、接口原样 {result['raw_deleted']} 根。"
+            )
+            locked = list(result.get("csv_locked") or [])
+            if locked:
+                files = "\n".join(locked)
+                msg += (
+                    "\n\n有 CSV 正被 Excel 打开，没能一起改掉。\n"
+                    "请先关掉这些表，再点一次删除（否则下次读图会把旧 CSV 补回库里）：\n"
+                    f"{files}"
+                )
+            self._append_log(f"删除本地K线 {msg.replace(chr(10), ' ')}")
+            messagebox.showinfo("已删除" if not locked else "库已删，CSV 还被占用", msg, parent=dialog)
+            if not locked:
+                dialog.destroy()
+
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(8, 16))
+        ctk.CTkButton(btn_row, text="先看要删多少", command=_preview, width=140).pack(side="left")
+        ctk.CTkButton(btn_row, text="确认删除", command=_do_delete, width=140, fg_color="#8B2E2E").pack(
+            side="right"
+        )
+
+    def _on_inspect_local_kline(self) -> None:
+        """抽查某一根本地K线：选数据源、合约、周期、日期、时间，对照同花顺开高低收。"""
+        from src.data.periods import PERIOD_MENU, canonical_period, period_label
+        from src.data.quote_check import BACKTEST_SOURCE_LABELS, normalize_source
+        from src.data.bar_inspect import format_kline_inspect, inspect_kline
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("查看这根K线")
+        dialog.geometry("520x800")
+        dialog.minsize(480, 620)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        ctk.CTkLabel(
+            dialog,
+            text="对照同花顺信息框时，只对开盘、最高、最低、收盘、成交量。\n"
+            "今结、涨跌、持仓本地没有。时间是这根K线的结束时刻。不下单。",
+            justify="left",
+            text_color=T.TEXT_DIM,
+            wraplength=480,
+        ).pack(anchor="w", padx=16, pady=(16, 10))
+
+        default_src = (self.bt_source_var.get() or "新浪").strip()
+        if default_src not in BACKTEST_SOURCE_LABELS:
+            default_src = "新浪"
+        source_var = ctk.StringVar(value=default_src)
+        ctk.CTkLabel(dialog, text="数据源").pack(anchor="w", padx=16)
+        ctk.CTkOptionMenu(
+            dialog, variable=source_var, values=list(BACKTEST_SOURCE_LABELS), width=240
+        ).pack(anchor="w", padx=16, pady=(0, 8))
+
+        ctk.CTkLabel(dialog, text="合约（如 fu2701）").pack(anchor="w", padx=16)
+        symbol_entry = ctk.CTkEntry(dialog, height=32, placeholder_text="fu2701")
+        symbol_entry.pack(fill="x", padx=16, pady=(0, 8))
+        current = (self.bt_symbol_var.get() or "").strip()
+        if current and current != "（还没有）":
+            symbol_entry.insert(0, current)
+
+        period_values = [x for x in PERIOD_MENU if x != "自定义"]
+        try:
+            default_period = period_label(
+                self._period_code(self.bt_tf_var, self.bt_tf_custom_var)
+            )
+        except Exception:
+            default_period = "5分钟"
+        if default_period not in period_values:
+            default_period = period_values[0] if period_values else "5分钟"
+        period_var = ctk.StringVar(value=default_period)
+        ctk.CTkLabel(dialog, text="周期").pack(anchor="w", padx=16)
+        ctk.CTkOptionMenu(dialog, variable=period_var, values=period_values, width=240).pack(
+            anchor="w", padx=16, pady=(0, 8)
+        )
+
+        from src.ui.datetime_pickers import DateField, TimeField
+
+        ctk.CTkLabel(dialog, text="日期").pack(anchor="w", padx=16)
+        date_var = ctk.StringVar(value=date.today().isoformat())
+        DateField(dialog, date_var, allow_empty=False).frame.pack(anchor="w", padx=16, pady=(0, 8))
+        ctk.CTkLabel(dialog, text="时间（日线、周线可不选；分钟线要选到这根结束时刻）").pack(
+            anchor="w", padx=16
+        )
+        time_var = ctk.StringVar(value="")
+        TimeField(dialog, time_var, allow_empty=True).frame.pack(anchor="w", padx=16, pady=(0, 8))
+
+        result = ctk.CTkTextbox(
+            dialog, height=220, font=T.FONT_MONO, fg_color=T.BG, text_color=T.TEXT, wrap="word"
+        )
+        result.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        result.insert("end", "选好日期和时间后点「查看」。不会改库，也不会下单。")
+        last_paths: dict[str, str] = {}
+
+        def _show(book: dict) -> None:
+            last_paths.clear()
+            last_paths.update(book.get("paths") or {})
+            text = format_kline_inspect(book)
+            result.delete("1.0", "end")
+            result.insert("end", text)
+            self._append_log(
+                f"查看K线 {book.get('source_label')} {book.get('symbol')} "
+                f"{book.get('period_label')} {book.get('when')}"
+            )
+
+        def _lookup() -> None:
+            try:
+                book = inspect_kline(
+                    self.root_dir,
+                    source=normalize_source(source_var.get()),
+                    symbol=symbol_entry.get().strip(),
+                    period=canonical_period(period_var.get()),
+                    date_text=date_var.get(),
+                    time_text=time_var.get(),
+                )
+            except ValueError as exc:
+                result.delete("1.0", "end")
+                result.insert("end", str(exc))
+                return
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("查看这根K线失败")
+                result.delete("1.0", "end")
+                result.insert("end", f"查看失败：{exc}")
+                return
+            _show(book)
+
+        def _open_csv() -> None:
+            path = last_paths.get("csv") or ""
+            if not path:
+                _lookup()
+            path = last_paths.get("csv") or ""
+            if not path:
+                return
+            if not Path(path).exists():
+                result.delete("1.0", "end")
+                result.insert("end", f"还没有这份 CSV。\n{path}\n可改点「打开库存文件夹」。")
+                return
+            if not self._open_local_file(path):
+                result.insert("end", f"\n系统没能打开：{path}")
+
+        def _open_folder() -> None:
+            folder = last_paths.get("folder") or str(self.root_dir / "data" / "klines")
+            Path(folder).mkdir(parents=True, exist_ok=True)
+            if not self._open_local_file(folder):
+                result.insert("end", f"\n打不开文件夹：{folder}")
+
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(0, 16))
+        ctk.CTkButton(btn_row, text="查看", command=_lookup, width=100).pack(side="left")
+        ctk.CTkButton(btn_row, text="打开对应CSV", command=_open_csv, width=120).pack(
+            side="left", padx=(8, 0)
+        )
+        ctk.CTkButton(btn_row, text="打开库存文件夹", command=_open_folder, width=130).pack(
+            side="right"
+        )
+
+    def _on_check_quote_quality(self) -> None:
+        """
+        读本地各家原样库和清洗库，写成 Excel 分析报表。
+
+        只读 sqlite，不访问网络，也不下单。点一下才跑，不跟扫描绑在一起。
+        入口只在历史回测页，用本页选的合约和周期。
+        """
+        from tkinter import messagebox
+
+        from src.data.quality import inspect_quote_book, write_quality_report
+
+        symbol = (self.bt_symbol_var.get() or "").strip()
+        period = self._period_code(self.bt_tf_var, self.bt_tf_custom_var)
+        if not symbol:
+            messagebox.showwarning("还不能检查", "请先选一个合约。")
+            return
+        try:
+            report = inspect_quote_book(self.root_dir, symbol, period, cfg=self.cfg)
+            path = write_quality_report(self.root_dir, report)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("检查行情质量失败")
+            messagebox.showerror("检查失败", str(exc))
+            return
+        title = {"ok": "行情能用", "watch": "该看一眼", "empty": "还没有库存"}.get(
+            report.status, "行情质量"
+        )
+        messagebox.showinfo(title, f"{report.message}\n\n已保存 {path}")
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(path))  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(path)])
+            else:
+                subprocess.Popen(["xdg-open", str(path)])
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("打不开质量报告 {}: {}", path, exc)
+        self._append_log(f"行情质量 {symbol} {report.status} | {path}")
+
     def _on_review(self) -> None:
         """后台生成收盘复盘，结果写在「复盘」页，并保存到 data/reviews。"""
         from datetime import date
         from tkinter import messagebox
 
-        from src.review.replay import ENGINE_BY_LABEL
+        from src.review.replay import ENGINE_BY_LABEL, engine_from_label
 
         raw_day = self.rv_date_var.get().strip()
         try:
@@ -5093,10 +8125,10 @@ class AutoTradingApp(ctk.CTk):
             messagebox.showerror("日期不对", "请按 YYYY-MM-DD 填写，例如 2026-10-14。")
             return
         label = self.rv_engine_var.get().strip()
-        if label not in ENGINE_BY_LABEL:
+        if label not in ENGINE_BY_LABEL and engine_from_label(label) is None:
             messagebox.showerror("策略不对", "请重新选择「策略对照」。")
             return
-        engine = ENGINE_BY_LABEL[label]
+        engine = ENGINE_BY_LABEL[label] if label in ENGINE_BY_LABEL else engine_from_label(label)
         symbol = self.rv_symbol_var.get().strip()
         if not symbol or symbol == "（还没有）":
             messagebox.showwarning("还没有合约", "请先到配置页的关注品种里添加要复盘的合约。")
@@ -5139,16 +8171,218 @@ class AutoTradingApp(ctk.CTk):
                     text = f"{text}\n\n{summarize_text(self.root_dir)}"
                 except Exception:  # noqa: BLE001
                     logger.debug("滑点汇总失败，已忽略", exc_info=True)
-                self.after(0, lambda t=text: self._set_result_text(self.rv_result_box, t))
-                self.after(0, lambda: self._append_log(f"复盘完成 {symbol} {raw_day}"))
+                self._post_to_main(lambda t=text: self._set_result_text(self.rv_result_box, t))
+                self._post_to_main(lambda: self._append_log(f"复盘完成 {symbol} {raw_day}"))
             except Exception as e:  # noqa: BLE001
                 logger.exception("复盘失败")
                 err = str(e)
-                self.after(0, lambda: self._append_log(f"复盘失败: {err}"))
-                self.after(0, lambda m=err: self._set_result_text(self.rv_result_box, f"复盘失败:\n{m}"))
-                self.after(0, lambda m=err: messagebox.showerror("复盘失败", m))
+                self._post_to_main(lambda: self._append_log(f"复盘失败: {err}"))
+                self._post_to_main(lambda m=err: self._set_result_text(self.rv_result_box, f"复盘失败:\n{m}"))
+                self._post_to_main(lambda m=err: messagebox.showerror("复盘失败", m))
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _sync_account_mode(self) -> None:
+        """同花顺账显示手改工具；CTP 账显示柜台资金表。两套界面不同时出现。"""
+        from src.account.workspace import is_ctp_book, load_active_id
+
+        ctp = is_ctp_book(load_active_id(self.root_dir))
+        ths_inner = getattr(self, "ac_ths_panel", None)
+        ctp_inner = getattr(self, "ac_ctp_panel", None)
+        if ths_inner is None or ctp_inner is None:
+            return
+        ths_card = ths_inner.master
+        ctp_card = ctp_inner.master
+        refresh = getattr(self, "ac_common_refresh", None)
+        if ctp:
+            ths_card.pack_forget()
+            if hasattr(self, "ac_ths_manual"):
+                self.ac_ths_manual.pack_forget()
+            if hasattr(self, "ac_ths_manual_note"):
+                self.ac_ths_manual_note.pack_forget()
+            if refresh is not None:
+                ctp_card.pack(fill="x", pady=(0, 4), before=refresh)
+            else:
+                ctp_card.pack(fill="x", pady=(0, 4))
+        else:
+            ctp_card.pack_forget()
+            if refresh is not None:
+                ths_card.pack(fill="x", pady=(0, 4), before=refresh)
+            else:
+                ths_card.pack(fill="x", pady=(0, 4))
+            if hasattr(self, "ac_ths_manual"):
+                self.ac_ths_manual.pack(fill="x", padx=4, pady=(0, 4))
+            if hasattr(self, "ac_ths_manual_note"):
+                self.ac_ths_manual_note.pack(anchor="w", padx=4, pady=(0, 8))
+
+    def _paint_ctp_fund_panel(self, book) -> None:
+        """把已保存的柜台资金画到账户分析，字段和交易台资金页一致。"""
+        from src.trader.ctp_display import account_pairs
+
+        snap = (book or {}).get("ctp_snapshot") if isinstance(book, dict) else None
+        if not isinstance(snap, dict):
+            snap = {}
+        user = str(snap.get("account_id") or snap.get("user_id") or "").strip() or "—"
+        if hasattr(self, "ac_ctp_user_label"):
+            self.ac_ctp_user_label.configure(text=f"资金账号  {user}")
+        if hasattr(self, "ac_ctp_time_label"):
+            stamp = str(snap.get("time") or "").strip()
+            self.ac_ctp_time_label.configure(text=f"更新于 {stamp}" if stamp else "还没有查询记录")
+        values = getattr(self, "_ac_fund_values", None)
+        if not isinstance(values, dict) or not values:
+            return
+        for title, value in account_pairs(snap if snap else None):
+            label = values.get(title)
+            if label is not None:
+                label.configure(text=value)
+
+    def _paint_account_hint(self) -> None:
+        """账户分析左边说明现在记的是哪一本，以及期货通该开哪边。"""
+        from src.account.signal_book import load_book
+        from src.account.workspace import display_label, profile_of
+
+        info = profile_of(root=self.root_dir)
+        shown_label = display_label(info["id"], self.root_dir)
+        extra = ""
+        book = load_book(self.root_dir)
+        snap = (book or {}).get("ctp_snapshot") if isinstance(book, dict) else None
+        if isinstance(snap, dict) and snap.get("time"):
+            extra = (
+                f"\n柜台 {snap.get('account_id') or snap.get('user_id') or ''} "
+                f"动态权益 {float(snap.get('balance') or 0):.2f}，"
+                f"可用 {float(snap.get('available') or 0):.2f}，"
+                f"更新于 {snap.get('time')}。"
+            )
+        self._sync_account_mode()
+        self._paint_ctp_fund_panel(book)
+        hint = getattr(self, "ac_account_hint", None)
+        if hint is not None:
+            hint.configure(text=info["hint"] + extra)
+        if hasattr(self, "ac_account_var"):
+            shown = self.ac_account_var.get()
+            if shown != shown_label:
+                busy = self._account_switch_busy
+                self._account_switch_busy = True
+                try:
+                    self.ac_account_var.set(shown_label)
+                finally:
+                    self._account_switch_busy = busy
+
+    def _on_account_switch(self, choice: str) -> None:
+        """
+        换成另一本账。常驻必须先停，否则内存里的仓还是上一本的。
+
+        只改当前记号。实盘账和模拟账的文件互不覆盖，也不会把成交抄到另一本。
+        """
+        from tkinter import messagebox
+
+        from src.account.signal_book import load_book, multiplier_map, shown_equity
+        from src.account.workspace import (
+            display_label,
+            id_from_label,
+            is_ctp_book,
+            load_active_id,
+            profile_of,
+            set_active_id,
+        )
+
+        if self._account_switch_busy:
+            return
+        wanted = id_from_label(choice)
+        current = load_active_id(self.root_dir)
+        if wanted == current:
+            self._paint_account_hint()
+            return
+        if self.worker.running:
+            messagebox.showwarning(
+                "先停常驻",
+                "换账会换资金和持仓记录。请先在运行页点「停止常驻」，再换到另一本账。",
+            )
+            self._account_switch_busy = True
+            try:
+                self.ac_account_var.set(display_label(current, self.root_dir))
+            finally:
+                self._account_switch_busy = False
+            return
+        target = profile_of(wanted)
+        shown = display_label(wanted, self.root_dir)
+        if not messagebox.askyesno(
+            "换账",
+            f"确定换成「{shown}」吗？\n\n"
+            f"{target['hint']}\n\n"
+            "另一本账的成交和持仓原样留着，不会被这本改掉。",
+        ):
+            self._account_switch_busy = True
+            try:
+                self.ac_account_var.set(display_label(current, self.root_dir))
+            finally:
+                self._account_switch_busy = False
+            return
+        set_active_id(self.root_dir, wanted)
+        self._signal_book_mtime = 0.0
+        self._paint_account_hint()
+        self._refresh_signal_view()
+        book = load_book(self.root_dir)
+        if book is not None:
+            self._apply_book_balance(shown_equity(book, multiplier_map(self.cfg)))
+        self._refresh_status_cards()
+        self._append_log(f"账户分析已换成 {shown}")
+        if wanted == "paper":
+            messagebox.showinfo(
+                "同花顺模拟账",
+                "程序这边已经换成模拟账。\n"
+                "请到期货通左上角打开「模拟交易」，再点启动常驻。\n"
+                "这样点单走模拟盘，不会动真实资金，也不会改实盘账。\n"
+                "这本账的余额仍要手工记入金、出金或每日结算。",
+            )
+        elif is_ctp_book(wanted):
+            messagebox.showinfo(
+                shown,
+                "这本账的权益以华泰柜台查询为准。\n"
+                "请打开交易台，用对应账号登录后点「刷新持仓」，\n"
+                "或在本页点「从柜台刷新资金」。\n"
+                "同花顺登录号不要填进 CTP 资金账号。",
+            )
+
+    def _on_ctp_refresh_funds(self) -> None:
+        """向已经登录的柜台再查一次资金，写入当前这本华泰账。"""
+        from tkinter import messagebox
+
+        from src.account.ctp_sync import can_pull_from_trader, push_gateway_account
+        from src.account.workspace import is_ctp_book, load_active_id
+
+        aid = load_active_id(self.root_dir)
+        if not is_ctp_book(aid):
+            messagebox.showinfo(
+                "这本账不接柜台",
+                "同花顺模拟账仍要手工改余额。\n"
+                "同花顺实盘账仍是程序开平仓加手工结算。\n"
+                "请换到「华泰仿真」或「华泰真实账户」再刷新。",
+            )
+            return
+        trader = None
+        probe = getattr(self, "_ctp_probe", None)
+        if probe is not None and getattr(probe, "winfo_exists", lambda: False)() and getattr(probe, "trader", None):
+            trader = probe.trader
+        worker = getattr(self, "worker", None)
+        bot = getattr(worker, "bot", None) if worker is not None else None
+        if trader is None and bot is not None:
+            trader = getattr(bot, "trader", None)
+        if not can_pull_from_trader(trader, aid):
+            messagebox.showwarning(
+                "还没连上对应柜台",
+                "请先打开交易台，用这一本账对应的账号登录，再点「刷新持仓」或本按钮。",
+            )
+            return
+
+        def work() -> None:
+            ok, text = trader.fetch_account_snapshot()
+            self._post_to_main(lambda: self._append_log(text if ok else ("查询失败：" + text)))
+            self._post_to_main(self._paint_account_hint)
+            self._post_to_main(self._refresh_signal_view)
+
+        threading.Thread(target=work, daemon=True).start()
+        self._append_log("正在向柜台查询资金。")
 
     def _signal_book_or_new(self):
         """读信号账户。还没有就开始一本，本金用左边的初始资金，没有就用配置里的账户权益。"""
@@ -5192,14 +8426,28 @@ class AutoTradingApp(ctk.CTk):
         让配置页上的账户权益显示这笔余额。
 
         配置页不能手改这个数。正在跑的程序下一笔按这个余额算手数。
+        常驻已经连上 CTP 时，手数仍跟期货公司数字，不用账本里估的成交盈亏去改。
         """
         shown = str(int(balance)) if float(balance) == int(balance) else f"{float(balance):.2f}"
         self.capital_var.set(shown)
         self.cfg.setdefault("risk", {})["capital"] = float(balance)
         bot = getattr(self.worker, "bot", None)
-        if bot is not None:
-            bot.sizer.capital = float(balance)
-            bot.cfg.setdefault("risk", {})["capital"] = float(balance)
+        if bot is None:
+            return
+        raw = getattr(getattr(bot, "trader", None), "last_broker_equity", None)
+        try:
+            broker = float(raw) if raw is not None else 0.0
+        except (TypeError, ValueError):
+            broker = 0.0
+        if broker > 0:
+            bot.sizer.capital = broker
+            bot.cfg.setdefault("risk", {})["capital"] = broker
+            shown = str(int(broker)) if float(broker) == int(broker) else f"{float(broker):.2f}"
+            self.capital_var.set(shown)
+            self.cfg.setdefault("risk", {})["capital"] = broker
+            return
+        bot.sizer.capital = float(balance)
+        bot.cfg.setdefault("risk", {})["capital"] = float(balance)
 
     def _on_signal_initial(self) -> None:
         """
@@ -5253,6 +8501,11 @@ class AutoTradingApp(ctk.CTk):
         from tkinter import messagebox
 
         from src.account.signal_book import add_cash, balance_of
+        from src.account.workspace import is_ctp_book, load_active_id
+
+        if is_ctp_book(load_active_id(self.root_dir)):
+            messagebox.showinfo("这本账用柜台资金", "华泰仿真和华泰真实的余额请点「从柜台刷新资金」，不要手工记入金出金。")
+            return
 
         try:
             amount = self._signal_positive_amount(self.ac_cash_var.get(), label)
@@ -5272,6 +8525,11 @@ class AutoTradingApp(ctk.CTk):
         from tkinter import messagebox
 
         from src.account.signal_book import settle_to
+        from src.account.workspace import is_ctp_book, load_active_id
+
+        if is_ctp_book(load_active_id(self.root_dir)):
+            messagebox.showinfo("这本账用柜台资金", "华泰仿真和华泰真实请点「从柜台刷新资金」，不要用每日结算手改。")
+            return
 
         try:
             target = float(self.ac_settle_var.get().strip())
@@ -5398,6 +8656,35 @@ class AutoTradingApp(ctk.CTk):
             default_margin=default_margin,
         )
         self._ac_report = report
+        if book and str(book.get("funding") or "") == "ctp":
+            from src.account.signal_book import ctp_history_equity
+
+            series = []
+            for stamp, value in ctp_history_equity(book):
+                try:
+                    moment = datetime.strptime(str(stamp), "%Y-%m-%d %H:%M:%S")
+                except (TypeError, ValueError):
+                    continue
+                if start is not None and moment.date() < start:
+                    continue
+                if moment.date() > end:
+                    continue
+                series.append((moment, value))
+            if series:
+                report.equity = series
+                peak = series[0][1]
+                max_dd = 0.0
+                for _moment, point in series:
+                    peak = max(peak, point)
+                    max_dd = max(max_dd, peak - point)
+                report.account.max_drawdown = max_dd
+                snap = book.get("ctp_snapshot") if isinstance(book.get("ctp_snapshot"), dict) else {}
+                try:
+                    usage = float(snap.get("usage") or 0)
+                except (TypeError, ValueError):
+                    usage = 0.0
+                if usage > 0:
+                    report.account.utilization = usage
         stat = report.account
         self.ac_win_label.configure(text=format_win_rate(stat.win_rate))
         self.ac_factor_label.configure(text=format_factor(stat.profit_factor))
@@ -5573,36 +8860,60 @@ class AutoTradingApp(ctk.CTk):
     def _refresh_signal_view(self) -> None:
         """右边重画成绩。账本还没有时说明从这一版才开始记，不把旧的手工账显示出来。"""
         from src.account.signal_book import multiplier_map
-        from src.account.signal_book import balance_of, book_path, describe, load_book
+        from src.account.signal_book import book_path, describe, load_book, shown_equity
 
         if not hasattr(self, "ac_result_box"):
             return
+        from src.account.workspace import profile_of
+
+        info = profile_of(root=self.root_dir)
+        self._paint_account_hint()
         book = load_book(self.root_dir)
         if book is None:
             if hasattr(self, "ac_balance_label"):
                 self.ac_balance_label.configure(text="当前余额  还没开始")
             self._paint_account_stats(None)
-            self._set_result_text(
-                self.ac_result_box,
-                "还没有开始记账。\n"
-                "程序从这一版起，按信号真正开仓或平仓后会自动记在这里。\n"
-                "也可以先点「初始化」。以前手工记的成交不带过来。\n"
-                "模拟模式只看不下单，不会记进这本账。",
-            )
+            self._paint_ctp_fund_panel(None)
+            self._sync_account_mode()
+            from src.account.workspace import is_ctp_book
+
+            if is_ctp_book(info["id"]):
+                empty = (
+                    f"「{info['label']}」还没有期货公司资金回报。\n"
+                    "请先打开交易台，用这一本账对应的账号登录，点「刷新持仓」或左边「从柜台刷新资金」。\n"
+                    "查到的账号、权益、可用资金会原样存到本地，不能手改。\n"
+                    "同花顺点单请换到同花顺实盘账或同花顺模拟账。"
+                )
+            else:
+                empty = (
+                    f"「{info['label']}」还没有开始记账。\n"
+                    "程序按信号真正开仓或平仓后会自动记在这里。\n"
+                    "也可以先点「初始化」。以前手工记的成交不带过来。\n"
+                    "另一本账的记录不会出现在这里。\n"
+                    "运行页的「模拟（不点单）」只看信号、不点击，那种单也不会记进这本账。"
+                )
+            self._set_result_text(self.ac_result_box, empty)
             return
         path = book_path(self.root_dir)
         try:
             self._signal_book_mtime = path.stat().st_mtime
         except OSError:
             self._signal_book_mtime = 0.0
-        balance = balance_of(book, multiplier_map(self.cfg))
+        balance = shown_equity(book, multiplier_map(self.cfg))
         shown = str(int(balance)) if float(balance) == int(balance) else f"{float(balance):.2f}"
         if hasattr(self, "ac_balance_label"):
             self.ac_balance_label.configure(text=f"当前余额  {shown} 元")
         if not self.ac_capital_var.get().strip():
             initial = float(book.get("initial_capital") or 0)
             self.ac_capital_var.set(str(int(initial)) if initial == int(initial) else f"{initial:.2f}")
-        self._set_result_text(self.ac_result_box, describe(book, multiplier_map(self.cfg)))
+        if str(book.get("funding") or "") == "ctp":
+            from src.account.signal_book import describe_ctp_funds
+
+            self._set_result_text(self.ac_result_box, describe_ctp_funds(book))
+        else:
+            self._set_result_text(self.ac_result_box, describe(book, multiplier_map(self.cfg)))
+        self._paint_ctp_fund_panel(book)
+        self._sync_account_mode()
         self._paint_account_stats(book)
 
     def _pull_signal_balance(self) -> None:
@@ -5613,27 +8924,29 @@ class AutoTradingApp(ctk.CTk):
         账本文件没变时，不反复刷账户分析右边的文字。
         """
         from src.account.signal_book import multiplier_map
-        from src.account.signal_book import balance_of, book_path, load_book
+        from src.account.signal_book import book_path, load_book, shown_equity
 
         path = book_path(self.root_dir)
         if not path.exists():
             return
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            return
+        # 账本文件没变，余额和右边文字都不会变，不必每 800ms 全量读一遍 JSON。
+        if mtime == self._signal_book_mtime:
+            return
         book = load_book(self.root_dir)
         if book is None:
             return
-        balance = balance_of(book, multiplier_map(self.cfg))
+        balance = shown_equity(book, multiplier_map(self.cfg))
         try:
             shown = float(self.capital_var.get())
         except (TypeError, ValueError):
             shown = None
         if shown is None or abs(balance - shown) > 0.01:
             self._apply_book_balance(balance)
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            return
-        if mtime != self._signal_book_mtime:
-            self._refresh_signal_view()
+        self._refresh_signal_view()
 
     def _on_export_account_part(self, part: str) -> None:
         """只导出账户分析的一张表。交易记录是开平仓，资金变动记录是五种余额变动。"""
@@ -5697,13 +9010,46 @@ class AutoTradingApp(ctk.CTk):
         self._clear_cross_results()
         self._append_log(f"已导出全部到 {out}。界面上的交叉测试结果已清空")
 
-    def _on_optimize(self) -> None:
-        """后台网格优化：对选定策略/时间段反复回测打分。"""
+    def _sync_opt_write_button(self) -> None:
+        """对照全面更好时，写入按钮改成切实盘；否则仍是原来的写入。"""
+        btn = getattr(self, "opt_write_btn", None)
+        if btn is None:
+            return
+        if getattr(self, "_last_evolve_better", False):
+            if hasattr(self, "opt_save_preset_var"):
+                self.opt_save_preset_var.set(True)
+            btn.configure(
+                text="写入并切实盘（先存档）",
+                fg_color=T.ACCENT,
+                hover_color=T.ACCENT_HOVER,
+                text_color=T.ACCENT_ON,
+                border_width=0,
+            )
+            return
+        btn.configure(
+            text="把所选参数写入配置",
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            text_color=T.ACCENT,
+            border_width=1,
+            border_color=T.ACCENT,
+        )
+
+    def _on_optimize(self, evolve_only: bool = False) -> None:
+        """后台网格优化：对选定策略/时间段反复回测打分。
+
+        打开「对照正在用的参数」时，搜完再和现在这套比，默认不写配置。
+        """
         from tkinter import messagebox
 
         if self.worker.running:
             messagebox.showwarning("请先停止", "策略优化较耗资源，请先停止常驻扫描。")
             return
+        evolve_only = bool(evolve_only) or bool(self.opt_compare_var.get())
+        self._last_evolve_better = False
+        self._last_evolve_reason = ""
+        self._last_opt_compared = False
+        self._sync_opt_write_button()
 
         symbol = self.opt_symbol_var.get().strip()
         if not symbol or symbol == "（还没有）":
@@ -5783,19 +9129,23 @@ class AutoTradingApp(ctk.CTk):
             "skipped_opens": {},
         }
         cross_symbols = list(self._watch_symbols)
+        job_name = "模拟重跑优化（只出报告）" if evolve_only else "开始策略优化"
         self._append_log(
-            f"开始策略优化… engine={engine} depth={depth} mode={mode} "
+            f"{job_name}… engine={engine} depth={depth} mode={mode} "
             f"检验比例={holdout_pct}% symbol={symbol} "
             f"行情={self.opt_source_var.get()} "
             f"限制={'开' if limit_snap['apply_limits'] else '关'} "
             f"trials<={max_trials} 区间={start or '起'}~{end or '止'}"
         )
         self.tabs.set("策略优化")
+        self._opt_started_at = time.monotonic()
+        self._opt_progress_at = 0.0
+        self._show_opt_progress(0, 1, "准备行情", force=True)
         if hasattr(self, "opt_result_box"):
             try:
                 from src.backtest.optimizer import describe_grid, grid_for_engine
 
-                preview = describe_grid(grid_for_engine(engine, depth))
+                preview = describe_grid(grid_for_engine(engine, depth, cfg))
             except Exception:  # noqa: BLE001
                 preview = ""
             mode_hint = (
@@ -5803,15 +9153,18 @@ class AutoTradingApp(ctk.CTk):
                 if mode == "滚动前进"
                 else f"一次切断，检验比例约 {holdout_pct}%"
             )
+            evolve_hint = "这轮只出报告，不会改正在用的参数。\n" if evolve_only else ""
             self._set_result_text(
                 self.opt_result_box,
                 f"策略优化进行中（{mode_hint}，depth={depth}，最多{max_trials}组）…\n"
+                f"{evolve_hint}"
                 f"请不要关闭窗口。\n\n本次搜索旋钮：\n{preview}\n",
             )
 
         def _run() -> None:
             try:
                 from src.backtest.optimizer import (
+                    describe_params,
                     format_perf_block,
                     optimize_strategy,
                     save_optimization_report,
@@ -5829,9 +9182,88 @@ class AutoTradingApp(ctk.CTk):
                     mode=mode,
                     walk_steps=walk_steps,
                     cross_symbols=cross_symbols,
+                    progress=lambda done, total, phase: self._post_to_main(
+                        lambda d=done, t=total, p=phase: self._show_opt_progress(d, t, p)
+                    ),
                 )
                 path = self.root_dir / "data" / "optimize_last.json"
                 save_optimization_report(result, path)
+                evolve_block: list[str] = []
+                evolve_can_apply = False
+                evolve_reason = ""
+                if evolve_only:
+                    from src.backtest.optimizer import (
+                        current_params_from_config,
+                        check_params_on_holdout,
+                        judge_better_than_current,
+                        save_evolve_report,
+                    )
+
+                    old_params = current_params_from_config(
+                        cfg, engine, list((result.best_params or {}).keys())
+                    )
+                    self._post_to_main(
+                        lambda: self._show_opt_progress(1, 1, "对照现在的参数", force=True)
+                    )
+                    old_checked = check_params_on_holdout(
+                        cfg,
+                        params=old_params,
+                        symbol=symbol,
+                        engine=engine,
+                        depth=depth,
+                        holdout_pct=holdout_pct,
+                        start_date=start,
+                        end_date=end,
+                        cross_symbols=cross_symbols,
+                    )
+                    verdict = judge_better_than_current(
+                        result.holdout_performance or {},
+                        old_checked.get("holdout_performance") or {},
+                        accepted=bool(result.accepted),
+                        new_params=dict(result.best_params or {}),
+                        old_params=old_params,
+                    )
+                    evolve_can_apply = bool(verdict.get("can_apply_live"))
+                    evolve_reason = str(verdict.get("reason") or "")
+                    report_path = self.root_dir / "data" / "evolve_last.json"
+                    save_evolve_report(
+                        {
+                            "symbol": result.symbol,
+                            "engine": result.engine,
+                            "new_params": dict(result.best_params or {}),
+                            "old_params": old_params,
+                            "new_accepted": bool(result.accepted),
+                            "new_accept_reason": str(result.accept_reason or ""),
+                            "new_holdout": dict(result.holdout_performance or {}),
+                            "old_holdout": dict(old_checked.get("holdout_performance") or {}),
+                            "old_accepted": bool(old_checked.get("accepted")),
+                            "verdict": verdict,
+                            "optimize_report": str(path),
+                        },
+                        report_path,
+                    )
+                    evolve_block = [
+                        "",
+                        "—— 和现在这套对照（模拟重跑，没有改实盘）——",
+                        f"现在的参数  {describe_params(old_params)}",
+                        f"现在检验净盈亏  {float((old_checked.get('holdout_performance') or {}).get('net_pnl') or 0):.0f}"
+                        f"  回撤 {float((old_checked.get('holdout_performance') or {}).get('max_drawdown') or 0):.0f}"
+                        f"  盈利因子 {float((old_checked.get('holdout_performance') or {}).get('profit_factor') or 0):.2f}",
+                        f"新的检验净盈亏  {float((result.holdout_performance or {}).get('net_pnl') or 0):.0f}"
+                        f"  回撤 {float((result.holdout_performance or {}).get('max_drawdown') or 0):.0f}"
+                        f"  盈利因子 {float((result.holdout_performance or {}).get('profit_factor') or 0):.2f}",
+                        *(str(x) for x in (verdict.get("checks") or [])),
+                        str(verdict.get("reason") or ""),
+                        f"对照报告  {report_path}",
+                    ]
+                    if evolve_can_apply:
+                        evolve_block.append(
+                            "左侧写入按钮会改成「写入并切实盘（先存档）」。切之前会留下整页配置存档和参数版本。"
+                        )
+                    else:
+                        evolve_block.append(
+                            "默认不建议切实盘。仍可点「把所选参数写入配置」，程序会再问一次。"
+                        )
                 self._last_opt_params = dict(result.best_params or {})
                 # 同时记住引擎，写入配置时用。没通过后一段时，下面的写入按钮会拒绝保存。
                 self._last_opt_engine = engine
@@ -5839,6 +9271,17 @@ class AutoTradingApp(ctk.CTk):
                 self._last_opt_reason = str(result.accept_reason or "")
                 self._last_opt_start = str(start or "")
                 self._last_opt_end = str(end or "")
+                # 记下全部打分行和本轮设置，供「写入第几组」复核非最优组。
+                self._last_opt_trials = list(result.trials or [])
+                self._last_opt_ctx = {
+                    "symbol": result.symbol,
+                    "engine": result.engine,
+                    "depth": result.depth,
+                    "holdout_pct": result.holdout_pct,
+                    "start_date": str(result.start_date or ""),
+                    "end_date": str(result.end_date or ""),
+                    "cross_symbols": list(cross_symbols or []),
+                }
 
                 train = result.train_performance or result.best_performance or {}
                 hold = result.holdout_performance or {}
@@ -5856,7 +9299,7 @@ class AutoTradingApp(ctk.CTk):
                     f"K线根数   一共{result.bars}根",
                     f"训练段    {result.train_bars}根，到 {result.train_end or '切断处'}，用来挑参数",
                     f"检验段    {result.holdout_bars}根，从 {result.holdout_start or '切断处'} 起，不参与挑参数",
-                    f"挑出的参数  {result.best_params}",
+                    f"挑出的参数  {describe_params(result.best_params)}",
                     "",
                     *format_perf_block(
                         "训练成绩",
@@ -5925,7 +9368,7 @@ class AutoTradingApp(ctk.CTk):
                         self._last_opt_reason,
                     f"报告      {path}",
                     "",
-                    "—— 本次搜索的参数（含 Pinbar 定义等）——",
+                        "—— 本次搜索的旋钮与取值范围 ——",
                     result.grid_describe or "",
                     "",
                         "—— 训练段得分靠前的几组 ——",
@@ -5939,30 +9382,53 @@ class AutoTradingApp(ctk.CTk):
                         f"trades={pr.get('trades', 0)} "
                         f"wr={float(pr.get('win_rate', 0)):.0%} "
                         f"net={float(pr.get('net_pnl', 0)):.0f} "
-                        f"cover={cover:.0f} | {row.get('params')}"
+                        f"cover={cover:.0f} | {describe_params(row.get('params'))}"
                     )
                 lines.append("")
-                if result.accepted:
+                if evolve_only:
+                    lines.extend(evolve_block)
+                elif result.accepted:
                     lines.append(
-                        "可以点左侧「把最优参数写入配置」。"
+                        "可以在左侧「写入第几组」填 #编号（默认 1=训练最优），再点「把所选参数写入配置」。"
+                        "选其它组时会先按检验段重新复核，复核没过就不写。"
+                    )
+                    lines.append(
                         "策略、品种、周期和开仓限制要另外点历史回测页「把本页参数写入配置页」，这次不会自动写进去。"
                     )
                 else:
-                    lines.append("这组没有通过检验，不要点写入。配置里的参数没有改。")
+                    lines.append(
+                        "第 1 组没有通过检验，不能直接写；可以换「写入第几组」选其它组，"
+                        "程序会按检验段重新复核，过了才允许写入。"
+                    )
                 text = "\n".join(lines)
                 verdict = "可以写入" if result.accepted else "不能写入"
-                self.after(0, lambda: self._append_log(
-                    f"策略优化完成 {result.symbol} | 训练得分={result.best_score:.3f} | {verdict} | {result.best_params}"
+                if evolve_only:
+                    verdict = "可以切实盘" if evolve_can_apply else "不切实盘"
+                self._last_evolve_reason = evolve_reason
+                self._post_to_main(lambda: self._append_log(
+                    f"{'模拟重跑' if evolve_only else '策略优化'}完成 {result.symbol} | "
+                    f"训练得分={result.best_score:.3f} | {verdict} | "
+                    f"{describe_params(result.best_params)}"
                 ))
                 if hasattr(self, "opt_result_box"):
-                    self.after(0, lambda t=text: self._set_result_text(self.opt_result_box, t))
+                    self._post_to_main(lambda t=text: self._set_result_text(self.opt_result_box, t))
+                self._post_to_main(lambda: self._finish_opt_progress(ok=True))
+                self._post_to_main(
+                    lambda compared=bool(evolve_only), ok=evolve_can_apply, why=evolve_reason: (
+                        setattr(self, "_last_opt_compared", compared),
+                        setattr(self, "_last_evolve_better", bool(ok)),
+                        setattr(self, "_last_evolve_reason", why),
+                        self._sync_opt_write_button(),
+                    )
+                )
             except Exception as e:  # noqa: BLE001
                 logger.exception("策略优化失败")
                 err = str(e)
-                self.after(0, lambda: self._append_log(f"策略优化失败: {err}"))
+                self._post_to_main(lambda: self._append_log(f"策略优化失败: {err}"))
                 if hasattr(self, "opt_result_box"):
-                    self.after(0, lambda m=err: self._set_result_text(self.opt_result_box, f"策略优化失败:\n{m}"))
-                self.after(0, lambda m=err: messagebox.showerror("策略优化失败", m))
+                    self._post_to_main(lambda m=err: self._set_result_text(self.opt_result_box, f"策略优化失败:\n{m}"))
+                self._post_to_main(lambda: self._finish_opt_progress(ok=False))
+                self._post_to_main(lambda m=err: messagebox.showerror("策略优化失败", m))
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -6061,18 +9527,175 @@ class AutoTradingApp(ctk.CTk):
         self._refresh_opt_history()
         self._append_log(f"已删除参数版本: {removed}")
 
-    def _on_apply_opt_params(self) -> None:
-        """把上一次优化得到的最优参数写入磁盘配置，并先备份当前版本便于回溯。"""
+    def _open_optimizer_file(self) -> None:
+        """用系统默认程序打开优化参数表，不装 IDE 也能直接改网格档位和中文名。"""
         from tkinter import messagebox
 
+        from src.backtest.param_table import ensure_param_table, resolve_param_table_path
+
+        path = resolve_param_table_path(self.cfg)
+        try:
+            ensure_param_table(path)
+            os.startfile(str(path))  # type: ignore[attr-defined]
+        except Exception as e:  # noqa: BLE001
+            logger.exception("打开优化参数表失败")
+            messagebox.showerror("打不开优化参数表", f"{e}\n\n路径：{path}")
+
+    def _on_apply_opt_params(self) -> None:
+        """按「写入第几组」写入：第 1 组直接写；其它组先重新复核检验，过了再写。
+
+        对照全面更好时走切实盘（强制整页存档）。对照过但没更好时仍允许写入，会多问一次。
+        """
+        from tkinter import messagebox
+
+        if self.worker.running:
+            messagebox.showwarning(
+                "请先停止",
+                "常驻正在跑，不会自己换成新参数。\n请先点「停止常驻」，再写入，然后重新启动。",
+            )
+            return
         if not self._last_opt_params:
             messagebox.showwarning("还没有策略优化结果", "请先在本页点「开始策略优化」，完成后再写入。")
             return
-        if not getattr(self, "_last_opt_accepted", False):
+        raw = (self.opt_write_index_var.get() or "").strip() or "1"
+        try:
+            idx = int(raw)
+        except ValueError:
+            messagebox.showwarning("组号填错了", "请填结果框里 #1、#2 这样的整数。")
+            return
+        trials = list(getattr(self, "_last_opt_trials", []) or [])
+        live_switch = bool(getattr(self, "_last_evolve_better", False))
+        save_page_preset = bool(self.opt_save_preset_var.get()) or live_switch
+        if not trials:
+            self._write_optimized_params(
+                None, group_index=1, live_switch=live_switch, save_page_preset=save_page_preset
+            )
+            return
+        if idx < 1 or idx > len(trials):
+            messagebox.showwarning(
+                "组号超出范围", f"这次优化共 {len(trials)} 组，只能填 1～{len(trials)}。"
+            )
+            return
+        if idx == 1:
+            self._write_optimized_params(
+                None, group_index=1, live_switch=live_switch, save_page_preset=save_page_preset
+            )
+            return
+        trial = trials[idx - 1]
+        params = dict(trial.get("params") or {})
+        if not params:
+            messagebox.showwarning("这组没有参数", "换个组号再试。")
+            return
+        self._recheck_and_write_optimized(idx, params, trial)
+
+    def _recheck_and_write_optimized(
+        self, idx: int, params: dict[str, Any], trial: dict[str, Any]
+    ) -> None:
+        """非最优组：后台按检验段重新验收 + 多品种，通过了才让写入。"""
+        from tkinter import messagebox
+
+        ctx = dict(getattr(self, "_last_opt_ctx", {}) or {})
+        if not ctx.get("symbol"):
+            messagebox.showwarning("缺少复核信息", "请重新跑一次策略优化，再选组写入。")
+            return
+        self._append_log(f"复核第 {idx} 组参数（检验段 + 多品种）…")
+        self._opt_started_at = time.monotonic()
+        self._opt_progress_at = 0.0
+        self._show_opt_progress(0, 1, f"复核第 {idx} 组", force=True)
+        cfg = self._clone_cfg()
+
+        def _run() -> None:
+            try:
+                from src.backtest.optimizer import check_params_on_holdout
+
+                checked = check_params_on_holdout(
+                    cfg,
+                    params=params,
+                    symbol=str(ctx.get("symbol") or ""),
+                    engine=str(ctx.get("engine") or ""),
+                    depth=str(ctx.get("depth") or "标准"),
+                    holdout_pct=ctx.get("holdout_pct"),
+                    start_date=str(ctx.get("start_date") or "") or None,
+                    end_date=str(ctx.get("end_date") or "") or None,
+                    cross_symbols=list(ctx.get("cross_symbols") or []),
+                    progress=lambda done, total, phase: self._post_to_main(
+                        lambda d=done, t=total, p=phase: self._show_opt_progress(d, t, p)
+                    ),
+                )
+            except Exception as e:  # noqa: BLE001
+                logger.exception("复核第 {} 组失败", idx)
+                self._post_to_main(lambda: self._finish_opt_progress(ok=False))
+                self._post_to_main(lambda m=str(e): messagebox.showerror("复核失败", m))
+                return
+            accepted = bool(checked.get("accepted"))
+            self._post_to_main(lambda: self._finish_opt_progress(ok=accepted))
+            if not accepted:
+                reason = str(checked.get("reason") or "检验段没过")
+                self._post_to_main(lambda: self._append_log(f"第 {idx} 组复核没过: {reason}"))
+                self._post_to_main(
+                    lambda r=reason: messagebox.showwarning(
+                        f"第 {idx} 组不能写入",
+                        r + "\n\n可以换一组，或到历史回测页手动验证。配置没有改。",
+                    )
+                )
+                return
+            self._post_to_main(lambda: self._append_log(f"第 {idx} 组复核通过，准备写入。"))
+            live_switch = bool(getattr(self, "_last_evolve_better", False))
+            save_page_preset = bool(self.opt_save_preset_var.get()) or live_switch
+            self._post_to_main(
+                lambda: self._write_optimized_params(
+                    params,
+                    group_index=idx,
+                    score=trial.get("score"),
+                    performance=trial.get("performance") or {},
+                    confirm_extra=checked,
+                    live_switch=live_switch,
+                    save_page_preset=save_page_preset,
+                )
+            )
+
+        threading.Thread(target=_run, daemon=True, name="opt-recheck").start()
+
+    def _write_optimized_params(
+        self,
+        params: dict[str, Any] | None = None,
+        *,
+        group_index: int = 1,
+        score: float | None = None,
+        performance: dict[str, Any] | None = None,
+        confirm_extra: dict[str, Any] | None = None,
+        live_switch: bool = False,
+        save_page_preset: bool = False,
+    ) -> None:
+        """
+        把选中的参数写入磁盘配置，并先备份当前版本便于回溯。
+
+        params 为空时用刚才优化的第 1 组（训练最优），此时必须后一段验收通过；
+        选中其它组时，调用方已先复核通过，这里不再重复门槛。
+        """
+        from tkinter import messagebox
+
+        use = dict(params or self._last_opt_params or {})
+        if not use:
+            messagebox.showwarning("还没有策略优化结果", "请先在本页点「开始策略优化」，完成后再写入。")
+            return
+        if params is None and not getattr(self, "_last_opt_accepted", False):
             reason = getattr(self, "_last_opt_reason", "") or "后一段验收没过。"
             messagebox.showwarning("这次不能写入", reason + "\n\n配置里的参数没有改。")
             return
-        from src.backtest.optimizer import describe_run_switches
+        compared = bool(getattr(self, "_last_opt_compared", False))
+        save_page_preset = bool(save_page_preset) or live_switch or bool(
+            getattr(self, "opt_save_preset_var", None) and self.opt_save_preset_var.get()
+        )
+        if compared and not live_switch:
+            extra = getattr(self, "_last_evolve_reason", "") or "对照没有全面优于现在这套。"
+            if not messagebox.askyesno(
+                "对照没有更好",
+                extra
+                + "\n\n仍可以按原来的方式写入，但建议先不要切实盘。\n确定继续写入？",
+            ):
+                return
+        from src.backtest.optimizer import describe_params, describe_run_switches
         from src.backtest.param_history import strategy_display_name
 
         engine = getattr(self, "_last_opt_engine", None) or self.opt_engine_var.get()
@@ -6094,17 +9717,48 @@ class AutoTradingApp(ctk.CTk):
             if engine == "daily_body"
             else "正在用的策略、品种、周期不会改。另外几套的参数也不会改。\n"
         )
+        group_note = "" if group_index == 1 else f"这次写入的是第 {group_index} 组（不是训练最优那组）。\n"
+        recheck_text = ""
+        if confirm_extra:
+            train = confirm_extra.get("train_performance") or {}
+            hold = confirm_extra.get("holdout_performance") or {}
+            recheck_text = (
+                f"复核成绩  训练净赚 {float(train.get('net_pnl') or 0):.0f}，"
+                f"检验净赚 {float(hold.get('net_pnl') or 0):.0f}"
+                f"（{int(hold.get('trades') or 0)} 笔）\n"
+                f"复核结论  {confirm_extra.get('reason') or '通过'}\n\n"
+            )
+        title = "写入并切实盘" if live_switch else "写入配置"
+        archive_line = (
+            "切之前会留下整页配置存档（配置页可一键应用），并备份这一套策略的参数版本。\n"
+            if save_page_preset
+            else "写入前会备份这一套策略的参数版本（下面「参数版本历史」）。这次不留整页配置存档。\n"
+        )
+        head = (
+            f"把对照后挑出的{name}写入正在用的配置。\n"
+            "默认本来不切；这次是因为对照全面更好，并且你点了确认。\n"
+            if live_switch
+            else f"写入刚才策略优化得到的{name}。\n"
+        ) + archive_line
         if not messagebox.askyesno(
-            "写入配置",
-            f"写入刚才策略优化得到的{name}。\n"
+            title,
+            f"{head}"
+            f"{group_note}"
             f"{period_note}"
             "写入前会自动备份。\n\n"
             f"{mismatch}"
+            f"{recheck_text}"
             f"这次打分用的开关会一起留下：\n{switch_text}\n\n"
             "开仓限制（权益、手数、保证金）这次不写。"
             "若历史回测页和配置页的数字不同，写入后历史回测页会变回配置页的数字。"
             "要留下历史回测页的策略、品种、周期和开仓限制，请先点「把本页参数写入配置页」。\n\n"
-            f"即将写入的参数：\n{self._last_opt_params}\n\n确定？",
+            f"即将写入的参数：\n{describe_params(use)}\n\n确定？"
+            + (
+                "\n\n切坏了：下面选旧版本点「回溯」（只还原这一套旋钮）；"
+                "配置页可一键应用整页存档；要出厂点「重置当前策略为出厂默认」。"
+                if save_page_preset or live_switch
+                else "\n\n若效果不好：下面选旧版本点「回溯」，或重置为出厂默认。"
+            ),
         ):
             return
         try:
@@ -6113,6 +9767,18 @@ class AutoTradingApp(ctk.CTk):
 
             cfg = self._clone_cfg()
             sym = self.opt_symbol_var.get().strip()
+            if save_page_preset:
+                from src.ui.config_presets import add_preset
+
+                stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                prefix = "切实盘前" if live_switch else "优化写入前"
+                entry = add_preset(
+                    self.root_dir,
+                    cfg,
+                    name=f"{prefix}-{sym or '未填'}-{name}-{stamp}",
+                )
+                self._refresh_config_presets(select_id=str(entry.get("id") or ""))
+                self._append_log(f"已留下整页配置存档: {entry.get('name')}")
             # 1) 先备份写入前的配置。记在被优化的那一套下面。
             add_version(
                 self.root_dir,
@@ -6128,46 +9794,58 @@ class AutoTradingApp(ctk.CTk):
                 flatten_at_close=bool(self.bt_flatten_var.get()),
             )
 
-            new_cfg = apply_params_to_config(cfg, self._last_opt_params, engine=engine)
+            new_cfg = apply_params_to_config(cfg, use, engine=engine)
             save_config(new_cfg)
             self.cfg = new_cfg
             self._reload_values_only()
 
             # 2) 再存「优化写入后」版本，方便对比
-            score = None
-            perf = {}
-            try:
-                # 从结果框无法可靠解析；若刚优化完，score 可从文件读
-                import json
-                from pathlib import Path
+            perf = dict(performance or {})
+            if score is None:
+                try:
+                    # 从结果框无法可靠解析；若刚优化完，score 可从文件读
+                    import json
+                    from pathlib import Path
 
-                rep = Path(self.root_dir) / "data" / "optimize_last.json"
-                if rep.exists():
-                    payload = json.loads(rep.read_text(encoding="utf-8"))
-                    score = payload.get("best_score")
-                    perf = payload.get("best_performance") or {}
-            except Exception:  # noqa: BLE001
-                pass
+                    rep = Path(self.root_dir) / "data" / "optimize_last.json"
+                    if rep.exists():
+                        payload = json.loads(rep.read_text(encoding="utf-8"))
+                        score = payload.get("best_score")
+                        perf = payload.get("best_performance") or {}
+                except Exception:  # noqa: BLE001
+                    pass
             add_version(
                 self.root_dir,
                 new_cfg,
-                note=f"写入优化参数 {self._last_opt_params}",
+                note=f"写入优化参数（第 {group_index} 组） {describe_params(use)}",
                 source="optimize",
                 score=float(score) if score is not None else None,
                 performance=perf,
-                opt_params=dict(self._last_opt_params),
+                opt_params=dict(use),
                 engine=engine,
                 symbol=sym or None,
             )
             # 历史列表跟着刚才优化的那一套走，避免写入后还停在另一个策略的名单上。
             self.opt_engine_var.set(engine)
             self._refresh_opt_history()
-            self._append_log(f"已写入优化参数（只改了 {name}，已备份历史）: {self._last_opt_params}")
+            self._append_log(
+                f"{'已切实盘' if live_switch else '已写入优化参数'}（第 {group_index} 组，只改了 {name}，已备份历史）: {describe_params(use)}"
+            )
+            self._last_evolve_better = False
+            self._sync_opt_write_button()
+            preset_msg = (
+                "配置页多了一份整页存档，可一键应用回去。\n"
+                if save_page_preset
+                else ""
+            )
             messagebox.showinfo(
-                "已写入",
+                "已切实盘" if live_switch else "已写入",
                 f"已保存{name}的参数，以及这次打分用到的开关。\n"
                 "正在用的策略、品种和周期没有改。开仓限制也没有改。\n"
-                "若效果不好：在下方选旧版本 →「回溯到选中版本」。",
+                f"{preset_msg}"
+                "这一套旋钮的备份在下方「参数版本历史」。\n"
+                "若效果不好：选旧版本 →「回溯到选中版本」。"
+                "要出厂：点「重置当前策略为出厂默认」。",
             )
         except Exception as e:  # noqa: BLE001
             logger.exception("写入优化参数失败")
@@ -6234,11 +9912,8 @@ class AutoTradingApp(ctk.CTk):
             section = {
                 "daily_body": "daily_body",
                 "morning_box_a": "morning_box_a",
-                "morning_structure_b": "morning_structure_b",
                 "trend_follow": "trend_follow",
                 "supertrend": "supertrend",
-                "Single_ma": "single_ma",
-                "single_ma": "single_ma",
                 "dual_ma": "dual_ma",
                 "ma_cross": "dual_ma",
                 "swing_trend": "swing_trend",
@@ -6257,9 +9932,6 @@ class AutoTradingApp(ctk.CTk):
             if engine in (
                 "daily_body",
                 "morning_box_a",
-                "morning_structure_b",
-                "Single_ma",
-                "single_ma",
                 "dual_ma",
                 "ma_cross",
             ):
@@ -6311,15 +9983,16 @@ class AutoTradingApp(ctk.CTk):
         )
 
     def _on_export_params_excel(self) -> None:
-        """把程序内最近最多30条参数历史追加到本地 Excel（长期存档）。"""
+        """把程序内最近最多30条参数历史追加到「优化参数」表，并把最近一次优化追加到「优化结果」表。"""
         from tkinter import filedialog, messagebox
 
         try:
             from src.backtest.param_excel import default_excel_path, export_append_excel
+            from src.export.bundle import export_optimize
 
             default_path = default_excel_path(self.root_dir)
             path = filedialog.asksaveasfilename(
-                title="导出/追加策略优化参数到 Excel",
+                title="导出/追加策略优化参数与优化结果到 Excel",
                 initialdir=str(default_path.parent),
                 initialfile=default_path.name,
                 defaultextension=".xlsx",
@@ -6328,15 +10001,22 @@ class AutoTradingApp(ctk.CTk):
             if not path:
                 return
             out, added, total = export_append_excel(self.root_dir, path, include_factory=True)
+            opt_msg = ""
+            try:
+                _out, opt_added, opt_total = export_optimize(self.root_dir, path)
+                opt_msg = f"\n「优化结果」表：本次新追加 {opt_added} 行（含全部候选组），合计 {opt_total} 行。"
+            except ValueError:
+                opt_msg = "\n「优化结果」表：还没有跑过策略优化，这次没写。"
             msg = (
-                f"已写入「优化参数」表。\n\n"
+                f"已写入「优化参数」表{opt_msg}\n\n"
                 f"文件：{out}\n"
-                f"本次新追加：{added} 条\n"
+                f"参数版本本次新追加：{added} 条\n"
                 f"该表合计：{total} 条\n\n"
-                f"同一个文件里还有交易记录、资金变动记录、复盘、回测摘要、回测成交、优化结果等表。\n"
-                f"已存在的版本ID不会重复写入。"
+                f"「优化结果」表第一列「测试时间」是这次优化跑完的时刻，用来分清是哪一次。\n"
+                f"同一个文件里还有交易记录、资金变动记录、复盘、回测摘要、回测成交、回测信号等表。\n"
+                f"已存在的版本ID / 同一次优化不会重复写入。"
             )
-            self._append_log(f"参数已导出追加到Excel: {out} (+{added}, 共{total})")
+            self._append_log(f"参数与优化结果已导出追加到Excel: {out} (参数+{added}, 共{total})")
             if hasattr(self, "opt_result_box"):
                 self._set_result_text(self.opt_result_box, msg)
             messagebox.showinfo("导出完成", msg)
@@ -6428,16 +10108,88 @@ class AutoTradingApp(ctk.CTk):
 
         threading.Thread(target=_run, daemon=True).start()
 
+    def _post_to_main(self, callback: Callable[[], None]) -> None:
+        """
+        后台线程安全地把回调排到 Tk 主线程队列。
+
+        self.after(0, ...) 官方就是线程安全的；唯一风险是窗口或其中某个子控件已
+        destroy 后，排队的 lambda 才被主线程取出来执行，此时对已销毁控件调
+        configure/insert 等会抛 TclError: invalid command name "...".
+
+        这里除了吞 self.after 自己可能抛的异常，还在执行期再包一层，把「已销毁
+        控件」的 TclError 也吞掉——后台线程慢半拍、弹窗先关了都算正常边界情况，
+        不值得写 ERROR 到日志。
+        """
+
+        def _safe() -> None:
+            try:
+                callback()
+            except tk.TclError:
+                # 99% 的情况是 "invalid command name '.!ctktoplevel...!label'"，
+                # 也就是 callback 闭包里抓着某个已经被 destroy 的子控件不放
+                # （比如手工平仓弹窗已关、后台线程才跑完推荐止损计算）。
+                # 静默丢弃即可，不要把正常边界情况写成 ERROR。
+                pass
+            except Exception:  # noqa: BLE001
+                # 其他真正的 bug 还是写日志，别让它静默。
+                logger.exception("_post_to_main 回调异常")
+
+        try:
+            self.after(0, _safe)
+        except tk.TclError:
+            # self 自己已经 destroy，after 队列也没意义了。
+            pass
+        except Exception:  # noqa: BLE001
+            pass
+
     def _on_close(self) -> None:
+        self._closing = True
+        for name in ("_tick_after_id", "_log_after_id", "_login_tick_after_id"):
+            after_id = getattr(self, name, None)
+            if after_id:
+                try:
+                    self.after_cancel(after_id)
+                except Exception:  # noqa: BLE001
+                    pass
+                setattr(self, name, None)
         if self.worker.running:
             self.worker.stop()
         self.destroy()
 
+    def report_callback_exception(self, exc, val, tb) -> None:
+        """
+        界面回调里的异常也写进日志文件。
+
+        默认实现只把 traceback 打到 stderr；用 pythonw 或双击 exe 启动时看不见，
+        控制台一关就没了。这里补一份到 logs，下次出错能直接翻日志定位。
+        """
+        import traceback
+
+        text = str(val or "")
+        # CustomTkinter 标签被挤得太窄时会画圆角失败。不影响下单，不当成程序坏了。
+        if "wrong # coordinates" in text:
+            logger.debug("界面绘制跳过（窗口太窄）: {}", text)
+            return
+        detail = "".join(traceback.format_exception(exc, val, tb))
+        logger.error("界面回调异常:\n{}", detail)
+        try:
+            self._append_log(f"界面出错：{val}（完整堆栈已写入 logs）")
+        except Exception:  # noqa: BLE001
+            pass
+
 
 def main() -> None:
     """GUI 入口。"""
-    app = AutoTradingApp()
-    app.mainloop()
+    try:
+        app = AutoTradingApp()
+        app.mainloop()
+    except KeyboardInterrupt:
+        # 终端里按 Ctrl+C，或 Cursor 点停止/重复运行时都会走到这里。
+        # 属于人为中断，不是程序出错，不用打印一大段 traceback。
+        logger.info("界面被键盘中断（Ctrl+C）关闭")
+    except BaseException:
+        logger.exception("图形界面异常退出")
+        raise
 
 
 if __name__ == "__main__":

@@ -66,7 +66,7 @@ def test_export_backtest_keeps_other_sheets(tmp_path) -> None:
     """回测导出只更新两张回测表，已经写过的账户成交还在。"""
     import json
 
-    from src.export.book import SHEET_BACKTEST, SHEET_BACKTEST_TRADES
+    from src.export.book import SHEET_BACKTEST, SHEET_BACKTEST_SIGNALS, SHEET_BACKTEST_TRADES
     from src.export.bundle import export_backtest
 
     path = tmp_path / "Auto-Trading导出.xlsx"
@@ -102,6 +102,17 @@ def test_export_backtest_keeps_other_sheets(tmp_path) -> None:
                         "reason_exit": "测试平仓",
                     }
                 ],
+                "rejected": [
+                    {
+                        "symbol": "bu2612",
+                        "time": "2026-10-01T09:30:00",
+                        "side": "空",
+                        "price": 3500,
+                        "stop": 3510,
+                        "stage": "风控手数",
+                        "reason": "止损过宽，手数不够",
+                    }
+                ],
             },
             ensure_ascii=False,
         ),
@@ -111,9 +122,11 @@ def test_export_backtest_keeps_other_sheets(tmp_path) -> None:
     book = pd.ExcelFile(path, engine="openpyxl")
     assert SHEET_BACKTEST in book.sheet_names
     assert SHEET_BACKTEST_TRADES in book.sheet_names
+    assert SHEET_BACKTEST_SIGNALS in book.sheet_names
     assert SHEET_FILLS in book.sheet_names
     summary = pd.read_excel(book, sheet_name=SHEET_BACKTEST)
     trades = pd.read_excel(book, sheet_name=SHEET_BACKTEST_TRADES)
+    signals = pd.read_excel(book, sheet_name=SHEET_BACKTEST_SIGNALS)
     assert list(summary.columns)[0] == "回测时间"
     assert str(summary.iloc[0]["回测时间"]).startswith("2026-10-19 14:00")
     assert str(trades.iloc[0]["回测时间"]).startswith("2026-10-19 14:00")
@@ -124,7 +137,14 @@ def test_export_backtest_keeps_other_sheets(tmp_path) -> None:
     assert "日内实体" in str(summary.iloc[0]["策略"])
     assert "夜盘分钟" in list(summary.columns)
     assert "测试开仓" in str(trades.iloc[0]["开仓原因"])
+    assert "日内实体" in str(trades.iloc[0]["策略"])
     assert trades.iloc[0]["方向"] == "多"
+    # 没开成的信号也要写进 Excel，时间和原因都要能查到。
+    assert str(signals.iloc[0]["回测时间"]).startswith("2026-10-19 14:00")
+    assert signals.iloc[0]["信号时间"] == "2026-10-01 09:30:00"
+    assert signals.iloc[0]["方向"] == "空"
+    assert signals.iloc[0]["拦截层"] == "风控手数"
+    assert "止损过宽" in str(signals.iloc[0]["原因"])
     fills = pd.read_excel(path, sheet_name=SHEET_FILLS, engine="openpyxl")
     assert list(fills["品种"]) == ["bu2612"]
 
@@ -256,6 +276,7 @@ def test_old_export_without_timestamp_is_filled_not_duplicated(tmp_path) -> None
             [
                 {
                     "品种": "bu2612",
+                    "策略": "日内实体",
                     "方向": "多",
                     "开仓时间": "2026-10-01 09:30",
                     "平仓时间": "2026-10-01 10:30",
@@ -304,6 +325,79 @@ def test_old_export_without_timestamp_is_filled_not_duplicated(tmp_path) -> None
     assert trade_added == 0 and trade_total == 1
     trades = pd.read_excel(path, sheet_name=SHEET_BACKTEST_TRADES, engine="openpyxl")
     assert list(trades["回测时间"].astype(str)) == ["2026-10-19 16:00:00"]
+
+
+def test_old_trades_without_strategy_get_it_from_summary(tmp_path) -> None:
+    """旧「回测成交」缺策略列：按回测时间从「回测摘要」补上，旧行不丢也不重复。"""
+    import json
+
+    from src.export.book import SHEET_BACKTEST, SHEET_BACKTEST_TRADES, write_sheet
+    from src.export.bundle import export_backtest
+
+    path = tmp_path / "Auto-Trading导出.xlsx"
+    write_sheet(
+        path,
+        SHEET_BACKTEST,
+        pd.DataFrame(
+            [{"回测时间": "2026-10-19 16:00:00", "品种": "bu2612", "策略": "日内实体"}]
+        ),
+    )
+    write_sheet(
+        path,
+        SHEET_BACKTEST_TRADES,
+        pd.DataFrame(
+            [
+                {
+                    "回测时间": "2026-10-19 16:00:00",
+                    "品种": "bu2612",
+                    "方向": "多",
+                    "开仓时间": "2026-10-01 09:30",
+                    "平仓时间": "2026-10-01 10:30",
+                    "开仓价": 3500,
+                    "平仓价": 3520,
+                    "手数": 1,
+                    "盈亏": 200,
+                    "开仓原因": "测试开仓",
+                    "平仓原因": "测试平仓",
+                }
+            ]
+        ),
+    )
+    folder = tmp_path / "data"
+    folder.mkdir()
+    (folder / "backtest_last.json").write_text(
+        json.dumps(
+            {
+                "symbol": "bu2612",
+                "timeframe": "15",
+                "trail_timeframe": "30",
+                "bars": 100,
+                "ran_at": "2026-10-19 16:00:00",
+                "performance": {"trades": 1, "win_rate": 1, "net_pnl": 200, "profit_factor": 2, "max_drawdown": 10},
+                "params_snapshot": {"engine": "daily_body"},
+                "trades": [
+                    {
+                        "symbol": "bu2612",
+                        "side": "long",
+                        "entry_time": "2026-10-01 09:30",
+                        "exit_time": "2026-10-01 10:30",
+                        "entry_price": 3500,
+                        "exit_price": 3520,
+                        "volume": 1,
+                        "pnl": 200,
+                        "reason_entry": "测试开仓",
+                        "reason_exit": "测试平仓",
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    _path, _summary_added, trade_added, _summary_total, trade_total = export_backtest(tmp_path, path)
+    assert trade_added == 0 and trade_total == 1
+    trades = pd.read_excel(path, sheet_name=SHEET_BACKTEST_TRADES, engine="openpyxl")
+    assert trades.iloc[0]["策略"] == "日内实体"
 
 
 def test_cell_text_treats_point_eight_as_same_number() -> None:
@@ -527,3 +621,108 @@ def test_rebuild_workbook_uses_current_schema(tmp_path) -> None:
     assert opt.iloc[0]["是否通过"] == "通过"
     assert "日内实体" in str(opt.iloc[0]["策略"])
     assert counts[SHEET_OPTIMIZE] == 1
+
+
+def _write_optimize_report(data, *, finished_at="2026-11-04 07:29:34") -> None:
+    """写一份带 finished_at 的优化结果文件，供导出测试。"""
+    import json
+
+    (data / "optimize_last.json").write_text(
+        json.dumps(
+            {
+                "symbol": "fu2701",
+                "engine": "daily_body",
+                "start_date": "2026-01-01",
+                "end_date": "2026-10-20",
+                "mode": "一次切断",
+                "holdout_pct": 30,
+                "depth": "标准",
+                "accepted": True,
+                "accept_reason": "可以写入",
+                "best_score": 0.69,
+                "best_params": {"eth_minutes": 21},
+                "train_end": "2026-04-01",
+                "holdout_start": "2026-04-02",
+                "finished_at": finished_at,
+                "best_performance": {
+                    "trades": 12,
+                    "win_rate": 0.58,
+                    "net_pnl": 1920,
+                    "profit_factor": 3.59,
+                    "max_drawdown": 690,
+                },
+                "train_performance": {"trades": 12, "net_pnl": 1920, "max_drawdown": 690},
+                "holdout_performance": {"trades": 4, "net_pnl": 300, "max_drawdown": 100},
+                "walk_efficiency": 0.16,
+                "oos_win_rate": 0.5,
+                "trials": [
+                    {
+                        "params": {"eth_minutes": 22},
+                        "score": 0.5,
+                        "performance": {"trades": 10, "net_pnl": 3524.62, "max_drawdown": 0},
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_optimize_sheet_has_stamp_and_appends(tmp_path) -> None:
+    """优化结果表第一列是测试时间；同一次再导出不重复，新的一次追加一组。"""
+    from src.export.bundle import OPTIMIZE_COLUMNS, export_optimize
+
+    data = tmp_path / "data"
+    data.mkdir()
+    path = data / "Auto-Trading导出.xlsx"
+    _write_optimize_report(data)
+
+    _out, added, total = export_optimize(tmp_path, path)
+    assert added == 2 and total == 2  # 最优 + 1 条候选
+    frame = pd.read_excel(path, sheet_name=SHEET_OPTIMIZE, engine="openpyxl")
+    assert list(frame.columns) == OPTIMIZE_COLUMNS
+    assert set(frame["测试时间"].astype(str)) == {"2026-11-04 07:29:34"}
+
+    # 同一份结果再导出不重复
+    _out, added2, total2 = export_optimize(tmp_path, path)
+    assert added2 == 0 and total2 == 2
+
+    # 另一次优化（finished_at 变了）会追加一组，测试时间分得清
+    _write_optimize_report(data, finished_at="2026-11-04 09:30:00")
+    _out, added3, total3 = export_optimize(tmp_path, path)
+    assert added3 == 2 and total3 == 4
+    frame = pd.read_excel(path, sheet_name=SHEET_OPTIMIZE, engine="openpyxl")
+    assert set(frame["测试时间"].astype(str)) == {"2026-11-04 07:29:34", "2026-11-04 09:30:00"}
+
+
+def test_optimize_export_without_result_raises(tmp_path) -> None:
+    """还没跑过优化时导出给出提示，不写进正式文件。"""
+    from src.export.bundle import export_optimize
+
+    data = tmp_path / "data"
+    data.mkdir()
+    try:
+        export_optimize(tmp_path, data / "Auto-Trading导出.xlsx")
+    except ValueError as exc:
+        assert "还没有策略优化结果" in str(exc)
+    else:  # pragma: no cover
+        raise AssertionError("没有优化结果时应抛 ValueError")
+
+
+def test_optimize_old_sheet_without_stamp_keeps_rows_and_fills_stamp(tmp_path) -> None:
+    """旧优化结果表缺「测试时间」列：内容相同的旧行补上时间，不重复追加。"""
+    data = tmp_path / "data"
+    data.mkdir()
+    path = data / "Auto-Trading导出.xlsx"
+    _write_optimize_report(data)
+    # 旧表 = 本次导出去掉「测试时间」列（模拟旧版程序导出的行）
+    from src.export.bundle import _optimize_frame, export_optimize
+
+    old_frame = _optimize_frame(tmp_path).drop(columns=["测试时间"])
+    old_frame.to_excel(path, sheet_name=SHEET_OPTIMIZE, index=False, engine="openpyxl")
+
+    _out, added, total = export_optimize(tmp_path, path)
+    frame = pd.read_excel(path, sheet_name=SHEET_OPTIMIZE, engine="openpyxl")
+    assert added == 0 and total == 2  # 旧行补时间后与新行一致，没有重复
+    assert set(frame["测试时间"].astype(str)) == {"2026-11-04 07:29:34"}

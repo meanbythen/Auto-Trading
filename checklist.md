@@ -1,47 +1,41 @@
-# Checklist — 阶段四：统一三套账本（v9.9.0）
+# Checklist — 策略优化参数按配置页重新规划（v9.31.0）
 
-对应规格：`spec.md`「阶段四：统一三套账本」。逐条核对 T17-T22。
+对应规格：`spec.md`。逐条核对 T1-T8。
 
-## 信号账户（T17）
+## 网格与深度（T1 / T2）
 
-- [x] 同一 `bar_id`、不同 `fill_key` 的两笔部分成交都会记进账本
-- [x] 同一 `fill_key` 的重复回报只记一次
-- [x] `open_position_rows` 返回正确方向、合计手数、加权开仓价
-- [x] `open_position_rows` 取最早的有效止损价；多空同品种按净仓处理
-- [x] `today_realized_pnl` 只统计当天的 `pnl` 与 `commission`，忽略初始资金/出入金/结算
+- [x] `GENERIC_STOP_KIND_LIGHT` / `GENERIC_STOP_KIND` / `GENERIC_STOP_PARAMS` 已新增
+- [x] `_with_generic_stop` 返回深拷贝，不改原常量
+- [x] `grid_for_engine("daily_body", "精简")` 组合 24 组，仅比 `off` / `sar`
+- [x] `grid_for_engine("daily_body", "标准")` 组合 2592 组，通用止损四种都试
+- [x] `grid_for_engine("daily_body", "完整")` 使用 `GRID_BODY_FULL`，组合约 398 万组
+- [x] 趋势跟随 / SuperTrend / 单均线 / 双均线 / 长线趋势三档都带通用止损
+- [x] 早盘 A/B 与未知引擎仍返回空网格
 
-## 风控口径（T18）
+## 参数名与写回（T3 / T4）
 
-- [x] `set_daily_pnl` 直接覆盖 `daily_pnl`
-- [x] 覆盖值低于 `-max_daily_loss` 时置 `halted=True` 并写 `halt_reason`
-- [x] 未超限额的小额不触发熔断
+- [x] `PARAM_LABELS_CN` 覆盖日内实体扩展项与全部 `generic_stop.*`
+- [x] `describe_grid` 预览能看到 18 个旋钮与中文名
+- [x] `_apply_params` 把 `generic_stop.kind` 规整成四种之一（`SAR` → `sar`）
+- [x] `generic_stop.lookback` / `atr_period` 写成 int，`atr_mult` 等写成 float
+- [x] `generic_stop.*` 写在 `strategy.generic_stop`，不残留在策略小节
 
-## 单一写入（T19）
+## 出厂值（T5）
 
-- [x] 一次成交后策略持仓、风控净仓、`bot_state`、信号账户四处一致
-- [x] 重复的同一笔成交回报不重复记账，也不重复加仓
-- [x] `_on_ctp_fill` 与 `_finish_ctp_order` 都把 `fill_key`、`stop_price` 传给记账入口
-- [x] 一次记账流程只调用一次 `_persist_state()`
+- [x] `_factory_values` 对全部非固定引擎给出 `generic_stop.kind == "off"`
+- [x] `FACTORY_DEFAULT_SNAPSHOT.daily_body` 补齐跳空/箱宽/急破/EMA 默认值
 
-## 启动对账（T20）
+## 测试与验证（T6 / T7）
 
-- [x] 账本有仓、策略无仓时按账本重建持仓（含止损）
-- [x] 账本无仓、策略有仓时清掉策略持仓
-- [x] 账本没有任何成交记录时跳过对账，不清真实持仓
-- [x] 对账有差异时向 `data/events.jsonl` 追加 `ledger_reconcile` 事件
-- [x] 对账后 `risk.daily_pnl` 等于账本当天净盈亏
+- [x] `tests/test_optimizer_holdout.py` 三种深度断言通过
+- [x] `ui_covered` 覆盖全部优化键，并按三种深度遍历
+- [x] 新增「通用止损写回 strategy 根」用例通过
+- [x] 新增「出厂值覆盖通用止损」用例通过
+- [x] `python -m pytest -q` 全量 514 项通过
+- [x] fu2701 5 分钟缓存数据上，四种通用止损都能跑出不同结果
 
-## 手工平账（T21）
+## 版本与文档（T8）
 
-- [x] 常驻在跑时 `TradingBot.manual_close` 同步策略、风控、`bot_state`、信号账户四处
-- [x] 常驻没在跑时 `manual_close_without_bot` 同步 `bot_state` 与信号账户
-- [x] 手工平账后 `bot_state.daily_pnl == 账本当天净盈亏`
-- [x] 界面 `_on_book_actual_close` 不再自己写信号账户，只调用上述两个入口
-
-## 测试、版本与文档（T22）
-
-- [x] `tests/test_signal_book.py`、`tests/test_state_store.py`、`tests/test_ctp_channel.py`、`tests/test_ledger_reconcile.py` 覆盖上述要点
-- [x] `.venv\Scripts\python.exe -m pytest -q` 全量通过（344 passed）
-- [x] `VERSION` 为 `9.9.0`，`__version__` 与之一致
-- [x] `CHANGELOG.md` 顶部有 9.9.0 条目
-- [x] `README.md`「状态持久化」「账户分析」写明账本统一口径
+- [x] `VERSION` 为 `9.31.0`
+- [x] `CHANGELOG.md` 顶部有 9.31.0 条目
+- [x] `README.md` 策略优化深度与通用止损说明已更新

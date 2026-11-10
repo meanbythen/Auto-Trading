@@ -22,7 +22,16 @@ from src.backtest.param_history import default_version_name, strategy_display_na
 FILE_NAME = "config_presets.json"
 MAX_KEEP = 30
 # 这些键是运行时填进内存的，不能写进存档。
-_SECRET_KEYS = {"resolved_password", "resolved_auth_code", "password", "ctp_password", "auth_code"}
+_SECRET_KEYS = {
+    "resolved_password",
+    "resolved_auth_code",
+    "resolved_sim_password",
+    "resolved_live_password",
+    "password",
+    "ctp_password",
+    "ctp_live_password",
+    "auth_code",
+}
 
 
 def presets_path(root: Path | str) -> Path:
@@ -37,7 +46,15 @@ def clean_config(cfg: dict[str, Any]) -> dict[str, Any]:
         dump["account"] = {k: v for k, v in account.items() if k not in _SECRET_KEYS}
     trade = dump.get("trade")
     if isinstance(trade, dict) and isinstance(trade.get("ctp"), dict):
-        trade["ctp"] = {k: v for k, v in trade["ctp"].items() if k not in _SECRET_KEYS}
+        nested = {}
+        for key, value in trade["ctp"].items():
+            if key in _SECRET_KEYS:
+                continue
+            if key in {"sim", "live"} and isinstance(value, dict):
+                nested[key] = {inner: inner_val for inner, inner_val in value.items() if inner not in _SECRET_KEYS}
+            else:
+                nested[key] = value
+        trade["ctp"] = nested
     return dump
 
 
@@ -77,12 +94,21 @@ def save_presets(root: Path | str, items: list[dict[str, Any]]) -> Path:
     return path
 
 
-def add_preset(root: Path | str, cfg: dict[str, Any], when: datetime | None = None) -> dict[str, Any]:
-    """追加一份当前配置。同名时在后面加序号，避免下拉框里两条分不清。"""
+def add_preset(
+    root: Path | str,
+    cfg: dict[str, Any],
+    when: datetime | None = None,
+    *,
+    name: str | None = None,
+) -> dict[str, Any]:
+    """追加一份当前配置。同名时在后面加序号，避免下拉框里两条分不清。
+
+    name 有值时用你起的名字（例如「切实盘前」），没有时仍按品种-策略-时间。
+    """
     now = when or datetime.now()
     items = load_presets(root)
     taken = {str(item.get("name") or "") for item in items}
-    name = preset_name(cfg, now)
+    name = (name or "").strip() or preset_name(cfg, now)
     if name in taken:
         extra = 2
         candidate = f"{name}-{extra}"

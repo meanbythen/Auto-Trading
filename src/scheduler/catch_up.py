@@ -2,9 +2,9 @@
 启动常驻第一轮回溯补开仓。
 
 功能：启动后只看一次最近几根已收盘信号 K 线；若当时有开仓信号，
-且仍满足「时间不太久、现价没跑太远、止损没被扫到」，就允许补开一笔。
+且仍满足「时间不太久、现价没跑太远、不是追在大K线末端、止损没被扫到」，就允许补开一笔。
 原理：用临时策略实例去试历史前缀，不弄脏常驻策略的内部记忆；
-三道门（时间 / ATR 偏离 / 止损路径）都过了，才把同一段前缀交给正式策略下单。
+四道门（时间 / ATR 偏离 / 追高幅度 / 止损路径）都过了，才把同一段前缀交给正式策略下单。
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ class CatchUpSettings:
     lookback_bars: int = 3
     max_age_minutes: float = 20.0
     max_entry_atr: float = 0.5
+    max_chase_atr: float = 2.0
     atr_period: int = 14
 
     @classmethod
@@ -36,11 +37,16 @@ class CatchUpSettings:
         raw = ((cfg.get("strategy") or {}).get("catch_up_on_start") or {})
         if not isinstance(raw, dict):
             raw = {}
+        try:
+            max_chase = float(raw.get("max_chase_atr", 2.0))
+        except (TypeError, ValueError):
+            max_chase = 2.0
         return cls(
             enabled=config_flag(raw.get("enabled"), True),
             lookback_bars=max(1, int(raw.get("lookback_bars") or 3)),
             max_age_minutes=float(raw.get("max_age_minutes") or 20),
             max_entry_atr=float(raw.get("max_entry_atr") or 0.5),
+            max_chase_atr=max(0.0, max_chase),
             atr_period=max(2, int(raw.get("atr_period") or 14)),
         )
 
@@ -220,6 +226,7 @@ def find_catch_up_open(
 
         entry = float(decision.entry_price or 0.0)
         stop = float(decision.stop_price or 0.0)
+        side = "long" if decision.action == StrategyAction.BUY_OPEN else "short"
         if entry <= 0 or stop <= 0:
             skip_notes.append(f"往前第{older + 1}根开仓信号缺少开仓价或止损价")
             continue
@@ -236,24 +243,37 @@ def find_catch_up_open(
             )
             continue
 
+        # 追高/追低：信号那根自己走得多远。收盘价离顺向极值越远，
+        # 止损就越容易落在这根 K 自己的振幅里，补开等于刚进场就贴着止损。
+        bar_high = float(pd.to_numeric(prefix["high"], errors="coerce").iloc[-1])
+        bar_low = float(pd.to_numeric(prefix["low"], errors="coerce").iloc[-1])
+        chase = entry - bar_low if side == "long" else bar_high - entry
+        if settings.max_chase_atr > 0 and chase > settings.max_chase_atr * atr + 1e-12:
+            edge = "最低" if side == "long" else "最高"
+            skip_notes.append(
+                f"往前第{older + 1}根收盘价距{edge} {chase:.4f}，"
+                f"超过 {settings.max_chase_atr}×ATR({atr:.4f})，不追"
+            )
+            continue
+
         # 信号这根本身不算「之后」；之后 = 更新的已收盘 + 正在走的那根。
         after = closed.iloc[len(prefix) :]
         if forming is not None and len(forming) > 0:
             after = pd.concat([after, forming]) if len(after) else forming
-        side = "long" if decision.action == StrategyAction.BUY_OPEN else "short"
         if stop_was_touched(side=side, stop_price=stop, after_signal=after):
             skip_notes.append(f"往前第{older + 1}根开仓后价格已碰到止损 {stop}")
             continue
 
         logger.info(
             "启动回溯补开仓命中 {} | 信号时间 {} | 已过 {:.0f} 分钟 | "
-            "开仓价 {} 现价 {} 偏离 {:.4f} ATR {:.4f} | {}",
+            "开仓价 {} 现价 {} 偏离 {:.4f} 追高 {:.4f} ATR {:.4f} | {}",
             symbol,
             bar_time.strftime("%Y-%m-%d %H:%M"),
             age_min,
             entry,
             current_close,
             price_gap,
+            chase,
             atr,
             decision.reason,
         )

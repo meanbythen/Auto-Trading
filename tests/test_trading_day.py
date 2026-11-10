@@ -2,7 +2,7 @@
 
 from datetime import date, datetime
 
-from src.utils.trading_day import futures_trading_day
+from src.utils.trading_day import futures_trading_day, settlement_session_day, trading_days_between
 
 
 def test_day_session_belongs_to_the_same_day() -> None:
@@ -36,3 +36,22 @@ def test_accepts_date_strings() -> None:
     """状态文件里存的是字符串，读回来也要能算出交易日。"""
     assert futures_trading_day("2026-11-01 21:30:00") == date(2026, 11, 2)
     assert futures_trading_day("2026-11-02") == date(2026, 11, 2)
+
+
+def test_settlement_session_flips_before_night_login() -> None:
+    """20:50 夜盘登录必须已经算下一天，不能和上午 08:50 共用结算单额度。"""
+    assert settlement_session_day(datetime(2026, 11, 2, 8, 50)) == date(2026, 11, 2)
+    assert settlement_session_day(datetime(2026, 11, 2, 19, 59)) == date(2026, 11, 2)
+    assert settlement_session_day(datetime(2026, 11, 2, 20, 0)) == date(2026, 11, 3)
+    assert settlement_session_day(datetime(2026, 11, 2, 20, 50)) == date(2026, 11, 3)
+    # 盈亏换日仍是 21:00，两套规则不要混。
+    assert futures_trading_day(datetime(2026, 11, 2, 20, 50)) == date(2026, 11, 2)
+    assert settlement_session_day(datetime(2026, 10, 30, 20, 50)) == date(2026, 11, 2)
+
+
+def test_trading_days_between_same_session_is_zero() -> None:
+    """夜盘和次日日盘是同一个交易日，中间过了 0 天。"""
+    assert trading_days_between(datetime(2026, 4, 21, 22, 30), datetime(2026, 4, 22, 10, 0)) == 0
+    assert trading_days_between(datetime(2026, 4, 21, 22, 30), datetime(2026, 4, 23, 9, 0)) == 1
+    assert trading_days_between(datetime(2026, 10, 30, 22, 30), datetime(2026, 11, 2, 10, 0)) == 0
+    assert trading_days_between(datetime(2026, 10, 30, 22, 30), datetime(2026, 11, 3, 9, 0)) == 1

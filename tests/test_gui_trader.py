@@ -1,5 +1,8 @@
 """同花顺点击下单：手数面板必须先收起，再点卖空。不真的移动鼠标。"""
 
+import threading
+
+import src.trader.gui_trader as gui_mod
 from src.trader.base import OrderRequest
 from src.trader.gui_trader import GuiTrader
 
@@ -36,7 +39,7 @@ def test_escape_closes_the_volume_pad_before_sell(monkeypatch) -> None:
                     "sell_open_btn": [548, 1206],
                     "close_btn": [707, 1215],
                     "confirm_mode": "enter",
-                    "confirm_times": 1,
+                    "confirm_times": 0,
                     "confirm_delay_sec": 0,
                 }
             },
@@ -47,6 +50,7 @@ def test_escape_closes_the_volume_pad_before_sell(monkeypatch) -> None:
     result = trader.place_order(OrderRequest("bu2612", "sell_open", 1))
 
     assert result.ok
+    # 点完卖空不再按回车：期货通没有确认框，回车可能再发一单。
     typed_at = next(index for index, item in enumerate(events) if item[0] == "type")
     vol_click = next(index for index, item in enumerate(events) if item[:3] == ("click", 498, 1129))
     sell_at = next(index for index, item in enumerate(events) if item[:3] == ("click", 548, 1206))
@@ -56,8 +60,9 @@ def test_escape_closes_the_volume_pad_before_sell(monkeypatch) -> None:
     esc_before_sell = next(
         index for index, item in enumerate(events) if index > typed_at and item == ("press", "esc") and index < sell_at
     )
-    # 点开手数框后先收回下拉再输入，输入后再收回，然后才点卖空。
+    # 点开手数框后先收回下拉再输入，输入后再收回，然后才点卖空。点完不再按回车。
     assert vol_click < esc_before_type < typed_at < esc_before_sell < sell_at
+    assert not any(index > sell_at and item == ("press", "enter") for index, item in enumerate(events))
 
 
 def test_lot_typed_into_the_price_box_does_not_click_close(monkeypatch) -> None:
@@ -151,7 +156,7 @@ def _trader() -> GuiTrader:
                     "volume_input": [498, 1129],
                     "sell_open_btn": [548, 1206],
                     "confirm_mode": "enter",
-                    "confirm_times": 1,
+                    "confirm_times": 0,
                     "confirm_delay_sec": 0,
                 }
             },
@@ -160,7 +165,7 @@ def _trader() -> GuiTrader:
 
 
 def test_simulator_types_its_own_price_before_the_same_click(monkeypatch) -> None:
-    """模拟器先全选价格框，再用限价替换，然后走和常驻一样的填手数、点卖空、回车。"""
+    """模拟器先全选价格框，再用限价替换，然后走和常驻一样的填手数、点卖空。点完不再按回车。"""
     trader = _trader()
     events = _mute_mouse(monkeypatch, trader, ["4000", "4000"])
     result = trader.place_order(OrderRequest("bu2612", "sell_open", 1, 4000, gui_price="limit"))
@@ -179,6 +184,7 @@ def test_simulator_types_its_own_price_before_the_same_click(monkeypatch) -> Non
     assert price_click < menu_closed < selected_at < price_at < sell_at
     assert ("press", "backspace") not in events
     assert ("press", "delete") not in events
+    assert not any(index > sell_at and item == ("press", "enter") for index, item in enumerate(events))
 
 
 def test_resident_order_does_not_type_a_limit_price(monkeypatch) -> None:
@@ -193,6 +199,22 @@ def test_resident_order_does_not_type_a_limit_price(monkeypatch) -> None:
     # 常驻只核对对手价，不能把价格框里的字删掉或改成限价。
     assert ("press", "backspace") not in events
     assert ("press", "delete") not in events
+
+
+def test_place_order_skips_when_another_click_is_running(monkeypatch) -> None:
+    """两个 GuiTrader 实例（常驻 / 模拟器）共用一把锁，抢不到就跳过，绝不并发点击。"""
+    held = threading.Lock()
+    held.acquire()
+    monkeypatch.setattr(gui_mod, "_TRADE_LOCK", held)
+    monkeypatch.setattr(gui_mod, "_TRADE_LOCK_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr("src.trader.gui_trader.pyautogui.click", lambda **kwargs: None)
+
+    trader = GuiTrader({"dry_run": False, "trade": {"gui": {}}})
+    result = trader.place_order(OrderRequest("bu2612", "buy_open", 1))
+
+    assert result.ok is False
+    assert "跳过" in result.message
+    held.release()
 
 
 def test_ready_trade_window_is_brought_forward_once_and_not_logged_in(monkeypatch) -> None:
@@ -295,3 +317,246 @@ def test_missing_trade_window_logs_in_once(monkeypatch) -> None:
     assert trader._ensure_trade_desk() is True
     assert calls["login"] == 1
     assert calls["panel"] == 2
+
+
+def test_order_refocuses_the_window_before_giving_up(monkeypatch) -> None:
+    """准备窗口后焦点被抢走时，先拉回同花顺再点，不等到下一轮扫描。"""
+    monkeypatch.setenv("PYTEST_CURRENT_TEST", "test_gui_trader")
+    events: list[tuple] = []
+    refocus = {"n": 0}
+
+    monkeypatch.setattr(
+        "src.trader.gui_trader.pyautogui.click",
+        lambda **kwargs: events.append(("click", kwargs["x"], kwargs["y"])),
+    )
+    monkeypatch.setattr("src.trader.gui_trader.pyautogui.press", lambda key: None)
+    monkeypatch.setattr("src.trader.gui_trader.pyautogui.hotkey", lambda *keys: None)
+    monkeypatch.setattr("src.trader.gui_trader.pyautogui.typewrite", lambda text, interval=0: None)
+    monkeypatch.setattr("src.trader.gui_trader.time.sleep", lambda _seconds: None)
+
+    trader = GuiTrader(
+        {
+            "dry_run": False,
+            "trade": {
+                "gui": {
+                    "volume_input": [498, 1129],
+                    "close_btn": [707, 1215],
+                    "confirm_mode": "enter",
+                    "confirm_times": 0,
+                    "confirm_delay_sec": 0,
+                }
+            },
+        }
+    )
+    monkeypatch.setattr(trader, "_ensure_trade_desk", lambda: True)
+
+    def _focus() -> bool:
+        refocus["n"] += 1
+        return True
+
+    monkeypatch.setattr(trader, "_focus_ths_before_click", _focus)
+    states = iter([False, True])
+    monkeypatch.setattr(trader, "_foreground_is_trade_panel", lambda: next(states, True))
+    trader._price_reader = lambda: "对手价"
+
+    result = trader.place_order(OrderRequest("fu2701", "close", 1))
+
+    assert result.ok
+    assert refocus["n"] == 1
+    assert ("click", 707, 1215) in events
+
+def test_volume_readback_mismatch_stops_before_buying(monkeypatch) -> None:
+    """键盘兜底打完字后回读手数框；数字没写进去就抛错，不许点买卖。"""
+    monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+    trader = _trader()
+    monkeypatch.setattr(trader, "_write_number_into_box", lambda point, text: False)
+    monkeypatch.setattr(trader, "_foreground_is_trade_panel", lambda: True)
+    monkeypatch.setattr(trader, "_type_into", lambda key, text: None)
+    monkeypatch.setattr(trader, "_price_control_text", lambda point: (object(), "99"))
+
+    try:
+        trader._fill_volume("1")
+    except RuntimeError as exc:
+        assert "手数没有写进手数框" in str(exc)
+    else:
+        raise AssertionError("手数没写进去，应该抛错")
+
+
+def test_dismiss_confirm_does_nothing_when_times_zero(monkeypatch) -> None:
+    """confirm_times=0 时连回车都不按，避免空按落到买卖键上。以前写成 0 仍会按一轮。"""
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        "src.trader.gui_trader.pyautogui.click",
+        lambda **kwargs: events.append(("click", kwargs["x"], kwargs["y"])),
+    )
+    monkeypatch.setattr(
+        "src.trader.gui_trader.pyautogui.press",
+        lambda key: events.append(("press", key)),
+    )
+    monkeypatch.setattr("src.trader.gui_trader.time.sleep", lambda _seconds: None)
+
+    trader = GuiTrader(
+        {
+            "dry_run": False,
+            "trade": {
+                "gui": {
+                    "close_btn": [707, 1215],
+                    "confirm_mode": "enter",
+                    "confirm_times": 0,
+                    "confirm_delay_sec": 0.2,
+                    "confirm_btn": [800, 900],
+                }
+            },
+        }
+    )
+    trader._order_armed = True
+    trader._dismiss_confirm()
+    assert events == []
+
+
+def test_default_confirm_times_is_zero() -> None:
+    """没写配置时也不关弹窗，和期货通无确认框一致。"""
+    trader = GuiTrader({"dry_run": True, "trade": {"gui": {}}})
+    assert trader.confirm_times == 0
+
+
+def test_confirm_enter_is_skipped_when_no_popup(monkeypatch) -> None:
+    """账号仍开着下单确认、且标定了确定按钮时：没弹窗就不按回车，改点确认按钮。"""
+    events: list[tuple] = []
+    monkeypatch.setattr(
+        "src.trader.gui_trader.pyautogui.click",
+        lambda **kwargs: events.append(("click", kwargs["x"], kwargs["y"])),
+    )
+    monkeypatch.setattr(
+        "src.trader.gui_trader.pyautogui.press",
+        lambda key: events.append(("press", key)),
+    )
+    monkeypatch.setattr("src.trader.gui_trader.time.sleep", lambda _seconds: None)
+
+    trader = GuiTrader(
+        {
+            "dry_run": False,
+            "trade": {
+                "gui": {
+                    "close_btn": [707, 1215],
+                    "confirm_mode": "both",
+                    "confirm_times": 1,
+                    "confirm_delay_sec": 0,
+                    "confirm_btn": [800, 900],
+                }
+            },
+        }
+    )
+    trader._pinned_hwnd = 42
+    trader._order_armed = True
+    monkeypatch.setattr(trader, "_focus_ths_before_click", lambda: True)
+    monkeypatch.setattr(trader, "_confirm_dialog_in_front", lambda: False)
+
+    trader._dismiss_confirm()
+
+    assert ("press", "enter") not in events
+    assert ("click", 800, 900) in events
+
+
+def test_dry_run_does_not_block_the_real_mouse(monkeypatch) -> None:
+    """模拟点击只关掉四角急停，不锁人手鼠标，避免测试把电脑鼠标冻住。"""
+    calls: list[bool] = []
+
+    def _block(flag: bool) -> int:
+        calls.append(bool(flag))
+        return 1
+
+    monkeypatch.setattr(gui_mod.ctypes.windll.user32, "BlockInput", _block)
+    gui_mod.pyautogui.FAILSAFE = True
+
+    token = gui_mod.grab_pointer_for_order(dry_run=True)
+    assert token["blocked"] is False
+    assert calls == []
+    assert gui_mod.pyautogui.FAILSAFE is False
+
+    gui_mod.release_pointer_after_order(token)
+    assert calls == []
+    assert gui_mod.pyautogui.FAILSAFE is False
+
+
+def test_live_click_blocks_user_mouse_and_keeps_failsafe_off(monkeypatch) -> None:
+    """真下单：挡住人手；程序自己点按钮时四角急停必须关，否则会跟填价格抢鼠标。"""
+    calls: list[bool] = []
+
+    def _block(flag: bool) -> int:
+        calls.append(bool(flag))
+        return 1
+
+    monkeypatch.setattr(gui_mod.sys, "platform", "win32")
+    monkeypatch.setattr(gui_mod.sys, "modules", {})
+    monkeypatch.setattr(gui_mod.ctypes.windll.user32, "BlockInput", _block)
+    gui_mod.pyautogui.FAILSAFE = True
+
+    token = gui_mod.grab_pointer_for_order(dry_run=False)
+    assert token["blocked"] is True
+    assert calls == [True]
+    assert gui_mod.pyautogui.FAILSAFE is False
+
+    gui_mod.release_pointer_after_order(token)
+    assert calls == [True, False]
+    assert gui_mod.pyautogui.FAILSAFE is False
+
+
+def test_old_failsafe_would_raise_when_cursor_sits_in_a_corner(monkeypatch) -> None:
+    """对照：急停开着、光标在左上角时，点一下就会报错。用来证明我们关掉它是有用的。"""
+    gui_mod.pyautogui.FAILSAFE = True
+    monkeypatch.setattr(gui_mod.pyautogui, "position", lambda: (0, 0))
+    raised = False
+    try:
+        gui_mod.pyautogui.failSafeCheck()
+    except gui_mod.pyautogui.FailSafeException:
+        raised = True
+    assert raised is True
+
+
+def test_grab_pointer_lets_clicks_continue_when_cursor_is_in_every_corner(monkeypatch) -> None:
+    """下单前先关掉急停后，光标就算在四个角，检查函数也不能抛异常。"""
+    corners = list(gui_mod.pyautogui.FAILSAFE_POINTS)
+    assert len(corners) >= 4
+    gui_mod.grab_pointer_for_order(dry_run=True)
+    assert gui_mod.pyautogui.FAILSAFE is False
+    for corner in corners:
+        monkeypatch.setattr(gui_mod.pyautogui, "position", lambda c=corner: c)
+        gui_mod.pyautogui.failSafeCheck()
+
+
+def test_place_order_does_not_surface_failsafe_error_if_cursor_in_corner(monkeypatch) -> None:
+    """走一遍模拟下单：光标假装在角落，不能出现 FailSafe 报错，订单应成功。"""
+    monkeypatch.setattr(gui_mod.pyautogui, "position", lambda: (0, 0))
+    gui_mod.pyautogui.FAILSAFE = True
+
+    trader = GuiTrader(
+        {
+            "dry_run": True,
+            "trade": {
+                "gui": {
+                    "volume_input": [10, 10],
+                    "buy_open_btn": [0, 0],
+                    "sell_open_btn": [20, 20],
+                    "close_btn": [30, 30],
+                    "confirm_mode": "enter",
+                    "confirm_times": 0,
+                    "confirm_delay_sec": 0,
+                }
+            },
+        }
+    )
+    trader._park_own_windows = lambda: None
+    trader._restore_own_windows = lambda: None
+    trader._unpin_trade_window = lambda: None
+    trader._ensure_trade_desk = lambda: True
+    trader._foreground_is_trade_panel = lambda: True
+    trader._fill_volume = lambda _text: False
+    trader._read_price_text = lambda: "对手价"
+    trader._prepare_opponent_price = lambda: "对手价"
+
+    result = trader.place_order(OrderRequest("bu2612", "buy_open", 1))
+    assert result.ok is True
+    assert "FailSafe" not in result.message
+    assert "fail-safe" not in result.message.lower()
+    assert gui_mod.pyautogui.FAILSAFE is False

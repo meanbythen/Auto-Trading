@@ -6,8 +6,8 @@
 #
 # 1) 策略引擎 strategy.engine（主推 daily_body）
 #    - daily_body            日内实体：ETH画开盘箱体，收盘突破才开
-#    - morning_box_a / morning_structure_b  早盘两套
-#    - trend_follow / supertrend / single_ma / dual_ma
+#    - morning_box_a        早盘箱体突破A
+#    - trend_follow / supertrend / dual_ma
 #
 # 2) 执行通道 trade.executor
 #    - sim   模拟成交（默认，不下真单）
@@ -31,7 +31,6 @@ account:
   # 配置页「自动登录」打开时，这里是 false。模板保持 true，复制成新配置时不会自动去点登录。
   skip_auto_login: true
   force_relogin: false
-  note: "未开通程序化交易权限"
 
 schedule:
   login_times:
@@ -44,12 +43,12 @@ schedule:
   trading_sessions:
     - ["09:00", "11:30"]
     - ["13:30", "15:00"]
-    - ["21:00", "23:00"]
+    - ["21:00", "02:30"]
 
 # ---------- 策略引擎（见文件顶部路线菜单） ----------
 strategy:
-  enabled: true
-  # 切换策略：daily_body | morning_box_a | morning_structure_b | trend_follow | supertrend | single_ma | dual_ma | swing_trend
+  # 切换策略：daily_body | morning_box_a | trend_follow | supertrend |
+  # dual_ma | bollinger | sar_trend | multi_factor | multi_vote | multi_hybrid | swing_trend | jesse_casper
   engine: "daily_body"
   # 信号周期：5 / 15 / 60 是分钟。日线写 D，周线写 W。自定义分钟直接写数字，如 120
   timeframe: "5"
@@ -62,36 +61,73 @@ strategy:
   cross_engines:
     - daily_body
     - morning_box_a
-    - morning_structure_b
     - trend_follow
     - supertrend
-    - single_ma
     - dual_ma
+    - bollinger
+    - sar_trend
+    - multi_factor
+    - multi_vote
+    - multi_hybrid
     - swing_trend
+    - jesse_casper
   flatten_times:
     - "14:55"
     - "22:55"
   # true=到清仓时刻强平；false=不按收盘平仓，仓可以留过午盘、夜盘和周末
   flatten_at_close: true
+  # 止损触发方式（全策略共用）：touch=价格触及止损位立刻平（实时看影线）；
+  # close=等这根K线收盘，收盘价跌破/站上止损位才平（默认，回测/实盘口径一致）。
+  stop_mode: close
+  # 开仓触发方式（全策略共用）：trigger=未收线那根的最高/最低碰到开仓位就进（激进）；
+  # close=等这根K线收盘，收盘价穿越开仓位才进（保守，默认）。只在模拟盘/实盘生效。
+  entry_mode: close
+  # 通用止损（独立于各策略自身止损，谁先触发就平）：
+  # off=关闭（默认，只用策略自身止损）；sar=SAR 移动止损（按止损周期计算，
+  # 初始 SAR 与持仓方向相反时先等它转向，不会一开仓就被误触）；
+  # prior_extreme=前 N 根高低点止损（多守最近 N 根最低，空守最高）；
+  # chandelier=Chandelier 吊灯跟踪（多=最近 N 根最高 - k×ATR，空=最近 N 根最低 + k×ATR，
+  #   随新高/新低移动；旧高低点滑出回看窗口时这条线会跟着回退）；
+  # breakeven=盈利1ATR后保本（浮盈达到 be_atr_mult×ATR 后，止损抬到开仓价，之前不生效）。
+  # 触发口径同样听 strategy.stop_mode；回测、策略优化、实盘都生效。
+  generic_stop:
+    kind: "off"
+    lookback: 20
+    sar_af_start: 0.02
+    sar_af_step: 0.02
+    sar_af_max: 0.2
+    atr_period: 14
+    atr_mult: 3.0
+    be_atr_mult: 1.0
 
   # 启动常驻后的第一轮扫描：往前最多看几根已收盘信号 K 线，条件仍合适就补开一笔。
   # 之后每轮仍只看最新一根，不会反复补单。关掉 enabled 就完全不回溯。
+  # max_chase_atr：信号 K 线自己走得太远就不补开（多头看 收盘价-最低价，空头看 最高价-收盘价），
+  #   超过 max_chase_atr×ATR 说明已经贴着止损进场，补开等于追高。0 表示不限制。
   catch_up_on_start:
     enabled: true
     lookback_bars: 3
     max_age_minutes: 20
     max_entry_atr: 0.5
+    max_chase_atr: 2.0
     atr_period: 14
 
-  # 趋势跟随（engine=trend_follow 时生效）。收盘冲破前一段最高做多、跌破最低做空。
-  # 不看成交量。保护止损是 2 倍平均波动，并且只往有利方向收紧。更短的一段被收盘打穿就离场。
-  # flatten_at_close 只属于这一套，默认关。配置页的收盘清仓总开关不管它。
+  # 趋势跟随 / 海龟突破（engine=trend_follow）。收盘冲破前 N 根最高做多、跌破最低做空。
+  # 文档 5 分钟口径：进场 20 根、出场 10 根、止损 2ATR，日内收盘强平。
+  # 只想保持原有 36/12 的，把下面两个数改回去即可。
   trend_follow:
-    entry_bars: 36
-    exit_bars: 12
+    entry_bars: 20
+    exit_bars: 10
     atr_period: 14
     atr_mult: 2.0
-    flatten_at_close: false
+    flatten_at_close: true
+    # 本策略趋势过滤：ADX 太低或波动压缩不开新仓。默认关。
+    filter_enabled: false
+    filter_adx_period: 14
+    filter_atr_period: 14
+    filter_lookback: 60
+    filter_adx_flat: 20
+    filter_atr_low_pct: 0.2
 
   # SuperTrend（engine=supertrend / st）。ATR 通道翻转开仓；默认不听收盘清仓总开关。
   supertrend:
@@ -99,17 +135,138 @@ strategy:
     multiplier: 3.0
     reverse_on_flip: true
     flatten_at_close: false
+    filter_enabled: false
+    filter_adx_period: 14
+    filter_atr_period: 14
+    filter_lookback: 60
+    filter_adx_flat: 20
+    filter_atr_low_pct: 0.2
 
-  # 单均线系统（engine=Single_ma）。根数可改；听收盘清仓总开关。
-  single_ma:
-    ma_period: 20
-    reverse_on_cross: true
-
-  # 双均线趋势（engine=dual_ma / ma_cross）。短线上穿长线做多；听收盘清仓总开关。
+  # 双均线趋势（engine=dual_ma / ma_cross）。短线上穿长线、且收盘站上长线才做多；反向做空。
+  # 止损用 2 倍 ATR（文档口径），比原来的「开仓那根高低点」宽，不容易被正常波动扫掉。
   dual_ma:
     short_period: 20
     long_period: 60
     reverse_on_cross: true
+    atr_period: 14
+    atr_stop_mult: 2.0
+    filter_enabled: false
+    filter_adx_period: 14
+    filter_atr_period: 14
+    filter_lookback: 60
+    filter_adx_flat: 20
+    filter_atr_low_pct: 0.2
+
+  # 布林带趋势突破（engine=bollinger）。只顺势：中轨上方突破上轨做多，中轨下方跌破下轨做空。
+  # 不做轨道反转（那是均值回归）。跌回中轨离场，止损 1.5 倍 ATR。
+  bollinger:
+    boll_window: 20
+    boll_dev: 2.0
+    atr_period: 14
+    atr_stop_mult: 1.5
+    flatten_at_close: true
+    filter_enabled: false
+    filter_adx_period: 14
+    filter_atr_period: 14
+    filter_lookback: 60
+    filter_adx_flat: 20
+    filter_atr_low_pct: 0.2
+
+  # SAR 波段（engine=sar_trend）。SAR 翻多做多、翻空做空，再用 ma_filter 均线过滤方向。
+  # SAR 线本身就是移动止损，不额外设固定止损。跳空大的品种靠市场过滤兜底。
+  sar_trend:
+    af_start: 0.02
+    af_step: 0.02
+    af_max: 0.2
+    ma_filter: 20
+    atr_period: 14
+    flatten_at_close: true
+    filter_enabled: false
+    filter_adx_period: 14
+    filter_atr_period: 14
+    filter_lookback: 60
+    filter_adx_flat: 20
+    filter_atr_low_pct: 0.2
+
+  # 多因子 CTA 完整版（engine=multi_factor 加权打分）。信号周期跟上面的 timeframe。
+  # 日线收盘相对 EMA 定方向（bias_ma 根）；SAR 开关在这一节，不是总开关。权重不参与自动优化。
+  multi_factor:
+    ma_short: 20
+    ma_long: 60
+    channel: 20
+    boll_window: 20
+    boll_dev: 2.0
+    af_start: 0.02
+    af_step: 0.02
+    af_max: 0.2
+    threshold: 0.6
+    atr_period: 14
+    atr_stop_mult: 2.0
+    use_sar: true
+    disagree_max: 0.7
+    bias_ma: 60
+    trend_timeframe: "D"
+    weights:
+      ma: 0.30
+      turtle: 0.25
+      boll: 0.25
+      sar: 0.20
+    flatten_at_close: true
+    # 本策略自己的行情闸门，不走页面底下那张公共过滤。
+    cta_filter:
+      enabled: true
+      use_adx: true
+      use_atr: true
+      use_disagree: true
+      adx_period: 14
+      adx_flat: 20
+      adx_trend: 25
+      atr_lookback: 60
+      atr_low_pct: 0.2
+      weak_score: 0.75
+      weak_size: 0.5
+      weak_votes: 0
+
+  # 对照：等权投票。因子参数读 multi_factor，这里只改投票门槛和本策略过滤。
+  multi_vote:
+    min_votes: 2
+    min_vote_diff: 2
+    flatten_at_close: true
+    cta_filter:
+      enabled: true
+      use_adx: true
+      use_atr: true
+      use_disagree: true
+      adx_period: 14
+      adx_flat: 20
+      adx_trend: 25
+      atr_lookback: 60
+      atr_low_pct: 0.2
+      weak_score: 0.0
+      weak_size: 1.0
+      weak_votes: 3
+
+  # 对照：投票开门 + 打分定仓位成数。
+  multi_hybrid:
+    min_votes: 2
+    min_vote_diff: 2
+    threshold: 0.6
+    min_position_ratio: 0.5
+    max_position_ratio: 1.0
+    flatten_at_close: true
+    cta_filter:
+      enabled: true
+      use_adx: true
+      use_atr: true
+      use_disagree: true
+      adx_period: 14
+      adx_flat: 20
+      adx_trend: 25
+      atr_lookback: 60
+      atr_low_pct: 0.2
+      weak_score: 0.75
+      weak_size: 0.5
+      weak_votes: 3
 
   # 早盘 A：开盘半小时箱体，放量突破定方向。钟点可用默认，一般不用改。
   morning_box_a:
@@ -121,19 +278,12 @@ strategy:
     enable_night: true
     no_new_before_close_minutes: 15
 
-  # 早盘 B：半小时高低递进定方向。参数含义和 A 类似。
-  morning_structure_b:
-    be_box_mult: 0.9
-    max_trades_per_day: 2
-    stop_buffer_ticks: 2
-    enable_night: true
-    no_new_before_close_minutes: 15
-
   # 日内实体（engine=daily_body 时生效）。
   # 方向看信号周期。ETH 走完后，收盘离开开盘区间才开仓。夜盘用夜盘自己的区间。
   # 止损固定在开盘箱体对沿再让 stop_extra_ticks 跳（默认 1）：多守箱底、空守箱顶，开仓后冻结。
-  # 打破箱体对沿才平仓；中间不做回撤止损；否则顺着捅破方向拿到收盘。
-  # 策略优化只搜：ETH分钟数、信号周期。配置页可改 ETH 分钟数、箱沿外再让几跳、跳空上限、箱体宽度上限。
+  # 触发方式用全策略共用的 strategy.stop_mode：touch 触及即止损；close 等收盘价确认。
+  # 没触发就顺着捅破方向拿到收盘。中间不做回撤止损。
+  # 策略优化只搜：ETH分钟数、信号周期、止损触发方式。配置页可改 ETH 分钟数、箱沿外再让几跳、跳空上限、箱体宽度上限。
   daily_body:
     eth_minutes: 20
     # 第二段 ETH：日盘第一段止损后、截止前，用这段箱体再开一次（仅日盘，夜盘仍只开一次）。0=关闭二次开仓。
@@ -146,6 +296,13 @@ strategy:
     # 开仓截止钟点：过了这个钟点，这一段不再开新仓。日盘和夜盘分开设。
     day_cutoff: "10:30"
     night_cutoff: "22:15"
+    # 本策略自带的区间过滤。不拦波动压缩。filter_enabled 关了这一层就不看。
+    filter_enabled: true
+    filter_adx_period: 14
+    filter_atr_period: 14
+    filter_lookback: 60
+    filter_adx_upper: 30
+    filter_atr_high_pct: 0.8
 
   # 长线趋势加减仓（engine=swing_trend）。
   # 逻辑自相似：scale=D_60 为日线定方向+60分钟回调；scale=60_15 为60分钟定方向+15分钟回调。
@@ -167,7 +324,30 @@ strategy:
     min_core_units: 1
     stop_atr: 2.0
     flatten_at_close: false
+    filter_enabled: false
+    filter_adx_period: 14
+    filter_atr_period: 14
+    filter_lookback: 60
+    filter_adx_flat: 20
+    filter_atr_low_pct: 0.2
 
+  # Jesse Casper 简化 SMC（engine=jesse_casper）。没有足迹图，用放量和价值区代替。
+  # 信号周期建议 5 分钟；15 分钟定方向。默认黄金时段才开、收盘清仓。
+  jesse_casper:
+    trend_timeframe: "15"
+    lookback_liq: 20
+    vol_ma_len: 20
+    vol_mult: 1.2
+    displacement_body_ratio: 0.5
+    min_rr: 3.0
+    price_tick: 1.0
+    va_pct: 0.70
+    use_va: true
+    use_kill_zone: true
+    use_daily_halt: true
+    setup_wait_bars: 16
+    target_lookback: 40
+    flatten_at_close: true
 
 data:
   source: "akshare"
@@ -195,6 +375,8 @@ backtest:
   max_bars: 1200
   warmup: 40
   max_trials: 60
+  # 策略优化参数表：网格档位、参数中文名、取值说明。改完保存即生效，不用改代码。
+  optimizer_table: "config/优化参数.xlsx"
   range_preset: "全部可用"
   start_date: ""          # 空着时，界面默认填当年1月1日
   end_date: ""
@@ -205,32 +387,56 @@ trade:
   volume: 1
   # 切换通道：sim | gui | ctp。没拿到前置和认证码之前保持 sim 或 gui
   executor: "sim"
+  # CTP 上线四步：desk_sim 手工仿真 → desk_live 手工真实 → auto_sim 策略仿真 → auto_live 策略真实
+  go_live:
+    stage: desk_sim
+  # 开仓滑点闸门：现价相对信号价反向偏移超过 0.5×ATR 就不追，等下一根。0=关闭
+  max_entry_slip_atr: 0.5
+  # 再叠一个绝对点数上限，和上面同时开就取更严的；0=不用
+  max_entry_slip_points: 0
   ctp:
+    # sim=仿真账号，live=真实账号。测试窗口和策略共用这一项，只换账号和前置。
+    account_kind: sim
     # 下面几项由华泰技术提供。留空时程序只准备接口，不会去连柜台。
     td_front: ""
     # 仿真报价的行情前置。华泰测试环境是交易端口 27226，行情端口 27236。留空时程序会按这个配对。
     md_front: ""
     broker_id: ""
-    # 仿真账号写在这里。留空时会用 account.user_id，但测试前置会拒绝实盘账号。
+    # 仿真账号写在这里，例如 28077。不要填真实资金账号。
     user_id: ""
+    sim:
+      td_front: ""
+      md_front: ""
+      broker_id: ""
+      user_id: ""
+    live:
+      # 真实资金账号跟配置页「资金账号」同一号，这里保存时会自动抄一份。
+      # 交易/行情前置必须填华泰给你的实盘地址，不要填仿真前置。
+      td_front: ""
+      md_front: ""
+      broker_id: ""
+      user_id: ""
     app_id: "client_AutoTrading_1.0"
     # 认证码不要写在这个文件里。放到环境变量 CTP_AUTH_CODE，或 config/secrets.local.yaml 的 ctp_auth_code
-    # 仿真密码另写 secrets.local.yaml 的 ctp_password，不要覆盖同花顺用的 password
+    # 仿真密码写 secrets.local.yaml 的 ctp_password。真实通道默认用同一份交易密码；若不同再写 ctp_live_password。
     auth_code_env: "CTP_AUTH_CODE"
     price_tick: 1
+    # 本机单笔手数上限。超过会拦住，不是华泰只许做这么多手。
     max_order_volume: 2
+    # 报单、撤单笔数提醒。到了只写日志，不是只能做 8 次。
     order_count_warn: 8
     cancel_count_warn: 8
     flow_dir: "data/ctp_flow"
     query_interval_sec: 30
     order_wait_sec: 8
-    # 沥青、玉米平仓要分开报平今和平昨。其他品种用普通平仓。
+    # 上期所、能源中心、大商所会自动拆平今/平昨。这里可再追加品种。
     close_split_products: ["bu", "c"]
   gui:
-    # 下单确认框：enter | click | both（推荐 both）
+    # 期货通默认无确认弹窗。0=点完买卖就结束，不要按回车。
+    # 若账号打开了「下单确认」，改成 1 或 2，并选 enter / click / both。
     confirm_mode: both
-    confirm_delay_sec: 0.6
-    confirm_times: 2
+    confirm_delay_sec: 0.2
+    confirm_times: 0
     # true=点击后立刻改内部持仓（挂机方便，但点击≠成交）；false=只记发单不改仓（更安全）
     assume_fill: true
     # GUI 默认禁止多品种；标定了 symbol_input 且确需多品种时才开
@@ -261,6 +467,17 @@ risk:
   max_daily_loss: 5000
   min_order_interval_sec: 60
   max_orders_per_day: 20
+  # 账户从最高点回撤、或波动突然放大时少开/暂停。日最大亏损仍只看当天。
+  # 1 手账户减半仍是 1 手，不会被强平。enabled: false 就不再压这一层。
+  dynamic:
+    enabled: true
+    dd_half_pct: 5
+    dd_pause_pct: 10
+    atr_half_mult: 1.8
+    atr_pause_mult: 2.5
+    atr_period: 14
+    atr_lookback: 20
+    reduce_held: true
   # 每手保证金。0 表示不看。表里没写的品种用这个数。
   margin_per_lot: 0
   # 关注合约+保证金/乘数只认这张总表（配置页可打开/重新读取）。同品种保证金必须相同。

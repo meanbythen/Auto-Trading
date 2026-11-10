@@ -169,12 +169,93 @@ def test_catch_up_settings_from_cfg_defaults() -> None:
     assert s.lookback_bars == 3
     assert s.max_age_minutes == 20
     assert s.max_entry_atr == 0.5
+    assert s.max_chase_atr == 2.0
 
     s2 = CatchUpSettings.from_cfg(
         {"strategy": {"catch_up_on_start": {"enabled": False, "lookback_bars": 1}}}
     )
     assert s2.enabled is False
     assert s2.lookback_bars == 1
+
+    s3 = CatchUpSettings.from_cfg(
+        {"strategy": {"catch_up_on_start": {"max_chase_atr": "bad"}}}
+    )
+    assert s3.max_chase_atr == 2.0
+
+
+def test_catch_up_rejects_chasing_big_bar_end() -> None:
+    """11-05 夜盘：4216→4308 那根收在 4288，止损只差 60 点，补开就是贴着止损进场。"""
+    now = datetime(2026, 11, 5, 21, 10, 30)
+    closed = _bars(now - timedelta(minutes=0), n=40, base=100.0)
+    closed = closed.copy()
+    # 最后一根做成大阳线：低点 90，收在 108，振幅远大于 ATR。
+    last = len(closed) - 1
+    closed.iloc[last, closed.columns.get_loc("low")] = 90.0
+    closed.iloc[last, closed.columns.get_loc("close")] = 108.0
+    closed.iloc[last, closed.columns.get_loc("high")] = 108.5
+
+    settings = CatchUpSettings(
+        enabled=True,
+        lookback_bars=1,
+        max_age_minutes=20,
+        max_entry_atr=0.5,
+        max_chase_atr=1.0,
+        atr_period=14,
+    )
+    entry = float(closed.iloc[last]["close"])
+    open_decision = StrategyDecision(
+        StrategyAction.BUY_OPEN,
+        "fu2701",
+        "假开仓追高",
+        entry_price=entry,
+        stop_price=entry - 10.0,
+    )
+    with patch("src.scheduler.catch_up._probe_open", return_value=open_decision):
+        hit = find_catch_up_open(
+            cfg={},
+            symbol="fu2701",
+            closed=closed,
+            settings=settings,
+            now=now,
+        )
+    assert hit is None
+
+
+def test_catch_up_allows_normal_bar() -> None:
+    """普通振幅的 K 线不能被追高门误杀。"""
+    now = datetime(2026, 11, 5, 21, 10, 30)
+    closed = _bars(now - timedelta(minutes=0), n=40, base=100.0)
+    closed = closed.copy()
+    last = len(closed) - 1
+    entry = float(closed.iloc[last]["close"])
+    # 收盘价距最低只有 2 元，远小于 2×ATR。
+    closed.iloc[last, closed.columns.get_loc("low")] = entry - 2.0
+    closed.iloc[last, closed.columns.get_loc("high")] = entry + 0.5
+
+    settings = CatchUpSettings(
+        enabled=True,
+        lookback_bars=1,
+        max_age_minutes=20,
+        max_entry_atr=0.5,
+        max_chase_atr=2.0,
+        atr_period=14,
+    )
+    open_decision = StrategyDecision(
+        StrategyAction.BUY_OPEN,
+        "fu2701",
+        "假开仓正常",
+        entry_price=entry,
+        stop_price=entry - 10.0,
+    )
+    with patch("src.scheduler.catch_up._probe_open", return_value=open_decision):
+        hit = find_catch_up_open(
+            cfg={},
+            symbol="fu2701",
+            closed=closed,
+            settings=settings,
+            now=now,
+        )
+    assert hit is not None
 
 
 def test_forming_bar_is_not_used_as_now() -> None:
@@ -200,8 +281,11 @@ def test_forming_bar_is_not_used_as_now() -> None:
     now = _eval_now(eval_bars, closed, catch_up=False)
     assert now is not None
     assert abs((datetime.now() - now).total_seconds()) < 120
-    # 只看已收盘的K线时，仍交给策略自己取最后一根的时间。
-    assert _eval_now(closed, closed, catch_up=False) is None
+    # 只看已收盘的K线时也用墙上时钟：周末过后最后一根可能停在周五收盘，
+    # 拿它当现在会误命中 22:55 的清仓窗口。
+    now = _eval_now(closed, closed, catch_up=False)
+    assert now is not None
+    assert abs((datetime.now() - now).total_seconds()) < 120
 
 
 def test_runner_skips_catch_up_when_already_long() -> None:

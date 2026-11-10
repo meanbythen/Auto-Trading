@@ -22,10 +22,17 @@ datas = [
 universe_xlsx = ROOT / "config" / "品种与合约.xlsx"
 if universe_xlsx.exists():
     datas.append((str(universe_xlsx), "config"))
+# 优化参数表：策略优化的网格档位、中文名、取值说明。用户不装 IDE 也能改。
+param_xlsx = ROOT / "config" / "优化参数.xlsx"
+if param_xlsx.exists():
+    datas.append((str(param_xlsx), "config"))
 # 交叉测试页说明书提到的备查名单；打进资源后，首次运行可拷到 exe 旁。
 beicha = ROOT / "config" / "全品种备查.txt"
 if beicha.exists():
     datas.append((str(beicha), "config"))
+# 主力合约表：回测按它的「主力时段」在换月日自动切到新主力。放进 config，用户可自己更新。
+for table in sorted((ROOT / "config").glob("*主力合约表*.xlsx")):
+    datas.append((str(table), "config"))
 if (ROOT / "strategies").exists():
     datas.append((str(ROOT / "strategies"), "strategies"))
 
@@ -68,14 +75,21 @@ hiddenimports += [
     "src.review.session",
     "src.ui.test_tools",
     "src.ui.order_simulator",
+    # 主力合约换月与主力表生成：回测页的换月开关和「更新主力合约表」按钮依赖它们
+    "src.backtest.rollover",
+    "src.backtest.main_table",
+    "src.backtest.optimizer",
+    # 优化参数 Excel 表读写：优化页「打开优化参数表」和网格加载依赖它
+    "src.backtest.param_table",
     # 当前仍保留的策略（已删的 ema_pin / macd / sar 等不要再写进来）
     "src.strategy.daily_body",
-    "src.strategy.single_ma",
     "src.strategy.dual_ma",
     "src.strategy.supertrend",
     "src.strategy.trend_follow",
     "src.strategy.swing_trend",
     "src.strategy.morning_edge",
+    "src.ui.datetime_pickers",
+    "src.data.bar_inspect",
 ]
 hiddenimports += [
     "yaml",
@@ -107,6 +121,9 @@ hiddenimports += [
     "tkinter.ttk",
     "tkinter.messagebox",
     "tkinter.filedialog",
+    "matplotlib",
+    "matplotlib.pyplot",
+    "matplotlib.backends.backend_agg",
 ]
 
 excludes = [
@@ -114,7 +131,6 @@ excludes = [
     "IPython",
     "jupyter",
     "notebook",
-    "matplotlib",
     "pandas.tests",
     "numpy.tests",
 ]

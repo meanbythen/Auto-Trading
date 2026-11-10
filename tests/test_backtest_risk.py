@@ -34,6 +34,7 @@ def _cfg(**risk) -> dict:
             "symbols": ["bu"],
             "flatten_times": ["14:55", "22:55"],
             "flatten_at_close": False,
+            "market_filter": {"enabled": False},
             "trend_follow": {
                 "entry_bars": 20,
                 "exit_bars": 8,
@@ -83,6 +84,13 @@ def test_wide_stop_is_skipped_when_budget_is_tiny() -> None:
     assert result.performance.trades == 0
     skipped = result.params_snapshot["skipped_opens"]
     assert skipped.get("止损过宽，手数不够", 0) >= 1
+    # 成交明细之外，每一条没开成的信号都带时间、方向、原因。
+    assert result.rejected, "有信号但没开成，必须留下记录"
+    first = result.rejected[0]
+    assert first.stage == "风控手数"
+    assert first.side == "多"
+    assert first.time
+    assert "止损过宽" in first.reason
 
 
 def test_limits_off_keeps_one_lot_even_if_stop_is_wide() -> None:
@@ -122,6 +130,7 @@ def test_daily_loss_halt_clears_on_next_day() -> None:
     limits.on_bar(datetime(2026, 10, 17, 9, 30))
     ok2, _ = limits.allow_open(datetime(2026, 10, 17, 9, 30), 1)
     assert ok2 is True
+    assert limits.guard.write_alerts is False
 
 
 def test_night_session_does_not_reset_counters_at_midnight() -> None:
@@ -137,3 +146,87 @@ def test_night_session_does_not_reset_counters_at_midnight() -> None:
     limits.on_bar(datetime(2026, 10, 28, 21, 0))
     ok, _ = limits.allow_open(datetime(2026, 10, 28, 21, 5), 1)
     assert ok is True
+
+
+def _daily_body_bars(day: str = "2026-10-23") -> pd.DataFrame:
+    """09:00 起 5 分钟一根。ETH 20 分钟箱体 99~101，09:25 收盘 95 跌破。"""
+    idx = pd.date_range(f"{day} 09:00", f"{day} 11:00", freq="5min")
+    rows: list[tuple[float, float, float, float]] = []
+    rise = 0.0
+    for stamp in idx:
+        if stamp <= pd.Timestamp(f"{day} 09:20"):
+            rows.append((100.0, 101.0, 99.0, 100.0))
+        elif stamp == pd.Timestamp(f"{day} 09:25"):
+            rows.append((100.0, 100.0, 94.8, 95.0))
+        else:
+            rise += 0.1
+            rows.append((95.0 + rise, 95.3 + rise, 94.8 + rise, 95.1 + rise))
+    return pd.DataFrame(
+        {
+            "open": [r[0] for r in rows],
+            "high": [r[1] for r in rows],
+            "low": [r[2] for r in rows],
+            "close": [r[3] for r in rows],
+            "volume": [100.0] * len(rows),
+        },
+        index=idx,
+    )
+
+
+def _daily_body_cfg() -> dict:
+    """日内实体：ETH 20 分钟，箱体宽 2 点，上限压到 1 跳 → 跌破信号成立也不开。"""
+    return {
+        "dry_run": True,
+        "strategy": {
+            "engine": "daily_body",
+            "timeframe": "5",
+            "trail_timeframe": "5",
+            "symbols": ["bu"],
+            "flatten_times": ["14:55", "22:55"],
+            "flatten_at_close": False,
+            "daily_body": {
+                "eth_minutes": 20,
+                "max_box_ticks": 1,
+                "stop_extra_ticks": 1,
+                "regime_filter": False,
+            },
+        },
+        "trade": {"volume": 1, "symbol": "bu", "ctp": {"price_tick": 1}},
+        "schedule": {"trading_sessions": [["09:00", "15:00"]]},
+        "risk": {"capital": 14000, "contracts": {"bu": {"multiplier": 10}}},
+        "backtest": {"slippage_ticks": 0},
+    }
+
+
+def test_rejected_signal_records_strategy_filter_reason() -> None:
+    """策略看到跌破信号、但被自己的规则挡回去时，也要记一条带原因的记录。"""
+    result = run_backtest(
+        _daily_body_cfg(), symbol="bu", bars_signal=_daily_body_bars(), warmup=5, volume=1
+    )
+    assert result.performance.trades == 0
+    assert result.rejected, "被策略过滤掉的信号也要留下记录"
+    records = result.rejected
+    # 09:25 到 11:00 每根都在发同一个信号、同一条原因，同一时段只留第一条。
+    assert len(records) == 1
+    first = records[0]
+    assert first.stage == "策略过滤"
+    assert first.side == "空"
+    assert first.time.startswith("2026-10-23T09:25")
+    assert "箱体" in first.reason
+    assert "这段不开" in first.reason
+    # 保存成 JSON 后仍能看到这些记录。
+    payload = result.to_dict()
+    assert payload["rejected"][0]["stage"] == "策略过滤"
+
+
+def test_same_reason_is_recorded_once_per_session_not_once_forever() -> None:
+    """同样的原因，换一个交易时段仍要重新记一条。"""
+    frames = [_daily_body_bars("2026-10-23"), _daily_body_bars("2026-10-26")]
+    result = run_backtest(
+        _daily_body_cfg(),
+        symbol="bu",
+        bars_signal=pd.concat(frames),
+        warmup=5,
+        volume=1,
+    )
+    assert [item.time[:10] for item in result.rejected] == ["2026-10-23", "2026-10-26"]

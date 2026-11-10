@@ -2,8 +2,8 @@
 长线趋势加减仓（大小周期自相似）。
 
 功能：
-  - 大周期判断方向（收盘在大周期均线上方只做多，下方只做空）
-  - 小周期回调靠近均线后再顺势确认，才开第一笔
+  - 大周期判断方向（收盘在大周期 EMA 上方只做多，下方只做空）
+  - 小周期回调靠近 EMA 后再顺势确认，才开第一笔
   - 趋势还在时，浮盈够了、又出现回调，可以加仓（有次数上限）
   - 价格离均线冲太远时先减仓锁定一部分；大周期翻向或止损触发再清掉剩余
 原理：
@@ -21,8 +21,18 @@ from typing import Any, Literal
 import pandas as pd
 from loguru import logger
 
+from .indicators import ema_series
+from .market_state import MarketFilter, trend_params_for_section
 from .session_scope import scope_allows, scope_from_cfg
-from .types import PositionState, StrategyAction, StrategyDecision, config_flag
+from .types import (
+    STOP_MODE_TOUCH,
+    PositionState,
+    StrategyAction,
+    StrategyDecision,
+    config_flag,
+    stop_mode_from_cfg,
+    stop_triggered,
+)
 
 Bias = Literal["long", "short", "flat"]
 
@@ -71,11 +81,11 @@ def _parse_hhmm(value: str) -> dtime:
     return dtime(int(hour), int(minute))
 
 
-def _sma(series: pd.Series, period: int) -> float | None:
-    """最近 period 根收盘均线；不够就返回 None。"""
+def _ema(series: pd.Series, period: int) -> float | None:
+    """最近这段收盘的指数均线；K 线不够就返回 None。"""
     if series is None or len(series) < period:
         return None
-    value = float(series.astype(float).iloc[-period:].mean())
+    value = float(ema_series(series, period).iloc[-1])
     if pd.isna(value):
         return None
     return value
@@ -106,6 +116,7 @@ class SwingTrendStrategy:
     uses_trend_bars = True
 
     def __init__(self, cfg: dict[str, Any]) -> None:
+        self.cfg = cfg
         st = cfg.get("strategy", {}) or {}
         box = st.get("swing_trend") or {}
         if not isinstance(box, dict):
@@ -120,6 +131,9 @@ class SwingTrendStrategy:
 
         self.symbols: list[str] = list(st.get("symbols") or [trade.get("symbol", "bu2612")])
         self.volume = int(trade.get("volume", 1))
+        # 止损触发方式（全策略共用）。收盘确认时调度层不会把未收线那根拼进来。
+        self.stop_mode = stop_mode_from_cfg(cfg)
+        self.stop_on_touch = self.stop_mode == STOP_MODE_TOUCH
 
         # daily_ma 名字沿用：其实是「大周期均线根数」，60+15 时也是这个键。
         self.daily_ma = max(2, int(box.get("daily_ma", 20) or 20))
@@ -140,13 +154,15 @@ class SwingTrendStrategy:
         # 总仓位另由公共的仓位上限%、日最大亏损管，不再读最大持仓手数。
         self.lot_cap = max(1, self.unit_volume * (1 + self.max_adds))
 
-        self.flatten_times = [
-            _parse_hhmm(x) for x in st.get("flatten_times", ["14:55", "22:55"])
-        ]
+        from src.utils.session_clock import flatten_clocks_for_symbol, session_tuples
+
+        live = self.symbols[0] if self.symbols else ""
+        self.flatten_times = flatten_clocks_for_symbol(cfg, live)
         # 长线默认不听收盘清仓总开关；本小节单独控制。
         self.flatten_at_close = config_flag(box.get("flatten_at_close", False), default=False)
-        sessions = (cfg.get("schedule") or {}).get("trading_sessions") or []
-        self.entry_sessions = [(_parse_hhmm(a), _parse_hhmm(b)) for a, b in sessions]
+        # 长线自己的趋势过滤：大周期没趋势时加减仓没意义。
+        self.market_filter = MarketFilter(trend_params_for_section(cfg, "swing_trend"))
+        self.entry_sessions = session_tuples(cfg, live)
         self.session_scope = scope_from_cfg(cfg)
 
         self.positions: dict[str, PositionState] = {
@@ -164,25 +180,25 @@ class SwingTrendStrategy:
     def is_flatten_time(self, now: datetime | None = None) -> bool:
         if not self.flatten_at_close:
             return False
-        now = now or datetime.now()
-        t = now.time().replace(second=0, microsecond=0)
-        cur = datetime.combine(now.date(), t)
-        for ft in self.flatten_times:
-            start = datetime.combine(now.date(), ft)
-            end = start + timedelta(minutes=10)
-            if start <= cur <= end:
-                return True
-        return False
+        from src.utils.session_clock import in_flatten_window
 
-    def in_entry_session(self, now: datetime) -> bool:
+        return in_flatten_window(self.flatten_times, now or datetime.now())
+
+    def in_entry_session(self, now: datetime, symbol: str | None = None) -> bool:
         if str(self.timeframe).upper() in {"D", "W"}:
             return True
         if not scope_allows(self.session_scope, now):
             return False
-        if not self.entry_sessions:
+        from src.utils.session_clock import in_session_windows, parse_hhmm, sessions_for_symbol
+
+        windows = self.entry_sessions
+        if symbol:
+            rows = sessions_for_symbol(self.cfg, symbol)
+            if rows:
+                windows = [(parse_hhmm(a), parse_hhmm(b)) for a, b in rows]
+        if not windows:
             return True
-        t = now.time()
-        return any(a <= t <= b for a, b in self.entry_sessions)
+        return in_session_windows(windows, now)
 
     def on_filled(
         self,
@@ -260,6 +276,8 @@ class SwingTrendStrategy:
         now = now or datetime.now()
         pos = self.positions.setdefault(symbol, PositionState(symbol=symbol))
         need = max(self.signal_ma, self.atr_period, self.pullback_lookback) + 3
+        if self.market_filter.enabled:
+            need = max(need, self.market_filter.params.need_bars)
         if bars is None or len(bars) < need:
             return StrategyDecision(StrategyAction.HOLD, symbol, "60分钟K线不足，长线趋势还算不出来")
 
@@ -284,8 +302,15 @@ class SwingTrendStrategy:
 
         if self.is_flatten_time(now):
             return StrategyDecision(StrategyAction.HOLD, symbol, "收盘清仓时段，不再开新仓")
-        if not self.in_entry_session(now):
+        if not self.in_entry_session(now, symbol):
             return StrategyDecision(StrategyAction.HOLD, symbol, "非交易时段")
+
+        # 文档第 1 条：行情不匹配直接停手，长线也不硬扛震荡。
+        state = self.market_filter.check(bars)
+        if not state.ok:
+            return StrategyDecision(
+                StrategyAction.HOLD, symbol, f"行情不匹配：{state.reason}"
+            )
 
         return self._try_first_entry(symbol, bars, bias, now, bar_id)
 
@@ -296,7 +321,7 @@ class SwingTrendStrategy:
         if trend_bars is None or len(trend_bars) < self.daily_ma:
             return "flat"
         close = trend_bars["close"].astype(float)
-        ma = _sma(close, self.daily_ma)
+        ma = _ema(close, self.daily_ma)
         if ma is None:
             return "flat"
         last = float(close.iloc[-1])
@@ -334,7 +359,7 @@ class SwingTrendStrategy:
         bar_id: str,
     ) -> StrategyDecision:
         close = bars["close"].astype(float)
-        ma = _sma(close, self.signal_ma)
+        ma = _ema(close, self.signal_ma)
         atr = _atr(bars, self.atr_period)
         if ma is None or atr is None:
             return StrategyDecision(StrategyAction.HOLD, symbol, "均线或波动还没算稳")
@@ -385,7 +410,7 @@ class SwingTrendStrategy:
         bar_id = str(bar.name)
         close = float(bar["close"])
         atr = _atr(bars, self.atr_period)
-        ma = _sma(bars["close"].astype(float), self.signal_ma)
+        ma = _ema(bars["close"].astype(float), self.signal_ma)
         if atr is None:
             return StrategyDecision(StrategyAction.HOLD, symbol, "波动还算不出来，先持仓观望")
 
@@ -420,11 +445,14 @@ class SwingTrendStrategy:
         pos.trail_stop = stop
         pos.trail_armed = True
         if not self._is_entry_bar(symbol, bar_id):
-            if pos.side == "long" and float(bar["low"]) <= stop:
-                return self._close_decision(
-                    symbol, now, bar_id, pos.volume, f"长线止损触发 {stop:.2f}", scale="exit"
-                )
-            if pos.side == "short" and float(bar["high"]) >= stop:
+            if stop_triggered(
+                side=pos.side,
+                stop=stop,
+                close=close,
+                high=float(bar["high"]),
+                low=float(bar["low"]),
+                mode=self.stop_mode,
+            ):
                 return self._close_decision(
                     symbol, now, bar_id, pos.volume, f"长线止损触发 {stop:.2f}", scale="exit"
                 )
@@ -453,7 +481,7 @@ class SwingTrendStrategy:
                 self._reduced_on_extend[symbol] = False
 
         # 4) 浮盈回调加仓：大周期方向仍同向，且又出现回调确认。
-        if bias == pos.side and ma is not None and self.in_entry_session(now):
+        if bias == pos.side and ma is not None and self.in_entry_session(now, symbol):
             add_decision = self._try_add(symbol, bars, pos, bias, ma, atr, now, bar_id, close)
             if add_decision is not None:
                 return add_decision

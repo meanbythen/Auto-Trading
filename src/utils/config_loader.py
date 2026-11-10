@@ -22,6 +22,42 @@ def _project_root() -> Path:
     return project_root()
 
 
+def _drop_dead_keys(cfg: dict[str, Any]) -> None:
+    """
+    丢掉代码从不读取的旧键，加载和保存都清一次。
+
+    strategy.enabled：策略启停早已由 engine 决定；
+    account.note：早期给人写备注用的字段，程序不读。
+    """
+    strategy = cfg.get("strategy")
+    if isinstance(strategy, dict):
+        strategy.pop("enabled", None)
+    account = cfg.get("account")
+    if isinstance(account, dict):
+        account.pop("note", None)
+
+
+_CTP_RUNTIME_KEYS = {
+    "resolved_auth_code",
+    "resolved_password",
+    "resolved_sim_password",
+    "resolved_live_password",
+}
+
+
+def _strip_ctp_runtime(ctp: dict[str, Any]) -> dict[str, Any]:
+    """保存时去掉内存里的密码和认证码，sim/live 小节同样处理。"""
+    cleaned: dict[str, Any] = {}
+    for key, value in ctp.items():
+        if key in _CTP_RUNTIME_KEYS:
+            continue
+        if key in {"sim", "live"} and isinstance(value, dict):
+            cleaned[key] = {inner: inner_val for inner, inner_val in value.items() if inner not in _CTP_RUNTIME_KEYS}
+        else:
+            cleaned[key] = value
+    return cleaned
+
+
 def ensure_runtime_layout() -> Path:
     """
     打包后首次运行：把内置示例配置/模板拷到 exe 旁边（可改可写）。
@@ -41,11 +77,16 @@ def ensure_runtime_layout() -> Path:
         ("config/全品种备查.txt", "config/全品种备查.txt"),
         # 保证金/乘数只认这张总表，首次运行必须落到 exe 旁的 config 目录。
         ("config/品种与合约.xlsx", "config/品种与合约.xlsx"),
+        # 优化参数表：网格档位和中文名都在这里，打包后落在 exe 旁方便直接改。
+        ("config/优化参数.xlsx", "config/优化参数.xlsx"),
         ("strategies", "strategies"),
         ("README.md", "README.md"),
         ("CHANGELOG.md", "CHANGELOG.md"),
         ("VERSION", "VERSION"),
     ]
+    # 主力合约表：回测按它的「主力时段」自动换月。年份换了也不必改代码，按文件名拷过去。
+    for table in sorted((res / "config").glob("*主力合约表*.xlsx")):
+        pairs.append((f"config/{table.name}", f"config/{table.name}"))
     for src_rel, dst_rel in pairs:
         src = res / src_rel
         dst = root / dst_rel
@@ -148,10 +189,18 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
                 if auth_code:
                     os.environ[auth_env] = auth_code
             ctp["resolved_auth_code"] = auth_code
-            # 仿真密码和同花顺密码分开。没填时，CTP 不会拿同花顺密码去连测试前置。
+            # 仿真密码、实盘密码、同花顺密码三套分开，互不顶替。
             ctp_password = os.environ.get("CTP_PASSWORD", "")
             if not ctp_password:
                 ctp_password = str(secrets.get("ctp_password", "") or "")
+            live_password = os.environ.get("CTP_LIVE_PASSWORD", "")
+            if not live_password:
+                live_password = str(secrets.get("ctp_live_password", "") or "")
+            # 没单独写实盘密码时，CTP 真实通道用同一份交易密码（同花顺登录那一份）。
+            if not live_password:
+                live_password = password
+            ctp["resolved_sim_password"] = ctp_password
+            ctp["resolved_live_password"] = live_password
             ctp["resolved_password"] = ctp_password
 
     if not password:
@@ -173,6 +222,7 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
     risk = cfg.get("risk")
     if isinstance(risk, dict):
         risk.pop("max_position", None)
+    _drop_dead_keys(cfg)
 
     cfg["_project_root"] = str(root)
     cfg["_config_path"] = str(path)
@@ -225,15 +275,12 @@ def save_config(cfg: dict[str, Any], config_path: str | Path | None = None) -> P
     risk_dump = dump.get("risk")
     if isinstance(risk_dump, dict):
         risk_dump.pop("max_position", None)
+    _drop_dead_keys(dump)
     if "account" in dump and isinstance(dump["account"], dict):
         dump["account"] = {k: v for k, v in dump["account"].items() if k != "resolved_password"}
     trade_dump = dump.get("trade")
     if isinstance(trade_dump, dict) and isinstance(trade_dump.get("ctp"), dict):
-        trade_dump["ctp"] = {
-            k: v
-            for k, v in trade_dump["ctp"].items()
-            if k not in {"resolved_auth_code", "resolved_password"}
-        }
+        trade_dump["ctp"] = _strip_ctp_runtime(trade_dump["ctp"])
 
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w", encoding="utf-8") as f:

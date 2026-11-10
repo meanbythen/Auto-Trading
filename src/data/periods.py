@@ -15,9 +15,53 @@ K 线周期。
 from __future__ import annotations
 
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
+
+
+def unique_ohlc_columns(frame: pd.DataFrame | None) -> pd.DataFrame | None:
+    """
+    同一列名出现两次时只留最后一列。
+
+    新浪有时同时带回单字母列（c）和英文列（close），整理后会变成两列都叫 close。
+    后面如果写成 if 收盘价，Python 会把一整列数字当成「是不是」，报
+    「truth value of an array is ambiguous」。
+    """
+    if frame is None or len(frame) == 0:
+        return frame
+    columns = getattr(frame, "columns", None)
+    if columns is None:
+        return frame
+    if not columns.duplicated().any():
+        return frame
+    return frame.loc[:, ~columns.duplicated(keep="last")]
+
+
+def ohlc_series(frame: pd.DataFrame | None, name: str) -> pd.Series:
+    """取出开/高/低/收/量的一列数字。列名重复时用最后一列。"""
+    if frame is None or name not in getattr(frame, "columns", []):
+        return pd.Series(dtype=float)
+    col = frame[name]
+    if isinstance(col, pd.DataFrame):
+        col = col.iloc[:, -1]
+    return pd.to_numeric(col, errors="coerce")
+
+
+def last_ohlc_price(frame: pd.DataFrame | None, name: str) -> float | None:
+    """最新一根的开/高/低/收。拿不到或一格里挤了多个数就返回 None。"""
+    series = ohlc_series(frame, name).dropna()
+    if series.empty:
+        return None
+    raw = np.asarray(series.iloc[-1], dtype=float).reshape(-1)
+    if raw.size != 1:
+        return None
+    value = float(raw[0])
+    if value != value:
+        return None
+    return value
 
 # 新浪分钟接口直接能给的档。别的分钟数要用其中一档再合成。
 SINA_MINUTES = ("1", "5", "15", "30", "60")
@@ -165,6 +209,16 @@ def cache_tag(period: str) -> str:
     return f"{period}m"
 
 
+def csv_skip_marker(csv_path: Path) -> Path:
+    """
+    删库后这份 CSV 还被 Excel 开着改不掉时，在旁边放一个 .skip 标记。
+
+    下次读图或拉行情看到这个标记，就不会把旧 CSV 再补进清洗库。
+    CSV 真正删掉或成功写成新内容后，把标记去掉。
+    """
+    return Path(csv_path).with_name(Path(csv_path).name + ".skip")
+
+
 def stale_after_minutes(period: str, base: float = 90.0) -> float:
     """
     多久没更新才算行情过期。
@@ -184,6 +238,7 @@ def resample_ohlc(df: pd.DataFrame | None, period: str) -> pd.DataFrame | None:
     """把更细的 K 线收成目标周期。开盘取第一根，最高最低取极值，收盘取最后一根。"""
     if df is None or len(df) == 0:
         return df
+    df = unique_ohlc_columns(df)
     rule = pandas_rule(period)
     agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
     if "volume" in df.columns:
@@ -284,6 +339,59 @@ def bars_from_minutes(minutes: pd.DataFrame | None, period: str) -> pd.DataFrame
     return kept
 
 
+def fix_gap_spanning_bars(
+    bars: pd.DataFrame | None, *, gap_ratio: float = 0.002
+) -> pd.DataFrame | None:
+    """
+    修掉跨休市第一根K线里被拼进来的上一段收盘价。
+
+    新浪的分钟接口在休市后的第一根（09:05、13:35、21:05）有时会把上一段最后一笔
+    塞进 high/low：跳空低开时 high 正好压在上一根收盘，跳空高开时 low 正好压在
+    上一根收盘。这个价位本段并没有成交（比如今天 fu2701 的 09:05 最高价是昨晚收盘
+    4486，而今天开盘只有 4179），会让突破、ATR、止损全部失真。
+
+    只在这根开盘相对上一根明显跳空（默认 0.2%）时处理，普通K线不动。
+    取回本段自己的价格区间：低开时 high 收到 open/close 较高者，高开时 low 抬到较低者。
+    """
+    if bars is None or len(bars) < 2:
+        return bars
+    out = unique_ohlc_columns(bars)
+    if out is None:
+        return bars
+    need = {"open", "high", "low", "close"}
+    if not need.issubset(set(out.columns)):
+        return out
+    prev_close = ohlc_series(out, "close").shift(1)
+    open_px = ohlc_series(out, "open")
+    high_px = ohlc_series(out, "high")
+    low_px = ohlc_series(out, "low")
+    close_px = ohlc_series(out, "close")
+    body_high = open_px.where(open_px > close_px, close_px)
+    body_low = open_px.where(open_px < close_px, close_px)
+
+    gap = (open_px - prev_close).abs()
+    moved = gap >= (prev_close.abs() * gap_ratio)
+    tol = (prev_close.abs() * 1e-4).clip(lower=1e-6)
+    down = moved & (open_px < prev_close) & (high_px <= prev_close + tol) & (high_px > body_high)
+    up = moved & (open_px > prev_close) & (low_px >= prev_close - tol) & (low_px < body_low)
+
+    def _flag(mask: Any) -> pd.Series:
+        arr = np.asarray(mask, dtype=bool)
+        if arr.ndim > 1:
+            arr = arr.reshape(len(out), -1)[:, -1]
+        arr = arr.reshape(-1)[: len(out)]
+        return pd.Series(arr, index=out.index)
+
+    down_flag = _flag(down)
+    up_flag = _flag(up)
+    # 必须先收成一列 True/False。多列时 .any() 会变成一排数字，不能写进 if。
+    if bool(down_flag.to_numpy().any()):
+        out.loc[down_flag, "high"] = body_high[down_flag]
+    if bool(up_flag.to_numpy().any()):
+        out.loc[up_flag, "low"] = body_low[up_flag]
+    return out
+
+
 def overlay_minute_bars(
     native: pd.DataFrame | None,
     built: pd.DataFrame | None,
@@ -329,6 +437,12 @@ def overlay_minute_bars(
     # 拼图覆盖的时段：丢掉旧时间戳（含新浪左标签错位的那几根），再写入右标签版本
     drop_mask = (out.index >= start) & (out.index <= end)
     out = out.loc[~drop_mask]
+    try:
+        out.attrs = {}
+        persist = persist.copy()
+        persist.attrs = {}
+    except Exception:  # noqa: BLE001
+        pass
     out = pd.concat([out, persist[cols]]).sort_index()
     out = out[~out.index.duplicated(keep="last")].sort_index()
     # 实盘最后一根未齐时，仍显示在返回结果里

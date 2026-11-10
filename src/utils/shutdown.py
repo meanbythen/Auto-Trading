@@ -43,7 +43,11 @@ def last_close_time(
             continue
     if not ends:
         return None
-    return max(ends)
+    # 凌晨结束（02:30）比下午 15:00 更晚：不能按钟点数字取最大，否则白银会下午就关机。
+    def _later_in_trading_day(stamp: dtime) -> tuple[int, dtime]:
+        return (0, stamp) if stamp >= dtime(8, 0) else (1, stamp)
+
+    return max(ends, key=_later_in_trading_day)
 
 
 def ready_for_shutdown(
@@ -52,14 +56,21 @@ def ready_for_shutdown(
     flatten_times: list[str] | None,
     now: datetime | None = None,
     grace_minutes: int = 5,
+    has_position: bool = False,
 ) -> tuple[bool, str]:
     """
     是否已到收盘后可关机窗口。
 
     参数:
         grace_minutes: 过了最后收盘时刻后再等几分钟，给最后一轮扫描/清仓留时间
+        has_position: 程序账上是否还有未平仓位。有仓时一律不关机，避免把仓位留到场内。
     """
     now = now or datetime.now()
+    # 周末没有交易，不应触发关机（周五夜盘结束时 weekday 仍是周五，不受影响）。
+    if now.weekday() >= 5:
+        return False, "周末不自动关机"
+    if has_position:
+        return False, "程序账上还有未平仓位，不自动关机"
     close_t = last_close_time(sessions, flatten_times)
     if close_t is None:
         return False, "未配置清仓/交易时段，不自动关机"

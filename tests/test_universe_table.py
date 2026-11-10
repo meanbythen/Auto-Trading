@@ -98,3 +98,40 @@ def test_apply_to_cfg(tmp_path: Path) -> None:
     assert symbols == ["jm2701"]
     assert cfg["strategy"]["symbols"] == ["jm2701"]
     assert contracts["jm"]["multiplier"] == 60
+
+
+def test_symbol_sessions_roundtrip(tmp_path: Path) -> None:
+    """品种表里的交易时段、清仓时刻会跟合约一起读出来。"""
+    path = tmp_path / "sess.xlsx"
+    write_universe_table(
+        path,
+        [
+            {
+                "symbol": "ag2702",
+                "name": "白银",
+                "margin": 1,
+                "multiplier": 15,
+                "enabled": True,
+                "trading_sessions": "09:00-11:30,13:30-15:00,21:00-02:30",
+                "flatten_times": "14:55,02:25",
+            },
+            {
+                "symbol": "fu2701",
+                "name": "燃油",
+                "margin": 1,
+                "multiplier": 10,
+                "enabled": True,
+                "trading_sessions": "09:00-11:30,13:30-15:00,21:00-23:00",
+                "flatten_times": "14:55,22:55",
+            },
+        ],
+    )
+    cfg: dict = {"_project_root": str(tmp_path), "risk": {}, "strategy": {}}
+    _symbols, contracts = apply_universe_table_to_cfg(cfg, path=path, create_if_missing=False)
+    from src.utils.session_clock import in_trading_sessions, sessions_for_symbol
+
+    now = __import__("datetime").datetime(2026, 11, 10, 0, 37)
+    assert in_trading_sessions(sessions_for_symbol(cfg, "ag2702"), now) is True
+    assert in_trading_sessions(sessions_for_symbol(cfg, "fu2701"), now) is False
+    assert "02:30" in (contracts["ag"].get("trading_sessions") or "")
+    assert "22:55" in (contracts["fu"].get("flatten_times") or "")

@@ -19,7 +19,18 @@ DEFAULT_REL_PATH = "config/品种与合约.xlsx"
 LEGACY_MARGIN_REL = "config/品种保证金.xlsx"
 SHEET_NAME = "品种与合约"
 # 每跳价格（最小变动价位）留空时，用交易配置里的全局 price_tick。
-HEADERS = ("合约代码", "中文名", "每手保证金", "乘数", "每手手续费", "平今手续费", "启用", "每跳价格")
+HEADERS = (
+    "合约代码",
+    "中文名",
+    "每手保证金",
+    "乘数",
+    "每手手续费",
+    "平今手续费",
+    "启用",
+    "每跳价格",
+    "交易时段",
+    "清仓时刻",
+)
 
 
 def product_key(symbol: str) -> str:
@@ -97,6 +108,8 @@ def rows_from_cfg(cfg: dict[str, Any]) -> list[dict[str, Any]]:
                 "commission": max(0.0, _as_float(box.get("commission"), 0.0)),
                 "commission_close_today": _optional_close_today(box),
                 "price_tick": _optional_tick(box),
+                "trading_sessions": str(box.get("trading_sessions") or ""),
+                "flatten_times": str(box.get("flatten_times") or ""),
                 "enabled": True,
             }
         ))
@@ -118,6 +131,8 @@ def rows_from_cfg(cfg: dict[str, Any]) -> list[dict[str, Any]]:
                 "commission": max(0.0, _as_float(item.get("commission"), 0.0)),
                 "commission_close_today": _optional_close_today(item),
                 "price_tick": _optional_tick(item),
+                "trading_sessions": str(item.get("trading_sessions") or ""),
+                "flatten_times": str(item.get("flatten_times") or ""),
                 "enabled": False,
             }
         ))
@@ -153,6 +168,8 @@ def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     elif out.get("commission_close_today") is not None:
         out["commission_close_today"] = max(0.0, _as_float(out.get("commission_close_today"), 0.0))
     out["price_tick"] = _optional_tick(out)
+    out["trading_sessions"] = str(out.get("trading_sessions") or "").strip()
+    out["flatten_times"] = str(out.get("flatten_times") or "").strip()
     return out
 
 
@@ -196,6 +213,8 @@ def write_universe_table(path: Path | str, rows: list[dict[str, Any]]) -> Path:
                 _excel_number(today) if today is not None else None,
                 "是" if item.get("enabled", True) else "否",
                 _excel_number(tick) if tick is not None else None,
+                str(item.get("trading_sessions") or ""),
+                str(item.get("flatten_times") or ""),
             ]
         )
     sheet.column_dimensions["A"].width = 12
@@ -206,6 +225,8 @@ def write_universe_table(path: Path | str, rows: list[dict[str, Any]]) -> Path:
     sheet.column_dimensions["F"].width = 12
     sheet.column_dimensions["G"].width = 8
     sheet.column_dimensions["H"].width = 12
+    sheet.column_dimensions["I"].width = 42
+    sheet.column_dimensions["J"].width = 16
     book.save(file)
     return file
 
@@ -241,6 +262,8 @@ def read_universe_table(path: Path | str) -> list[dict[str, Any]]:
         idx_today = _find_col(names, ("平今手续费", "平今", "commission_close_today"))
         idx_on = _find_col(names, ("启用", "关注", "enabled", "on"))
         idx_tick = _find_col(names, ("每跳价格", "每跳", "最小变动价位", "tick", "price_tick"))
+        idx_sess = _find_col(names, ("交易时段", "时段", "trading_sessions", "sessions"))
+        idx_flat = _find_col(names, ("清仓时刻", "清仓", "flatten_times", "flatten"))
         if idx_sym is None or idx_margin is None:
             raise ValueError("表格至少要有「合约代码」「每手保证金」两列")
 
@@ -273,6 +296,12 @@ def read_universe_table(path: Path | str) -> list[dict[str, Any]]:
                 cell = raw[idx_tick]
                 if cell is not None and str(cell).strip() != "":
                     tick = max(0.0, _as_float(cell, 0.0))
+            sessions = ""
+            if idx_sess is not None and idx_sess < len(raw):
+                sessions = str(raw[idx_sess] or "").strip()
+            flats = ""
+            if idx_flat is not None and idx_flat < len(raw):
+                flats = str(raw[idx_flat] or "").strip()
             rows.append(
                 _normalize_row(
                     {
@@ -283,6 +312,8 @@ def read_universe_table(path: Path | str) -> list[dict[str, Any]]:
                         "commission": fee,
                         "commission_close_today": today,
                         "price_tick": tick,
+                        "trading_sessions": sessions,
+                        "flatten_times": flats,
                         "enabled": enabled,
                     }
                 )
@@ -365,6 +396,12 @@ def parse_universe_rows(rows: list[dict[str, Any]]) -> tuple[list[str], dict[str
         tick = _optional_tick(item)
         if tick is not None:
             box["price_tick"] = tick
+        sess = str(item.get("trading_sessions") or "").strip()
+        if sess:
+            box["trading_sessions"] = sess
+        flats = str(item.get("flatten_times") or "").strip()
+        if flats:
+            box["flatten_times"] = flats
         contracts[key] = box
     return symbols, contracts
 
@@ -434,6 +471,7 @@ def apply_universe_table_to_cfg(
     upgrade_universe_fee_columns(table_path, rows)
     # 旧表没有每跳价格列时也补上，留空表示用全局 price_tick。
     upgrade_universe_tick_column(table_path, rows)
+    upgrade_universe_session_columns(table_path, rows)
     symbols, contracts = parse_universe_rows(rows)
     if symbols:
         st["symbols"] = symbols
@@ -453,6 +491,10 @@ def apply_universe_table_to_cfg(
         tick = _optional_tick(item)
         if tick is not None:
             box["price_tick"] = tick
+        if item.get("trading_sessions"):
+            box["trading_sessions"] = str(item["trading_sessions"])
+        if item.get("flatten_times"):
+            box["flatten_times"] = str(item["flatten_times"])
         risk["contracts"][code] = box
     logger.info(
         "已从品种与合约表载入：关注 {} 个合约、{} 个品种保证金/手续费 → {}",
@@ -508,6 +550,47 @@ def upgrade_universe_tick_column(path: Path | str, rows: list[dict[str, Any]] | 
     data = rows if rows is not None else read_universe_table(file)
     write_universe_table(file, data)
     logger.info("品种与合约表已补上每跳价格列: {}", file)
+    return True
+
+
+def upgrade_universe_session_columns(path: Path | str, rows: list[dict[str, Any]] | None = None) -> bool:
+    """
+    旧表缺「交易时段」「清仓时刻」时补上。
+
+    空单元格按品种填出厂值：白银/黄金夜盘到 02:30、清仓 02:25；其它到 23:00、清仓 22:55。
+    表正在被 Excel 打开写不进去时，只记一句日志，不让启动失败。
+    """
+    from src.utils.session_clock import (
+        default_flatten_for_product,
+        default_sessions_for_product,
+        format_session_text,
+        product_code,
+    )
+
+    file = Path(path)
+    has_sess = _universe_headers_have(file, ("交易时段", "时段", "trading_sessions", "sessions"))
+    has_flat = _universe_headers_have(file, ("清仓时刻", "清仓", "flatten_times", "flatten"))
+    data = rows if rows is not None else read_universe_table(file)
+    filled = False
+    for row in data:
+        code = product_code(row.get("symbol"))
+        if not str(row.get("trading_sessions") or "").strip():
+            row["trading_sessions"] = format_session_text(default_sessions_for_product(code))
+            filled = True
+        if not str(row.get("flatten_times") or "").strip():
+            row["flatten_times"] = ",".join(default_flatten_for_product(code))
+            filled = True
+    if has_sess and has_flat and not filled:
+        return False
+    try:
+        write_universe_table(file, data)
+    except PermissionError:
+        logger.warning(
+            "品种与合约表正在被 Excel 打开，没能写入「交易时段」「清仓时刻」两列。"
+            "请先关掉表格再重新打开本程序。白银/黄金即使没写进表，夜盘也会按收到 02:30 扫。"
+        )
+        return False
+    logger.info("品种与合约表已补上交易时段/清仓时刻: {}", file)
     return True
 
 
@@ -591,7 +674,9 @@ def sync_watch_symbols_to_table(
                         "multiplier": float(box.get("multiplier") or 10),
                         "commission": float(box.get("commission") or 0),
                         "commission_close_today": _optional_close_today(box),
-                "price_tick": _optional_tick(box),
+                        "price_tick": _optional_tick(box),
+                        "trading_sessions": str(box.get("trading_sessions") or ""),
+                        "flatten_times": str(box.get("flatten_times") or ""),
                         "enabled": True,
                     }
                 )

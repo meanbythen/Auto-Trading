@@ -24,6 +24,20 @@ class TradeRecord:
     reason_entry: str = ""
     reason_exit: str = ""
     commission: float = 0.0  # 本笔开+平手续费合计（元）
+    # 多因子开仓快照。别的策略这些字段保持空，导出时不填衰减表。
+    score_ma: float | None = None
+    score_turtle: float | None = None
+    score_boll: float | None = None
+    score_sar: float | None = None
+    score_total: float | None = None
+    atr: float | None = None
+    pnl_ma: float | None = None
+    pnl_turtle: float | None = None
+    pnl_boll: float | None = None
+    pnl_sar: float | None = None
+    dominant_factor: str = ""
+    resonance: str = ""
+    multiplier: float | None = None
 
 
 # 收益率只用这个比例估算每笔要交的保证金。不改变开仓手数，也不参与优选排名。

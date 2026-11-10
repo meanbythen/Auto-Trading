@@ -22,6 +22,9 @@ REQUIRED_MODULES = [
     "src.review.sources",
     "src.review.service",
     "src.backtest.optimizer",
+    "src.backtest.param_table",
+    "src.backtest.rollover",
+    "src.backtest.main_table",
     "src.screen.picker",
     "src.account.signal_book",
     "src.export.bundle",
@@ -31,10 +34,42 @@ REQUIRED_MODULES = [
     "src.strategy.daily_body",
     "src.strategy.morning_edge",
     "src.strategy.supertrend",
-    "src.strategy.single_ma",
     "src.strategy.dual_ma",
     "src.strategy.trend_follow",
     "src.strategy.swing_trend",
+    "src.strategy.market_state",
+    "src.strategy.trend_base",
+    "src.strategy.bollinger_break",
+    "src.strategy.sar_trend",
+    "src.strategy.multi_factor",
+    "src.strategy.multi_factor_adapt",
+    "src.strategy.adaptive_weights",
+    "src.strategy.cta_factors",
+    "src.strategy.cta_filter",
+    "src.export.cta_decay",
+    "src.export.factor_decay_plot",
+    "src.data.quality",
+    "src.data.inventory",
+    "src.data.ths_chart",
+    "src.ops.alerts",
+    "src.risk.dynamic",
+    "src.ops.health",
+    "src.research.scan",
+    "src.research.pool",
+    "src.research.factors",
+    # 21:00 期货交易日、保证金表等运行必需模块
+    "src.utils.trading_day",
+    "src.risk.margin_table",
+    "src.account.signal_stats",
+    "src.scheduler.runner",
+    "src.trader.ctp_logic",
+    "src.trader.sim_trader",
+    "src.strategy.levels",
+    "src.strategy.explain",
+    "src.ui.config_presets",
+    "src.ui.datetime_pickers",
+    "src.data.bar_inspect",
+    "src.data.bar_store",
 ]
 
 def main() -> int:
@@ -61,21 +96,32 @@ def main() -> int:
         "config/config.example.yaml",
         "config/全品种备查.txt",
         "config/品种与合约.xlsx",
+        "config/优化参数.xlsx",
         "使用说明.txt",
         "strategies",
         "strategies/daily_body.yaml",
         "strategies/supertrend.yaml",
-        "strategies/single_ma.yaml",
         "strategies/dual_ma.yaml",
         "strategies/morning_box_a.yaml",
-        "strategies/morning_structure_b.yaml",
         "strategies/trend_follow.yaml",
+        "strategies/bollinger.yaml",
+        "strategies/sar_trend.yaml",
+        "strategies/multi_factor.yaml",
+        "strategies/multi_vote.yaml",
+        "strategies/multi_hybrid.yaml",
+        "strategies/jesse_casper.yaml",
         "VERSION",
         "CHANGELOG.md",
+        "docs/策略迭代进化说明.md",
+        "docs/日内实体操作说明书.md",
     ):
         path = DIST / rel
         if not path.exists():
             errors.append(f"缺少 {rel}")
+
+    # 主力合约表：少了也能启动，但回测不会按主力时段换月。
+    if not any(DIST.glob("config/*主力合约表*.xlsx")) and not any(DIST.glob("*主力合约表*.xlsx")):
+        errors.append("缺少 config/主力合约表.xlsx（回测无法按主力时段换月）")
 
     # 已删策略的说明书不应再进发布包，避免用户误以为还能选
     for gone in (

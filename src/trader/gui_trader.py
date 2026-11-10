@@ -2,26 +2,77 @@
 同花顺 GUI 点击交易执行器
 功能：通过鼠标点击下单面板上的「买开 / 卖开 / 平仓」按钮完成交易。
 原理：配置文件里预先标定按钮坐标 → pyautogui 移动点击。
-风险：窗口移动、分辨率变化会导致点错；务必先 dry_run，并用 FAILSAFE（鼠标甩左上角中断）。
+风险：窗口移动、分辨率变化会导致点错；务必先 dry_run。
+     下单这一段会关掉四角急停、挡住人手鼠标，并钉住同花顺，避免和填价格抢鼠标。
+     要停扫描请用运行页「停止」。同花顺里的仓去同花顺平。
 
 确认框处理：
-  同花顺下单后常弹出「确定/确认」提示，不点则卡死。
-  默认：稍等后按回车；若标定了 confirm_btn 再点一次确定按钮。
+  期货通实测：点买开/卖空/平仓后，能成交就立刻成交，暂时不成交就进委托单，没有确认弹窗。
+  默认 confirm_times=0：点完按钮就结束，不再按回车（回车可能落到还亮着的买卖键上再发一笔）。
+  若账号打开了「下单确认」，把 confirm_times 改成 1 或 2。
 """
 
 from __future__ import annotations
 
+import threading
 import time
 import uuid
 from typing import Any
 
+import ctypes
+import sys
+
 import pyautogui
 from loguru import logger
+
+# 常驻下单时四角急停必须关：填价格、点按钮如果经过屏幕角，会把这一笔点到一半掐掉。
+# 停扫描用运行页「停止」。下单这一段另外会挡住人手鼠标。
+pyautogui.FAILSAFE = False
+
+
+def grab_pointer_for_order(*, dry_run: bool) -> dict[str, Any]:
+    """
+    下单期间把鼠标控制权留给程序。
+
+    关掉四角急停，避免点按钮经过角落时自己把自己掐死。
+    真下单时再挡住人手鼠标（人手动鼠标就不会把光标拖出价格框）。
+    挡住人手不会挡住程序自己的点击。模拟点击不挡人手，免得测试把你的鼠标锁住。
+    """
+    old_failsafe = bool(getattr(pyautogui, "FAILSAFE", False))
+    pyautogui.FAILSAFE = False
+    blocked = False
+    # 单元测试里也会 dry_run=False 去走点击路径，绝不能真锁鼠标。
+    if not dry_run and sys.platform == "win32" and "pytest" not in sys.modules:
+        try:
+            blocked = bool(ctypes.windll.user32.BlockInput(True))
+            if not blocked:
+                logger.warning("没能挡住人手鼠标（有时需要管理员权限）。下单仍会点，请勿自己动鼠标")
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("没能挡住人手鼠标（下单仍会点，请勿自己动鼠标）: {}", exc)
+            blocked = False
+    return {"failsafe": old_failsafe, "blocked": blocked}
+
+
+def release_pointer_after_order(token: dict[str, Any] | None) -> None:
+    """下单结束：把手鼠标还回去，四角急停保持关掉（常驻下单不能再打开）。"""
+    token = token or {}
+    if token.get("blocked"):
+        try:
+            ctypes.windll.user32.BlockInput(False)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("解除鼠标锁定失败，可按 Ctrl+Alt+Delete 恢复: {}", exc)
+    pyautogui.FAILSAFE = False
 
 from .base import OrderRequest, OrderResult, TraderBase
 
 # 真下单的鼠标键盘还没结束时为真。界面这时不要把自己拉到同花顺前面。
 _ORDER_CLICKING = False
+
+# 进程级下单互斥。常驻 bot、下单模拟器、手工下单各自可能建 GuiTrader 实例，
+# 但它们点的是同一个同花顺窗口，必须串行，否则会互相抢焦点/改价格框。
+_TRADE_LOCK = threading.Lock()
+# 等锁上限。等不到说明另一笔正在点，宁可跳过也不并发点。
+_TRADE_LOCK_TIMEOUT_SEC = 45.0
 
 
 def order_click_in_progress() -> bool:
@@ -42,19 +93,19 @@ class GuiTrader(TraderBase):
         self._full_cfg = cfg  # 下单前激活同花顺窗口时用
         trade = cfg.get("trade", {})
         self.gui = trade.get("gui", {})
-        # confirm_mode: enter=只按回车 | click=只点坐标 | both=先回车再点（默认）
+        # confirm_mode: enter=只按回车 | click=只点坐标 | both=先回车再点
+        # 仅当 confirm_times>0（账号打开了下单确认）时才用。
         self.confirm_mode = str(self.gui.get("confirm_mode", "both")).lower()
         # 点完买卖后等多久再处理确认框（秒）
-        self.confirm_delay_sec = float(self.gui.get("confirm_delay_sec", 0.6))
-        # 确认框可能连弹两次，最多处理几次
-        self.confirm_times = int(self.gui.get("confirm_times", 2))
+        self.confirm_delay_sec = float(self.gui.get("confirm_delay_sec", 0.2))
+        # 0=不处理确认（期货通默认无弹窗）。写成 1 或 2 才去关弹窗。
+        self.confirm_times = int(self.gui.get("confirm_times", 0))
         # 这次下单钉住的同花顺窗口。结束时取消钉住，避免交易窗口一直盖住控制台。
         self._pinned_hwnd = 0
         # 这一笔已经把交易窗口准备好。后面填手数、点按钮时不再反复激活。
         self._order_armed = False
         # 下单时暂时禁止激活的本程序窗口，结束时恢复。
         self._parked_hwnds: list[int] = []
-        pyautogui.FAILSAFE = True
         pyautogui.PAUSE = 0.2
 
     def _focus_ths_before_click(self) -> bool:
@@ -85,6 +136,20 @@ class GuiTrader(TraderBase):
         except Exception as e:  # noqa: BLE001
             logger.warning("下单前激活同花顺失败: {}", e)
             return False
+
+    def _refocus_trade_window(self) -> bool:
+        """
+        窗口被用户或别的程序抢到前面时，把同花顺重新拉回来，再确认一次。
+
+        只在这一笔还没往价格框、手数框打字时调用；已经点进输入框再激活，光标会跑掉。
+        返回 False 表示拉不回来，调用方应停止，不能把字打进别的窗口。
+        """
+        if self.dry_run:
+            return True
+        if self._focus_ths_before_click() is False:
+            return False
+        time.sleep(0.25)
+        return self._trade_process_in_front() and self._foreground_is_trade_panel()
 
     def _trade_process_in_front(self) -> bool:
         """
@@ -204,17 +269,18 @@ class GuiTrader(TraderBase):
             return False
         return True
 
-    def _bring_tonghuashun_front(self, manager: Any) -> bool:
+    def _bring_tonghuashun_front(self, manager: Any, windows: list[Any] | None = None) -> bool:
         """
         下单开始时只把同花顺拉到最前一次。
 
         有交易窗口就拉交易窗口。还没有时，拉主窗口，好让下一步去点登录。
         不再连试三次，也不要在已经是这个窗口时再激活，避免界面被切来切去。
+        windows 传进来时直接用，避免调用方刚枚举过又枚举一遍。
         """
         from src.login.app_login import force_foreground
         from src.login.ths_login import looks_like_order_window
 
-        windows = list(manager.find_windows() or [])
+        windows = list(manager.find_windows() or []) if windows is None else list(windows)
         trade = [win for win in windows if looks_like_order_window(getattr(win, "title", "") or "")]
         chosen = trade[0] if trade else (windows[0] if windows else None)
         if chosen is None:
@@ -258,7 +324,7 @@ class GuiTrader(TraderBase):
         import copy
 
         from src.login import AppLoginManager
-        from src.login.ths_login import confirm_settlement_if_present, login_trade_account, order_probe_points, order_window_is_open
+        from src.login.ths_login import login_trade_account, order_probe_points, order_window_is_open
 
         desk = copy.deepcopy(self._full_cfg)
         desk["dry_run"] = False
@@ -266,18 +332,18 @@ class GuiTrader(TraderBase):
         manager = AppLoginManager(desk)
         points = order_probe_points(self.gui)
 
-        if not manager.window_exists():
+        # 顶层窗口只枚举一次：找到就直接拉到最前；没找到才启动，启动后再枚举一次。
+        windows = list(manager.find_windows() or [])
+        if not windows:
             logger.info("同花顺还没打开，先启动，再看交易窗口。")
             if not manager.start_app():
                 logger.error("没能打开同花顺，这次不下单。")
                 return False
-        if not self._bring_tonghuashun_front(manager):
+            windows = list(manager.find_windows() or [])
+        if not self._bring_tonghuashun_front(manager, windows):
             logger.error("没能把同花顺放到最前，这次不下单。")
             return False
-        # 结算单挡着时，先点掉那一个按钮。没有这个窗口就不会点任何地方。
-        if not confirm_settlement_if_present(wait_sec=0):
-            logger.error("「确认结算单」还挡着，这次不下单。")
-            return False
+        # 结算单在夜盘登录后已经点掉，下单这里不再扫描界面。
         if self._trade_panel_open(order_window_is_open, points):
             logger.info("交易窗口已在，拉到最前后直接下单。")
             self._pin_front_window(manager)
@@ -580,8 +646,26 @@ class GuiTrader(TraderBase):
         if point and self._write_number_into_box(point, text):
             return False
         if not self._foreground_is_trade_panel():
-            raise RuntimeError("交易窗口不在最前，手数没有写上，这次不点买卖。")
+            # 用户或别的程序刚把窗口抢走。手数还没写进去，重新拉回来再试一次，
+            # 别等到下一轮扫描——收盘清仓会因此晚半分钟以上。
+            if not self._refocus_trade_window():
+                raise RuntimeError("交易窗口不在最前，手数没有写上，这次不点买卖。")
+            if point and self._write_number_into_box(point, text):
+                return False
         self._type_into("volume_input", text)
+        # 键盘兜底也可能把字打到别处。回读一次，没写进去就不许点买卖。
+        if point:
+            from src.trader.price_mode import price_text_matches
+
+            try:
+                _ctrl, shown = self._price_control_text(point)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("手数框回读失败: {}", exc)
+                shown = ""
+            if not price_text_matches(shown, text):
+                raise RuntimeError(
+                    f"手数没有写进手数框（现在是「{shown or '空'}」），这次不点买卖。"
+                )
         return True
 
     def _write_number_into_box(self, point: list[int] | tuple[int, int], text: str) -> bool:
@@ -695,13 +779,36 @@ class GuiTrader(TraderBase):
         pyautogui.press("esc")
         time.sleep(0.15)
 
+    def _confirm_dialog_in_front(self) -> bool:
+        """
+        前台是不是一个独立的确认弹窗。
+
+        没钉住同花顺时按老办法（按回车）。钉住以后，如果前台还是交易窗口本身，
+        说明确认框没弹出来，这时按回车可能触发仍获焦的买卖按钮，不能再按。
+        """
+        target = int(getattr(self, "_pinned_hwnd", 0) or 0)
+        if not target:
+            return True
+        try:
+            import ctypes
+
+            front = int(ctypes.windll.user32.GetForegroundWindow() or 0)
+        except Exception:  # noqa: BLE001
+            return True
+        return bool(front) and front != target
+
     def _dismiss_confirm(self) -> None:
         """
         关掉下单后的确认提示框。
 
-        原理：弹窗通常默认焦点在「确定」，按 Enter 即可；
+        期货通默认不弹框：confirm_times=0 时什么都不做，避免空按回车再发一单。
+        只有次数大于 0 才处理。弹窗通常焦点在「确定」，按 Enter；
         若 Enter 无效，再用标定的 confirm_btn 坐标点击。
         """
+        # 0 必须真的跳过。以前 max(1, 次数) 会让写成 0 仍按一轮回车。
+        if self.confirm_times <= 0:
+            logger.debug("不处理确认框：点完买卖即结束（confirm_times=0）")
+            return
         if self.dry_run:
             logger.info(
                 "[模拟确认] mode={} delay={}s times={}",
@@ -717,12 +824,17 @@ class GuiTrader(TraderBase):
                 logger.error("确认前同花顺不在最前，不再按回车，避免回车进到程序窗口。")
                 return
         has_btn = bool(self.gui.get("confirm_btn"))
-        for i in range(max(1, self.confirm_times)):
+        for i in range(self.confirm_times):
             time.sleep(self.confirm_delay_sec)
             if self.confirm_mode in ("enter", "both"):
-                pyautogui.press("enter")
-                logger.info("已按回车确认弹窗 ({}/{})", i + 1, self.confirm_times)
-                time.sleep(0.25)
+                # 标定了确认按钮时，若前台仍是交易窗口（没有弹窗），不按回车，
+                # 交给下面的坐标点击，避免回车落到仍获焦的买卖按钮上再发一单。
+                if not (self.confirm_mode == "both" and has_btn) or self._confirm_dialog_in_front():
+                    pyautogui.press("enter")
+                    logger.info("已按回车确认弹窗 ({}/{})", i + 1, self.confirm_times)
+                    time.sleep(0.25)
+                else:
+                    logger.info("前台还是交易窗口，不按回车，改用确认按钮坐标 ({}/{})", i + 1, self.confirm_times)
             if self.confirm_mode in ("click", "both") and has_btn:
                 self._click("confirm_btn")
                 logger.info("已点击确认按钮坐标 ({}/{})", i + 1, self.confirm_times)
@@ -748,14 +860,26 @@ class GuiTrader(TraderBase):
     def place_order(self, req: OrderRequest) -> OrderResult:
         global _ORDER_CLICKING
         order_id = f"GUI-{uuid.uuid4().hex[:8]}"
+        # 同一时间只允许一笔 GUI 下单动作。等不到就跳过，绝不并发点击。
+        if not _TRADE_LOCK.acquire(timeout=_TRADE_LOCK_TIMEOUT_SEC):
+            message = "另一个 GUI 下单动作还没结束，本次跳过（避免并发点击同一交易窗口）"
+            logger.warning(message)
+            return OrderResult(ok=False, message=message, order_id=order_id)
         # 整段点击期间，界面不要把自己拉到前面。结束时无论成败都要取消钉住。
         _ORDER_CLICKING = True
+        pointer: dict[str, Any] | None = None
         try:
+            pointer = grab_pointer_for_order(dry_run=self.dry_run)
             # 下单期间本程序不能再跑到前面。先沉底并禁止激活，点完再恢复。
             self._park_own_windows()
             # 不在最前就先拉到最前。没有交易窗口就自动登录。准备好才填价格、点按钮。
             if self._ensure_trade_desk() is False:
                 message = "没有把同花顺交易窗口准备好，这次没有点买多、卖空或平仓。"
+                logger.error(message)
+                return OrderResult(ok=False, message=message, order_id=order_id)
+            # 准备窗口要读一圈界面，几秒钟里别的窗口可能已经抢到前面。下单前再确认一次。
+            if not self._foreground_is_trade_panel() and not self._refocus_trade_window():
+                message = "同花顺交易窗口被别的窗口盖住，这次没有点买多、卖空或平仓。"
                 logger.error(message)
                 return OrderResult(ok=False, message=message, order_id=order_id)
             # 后面只做对手价、手数和买卖按钮。不再拉起本程序，也不再打开下单模拟器。
@@ -838,7 +962,7 @@ class GuiTrader(TraderBase):
             else:
                 return OrderResult(ok=False, message=f"未知方向: {req.side}")
 
-            # 3) 处理「确定」提示框，否则后续点击会被挡住
+            # 3) 默认无确认框。只有配置了 confirm_times>0 才去关弹窗。
             self._dismiss_confirm()
 
             if use_limit:
@@ -866,7 +990,11 @@ class GuiTrader(TraderBase):
             logger.exception("GUI 下单失败: {}", e)
             return OrderResult(ok=False, message=str(e), order_id=order_id)
         finally:
-            _ORDER_CLICKING = False
-            self._order_armed = False
-            self._unpin_trade_window()
-            self._restore_own_windows()
+            try:
+                _ORDER_CLICKING = False
+                self._order_armed = False
+                self._unpin_trade_window()
+                self._restore_own_windows()
+            finally:
+                release_pointer_after_order(pointer)
+                _TRADE_LOCK.release()

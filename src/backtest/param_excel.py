@@ -44,6 +44,7 @@ COLUMNS = [
     "净盈亏",
     "盈利因子",
     "优化参数JSON",
+    "优化参数说明",
     "完整快照JSON",
     "导出时间",
 ]
@@ -63,6 +64,8 @@ def _perf(v: dict[str, Any]) -> dict[str, Any]:
 
 def version_to_row(v: dict[str, Any], *, exported_at: str | None = None) -> dict[str, Any]:
     """把一条历史版本压成 Excel 一行。"""
+    from src.backtest.optimizer import describe_params
+
     perf = _perf(v)
     return {
         "版本ID": str(v.get("id", "")),
@@ -78,6 +81,7 @@ def version_to_row(v: dict[str, Any], *, exported_at: str | None = None) -> dict
         "净盈亏": perf.get("net_pnl"),
         "盈利因子": perf.get("profit_factor"),
         "优化参数JSON": json.dumps(v.get("opt_params") or {}, ensure_ascii=False),
+        "优化参数说明": describe_params(v.get("opt_params") or {}),
         "完整快照JSON": json.dumps(v.get("snapshot") or {}, ensure_ascii=False),
         "导出时间": exported_at or datetime.now().isoformat(timespec="seconds"),
     }
@@ -196,7 +200,30 @@ def merged_param_frame(
     add_df = new_df[~new_df["版本ID"].astype(str).isin(existing_ids)]
     merged = pd.concat([old_df, add_df], ignore_index=True)
     # 已经导出过的行，改名后再导出时把「名称」更新掉，不另起一行。
-    return _refresh_exported_names(merged, new_df)
+    return _fill_param_explanations(_refresh_exported_names(merged, new_df))
+
+
+def _fill_param_explanations(frame: pd.DataFrame) -> pd.DataFrame:
+    """老 Excel 行没有「优化参数说明」：按同一行的 JSON 补上中文说明，方便直接看。"""
+    if frame is None or frame.empty or "优化参数说明" not in frame.columns:
+        return frame
+    from src.backtest.optimizer import describe_params
+
+    out = frame.copy()
+    for idx in out.index:
+        cur = out.at[idx, "优化参数说明"]
+        if cur is not None and not (isinstance(cur, float) and pd.isna(cur)) and str(cur).strip():
+            continue
+        raw = out.at[idx, "优化参数JSON"]
+        if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+            continue
+        try:
+            params = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if isinstance(params, dict) and params:
+            out.at[idx, "优化参数说明"] = describe_params(params)
+    return out
 
 
 def _refresh_exported_names(merged: pd.DataFrame, current: pd.DataFrame) -> pd.DataFrame:

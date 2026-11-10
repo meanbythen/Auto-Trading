@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from pathlib import Path
 from typing import Any, Callable
 
 from loguru import logger
 
-from src.trader.ctp_logic import ctp_instrument_id
+from src.trader.ctp_logic import ctp_depth_row, ctp_field_symbol, ctp_instrument_id
 from src.trader.ctp_td import prepare_ctp_dll_search
 
 
@@ -58,16 +59,58 @@ def describe_quote(row: dict[str, Any]) -> dict[str, Any]:
     view["upper_text"] = quote_text(row.get("upper"))
     view["lower_text"] = quote_text(row.get("lower"))
     view["time_text"] = str(row.get("time") or "").strip() or "—"
+    view["bid_vol_text"] = str(int(row.get("bid_volume") or 0))
+    view["ask_vol_text"] = str(int(row.get("ask_volume") or 0))
     return view
 
 
+def merge_quote(old: dict[str, Any] | None, incoming: dict[str, Any], *, replace_empty: bool) -> dict[str, Any]:
+    """
+    把新盘口叠到已有报价上。
+
+    实时行情 replace_empty=True：盘口真没卖一，就显示横线。
+    柜台快照 replace_empty=False：快照缺卖一，不要把已经收到的卖一擦掉。
+    """
+    base = dict(old or {})
+    for key in (
+        "symbol",
+        "last",
+        "bid",
+        "ask",
+        "bid_volume",
+        "ask_volume",
+        "upper",
+        "lower",
+        "time",
+    ):
+        if key not in incoming:
+            continue
+        val = incoming[key]
+        if key == "symbol":
+            if str(val or "").strip():
+                base[key] = val
+            continue
+        if key == "time":
+            if str(val or "").strip():
+                base[key] = val
+            continue
+        if key.endswith("volume"):
+            if replace_empty or val not in (None, ""):
+                base[key] = val
+            continue
+        if replace_empty or quote_text(val) != "—":
+            base[key] = val
+    return describe_quote(base)
+
+
 def quote_line(row: dict[str, Any]) -> str:
-    """一行说明，写进测试窗口日志。只在第一次收到这个合约时写，避免刷屏。"""
-    name = str(row.get("symbol") or "")
+    """一行说明。价格没变时调用方不要重复写日志。"""
+    view = describe_quote(row)
+    name = str(view.get("symbol") or "")
     return (
-        f"{name} 仿真报价 最新 {row.get('last_text', '—')}"
-        f" 买一 {row.get('bid_text', '—')} 卖一 {row.get('ask_text', '—')}"
-        f" 涨停 {row.get('upper_text', '—')} 跌停 {row.get('lower_text', '—')}"
+        f"{name} 仿真报价 最新 {view.get('last_text', '—')}"
+        f" 买一 {view.get('bid_text', '—')} 卖一 {view.get('ask_text', '—')}"
+        f" 涨停 {view.get('upper_text', '—')} 跌停 {view.get('lower_text', '—')}"
     )
 
 
@@ -82,6 +125,7 @@ class CtpMdClient:
         )
         self.wanted = ""
         self.latest: dict[str, Any] | None = None
+        self.last_tick_at = 0.0
         self.ready = False
         self._api: Any = None
         self._spi: Any = None
@@ -132,9 +176,8 @@ class CtpMdClient:
         if not self.ready or self._api is None:
             return False, "仿真行情还没登录"
         self.wanted = code
-        self.latest = None
         try:
-            result = self._api.SubscribeMarketData([code.encode("utf-8")], 1)
+            result = self._subscribe(code)
         except Exception as exc:  # noqa: BLE001
             text = f"订阅仿真行情失败：{exc}"
             logger.warning(text)
@@ -144,15 +187,29 @@ class CtpMdClient:
         logger.info("已订阅仿真行情 {}", code)
         return True, f"已订阅仿真行情 {code}。报价会显示在上面，第一次收到时写进日志。"
 
-    def apply_tick(self, row: dict[str, Any]) -> bool:
+    def _subscribe(self, code: str) -> int:
+        """6.7 封装要合约列表和个数。先按字节再按字符串试一次。"""
+        try:
+            return int(self._api.SubscribeMarketData([code.encode("utf-8")], 1) or 0)
+        except TypeError:
+            return int(self._api.SubscribeMarketData([code], 1) or 0)
+
+    def apply_tick(self, row: dict[str, Any], replace_empty: bool = True) -> bool:
         """收下和当前合约完全相同的一条。别的合约丢掉。"""
         got = str(row.get("symbol") or "").strip()
         if not got:
             return False
         if self.wanted and got.lower() != self.wanted.lower():
             return False
-        self.latest = describe_quote(row)
+        self.latest = merge_quote(self.latest, row, replace_empty=replace_empty)
+        self.last_tick_at = time.time()
         return True
+
+    def stale_seconds(self) -> float:
+        """距离上一笔行情过了几秒。还没收到过就很大。"""
+        if self.last_tick_at <= 0:
+            return 9999.0
+        return time.time() - self.last_tick_at
 
     def on_connected(self) -> None:
         """行情前置连上之后登录。行情登录不需要交易那一步的认证码。"""
@@ -241,26 +298,15 @@ def _build_md_spi(mdapi: Any, client: CtpMdClient) -> Any:
             if not ok:
                 logger.warning("订阅仿真行情被拒绝: {}", message or "柜台没有说明原因")
                 return
-            symbol = str(getattr(data, "InstrumentID", "") or "") if data is not None else ""
+            symbol = ctp_field_symbol(data)
             if symbol:
                 logger.info("仿真行情订阅已确认 {}", symbol)
 
         def OnRtnDepthMarketData(self, data: Any) -> None:
-            if data is None:
+            row = ctp_depth_row(data)
+            if row is None:
                 return
-            client.on_tick(
-                {
-                    "symbol": str(getattr(data, "InstrumentID", "") or ""),
-                    "last": float(getattr(data, "LastPrice", 0) or 0),
-                    "bid": float(getattr(data, "BidPrice1", 0) or 0),
-                    "ask": float(getattr(data, "AskPrice1", 0) or 0),
-                    "bid_volume": int(getattr(data, "BidVolume1", 0) or 0),
-                    "ask_volume": int(getattr(data, "AskVolume1", 0) or 0),
-                    "upper": float(getattr(data, "UpperLimitPrice", 0) or 0),
-                    "lower": float(getattr(data, "LowerLimitPrice", 0) or 0),
-                    "time": str(getattr(data, "UpdateTime", "") or ""),
-                }
-            )
+            client.on_tick(row)
 
     return _Spi()
 

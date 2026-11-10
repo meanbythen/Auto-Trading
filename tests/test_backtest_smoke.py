@@ -17,6 +17,7 @@ def test_backtest_runs_on_demo_bars() -> None:
             "flatten_times": ["14:55", "22:55"],
             "daily_body": {
                 "eth_minutes": 0,
+                "regime_filter": False,
             },
         },
         "trade": {"symbol": "bu2612", "volume": 1, "executor": "sim"},

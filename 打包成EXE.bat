@@ -15,7 +15,7 @@ if not exist ".venv\Scripts\python.exe" (
   exit /b 1
 )
 
-echo [1/3] 安装/更新 PyInstaller ...
+echo [1/4] 安装/更新 PyInstaller ...
 ".venv\Scripts\python.exe" -m pip install -U "pyinstaller>=6.0" wheel
 if errorlevel 1 (
   echo pip 安装失败
@@ -24,7 +24,7 @@ if errorlevel 1 (
 )
 
 echo.
-echo [2/3] 开始打包（首次可能要几分钟，请耐心等待）...
+echo [2/4] 开始打包（首次可能要几分钟，请耐心等待）...
 ".venv\Scripts\python.exe" -m PyInstaller Auto-Trading.spec --noconfirm --clean
 if errorlevel 1 (
   echo.

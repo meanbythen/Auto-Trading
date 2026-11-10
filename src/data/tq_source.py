@@ -1,10 +1,11 @@
 """
 天勤（TqSdk）行情源。
 
-功能：用账号密码登录天勤，取期货分钟 K 线，供策略算信号。只读行情，不下单。
+功能：用账号密码登录天勤，取期货分钟 / 小时 / 日线，供策略算信号。只读行情，不下单。
 原理：TqApi 登录一次后进程内复用；tqsdk 的 datetime 是 UTC 纳秒、且是 K 线「起点时间」。
-      这里先加 8 小时换成北京时间，再加一个周期换成程序其它地方用的右标签
-      （5 分钟 14:55 → 15:00）。还没走完的最后一根会被剔掉。
+      分钟、小时：先加 8 小时换成北京时间，再加一个周期换成右标签（5 分钟 14:55 → 15:00）。
+      日线：官方就是交易日 00:00，只换北京时间，不再加 86400 秒，否则会错成第二天。
+      周线：免费接口不能直接要大于 1 天的周期，用日线按周五收合成周线。
 """
 
 from __future__ import annotations
@@ -47,8 +48,9 @@ def session_open_minutes(symbol: str) -> tuple[int, ...]:
     return COMMODITY_OPEN_MINUTES
 
 
-# 分钟周期 → 秒。日线/周线暂不提供：tqsdk 日线的时间戳口径与新浪不一致，混用会把日期错开。
+# 能直接问天勤的周期（秒）。日线是 86400。周线不在这里：免费接口上限一天，要自己用日线合成。
 _MINUTE_SECONDS = {"1": 60, "5": 300, "15": 900, "30": 1800, "60": 3600}
+_DAY_SECONDS = 86400
 
 # TqApi 不是线程安全的。实盘扫描和回测可能同时来拉，排队用同一个连接。
 _LOCK = threading.RLock()
@@ -57,13 +59,25 @@ _api_key: tuple[str, str] | None = None
 
 
 def period_seconds(period: str) -> int:
-    """把程序里的周期换成 tqsdk 要的秒数。日线/周线不支持。"""
+    """
+    把程序里的周期换成 tqsdk 要的秒数。
+
+    日线 = 86400。周线请走 fetch_frame，不要直接要 604800（免费版上限一天）。
+    自定义分钟只要不超过一天都可以问。
+    """
     code = canonical_period(period)
+    if code == "D":
+        return _DAY_SECONDS
+    if code == "W":
+        raise ValueError("天勤没有原生周线，请用日线合成（fetch_frame 会自动做）")
     if code in _MINUTE_SECONDS:
         return _MINUTE_SECONDS[code]
     if code.isdigit() and int(code) > 0:
-        return int(code) * 60
-    raise ValueError(f"天勤没有 {period} 这一档，只支持分钟线（1/5/15/30/60 或自定义分钟）")
+        seconds = int(code) * 60
+        if seconds > _DAY_SECONDS:
+            raise ValueError(f"天勤免费接口周期最多 1 天，不能直接要 {period}")
+        return seconds
+    raise ValueError(f"天勤没有 {period} 这一档，支持分钟/小时/日线；周线用日线合成")
 
 
 def tq_symbol(symbol: str) -> str:
@@ -209,11 +223,24 @@ def reset_api() -> None:
     global _api, _api_key
     with _LOCK:
         api, _api, _api_key = _api, None, None
-    if api is not None:
+    if api is None:
+        return
+
+    def _close() -> None:
         try:
             api.close()
-        except Exception:  # noqa: BLE001
+        except BaseException:  # noqa: BLE001
+            # 退出阶段可能被 Ctrl-C / 事件循环销毁打断，任何异常都吞掉，
+            # 不让它在 atexit 回调里喷 traceback。
             logger.debug("天勤旧连接关闭时出错，已忽略")
+
+    # api.close() 内部要跑事件循环，可能因为网络/事件循环状态卡住。
+    # 放到后台线程，给 3 秒，到点进程继续退出，不阻塞关闭流程。
+    worker = threading.Thread(target=_close, name="TqApiClose", daemon=True)
+    worker.start()
+    worker.join(timeout=3.0)
+    if worker.is_alive():
+        logger.debug("天勤连接关闭超时，进程退出时丢弃")
 
 
 def _get_api(user: str, password: str) -> Any:
@@ -244,8 +271,11 @@ def frame_from_klines(raw: Any, seconds: int) -> pd.DataFrame:
     """
     把 tqsdk 的 K 线表收成和程序其它地方一样的开高低收量。
 
-    tqsdk 的 datetime 是 UTC 纳秒、且是起点时间。先加 8 小时换成北京时间，
-    再加一个周期变成右标签（这一段的结束时刻）。
+    tqsdk 的 datetime 是 UTC 纳秒、且是起点时间。先加 8 小时换成北京时间。
+
+    分钟、小时再加一个周期变成右标签（这一段的结束时刻）。
+    日线官方就是交易日 00:00，不能再加 86400 秒，否则整段会错成第二天，
+    多因子用日线定方向时会对不上分钟线所属的交易日。
 
     最后一根可能还在走，照样留着，不在这里删：持仓时它要用来看盘中影线，
     空仓和回测只认已经收盘的那些。删不删由调用方判断，两种行情源口径一致。
@@ -268,7 +298,10 @@ def frame_from_klines(raw: Any, seconds: int) -> pd.DataFrame:
     )
     # tqsdk 的时间戳是 UTC；程序里统一用不带时区的北京时间。
     beijing = pd.DatetimeIndex(times).floor("s") + pd.Timedelta(hours=8)
-    frame.index = beijing + pd.Timedelta(seconds=int(seconds))
+    if int(seconds) >= _DAY_SECONDS:
+        frame.index = beijing.normalize()
+    else:
+        frame.index = beijing + pd.Timedelta(seconds=int(seconds))
     frame.index.name = "datetime"
     frame = frame[~frame.index.duplicated(keep="last")].sort_index()
     frame = frame.dropna(subset=["open", "high", "low", "close"])
@@ -310,6 +343,17 @@ def fetch_frame(
     api: Any | None = None,
 ) -> pd.DataFrame:
     """向天勤要这一段 K 线。测试可以传入假的 api，不必真的登录。"""
+    code_period = canonical_period(period)
+    if code_period == "W":
+        # 免费接口不能直接要一周秒数。先拿日线，再收到周五，和新浪周线同一套收法。
+        daily = fetch_frame(symbol, "D", limit=max(int(limit), 80), user=user, password=password, api=api)
+        from src.data.periods import resample_ohlc
+
+        week = resample_ohlc(daily, "W")
+        if week is None or len(week) == 0:
+            raise RuntimeError("天勤日线合成周线后没有K线")
+        logger.info("天勤周线由日线合成 {} 根（日线 {} 根）", len(week), len(daily))
+        return week
     seconds = period_seconds(period)
     code = tq_symbol(symbol)
     # 天勤服务端自己有上限（免费账号实测约 10000 根，要多了不报错、按上限截），

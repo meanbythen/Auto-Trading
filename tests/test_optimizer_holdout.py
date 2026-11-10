@@ -12,9 +12,12 @@ import pytest
 from src.backtest.optimizer import (
     HOLDOUT_LOSS_RATIO,
     _apply_params,
+    _factory_values,
     _finest_grid_timeframe,
+    _sample_combos,
     _trades_on_or_after,
     clamp_holdout_pct,
+    describe_params,
     describe_run_switches,
     format_perf_block,
     grid_for_engine,
@@ -200,27 +203,52 @@ def test_holdout_only_counts_new_entries() -> None:
 
 
 def test_daily_body_grid_stays_small() -> None:
-    """精简只搜 ETH 和信号周期；标准再多加截止钟点和交易时段，靠抽样控制次数。"""
+    """精简只搜 ETH、信号周期、止损触发方式和通用止损开关；标准再加截止钟点、时段和四种通用止损；完整覆盖配置页全部结构项。"""
     light = grid_for_engine("daily_body", "精简")
-    full = grid_for_engine("daily_body", "标准")
-    assert set(light) == {"eth_minutes", "timeframe"}
-    assert light["eth_minutes"] == [20, 30]
+    standard = grid_for_engine("daily_body", "标准")
+    full = grid_for_engine("daily_body", "完整")
+    assert set(light) == {"eth_minutes", "timeframe", "stop_mode", "generic_stop.kind"}
+    assert light["eth_minutes"] == [15, 20, 30]
     assert light["timeframe"] == ["5", "15"]
-    assert set(full) == {
+    assert light["stop_mode"] == ["touch", "close"]
+    assert light["generic_stop.kind"] == ["off", "sar"]
+    assert set(standard) == {
         "eth_minutes",
+        "eth_minutes2",
         "timeframe",
         "day_cutoff",
         "night_cutoff",
         "session_scope",
+        "stop_mode",
+        "generic_stop.kind",
+    }
+    assert standard["generic_stop.kind"] == ["off", "sar", "prior_extreme", "chandelier"]
+    # 10:15～10:30 是上午休盘，截止 10:15 和 10:30 会拦住同一批 K 线；日盘避开这段。
+    assert standard["day_cutoff"] == ["09:45", "10:15", "10:45"]
+    assert set(full) == set(standard) | {
+        "stop_extra_ticks",
+        "skip_gap_ticks",
+        "max_box_ticks",
+        "max_chase_ticks",
+        "ema_period",
+        "ema_buffer_ticks",
+        "generic_stop.lookback",
+        "generic_stop.sar_af_step",
+        "generic_stop.atr_period",
+        "generic_stop.atr_mult",
     }
     light_n = 1
     for vals in light.values():
         light_n *= len(vals)
+    standard_n = 1
+    for vals in standard.values():
+        standard_n *= len(vals)
     full_n = 1
     for vals in full.values():
         full_n *= len(vals)
-    assert light_n <= 20
-    assert full_n <= 200
+    assert light_n <= 30
+    assert standard_n <= 3000
+    assert full_n > 100000
 
 
 def test_daily_body_params_write_eth_and_timeframe() -> None:
@@ -296,29 +324,155 @@ def test_every_optimized_param_is_a_config_page_item() -> None:
     ui_covered = {
         # 日内实体
         "eth_minutes",
+        "eth_minutes2",
         "timeframe",
         "day_cutoff",
         "night_cutoff",
         "session_scope",
+        "stop_mode",
+        "stop_extra_ticks",
+        "skip_gap_ticks",
+        "max_box_ticks",
+        "max_chase_ticks",
+        "ema_period",
+        "ema_buffer_ticks",
+        # 通用止损（止损设置页）
+        "generic_stop.kind",
+        "generic_stop.lookback",
+        "generic_stop.sar_af_step",
+        "generic_stop.atr_period",
+        "generic_stop.atr_mult",
         # 趋势跟随 / SuperTrend
         "entry_bars",
         "atr_mult",
         "atr_period",
         "multiplier",
-        # 单均线 / 双均线
-        "ma_period",
+        # 双均线 / 布林 / SAR / 多因子（新加三套也在配置页可改）
         "short_period",
         "long_period",
         "reverse_on_cross",
+        "atr_stop_mult",
+        "boll_window",
+        "boll_dev",
+        "ma_filter",
+        "af_step",
+        "threshold",
+        "ma_short",
+        "ma_long",
+        "channel",
+        "min_votes",
+        "min_vote_diff",
         # 长线趋势加减仓
         "daily_ma",
         "add_min_atr",
         "reduce_extend_atr",
         "max_adds",
+        "lookback_liq",
+        "vol_mult",
+        "min_rr",
     }
-    for engine in ("daily_body", "trend_follow", "supertrend", "single_ma", "dual_ma", "swing_trend"):
-        for depth in ("精简", "标准"):
+    for engine in (
+        "daily_body",
+        "trend_follow",
+        "supertrend",
+        "dual_ma",
+        "bollinger",
+        "sar_trend",
+        "multi_factor",
+        "multi_factor_adapt",
+        "multi_vote",
+        "multi_hybrid",
+        "swing_trend",
+        "jesse_casper",
+    ):
+        for depth in ("精简", "标准", "完整"):
             assert set(grid_for_engine(engine, depth)) <= ui_covered, (engine, depth)
+
+
+def test_generic_stop_params_write_under_strategy_root() -> None:
+    """通用止损是公共设置：任何策略的网格都写回 strategy.generic_stop，不留在策略小节。"""
+    cfg = {
+        "strategy": {
+            "engine": "daily_body",
+            "timeframe": "5",
+            "trail_timeframe": "5",
+            "generic_stop": {"kind": "off", "lookback": 20, "sar_af_start": 0.02},
+            "trend_follow": {"entry_bars": 36},
+        }
+    }
+    out = _apply_params(
+        cfg,
+        {"generic_stop.kind": "SAR", "generic_stop.lookback": "40", "generic_stop.atr_mult": 2.5},
+        "trend_follow",
+    )
+    st = out["strategy"]
+    assert st["generic_stop"]["kind"] == "sar"
+    assert isinstance(st["generic_stop"]["lookback"], int)
+    assert st["generic_stop"]["lookback"] == 40
+    assert isinstance(st["generic_stop"]["atr_mult"], float)
+    assert st["generic_stop"]["atr_mult"] == 2.5
+    assert "generic_stop.kind" not in st["trend_follow"]
+
+
+def test_factory_values_cover_generic_stop() -> None:
+    """出厂值要覆盖新加的通用止损项，分数接近时才能正确比较距离。"""
+    for engine in ("daily_body", "trend_follow", "supertrend", "dual_ma", "swing_trend"):
+        factory = _factory_values(engine)
+        assert factory["generic_stop.kind"] == "off"
+        assert factory["generic_stop.lookback"] == 20
+    body_factory = _factory_values("daily_body")
+    assert body_factory["skip_gap_ticks"] == 50
+    assert body_factory["max_box_ticks"] == 100
+    assert body_factory["ema_buffer_ticks"] == 2
+
+
+def test_describe_params_writes_chinese_labels_and_values() -> None:
+    """优化结果里的参数要带中文说明，开关型参数再带上代号，方便对照配置页。"""
+    text = describe_params(
+        {
+            "eth_minutes": 15,
+            "timeframe": "5",
+            "stop_mode": "close",
+            "session_scope": "night",
+            "generic_stop.kind": "sar",
+            "generic_stop.atr_mult": 2.5,
+        }
+    )
+    assert "ETH开盘观察分钟=15" in text
+    assert "信号周期（分钟）=5" in text
+    assert "止损触发方式=收盘价确认（close）" in text
+    assert "交易时段=只做夜盘（night）" in text
+    assert "通用止损类型=SAR 移动止损（sar）" in text
+    assert "通用止损 ATR 倍数=2.5" in text
+
+
+def test_sample_combos_covers_every_value_before_random_fill() -> None:
+    """组合太多时要分层抽样：每个旋钮的每个取值都至少出现一次，再随机补足。"""
+    values = [[1, 2, 3], [10, 20], [100, 200, 300, 400]]
+    got = _sample_combos(["a", "b", "c"], values, 12)
+    assert len(got) == 12
+    assert len(set(got)) == 12
+    for i, vals in enumerate(values):
+        assert {combo[i] for combo in got} == set(vals)
+    # 固定种子：同样网格再抽一次是同一批。
+    assert _sample_combos(["a", "b", "c"], values, 12) == got
+
+
+def test_sample_combos_runs_all_when_combos_fit() -> None:
+    """理论组合不超过上限时全部跑，不再抽。"""
+    values = [[1, 2], [10, 20]]
+    got = _sample_combos(["a", "b"], values, 80)
+    assert len(got) == 4
+
+
+def test_sample_combos_handles_huge_grid_without_expanding_it() -> None:
+    """完整网格有几百万组：只按需要取几组，不能把全部组合展开。"""
+    values = [[0, 1, 2, 3, 4, 5]] * 10
+    got = _sample_combos(list("abcdefghij"), values, 12)
+    assert len(got) == 12
+    assert len(set(got)) == 12
+    for i in range(10):
+        assert {combo[i] for combo in got} == set(values[i])
 
 
 def test_daily_body_switch_text_matches_current_rules() -> None:
@@ -331,3 +485,184 @@ def test_daily_body_switch_text_matches_current_rules() -> None:
     assert "ETH" in text
     assert "信号周期" in text
     assert "冻结" in text or "极值" in text or "本段" in text
+
+
+def test_param_table_defaults_match_builtin(tmp_path) -> None:
+    """按内置默认生成的 Excel，读回来要和代码里的网格完全一致。"""
+    from src.backtest.optimizer import default_grid_for_engine
+    from src.backtest.param_table import DEPTHS, ENGINE_NAMES, build_default_table, read_param_table
+
+    path = build_default_table(tmp_path / "优化参数.xlsx")
+    table = read_param_table(path)
+    assert table.labels["eth_minutes"] == "ETH开盘观察分钟"
+    for engine in ENGINE_NAMES:
+        for depth in DEPTHS:
+            default_grid = default_grid_for_engine(engine, depth)
+            if not default_grid:
+                # 固定规则引擎本来就没有可搜参数，表里不写行，交给内置默认。
+                assert table.grid(engine, depth) is None
+                continue
+            assert table.grid(engine, depth) == default_grid, (engine, depth)
+
+
+def test_param_table_edits_change_grid_and_can_switch_off_a_knob(tmp_path) -> None:
+    """改 Excel 的「取值」和「启用」后，读回来的网格跟着变；填「否」的那一项不再搜。"""
+    import openpyxl
+
+    from src.backtest.optimizer import default_grid_for_engine
+    from src.backtest.param_table import build_default_table, read_param_table
+
+    path = build_default_table(tmp_path / "优化参数.xlsx")
+    book = openpyxl.load_workbook(path)
+    sheet = book["参数网格"]
+    for row in sheet.iter_rows(min_row=2):
+        engine, depth, key = row[0].value, row[2].value, row[3].value
+        if engine == "daily_body" and depth == "标准" and key == "eth_minutes":
+            row[5].value = "20,30"
+        if engine == "daily_body" and depth == "标准" and key == "stop_mode":
+            row[6].value = "否"
+    book.save(path)
+    book.close()
+
+    table = read_param_table(path)
+    grid = table.grid("daily_body", "标准")
+    assert grid is not None
+    assert grid["eth_minutes"] == [20, 30]
+    assert "stop_mode" not in grid
+    # 其余参数不受影响，仍和内置默认一致。
+    default_grid = default_grid_for_engine("daily_body", "标准")
+    for key, values in grid.items():
+        if key == "eth_minutes":
+            continue
+        assert values == default_grid[key]
+
+
+def test_label_sheet_rows_are_split_by_strategy(tmp_path) -> None:
+    """「参数名称」表按策略拆行，带策略名称列和自动筛选，可直接按策略筛参数。"""
+    import openpyxl
+
+    from src.backtest.optimizer import default_grid_for_engine
+    from src.backtest.param_table import (
+        DEPTHS,
+        LABEL_HEADERS,
+        SHEET_LABELS,
+        build_default_table,
+        read_param_table,
+    )
+
+    path = build_default_table(tmp_path / "优化参数.xlsx")
+    book = openpyxl.load_workbook(path, data_only=True)
+    sheet = book[SHEET_LABELS]
+    assert [c.value for c in sheet[1]] == list(LABEL_HEADERS)
+    assert sheet.auto_filter.ref == f"A1:C{sheet.max_row}"
+    rows = list(sheet.iter_rows(min_row=2, values_only=True))
+    book.close()
+
+    daily_keys = set()
+    for depth in DEPTHS:
+        daily_keys.update(default_grid_for_engine("daily_body", depth))
+    daily_rows = {key for name, key, _ in rows if name == "日内实体（主推）"}
+    assert daily_rows == daily_keys
+    assert ("日内实体（主推）", "eth_minutes", "ETH开盘观察分钟") in rows
+    # 同一策略内同一个参数键只出现一次；读表仍能拿到中文名。
+    assert len(rows) == len({(name, key) for name, key, _ in rows})
+    assert read_param_table(path).labels["eth_minutes"] == "ETH开盘观察分钟"
+
+
+def test_param_table_without_rows_falls_back_to_builtin(tmp_path) -> None:
+    """表里某个策略 + 深度一行都没有时返回 None，让调用方回退内置默认。"""
+    import openpyxl
+
+    from src.backtest.param_table import GRID_HEADERS, read_param_table, SHEET_GRID
+
+    path = tmp_path / "空表.xlsx"
+    book = openpyxl.Workbook()
+    sheet = book.active
+    sheet.title = SHEET_GRID
+    sheet.append(list(GRID_HEADERS))
+    book.save(path)
+
+    table = read_param_table(path)
+    assert table.grid("daily_body", "标准") is None
+
+
+def test_param_table_parses_text_time_and_json_values() -> None:
+    """取值支持逗号、JSON 数组；周期/钟点保持文字，数值仍写成数字。"""
+    from src.backtest.param_table import parse_values
+
+    assert parse_values("15,20,30", "eth_minutes") == [15, 20, 30]
+    assert parse_values("5,15", "timeframe") == ["5", "15"]
+    assert parse_values("10:00,10:15", "day_cutoff") == ["10:00", "10:15"]
+    assert parse_values("true,false", "reverse_on_cross") == [True, False]
+    assert parse_values("1,0", "reverse_on_cross") == [True, False]
+    assert parse_values("[1.5, 2.0, 2.5]", "atr_mult") == [1.5, 2.0, 2.5]
+
+
+def test_current_params_from_config_reads_daily_body_and_public_keys() -> None:
+    """对照用的是配置里正在用的旋钮，不是出厂值。"""
+    from src.backtest.optimizer import current_params_from_config
+
+    cfg = {
+        "strategy": {
+            "engine": "daily_body",
+            "timeframe": "15",
+            "stop_mode": "touch",
+            "daily_body": {"eth_minutes": 30, "day_cutoff": "10:00"},
+            "generic_stop": {"kind": "sar", "lookback": 8},
+        },
+        "schedule": {"session_scope": "day"},
+    }
+    got = current_params_from_config(
+        cfg,
+        "daily_body",
+        ["eth_minutes", "timeframe", "stop_mode", "session_scope", "generic_stop.kind"],
+    )
+    assert got["eth_minutes"] == 30
+    assert got["timeframe"] == "15"
+    assert got["stop_mode"] == "touch"
+    assert got["session_scope"] == "day"
+    assert got["generic_stop.kind"] == "sar"
+
+
+def test_judge_better_requires_holdout_not_worse() -> None:
+    """检验段净赚或回撤变差时，不能一键切实盘。"""
+    from src.backtest.optimizer import judge_better_than_current
+
+    old = {"net_pnl": 1000, "max_drawdown": 200, "profit_factor": 1.5}
+    worse = judge_better_than_current(
+        {"net_pnl": 400, "max_drawdown": 180, "profit_factor": 1.2},
+        old,
+        accepted=True,
+        new_params={"a": 2},
+        old_params={"a": 1},
+    )
+    assert worse["can_apply_live"] is False
+
+    reject = judge_better_than_current(
+        {"net_pnl": 2000, "max_drawdown": 100, "profit_factor": 2.0},
+        old,
+        accepted=False,
+        new_params={"a": 2},
+        old_params={"a": 1},
+    )
+    assert reject["can_apply_live"] is False
+
+    same = judge_better_than_current(
+        {"net_pnl": 1200, "max_drawdown": 180, "profit_factor": 1.6},
+        old,
+        accepted=True,
+        new_params={"a": 1},
+        old_params={"a": 1},
+    )
+    assert same["can_apply_live"] is False
+
+    better = judge_better_than_current(
+        {"net_pnl": 1200, "max_drawdown": 180, "profit_factor": 1.6},
+        old,
+        accepted=True,
+        new_params={"a": 2},
+        old_params={"a": 1},
+    )
+    assert better["can_apply_live"] is True
+    assert "全面优于" in better["reason"]
+

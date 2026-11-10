@@ -122,6 +122,38 @@ def test_aligned_bars_drop_old_session_open_stamps() -> None:
     assert list(kept.index.strftime("%H:%M")) == ["09:05", "21:05"]
 
 
+def test_store_reuses_one_connection_and_turns_on_wal(tmp_path) -> None:
+    """同一路径只开一条连接并启用 WAL，避免每轮 fetch 反复开关库、读写互锁。"""
+    store = BarStore(tmp_path / "market.sqlite")
+    first = store._connect()
+    second = store._connect()
+    assert first is second
+    assert str(first.execute("PRAGMA journal_mode").fetchone()[0]).lower() == "wal"
+    store.upsert("bu2612", "5", _frame([("2026-09-01 09:00:00", 100)]))
+    assert store.count("bu2612", "5") == 1
+
+
+def test_load_with_limit_returns_only_recent_bars_and_keeps_history(tmp_path) -> None:
+    """实盘只读最近一段，旧K线仍留在库里，回测还能读全。"""
+    store = BarStore(tmp_path / "market.sqlite")
+    store.upsert(
+        "bu2612",
+        "5",
+        _frame(
+            [
+                ("2026-09-01 09:00:00", 100),
+                ("2026-09-02 09:00:00", 101),
+                ("2026-09-03 09:00:00", 102),
+            ]
+        ),
+    )
+    tail = store.load("bu2612", "5", limit=2)
+    assert tail is not None
+    assert [float(v) for v in tail["close"]] == [101.0, 102.0]
+    assert store.count("bu2612", "5") == 3
+    assert len(store.load("bu2612", "5")) == 3
+
+
 def test_aligned_bars_keep_cffex_afternoon_bar_at_1330() -> None:
     """中金所下午 13:00 开盘，13:30 是正常的右标签K线，不能按商品那套丢掉。"""
     frame = _frame([("2026-10-20 13:15:00", 6000), ("2026-10-20 13:30:00", 6001)])

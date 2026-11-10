@@ -1,13 +1,14 @@
 """
 运行状态持久化
 功能：保存/恢复持仓、当日盈亏、心跳时间，避免程序重启后「失忆」。
-原理：写入 data/bot_state.json；启动时读入，成交/平仓后写回。
+原理：写入当前账的持仓文件（实盘 data/bot_state.json，模拟账另一份）；启动时读入，成交/平仓后写回。
 主流自动交易程序几乎都有 State / Position Store，属于必备模块。
 """
 
 from __future__ import annotations
 
 import json
+import os
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -18,7 +19,10 @@ from src.utils.trading_day import futures_trading_day
 
 
 def default_state_path(project_root: Path | str) -> Path:
-    return Path(project_root) / "data" / "bot_state.json"
+    """当前选中那本账的持仓文件。换账之后读的是另一份，不会把实盘仓和模拟仓混在一起。"""
+    from src.account.workspace import state_file
+
+    return state_file(project_root)
 
 
 def load_state(path: Path | str) -> dict[str, Any]:
@@ -80,14 +84,21 @@ def load_state(path: Path | str) -> dict[str, Any]:
 
 
 def save_state(path: Path | str, state: dict[str, Any]) -> None:
-    """原子一点地写状态文件。"""
+    """原子一点地写状态文件。临时文件名带进程号，避免两个进程互相覆盖。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     state = dict(state)
     state["saved_at"] = datetime.now().isoformat(timespec="seconds")
-    tmp = path.with_suffix(".tmp")
-    tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-    tmp.replace(path)
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
 
 
 def snapshot_positions(strategy: Any) -> dict[str, dict[str, Any]]:
@@ -234,6 +245,75 @@ def flatten_strategy_position(strategy: Any, symbol: str) -> dict[str, Any] | No
     return closed
 
 
+def strategy_position_open(
+    strategy: Any,
+    symbol: str,
+    side: str,
+    volume: int,
+    entry_price: float,
+    *,
+    initial_stop: float = 0.0,
+) -> bool:
+    """
+    给正在运行的策略内存里加一笔仓。人工在同花顺上开了仓后回填程序内存用。
+
+    side: "long" / "short"。只改内存，不发单。
+    initial_stop: 可选的策略级止损价。填了之后 trail_stop/trail_armed 一起生效。
+    """
+    positions = getattr(strategy, "positions", None)
+    if positions is None:
+        return False
+    key = next((name for name in positions if str(name).lower() == str(symbol).lower()), None)
+    if key is None:
+        return False
+    pos = positions[key]
+    pos.side = side
+    pos.volume = int(volume)
+    pos.entry_price = float(entry_price)
+    stop = float(initial_stop or 0)
+    pos.initial_stop = stop
+    pos.trail_stop = stop
+    pos.trail_armed = stop > 0
+    pos.opened_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    return True
+
+
+def mark_position_open(
+    positions: dict[str, Any],
+    symbol: str,
+    side: str,
+    volume: int,
+    entry_price: float,
+    *,
+    initial_stop: float = 0.0,
+) -> dict[str, Any] | None:
+    """
+    在磁盘 state 的持仓字典里写一笔仓。只改字典，不发单，也不写文件。
+
+    返回写进去的那一笔（含 symbol/side/volume/entry_price/initial_stop）。
+    """
+    if side not in {"long", "short"} or int(volume) <= 0 or float(entry_price) <= 0:
+        return None
+    stop = float(initial_stop or 0)
+    key = symbol
+    positions[key] = {
+        "side": side,
+        "volume": int(volume),
+        "entry_price": float(entry_price),
+        "initial_stop": stop,
+        "trail_stop": stop,
+        "trail_armed": stop > 0,
+        "opened_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    return {
+        "symbol": str(key),
+        "side": side,
+        "volume": int(volume),
+        "entry_price": float(entry_price),
+        "initial_stop": stop,
+    }
+
+
 def manual_close_without_bot(
     root: Path | str,
     *,
@@ -278,6 +358,58 @@ def manual_close_without_bot(
         state["daily_pnl"] = today_realized_pnl(book)
     save_state(path, state)
     return closed, balance
+
+
+def manual_open_without_bot(
+    root: Path | str,
+    *,
+    symbol: str,
+    side: str,
+    volume: int,
+    entry_price: float,
+    multiplier: float,
+    initial_capital: float,
+    initial_stop: float = 0.0,
+    reason: str = "手工录入开仓",
+) -> tuple[dict[str, Any] | None, float | None]:
+    """
+    常驻没在跑时，手工录入一笔开仓。
+
+    改磁盘上的持仓状态，把这一笔写进信号账户。
+    返回 (写进去的这一笔, 新余额)。参数无效时返回 (None, None)。
+    initial_stop: 可选的策略级止损价。
+    """
+    if side not in ("long", "short") or int(volume) <= 0 or float(entry_price) <= 0:
+        return None, None
+
+    path = default_state_path(root)
+    state = load_state(path)
+    opened = mark_position_open(
+        state.setdefault("positions", {}), symbol, side, volume, entry_price,
+        initial_stop=float(initial_stop or 0),
+    )
+    if opened is None:
+        return None, None
+
+    direction = "多" if side == "long" else "空"
+    moment = datetime.now().strftime("%Y%m%d%H%M%S%f")
+    from src.account.signal_book import record_program_trade
+
+    balance = record_program_trade(
+        root,
+        initial_capital=float(initial_capital or 0),
+        symbol=str(symbol),
+        offset="开",
+        direction=direction,
+        price=float(entry_price),
+        volume=int(volume),
+        multiplier=float(multiplier or 10),
+        reason=reason,
+        bar_id=f"manual-open-{moment}",
+        fill_key=f"manual-open-{moment}",
+    )
+    save_state(path, state)
+    return opened, balance
 
 
 def restore_positions(strategy: Any, raw: dict[str, Any]) -> None:

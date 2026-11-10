@@ -34,7 +34,6 @@ def test_kept_engine_aliases_keep_their_name() -> None:
     """还在的策略再回溯时，仍是原来的名字，不会被改成别的策略。"""
     for old_engine, section, key, value in (
         ("supertrend", "supertrend", "multiplier", 3.5),
-        ("single_ma", "single_ma", "ma_period", 60),
         ("dual_ma", "dual_ma", "short_period", 10),
         ("morning_box_a", "morning_box_a", "be_box_mult", 0.8),
     ):

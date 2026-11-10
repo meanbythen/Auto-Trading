@@ -16,8 +16,17 @@ import pandas as pd
 from loguru import logger
 
 from .indicators import supertrend as calc_supertrend
+from .market_state import MarketFilter, trend_params_for_section
 from .session_scope import scope_allows, scope_from_cfg
-from .types import PositionState, StrategyAction, StrategyDecision, config_flag
+from .types import (
+    STOP_MODE_TOUCH,
+    PositionState,
+    StrategyAction,
+    StrategyDecision,
+    config_flag,
+    stop_mode_from_cfg,
+    stop_triggered,
+)
 
 
 def _parse_hhmm(value: str) -> dtime:
@@ -29,6 +38,7 @@ class SuperTrendStrategy:
     """SuperTrend 翻转开仓；线本身当移动止损；默认可隔夜。"""
 
     def __init__(self, cfg: dict[str, Any]) -> None:
+        self.cfg = cfg
         st = cfg.get("strategy", {}) or {}
         box = st.get("supertrend") or {}
         trade = cfg.get("trade", {}) or {}
@@ -37,6 +47,9 @@ class SuperTrendStrategy:
         self.trail_timeframe = self.timeframe
         self.symbols: list[str] = list(st.get("symbols") or [trade.get("symbol", "bu2612")])
         self.volume = int(trade.get("volume", 1))
+        # 止损触发方式（全策略共用）：touch 影线碰到止损线就平，close 等收盘确认。
+        self.stop_mode = stop_mode_from_cfg(cfg)
+        self.stop_on_touch = self.stop_mode == STOP_MODE_TOUCH
 
         # 常用默认：ATR 10 根、倍数 3（TradingView / 通达信常见）
         self.atr_period = max(2, int(box.get("atr_period", 10)))
@@ -45,14 +58,16 @@ class SuperTrendStrategy:
             self.multiplier = 3.0
         # 翻向时是否反手（平旧仓并开新方向）。关掉则只平仓、等下一根再开。
         self.reverse_on_flip = config_flag(box.get("reverse_on_flip", True), default=True)
+        # SuperTrend 自己的趋势过滤：震荡里通道会来回翻。
+        self.market_filter = MarketFilter(trend_params_for_section(cfg, "supertrend"))
 
-        self.flatten_times = [
-            _parse_hhmm(x) for x in st.get("flatten_times", ["14:55", "22:55"])
-        ]
+        from src.utils.session_clock import flatten_clocks_for_symbol, session_tuples
+
+        live = self.symbols[0] if self.symbols else ""
+        self.flatten_times = flatten_clocks_for_symbol(cfg, live)
         # 与 trend_follow 一样：默认不听总开关，到点不平，才能拿住趋势
         self.flatten_at_close = config_flag(box.get("flatten_at_close", False), default=False)
-        sessions = cfg.get("schedule", {}).get("trading_sessions") or []
-        self.entry_sessions = [(_parse_hhmm(a), _parse_hhmm(b)) for a, b in sessions]
+        self.entry_sessions = session_tuples(cfg, live)
         self.session_scope = scope_from_cfg(cfg)
 
         self.positions: dict[str, PositionState] = {
@@ -67,25 +82,25 @@ class SuperTrendStrategy:
     def is_flatten_time(self, now: datetime | None = None) -> bool:
         if not self.flatten_at_close:
             return False
-        now = now or datetime.now()
-        t = now.time().replace(second=0, microsecond=0)
-        cur = datetime.combine(now.date(), t)
-        for ft in self.flatten_times:
-            start = datetime.combine(now.date(), ft)
-            end = start + timedelta(minutes=10)
-            if start <= cur <= end:
-                return True
-        return False
+        from src.utils.session_clock import in_flatten_window
 
-    def in_entry_session(self, now: datetime) -> bool:
+        return in_flatten_window(self.flatten_times, now or datetime.now())
+
+    def in_entry_session(self, now: datetime, symbol: str | None = None) -> bool:
         if str(self.timeframe).upper() in {"D", "W"}:
             return True
         if not scope_allows(self.session_scope, now):
             return False
-        if not self.entry_sessions:
+        from src.utils.session_clock import in_session_windows, parse_hhmm, sessions_for_symbol
+
+        windows = self.entry_sessions
+        if symbol:
+            rows = sessions_for_symbol(self.cfg, symbol)
+            if rows:
+                windows = [(parse_hhmm(a), parse_hhmm(b)) for a, b in rows]
+        if not windows:
             return True
-        t = now.time()
-        return any(a <= t <= b for a, b in self.entry_sessions)
+        return in_session_windows(windows, now)
 
     def on_filled(
         self,
@@ -130,6 +145,8 @@ class SuperTrendStrategy:
         now = now or datetime.now()
         pos = self.positions.setdefault(symbol, PositionState(symbol=symbol))
         need = self.atr_period + 5
+        if self.market_filter.enabled:
+            need = max(need, self.market_filter.params.need_bars)
         if bars is None or len(bars) < need:
             return StrategyDecision(StrategyAction.HOLD, symbol, "K线不足，SuperTrend 还算不出来")
 
@@ -156,15 +173,31 @@ class SuperTrendStrategy:
         # 持仓：方向反了 → 平或反手；否则把止损收到当前线上
         if pos.side != "flat":
             return self._manage(
-                symbol, pos, now, bar_id, close, st_now, dir_now, dir_prev
+                symbol,
+                pos,
+                now,
+                bar_id,
+                close,
+                st_now,
+                dir_now,
+                dir_prev,
+                high=float(bar["high"]),
+                low=float(bar["low"]),
             )
 
         if self.is_flatten_time(now):
             return StrategyDecision(StrategyAction.HOLD, symbol, "收盘清仓时段，不再开新仓")
-        if not self.in_entry_session(now):
+        if not self.in_entry_session(now, symbol):
             return StrategyDecision(StrategyAction.HOLD, symbol, "非交易时段")
         if self._signaled_bar.get(symbol) == bar_id:
             return StrategyDecision(StrategyAction.HOLD, symbol, "这一根已经处理过 SuperTrend")
+
+        # 文档第 1 条：行情不匹配直接停手。ADX 低或 ATR 低分位时不开新仓。
+        state = self.market_filter.check(bars)
+        if not state.ok:
+            return StrategyDecision(
+                StrategyAction.HOLD, symbol, f"行情不匹配：{state.reason}", stop_price=st_now
+            )
 
         # 空仓：只在「本根刚翻转」时开仓，避免中途切入旧趋势
         if dir_now == dir_prev:
@@ -192,6 +225,9 @@ class SuperTrendStrategy:
         st_now: float,
         dir_now: int,
         dir_prev: int,
+        *,
+        high: float = 0.0,
+        low: float = 0.0,
     ) -> StrategyDecision:
         pos.trail_stop = st_now
         pos.trail_armed = True
@@ -200,7 +236,7 @@ class SuperTrendStrategy:
             (pos.side == "long" and dir_now < 0) or (pos.side == "short" and dir_now > 0)
         )
         if flipped:
-            if self.reverse_on_flip and self.in_entry_session(now) and not self.is_flatten_time(now):
+            if self.reverse_on_flip and self.in_entry_session(now, symbol) and not self.is_flatten_time(now):
                 new_side = "long" if dir_now > 0 else "short"
                 return self._open(
                     symbol,
@@ -217,6 +253,15 @@ class SuperTrendStrategy:
                 now,
                 bar_id,
                 f"SuperTrend 翻向，平{'多' if pos.side == 'long' else '空'} ST={st_now:.2f}",
+            )
+
+        # 止损触发方式（全策略共用）：touch 时影线碰到 SuperTrend 线就平；close 等收盘确认。
+        # 翻向优先，避免反手被止损抢走。
+        if self.stop_on_touch and stop_triggered(
+            side=pos.side, stop=st_now, close=close, high=high, low=low, mode=self.stop_mode
+        ):
+            return self._close_decision(
+                symbol, pos, now, bar_id, f"盘中触及 SuperTrend 线 {st_now:.2f}，先平"
             )
 
         # 未翻向：收盘打穿当前线也平（与线同步的保险）

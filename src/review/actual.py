@@ -21,7 +21,6 @@ _EVENT_TEXT = {
     "order_no_price": "想开仓但没有价格，被拒绝",
     "risk_block": "策略想做，被风控拦住",
     "stale_block_open": "行情太旧，禁止开仓",
-    "emergency_flatten": "按过紧急清仓",
 }
 
 

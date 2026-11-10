@@ -1,9 +1,9 @@
 """
-仿真柜台测试窗口。
+仿真/实盘共用的 CTP 交易窗口。
 
-功能：明天连华泰测试前置时，用按钮完成认证登录、开仓、平仓、撤单，
-以及合约、价位、手数这三项本机拦截。结果写进界面日志和 logs 目录。
-原理：这个窗口自己建一条 CTP 连接，不改变运行页正在用的执行通道。
+功能：给人手工测开、平、撤、反手。策略挂机请用运行页「启动常驻」，不要靠这个窗口自动扫信号。
+下单走和常驻相同的 CtpTrader.place_order（含沥青/玉米平今平昨）。窗口自己连柜台。
+原理：按钮把动作放到旁边线程，避免窗口卡住；持仓/委托/成交三张表直接画柜台回报。
 """
 
 from __future__ import annotations
@@ -16,14 +16,58 @@ from tkinter import ttk
 
 from loguru import logger
 
-from src.trader.base import OrderRequest
-from src.trader.ctp_logic import check_order_instruction
+from src.trader.ctp_orders import ctp_order, flatten_order_steps, prepare_live_ctp_cfg, reverse_order_steps
+from src.trader.ctp_display import (
+    account_headline,
+    account_pairs,
+    cancelled_volume,
+    contract_search_key,
+    describe_contract,
+    format_contract_row,
+    hedge_cn,
+    money_text,
+    order_matches_filter,
+    position_footer,
+    remaining_volume,
+    split_position_rows,
+    trade_footer,
+)
+from src.trader.ctp_gateway import STATUS_TEXT
+from src.risk.sizing import PositionSizer
+from src.trader.ctp_logic import (
+    CTP_KIND_LABELS,
+    ctp_kind_label,
+    direction_cn,
+    normalize_ctp_kind,
+    offset_cn,
+    overlay_ctp_profile,
+    symbol_key,
+)
 from src.trader.ctp_trader import CtpTrader
+from src.trader.go_live import (
+    HUATAI_REQUIRED,
+    account_kind_for_stage,
+    current_stage_from_cfg,
+    load_state,
+    save_state,
+    stage_label,
+)
 from src.utils.config_loader import load_config
 
 
+def _order_row_sort_key(row: tuple[str, ...]) -> tuple[str, int]:
+    """委托/成交按时间从新到旧。同一秒再看编号，大的在上。"""
+    clock = str(row[0] if row else "")
+    ref = str(row[-1] if row else "").strip()
+    try:
+        number = int(ref)
+    except ValueError:
+        number = 0
+    return (clock, number)
+
+
 def open_ctp_probe(master: tk.Misc) -> None:
-    """打开测试窗口。重复点击只把原来的窗口提到前面。"""
+    """打开交易窗口。重复点击只把原来的窗口提到前面。"""
     existing = getattr(master, "_ctp_probe", None)
     if existing is not None and existing.winfo_exists():
         existing.lift()
@@ -33,96 +77,394 @@ def open_ctp_probe(master: tk.Misc) -> None:
 
 
 class CtpProbeWindow(tk.Toplevel):
-    """华泰仿真测试用的小窗口。按钮点下去的说明会同时出现在主界面日志里。"""
+    """CTP 交易窗口。仿真测试和以后实盘柜台用同一套按钮和表格。"""
 
     def __init__(self, master: tk.Misc) -> None:
         super().__init__(master)
-        self.title("仿真柜台测试")
-        self.geometry("640x520")
+        self.title("CTP 交易台（手工测开平撤；挂机请用启动常驻）")
+        self.geometry("1280x840")
         self.trader: CtpTrader | None = None
         self.md = None
-        self.symbol = tk.StringVar(value="bu2612")
+        self.symbol = tk.StringVar(value="fu2701")
         self.price = tk.StringVar(value="")
         self.volume = tk.StringVar(value="1")
-        # 这些数字来自仿真行情。没收到之前用横线占着，避免和同花顺的实盘价混在一起。
         self.last = tk.StringVar(value="—")
         self.bid = tk.StringVar(value="—")
         self.ask = tk.StringVar(value="—")
         self.upper = tk.StringVar(value="—")
         self.lower = tk.StringVar(value="—")
         self.quote_time = tk.StringVar(value="—")
+        self.local_time = tk.StringVar(value="—")
+        self.bid_vol = tk.StringVar(value="0")
+        self.ask_vol = tk.StringVar(value="0")
+        self.quote_hint = tk.StringVar(value="")
+        self.account_line = tk.StringVar(value="还没登录")
+        self.limit_line = tk.StringVar(value="")
+        self.count_line = tk.StringVar(value="今日报单 0 笔，撤单 0 笔")
+        self.money_line = tk.StringVar(value="资金还没查到。")
+        self.price_mode = tk.StringVar(value="手动")
+        self.ord_filter = tk.StringVar(value="全部")
+        self.contract_q = tk.StringVar(value="")
+        self.contract_detail = tk.StringVar(value="登录后输入代码或前缀，点查询。再点一行，会填进上方合约框并查出保证金、手续费。")
+        self._fund_values: dict[str, tk.StringVar] = {}
+        self._filling_tree = False
+        self._followed_symbol = ""
+        self._picked_order_ref = ""
+        self._cost_loaded: set[str] = set()
+        self._last_pick = ""
+        self._last_pick_at = 0.0
+        cfg = load_config()
+        self._sizer = PositionSizer(cfg)
+        self._root = str(cfg.get("_project_root") or ".")
+        self._stage = current_stage_from_cfg(cfg)
+        kind = account_kind_for_stage(self._stage)
+        self.kind = tk.StringVar(value=ctp_kind_label(kind))
+        self._go_live = load_state(self._root)
+        self._huatai_vars: dict[str, tk.BooleanVar] = {}
         self._shown_quote: tuple[str, ...] | None = None
         self._logged_quote = ""
+        self._last_said = ""
         self._buttons: list[ttk.Button] = []
         self._busy = False
-        # 柜台登录和下单要等网络。这些结果先放进队列，由界面自己的定时器取出来写，避免把窗口卡死。
         self._ui_queue: queue.Queue = queue.Queue()
+        self._blotter_tick = 0
+        self._quote_pump_on = False
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.after(100, self._drain_ui)
 
     def _build(self) -> None:
         pad = {"padx": 8, "pady": 4}
+        ttk.Label(self, textvariable=self.account_line).pack(anchor="w", padx=8, pady=(8, 0))
+        ttk.Label(self, textvariable=self.money_line, font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=8)
+        ttk.Label(self, textvariable=self.limit_line, foreground="#555").pack(anchor="w", padx=8)
+        ttk.Label(self, textvariable=self.count_line, foreground="#333").pack(anchor="w", padx=8)
+
+        top = ttk.Frame(self)
+        top.pack(fill="x", **pad)
+        ttk.Label(top, text="操作账").grid(row=0, column=0, sticky="w")
+        kind_box = ttk.Combobox(
+            top,
+            textvariable=self.kind,
+            values=list(CTP_KIND_LABELS.values()),
+            state="readonly",
+            width=12,
+        )
+        kind_box.grid(row=0, column=1, sticky="w", padx=(4, 12))
+        kind_box.bind("<<ComboboxSelected>>", lambda _e: self._on_kind_change())
+        ttk.Label(top, text="仿真和真实走同一套下单，只换账号和前置。换账后请再点连接登录。").grid(
+            row=0, column=2, sticky="w"
+        )
+
         form = ttk.Frame(self)
         form.pack(fill="x", **pad)
         ttk.Label(form, text="合约").grid(row=0, column=0, sticky="w")
-        ttk.Entry(form, textvariable=self.symbol, width=16).grid(row=0, column=1, sticky="w")
-        ttk.Label(form, text="价格").grid(row=0, column=2, sticky="w")
-        ttk.Entry(form, textvariable=self.price, width=12).grid(row=0, column=3, sticky="w")
-        ttk.Label(form, text="手数").grid(row=0, column=4, sticky="w")
-        ttk.Entry(form, textvariable=self.volume, width=6).grid(row=0, column=5, sticky="w")
-        # 第二行是仿真柜台自己的报价。买开、卖开要落在买一和卖一附近，并且不能超出涨停、跌停。
-        labels = (
-            (1, 0, "最新"),
-            (1, 1, self.last),
-            (1, 2, "买一"),
-            (1, 3, self.bid),
-            (2, 0, "卖一"),
-            (2, 1, self.ask),
-            (2, 2, "涨停"),
-            (2, 3, self.upper),
-            (3, 0, "跌停"),
-            (3, 1, self.lower),
-            (3, 2, "行情时间"),
-            (3, 3, self.quote_time),
-        )
-        for row, column, item in labels:
-            if isinstance(item, str):
-                widget = ttk.Label(form, text=item)
-            else:
-                widget = ttk.Label(form, textvariable=item)
-            widget.grid(row=row, column=column, sticky="w", pady=(6, 0))
+        ttk.Entry(form, textvariable=self.symbol, width=12).grid(row=0, column=1, sticky="w")
+        ttk.Button(form, text="订阅行情", command=self._resub).grid(row=0, column=2, padx=4)
+        ttk.Label(form, text="价格").grid(row=0, column=3, sticky="w")
+        ttk.Entry(form, textvariable=self.price, width=10).grid(row=0, column=4, sticky="w")
+        ttk.Label(form, text="手数").grid(row=0, column=5, sticky="w")
+        ttk.Entry(form, textvariable=self.volume, width=6).grid(row=0, column=6, sticky="w")
+        ttk.Label(form, text="价格方式").grid(row=0, column=7, sticky="w", padx=(12, 0))
+        ttk.Combobox(
+            form,
+            textvariable=self.price_mode,
+            values=("手动", "对手价", "最新价"),
+            state="readonly",
+            width=8,
+        ).grid(row=0, column=8, sticky="w", padx=4)
+
+        quotes = ttk.Frame(self)
+        quotes.pack(fill="x", **pad)
+        for col, title, var, fill in (
+            (0, "最新", self.last, "last"),
+            (1, "买一", self.bid, "bid"),
+            (2, "买一量", self.bid_vol, None),
+            (3, "卖一", self.ask, "ask"),
+            (4, "卖一量", self.ask_vol, None),
+            (5, "涨停", self.upper, "upper"),
+            (6, "跌停", self.lower, "lower"),
+            (7, "行情时间", self.quote_time, None),
+            (8, "本机时间", self.local_time, None),
+        ):
+            self._quote_cell(quotes, col, title, var, fill)
+        ttk.Label(self, textvariable=self.quote_hint, foreground="#666").pack(anchor="w", padx=8)
 
         buttons = ttk.Frame(self)
         buttons.pack(fill="x", **pad)
         labels = [
             ("连接登录", self._connect),
+            ("刷新持仓", self._query_positions),
+            ("刷新委托", self._query_orders),
+            ("刷新成交", self._query_trades),
+            ("买开", self._buy_open),
+            ("卖开", self._sell_open),
+            ("买平", self._buy_close),
+            ("卖平", self._sell_close),
+            ("平仓", self._flatten),
+            ("反手", self._reverse),
+            ("撤选中委托", self._cancel_selected),
+            ("全撤未成交", self._cancel_all),
             ("暂停报单", self._pause),
             ("恢复报单", self._resume),
-            ("买开", self._buy_open),
-            ("卖平", self._sell_close),
-            ("撤最近一笔", self._cancel),
-            ("错误合约", self._bad_symbol),
-            ("错误价位", self._bad_price),
-            ("超过手数", self._too_big),
+            ("错误合约", self._block_symbol),
+            ("错误价位", self._block_tick),
+            ("超过手数", self._block_lots),
         ]
         for index, (text, command) in enumerate(labels):
             button = ttk.Button(buttons, text=text, command=command)
-            button.grid(row=index // 3, column=index % 3, sticky="ew", padx=4, pady=4)
+            button.grid(row=index // 5, column=index % 5, sticky="ew", padx=4, pady=4)
             self._buttons.append(button)
-        for column in range(3):
+        for column in range(5):
             buttons.columnconfigure(column, weight=1)
 
-        self.box = tk.Text(self, height=16, wrap="word")
-        self.box.pack(fill="both", expand=True, padx=8, pady=8)
+        book = ttk.Notebook(self)
+        book.pack(fill="both", expand=True, padx=8, pady=4)
+        self._desk_book = book
+        book.bind("<<NotebookTabChanged>>", self._on_desk_tab)
+        self.pos_tree = self._make_tree(
+            book,
+            "持仓",
+            (
+                "合约",
+                "买卖",
+                "手数",
+                "今仓",
+                "昨仓",
+                "均价",
+                "浮盈",
+                "保证金",
+                "市值",
+                "盈利价差",
+                "涨跌比例",
+                "涨停浮盈",
+                "资金占比",
+                "投保",
+            ),
+            {
+                "合约": 80,
+                "买卖": 45,
+                "手数": 45,
+                "今仓": 45,
+                "昨仓": 45,
+                "均价": 70,
+                "浮盈": 80,
+                "保证金": 80,
+                "市值": 80,
+                "盈利价差": 70,
+                "涨跌比例": 70,
+                "涨停浮盈": 80,
+                "资金占比": 70,
+                "投保": 50,
+            },
+            footer=True,
+        )
+        self._bind_pick(self.pos_tree, self._pick_position)
+        ord_page = ttk.Frame(book)
+        book.add(ord_page, text="委托")
+        filt = ttk.Frame(ord_page)
+        filt.pack(fill="x", padx=4, pady=2)
+        ttk.Label(filt, text="筛选").pack(side="left")
+        for name in ("全部", "可撤", "已撤", "成交"):
+            ttk.Radiobutton(
+                filt,
+                text=name,
+                value=name,
+                variable=self.ord_filter,
+                command=self._paint_blotter,
+            ).pack(side="left", padx=4)
+        ttk.Label(filt, text="今天的委托，含已成交。点一行填入合约；双击或再点「撤选中委托」。").pack(side="left", padx=12)
+        self.ord_tree = self._tree_in(
+            ord_page,
+            ("时间", "合约", "状态", "买卖", "开平", "委托价", "委托量", "可撤", "已成交", "已撤", "主场号", "投保", "编号"),
+            {
+                "时间": 70,
+                "合约": 80,
+                "状态": 70,
+                "买卖": 45,
+                "开平": 50,
+                "委托价": 70,
+                "委托量": 55,
+                "可撤": 45,
+                "已成交": 55,
+                "已撤": 45,
+                "主场号": 110,
+                "投保": 45,
+                "编号": 70,
+            },
+        )
+        self._bind_pick(self.ord_tree, self._pick_order)
+        self.ord_tree.bind("<Double-1>", lambda _e: self._cancel_selected())
+        self.trd_tree = self._make_tree(
+            book,
+            "成交",
+            ("时间", "合约", "买卖", "开平", "成交价", "成交量", "平仓盈亏", "手续费", "主场号", "投保", "编号"),
+            {
+                "时间": 70,
+                "合约": 80,
+                "买卖": 45,
+                "开平": 50,
+                "成交价": 70,
+                "成交量": 55,
+                "平仓盈亏": 80,
+                "手续费": 70,
+                "主场号": 110,
+                "投保": 45,
+                "编号": 70,
+            },
+            footer=True,
+        )
+        self._build_fund_tab(book)
+        self._build_contract_tab(book)
+        self._build_huatai_tab(book)
+        self._fill_footer(self.pos_tree, position_footer([]))
+        self._fill_footer(self.trd_tree, trade_footer([]))
+
+        self.box = tk.Text(self, height=8, wrap="word")
+        self.box.pack(fill="x", padx=8, pady=8)
         self._say(
-            "点「连接登录」后，窗口会保持可点。登录大约要等十几秒，结果出现在下面。"
-            "上面的最新价、买一、卖一是仿真行情，不是同花顺的价格。"
-            "日志文件在 logs 文件夹，文件名是 auto_trading_日期.log。"
+            f"当前上线阶段：{stage_label(self._stage)}。"
+            "这里只给人点：买开、卖开、买平、卖平、平仓（锁仓会平两边）、反手（先平再反向开）、撤单。"
+            "和常驻策略用同一套报单。策略自动出信号要到③④再点「启动常驻」。"
+            "点蓝色数字可把价格填进框。卖开用买一，买开用卖一。测涨跌停可点涨停/跌停。"
+            "改价请先撤未成交委托。华泰外接测试请打开「华泰必测」页勾选。"
+        )
+
+    def _make_tree(
+        self,
+        book: ttk.Notebook,
+        title: str,
+        columns: tuple[str, ...],
+        widths: dict[str, int],
+        footer: bool = False,
+    ) -> ttk.Treeview:
+        frame = ttk.Frame(book)
+        book.add(frame, text=title)
+        return self._tree_in(frame, columns, widths, footer=footer)
+
+    def _tree_in(
+        self,
+        parent: ttk.Frame,
+        columns: tuple[str, ...],
+        widths: dict[str, int],
+        footer: bool = False,
+    ) -> ttk.Treeview:
+        box = ttk.Frame(parent)
+        box.pack(fill="both", expand=True)
+        tree = ttk.Treeview(box, columns=columns, show="headings", height=8)
+        for name in columns:
+            tree.heading(name, text=name)
+            tree.column(name, width=widths.get(name, 80), anchor="center")
+        scroll = ttk.Scrollbar(box, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scroll.set)
+        tree.pack(side="left", fill="both", expand=True)
+        scroll.pack(side="right", fill="y")
+        if footer:
+            try:
+                ttk.Style().layout("CtpSum.Treeview.Heading", [])
+            except tk.TclError:
+                pass
+            foot = ttk.Treeview(
+                parent,
+                columns=columns,
+                show="headings",
+                height=1,
+                selectmode="none",
+                style="CtpSum.Treeview",
+            )
+            for name in columns:
+                foot.heading(name, text="")
+                foot.column(name, width=widths.get(name, 80), anchor="center")
+            foot.tag_configure("sum", background="#d9e4f2")
+            foot.pack(fill="x")
+            tree._footer = foot  # type: ignore[attr-defined]
+            tree.bind("<Configure>", lambda _e, t=tree: self._sync_footer_width(t), add="+")
+        else:
+            tree._footer = None  # type: ignore[attr-defined]
+        return tree
+
+    def _sync_footer_width(self, tree: ttk.Treeview) -> None:
+        foot = getattr(tree, "_footer", None)
+        if foot is None:
+            return
+        for name in tree["columns"]:
+            foot.column(name, width=int(tree.column(name, "width") or 80))
+
+    def _fill_footer(self, tree: ttk.Treeview, row: tuple[str, ...]) -> None:
+        foot = getattr(tree, "_footer", None)
+        if foot is None:
+            return
+        foot.delete(*foot.get_children())
+        foot.insert("", "end", values=row, tags=("sum",))
+        self._sync_footer_width(tree)
+
+    def _build_fund_tab(self, book: ttk.Notebook) -> None:
+        """资金页：柜台资金查询的完整字段。"""
+        frame = ttk.Frame(book)
+        book.add(frame, text="资金")
+        ttk.Button(frame, text="刷新资金", command=self._query_positions).pack(anchor="w", padx=8, pady=6)
+        grid = ttk.Frame(frame)
+        grid.pack(fill="both", expand=True, padx=8, pady=4)
+        for index, (title, _value) in enumerate(account_pairs({})):
+            row, col = divmod(index, 2)
+            ttk.Label(grid, text=title).grid(row=row, column=col * 2, sticky="e", padx=6, pady=3)
+            var = tk.StringVar(value="—")
+            self._fund_values[title] = var
+            ttk.Label(grid, textvariable=var, width=22, anchor="w").grid(row=row, column=col * 2 + 1, sticky="w")
+
+    def _build_contract_tab(self, book: ttk.Notebook) -> None:
+        """合约页：搜索后列出资料，点一行带回下单区和保证金、手续费。"""
+        frame = ttk.Frame(book)
+        book.add(frame, text="合约")
+        bar = ttk.Frame(frame)
+        bar.pack(fill="x", padx=6, pady=4)
+        ttk.Label(bar, text="合约搜索").pack(side="left")
+        ttk.Entry(bar, textvariable=self.contract_q, width=16).pack(side="left", padx=4)
+        ttk.Button(bar, text="查询", command=self._query_contracts).pack(side="left")
+        ttk.Label(bar, text="空着就按当前下单合约的品种字母搜。不要一次拉全市场。").pack(side="left", padx=8)
+        self.ins_tree = self._tree_in(
+            frame,
+            (
+                "交易代码",
+                "合约名称",
+                "市场",
+                "类别",
+                "每手数量",
+                "最小变动价位",
+                "多头保证金率",
+                "空头保证金率",
+                "开仓手续费",
+                "平仓手续费",
+                "平今手续费",
+                "开仓手续费率",
+                "平仓手续费率",
+                "平今手续费率",
+                "上市日",
+            ),
+            {
+                "交易代码": 80,
+                "合约名称": 90,
+                "市场": 70,
+                "类别": 50,
+                "每手数量": 70,
+                "最小变动价位": 80,
+                "多头保证金率": 90,
+                "空头保证金率": 90,
+                "开仓手续费": 80,
+                "平仓手续费": 80,
+                "平今手续费": 80,
+                "开仓手续费率": 90,
+                "平仓手续费率": 90,
+                "平今手续费率": 90,
+                "上市日": 80,
+            },
+        )
+        self._bind_pick(self.ins_tree, self._pick_contract)
+        ttk.Label(frame, textvariable=self.contract_detail, wraplength=1180, justify="left").pack(
+            anchor="w", padx=8, pady=6
         )
 
     def _drain_ui(self) -> None:
-        """把后台线程交来的界面更新，在窗口自己的线程里做完。"""
         try:
             while True:
                 task = self._ui_queue.get_nowait()
@@ -130,15 +472,21 @@ class CtpProbeWindow(tk.Toplevel):
         except queue.Empty:
             pass
         self._refresh_quote()
+        self.local_time.set(time.strftime("%H:%M:%S"))
+        self._blotter_tick += 1
+        if self._blotter_tick % 8 == 0:
+            self._paint_blotter()
         if self.winfo_exists():
             self.after(100, self._drain_ui)
 
     def _on_ui(self, task) -> None:
-        """后台线程不要直接改输入框。把要做的事放进队列。"""
         self._ui_queue.put(task)
 
     def _say(self, text: str) -> None:
-        """写进这个窗口，也写进主程序日志，方便截图和事后查看。"""
+        # 同一句话不连着刷。选中持仓、盘口没变时运行日志不再重复写。
+        if text == self._last_said:
+            return
+        self._last_said = text
         logger.info("仿真测试：{}", text)
         if threading.current_thread() is threading.main_thread():
             self._write(text)
@@ -152,19 +500,12 @@ class CtpProbeWindow(tk.Toplevel):
         self.box.see("end")
 
     def _set_busy(self, busy: bool) -> None:
-        """登录或下单还在等柜台时，按钮先停用，避免连点两次。"""
         self._busy = busy
         state = "disabled" if busy else "normal"
         for button in self._buttons:
             button.configure(state=state)
 
     def _run_in_background(self, waiting: str, work) -> None:
-        """
-        把会等网络的动作放到旁边的线程。
-
-        连接登录会一直等到柜台回应，最长大约二十秒。
-        如果放在窗口自己的线程里，Windows 会把标题改成「未响应」。
-        """
         if self._busy:
             self._say("上一步还没结束，请等下面出现结果。")
             return
@@ -179,57 +520,151 @@ class CtpProbeWindow(tk.Toplevel):
                 self._say(f"出错了：{exc}")
             finally:
                 self._on_ui(lambda: self._set_busy(False))
+                self._on_ui(self._paint_blotter)
 
         threading.Thread(target=job, name="ctp-probe", daemon=True).start()
 
-    def _ensure(self) -> CtpTrader | None:
+    def _selected_kind(self) -> str:
+        return normalize_ctp_kind(self.kind.get())
+
+    def _drop_session(self) -> None:
+        """换账号时先关掉旧连接，避免两本账混在一个流文件里。"""
+        if self.md is not None:
+            self.md.close()
+            self.md = None
         if self.trader is not None:
-            return self.trader
-        cfg = load_config()
-        # 这个窗口只测柜台。即使配置里的模拟开关开着，这里也按真连接准备。
-        cfg["dry_run"] = False
+            self.trader.shutdown()
+            self.trader = None
+
+    def _on_kind_change(self) -> None:
+        kind = self._selected_kind()
+        if self.trader is not None and self.trader.settings.account_kind != kind:
+            self._drop_session()
+            self.account_line.set("已换操作账，请重新点「连接登录」")
+            self._say(f"已改成{ctp_kind_label(kind)}。换账后必须重新登录。")
+
+    def _ensure(self) -> CtpTrader | None:
+        kind = self._selected_kind()
+        if self.trader is not None:
+            if self.trader.settings.account_kind == kind:
+                return self.trader
+            self._drop_session()
+        cfg = prepare_live_ctp_cfg(load_config(), kind)
+        ctp = (cfg.get("trade") or {}).get("ctp") or {}
+        preview = overlay_ctp_profile(ctp, kind, account=cfg.get("account"))
+        if kind == "live" and not str(preview.get("td_front") or "").strip():
+            self._say("真实账号还缺交易前置。请到配置页填「实盘交易前置」，或在 config.yaml 的 trade.ctp.live 里填。")
+            return None
+        if kind == "live" and not str(preview.get("user_id") or "").strip():
+            self._say("真实账号还缺资金账号。请到配置页「账号与登录」填「资金账号」。")
+            return None
         self.trader = CtpTrader(cfg)
         return self.trader
+
+    def _need_login(self) -> CtpTrader | None:
+        trader = self._ensure()
+        if trader is None:
+            return None
+        if not trader.gateway.session.ready:
+            self._say("请先点「连接登录」。")
+            return None
+        return trader
 
     def _connect(self) -> None:
         trader = self._ensure()
         if trader is None:
             return
+        worker = getattr(self.master, "worker", None)
+        if bool(getattr(worker, "running", False)):
+            executor = str(((load_config().get("trade") or {}).get("executor") or "")).lower()
+            if executor == "ctp":
+                self._say(
+                    "常驻已经在用 CTP 连这个账号。请先到运行页点「停止常驻」，再在交易台登录，"
+                    "否则柜台可能把一边踢下线。"
+                )
+                return
+        self._say(f"准备用{ctp_kind_label(trader.settings.account_kind)}登录 {trader.settings.user_id}")
 
         def work() -> None:
             ok, message = trader.connect()
             self._say(("连接成功：" if ok else "连接失败：") + message)
-            if ok:
-                self._say(
-                    f"账号 {trader.settings.user_id} AppID {trader.settings.app_id}。"
-                    f"报单阈值 {trader.settings.order_count_warn} 笔，"
-                    f"撤单阈值 {trader.settings.cancel_count_warn} 笔，"
-                    f"单笔最多 {trader.settings.max_order_volume} 手，"
-                    f"最小变动价位 {trader.settings.price_tick}。"
+            if not ok:
+                return
+            warn = trader.settings.order_count_warn
+            lots = trader.settings.max_order_volume
+            self._on_ui(
+                lambda: self.account_line.set(
+                    f"已登录账号 {trader.settings.user_id}  AppID {trader.settings.app_id}  前置 {trader.settings.td_front}"
                 )
-                # 柜台两次查询至少要隔 1 秒。登录时刚查过报单，这里等一下再要报价。
-                time.sleep(1.1)
-                self._load_price_band(trader)
-                self._open_market(trader)
+            )
+            self._on_ui(
+                lambda: self.limit_line.set(
+                    f"本机单笔最多 {lots} 手（超过会拦住，不是柜台上限）。"
+                    f"报单/撤单到 {warn} 笔只提醒、不拦单。"
+                    f"最小变动价位 {trader.settings.price_tick}。"
+                    f"挂单留给你手撤（华泰测撤单用）；常驻挂机仍会超时自动撤。"
+                )
+            )
+            self._say(
+                f"账号 {trader.settings.user_id}。本机单笔最多 {lots} 手。"
+                f"到 {warn} 笔只是提醒，不是只能报 {warn} 次。"
+            )
+            time.sleep(1.1)
+            self._load_price_band(trader)
+            time.sleep(1.1)
+            self._show_positions(trader)
+            time.sleep(1.1)
+            self._show_orders(trader)
+            time.sleep(1.1)
+            self._show_trades(trader)
+            self._open_market(trader)
+            self._on_ui(self._start_quote_pump)
 
         self._run_in_background("正在连接柜台，请稍等。窗口不会卡住。", work)
 
     def _load_price_band(self, trader: CtpTrader) -> None:
-        """先向交易前置要一笔快照，窗口不用干等第一笔行情。"""
-        symbol = self.symbol.get().strip() or "bu2612"
+        symbol = self.symbol.get().strip() or "fu2701"
         ok, text = trader.gateway.query_price_band(symbol)
         if not ok:
             self._say(text)
             return
-        band = trader.gateway._instrument or {}
+        band = dict(trader.gateway._instrument or {})
+        if not str(band.get("symbol") or "").strip():
+            band["symbol"] = symbol
+        md = self.md
+        if md is not None:
+            # 柜台快照用来补涨跌停；缺卖一时不要把实时盘口擦掉。
+            md.apply_tick(band, replace_empty=False)
+            if md.latest:
+                self._show_quote_soon(md.latest)
+                return
         self._show_quote_soon(band)
 
-    def _open_market(self, trader: CtpTrader) -> None:
-        """
-        连接仿真行情端口，订阅窗口里这个合约。
+    def _start_quote_pump(self) -> None:
+        if self._quote_pump_on:
+            return
+        self._quote_pump_on = True
+        self._keep_quotes()
 
-        交易登录成功之后才做。行情断了也不影响刚才的交易登录结果。
-        """
+    def _keep_quotes(self) -> None:
+        """行情几秒不跳时，再向柜台要一次盘口，避免时间和卖一一直停住。"""
+        if not self.winfo_exists():
+            return
+        trader = self.trader
+        md = self.md
+        stale = md is None or md.stale_seconds() >= 2.5
+        if stale and trader is not None and trader.gateway.session.ready and not self._busy:
+
+            def work() -> None:
+                try:
+                    self._load_price_band(trader)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("补刷盘口失败: {}", exc)
+
+            threading.Thread(target=work, daemon=True, name="ctp-quote").start()
+        self.after(2500, self._keep_quotes)
+
+    def _open_market(self, trader: CtpTrader) -> None:
         from src.trader.ctp_md import CtpMdClient
 
         if self.md is None:
@@ -238,34 +673,117 @@ class CtpProbeWindow(tk.Toplevel):
         self._say(message)
         if not ok:
             return
-        symbol = self.symbol.get().strip() or "bu2612"
+        self._follow_symbol(trader)
+
+    def _resub(self) -> None:
+        trader = self._need_login()
+        if trader is None:
+            return
+        self._follow_symbol(trader)
+        self._load_price_band(trader)
+
+    def _follow_symbol(self, trader: CtpTrader) -> None:
+        symbol = self.symbol.get().strip() or "fu2701"
+        if self.md is None:
+            return
+        key = symbol_key(symbol)
+        if key and key == self._followed_symbol:
+            return
         ok, message = self.md.subscribe(symbol)
-        self._say(message)
+        if ok:
+            self._followed_symbol = key
+        self._say(message if ok else ("订阅失败：" + message))
+
+    def _note_pick(self, signature: str) -> bool:
+        """同一行只提示一次。表格刷新会再次选中这一行，不能每次都写日志。"""
+        if signature == self._last_pick:
+            return False
+        self._last_pick = signature
+        self._last_pick_at = time.time()
+        return True
+
+    def _fill_symbol_box(self, code: str, lots: int | None = None) -> None:
+        """把点中的合约填进上方，手数有就一起填。"""
+        name = str(code or "").strip()
+        if not name:
+            return
+        self.symbol.set(name)
+        if lots is not None and int(lots) > 0:
+            self.volume.set(str(int(lots)))
+        trader = self.trader
+        if trader is not None and trader.gateway.session.ready:
+            self._follow_symbol(trader)
+
+    def _quote_cell(self, parent: ttk.Frame, col: int, title: str, var: tk.StringVar, fill: str | None) -> None:
+        """
+        盘口一格。买一、卖一、最新整块都能点，把价格填进上面的价格框。
+        原理：ttk 标签可点面积太小，这里用普通标签加大热区，手形光标表示能点。
+        """
+        box = tk.Frame(parent, cursor="hand2" if fill else "")
+        box.grid(row=0, column=col, padx=8, pady=2)
+        head = title + "（点填价）" if fill else title
+        items = [
+            tk.Label(box, text=head, fg="#555" if fill else None),
+            tk.Label(box, textvariable=var, font=("Segoe UI", 11, "bold"), fg="#0b57d0" if fill else None),
+        ]
+        for item in items:
+            item.pack()
+            if fill:
+                item.configure(cursor="hand2")
+                item.bind("<Button-1>", lambda _e, kind=fill: self._use_quote(kind))
+        if fill:
+            box.bind("<Button-1>", lambda _e, kind=fill: self._use_quote(kind))
+
+    def _use_quote(self, which: str) -> None:
+        mapping = {
+            "bid": self.bid,
+            "ask": self.ask,
+            "last": self.last,
+            "upper": self.upper,
+            "lower": self.lower,
+        }
+        names = {"bid": "买一", "ask": "卖一", "last": "最新", "upper": "涨停", "lower": "跌停"}
+        var = mapping.get(which)
+        text = var.get() if var is not None else ""
+        if text and text != "—":
+            self.price.set(text)
+            self.price_mode.set("手动")
+            self._say(f"已把{names.get(which, which)} {text} 填进价格框。")
+            return
+        missing = {
+            "ask": "现在没有卖一。盘口没人挂卖单。卖开请点买一；买开才用卖一。",
+            "bid": "现在没有买一。盘口没人挂买单。买开请点卖一。",
+            "upper": "现在没有涨停价。请先订阅行情。",
+            "lower": "现在没有跌停价。请先订阅行情。",
+        }
+        self._say(missing.get(which, "现在没有最新价。请先订阅行情。"))
 
     def _show_quote_soon(self, row: dict) -> None:
-        """后台线程把快照交给窗口线程去画。"""
         copied = dict(row)
         self._on_ui(lambda: self._show_quote(copied))
 
     def _refresh_quote(self) -> None:
-        """行情线程只保存最新一笔。窗口定时来取，避免每一笔都刷日志。"""
         md = self.md
         if md is None or md.latest is None:
             return
         self._show_quote(md.latest)
 
     def _show_quote(self, row: dict) -> None:
-        """把最新价、买一、卖一、涨跌停写到价格框上面。"""
         if not self.winfo_exists():
             return
+        from src.trader.ctp_md import describe_quote, quote_line
+
+        view = describe_quote(row)
         signature = (
-            str(row.get("symbol") or ""),
-            str(row.get("last_text") or "—"),
-            str(row.get("bid_text") or "—"),
-            str(row.get("ask_text") or "—"),
-            str(row.get("upper_text") or "—"),
-            str(row.get("lower_text") or "—"),
-            str(row.get("time_text") or "—"),
+            str(view.get("symbol") or ""),
+            str(view.get("last_text") or "—"),
+            str(view.get("bid_text") or "—"),
+            str(view.get("ask_text") or "—"),
+            str(view.get("upper_text") or "—"),
+            str(view.get("lower_text") or "—"),
+            str(view.get("time_text") or "—"),
+            str(view.get("bid_vol_text") or "0"),
+            str(view.get("ask_vol_text") or "0"),
         )
         if signature == self._shown_quote:
             return
@@ -276,20 +794,296 @@ class CtpProbeWindow(tk.Toplevel):
         self.upper.set(signature[4])
         self.lower.set(signature[5])
         self.quote_time.set(signature[6])
-        from src.trader.ctp_md import quote_line
+        self.bid_vol.set(signature[7])
+        self.ask_vol.set(signature[8])
+        if signature[3] == "—":
+            self.quote_hint.set("卖一是横线=盘口暂时没人挂卖。卖开请点买一填价（对手价），不要等卖一。")
+        else:
+            self.quote_hint.set("点蓝色的最新/买一/卖一/涨停/跌停，价格会填进上面的框。")
 
-        line = quote_line(row)
+        line = quote_line(view)
         if line != self._logged_quote:
             self._logged_quote = line
             logger.info("仿真测试：{}", line)
             self._write(line)
+
+    def _paint_blotter(self) -> None:
+        if not self.winfo_exists() or self.trader is None:
+            return
+        gateway = self.trader.gateway
+        self.money_line.set(account_headline(gateway.account))
+        self._paint_fund(gateway)
+        self._fill_tree(self.pos_tree, self._pos_rows(gateway), keep=("合约", "买卖"))
+        self._fill_tree(self.ord_tree, self._ord_rows(gateway), keep="编号")
+        self._fill_tree(self.trd_tree, self._trd_rows(gateway), keep="编号")
+        activity = gateway.activity
+        orders = int(getattr(activity, "orders", 0) or 0)
+        cancels = int(getattr(activity, "cancels", 0) or 0)
+        line = f"今日报单 {orders} 笔，撤单 {cancels} 笔（笔数不是手数）"
+        note = activity.describe() if hasattr(activity, "describe") else ""
+        if "阈值" in note:
+            extra = note.split("。", 1)[-1]
+            line += "  " + extra
+        self.count_line.set(line)
+
+    def _on_desk_tab(self, _event=None) -> None:
+        """点开资金页时立刻把已经查到的柜台数字画出来，避免还停在横杠。"""
+        if not self.winfo_exists():
+            return
+        try:
+            title = str(self._desk_book.tab(self._desk_book.select(), "text") or "")
+        except Exception:  # noqa: BLE001
+            return
+        if title != "资金":
+            return
+        if self.trader is None:
+            return
+        self._paint_fund(self.trader.gateway)
+
+    def _paint_fund(self, gateway) -> None:
+        account = getattr(gateway, "account", None) if gateway is not None else None
+        for title, value in account_pairs(account):
+            var = self._fund_values.get(title)
+            if var is not None:
+                var.set(value)
+
+    def _paint_contracts(self) -> None:
+        if not self.winfo_exists() or self.trader is None:
+            return
+        rows = [format_contract_row(item) for item in self.trader.gateway.contracts]
+        self._fill_tree(self.ins_tree, rows, keep="交易代码")
+
+    def _fill_tree(
+        self,
+        tree: ttk.Treeview,
+        rows: list[tuple[str, ...]],
+        keep: str | tuple[str, ...] = "",
+    ) -> None:
+        """刷新表格时留着点中的行，并且不要把滚动条拽回顶部。"""
+        shown = [tuple(str(v) for v in tree.item(iid, "values")) for iid in tree.get_children()]
+        wanted = [tuple(str(v) for v in row) for row in rows]
+        if shown == wanted:
+            return
+        keep_cols = (keep,) if isinstance(keep, str) and keep else tuple(keep or ())
+        keep_value: tuple[str, ...] = ()
+        if keep_cols:
+            chosen = tree.selection()
+            if chosen:
+                keep_value = tuple(self._cell(tree, chosen[0], col) for col in keep_cols)
+        y0 = tree.yview()[0]
+        self._filling_tree = True
+        try:
+            tree.delete(*tree.get_children())
+            restore = ""
+            for row in rows:
+                iid = tree.insert("", "end", values=row)
+                if keep_cols and keep_value and tuple(self._cell(tree, iid, col) for col in keep_cols) == keep_value:
+                    restore = iid
+            if restore:
+                # 只保留选中，不要 see() 把画面跳到这一行，否则刚翻下去又被拽回来。
+                tree.selection_set(restore)
+            tree.yview_moveto(y0)
+        finally:
+            # 选中事件可能排到刷新之后才执行，晚一点再放开，避免误报「已选中」。
+            self.after_idle(self._end_fill_tree)
+
+    def _end_fill_tree(self) -> None:
+        self._filling_tree = False
+
+    def _bind_pick(self, tree: ttk.Treeview, handler) -> None:
+        """单击一行就挑选。刷新表格时不会误触发。"""
+        tree.bind("<<TreeviewSelect>>", lambda _e: handler())
+        tree.bind("<ButtonRelease-1>", lambda event, t=tree, h=handler: self._pick_from_click(t, h, event))
+
+    def _pick_from_click(self, tree: ttk.Treeview, handler, event) -> None:
+        if self._filling_tree:
+            return
+        row = tree.identify_row(event.y)
+        if not row:
+            return
+        tree.selection_set(row)
+        handler()
+
+    def _cell(self, tree: ttk.Treeview, iid: str, column: str) -> str:
+        names = list(tree["columns"])
+        values = tree.item(iid, "values")
+        if column not in names:
+            return ""
+        index = names.index(column)
+        if index >= len(values):
+            return ""
+        return str(values[index] or "")
+
+    def _pos_rows(self, gateway) -> list[tuple[str, ...]]:
+        rows: list[tuple[str, ...]] = []
+        last = None
+        upper = None
+        lower = None
+        try:
+            last = float(self.last.get())
+        except ValueError:
+            last = None
+        try:
+            upper = float(self.upper.get())
+        except ValueError:
+            upper = None
+        try:
+            lower = float(self.lower.get())
+        except ValueError:
+            lower = None
+        watched = symbol_key(self.symbol.get())
+        items: list[dict[str, str]] = []
+        for name in sorted(gateway.positions):
+            view = gateway.positions[name]
+            quote_last = last if watched == name else None
+            quote_upper = upper if watched == name else None
+            quote_lower = lower if watched == name else None
+            for item in split_position_rows(
+                name,
+                view,
+                multiplier=self._sizer.multiplier_for(name),
+                last=quote_last,
+                upper=quote_upper,
+                lower=quote_lower,
+                balance=float((gateway.account or {}).get("balance") or 0),
+            ):
+                items.append(item)
+                rows.append(
+                    (
+                        item["symbol"],
+                        item["side"],
+                        item["lots"],
+                        item["today"],
+                        item["yesterday"],
+                        item["avg"],
+                        item["pnl"],
+                        item["margin"],
+                        item["value"],
+                        item["spread"],
+                        item["ratio"],
+                        item["limit_pnl"],
+                        item["share"],
+                        item["hedge"],
+                    )
+                )
+        self._fill_footer(self.pos_tree, position_footer(items))
+        return rows
+
+    def _ord_rows(self, gateway) -> list[tuple[str, ...]]:
+        rows: list[tuple[str, ...]] = []
+        kind = self.ord_filter.get()
+        for order in gateway.table.orders.values():
+            if not order_matches_filter(order, kind):
+                continue
+            left = remaining_volume(order)
+            if order.status in {"filled", "cancelled", "rejected"}:
+                can_cancel = 0
+            else:
+                can_cancel = left
+            rows.append(
+                (
+                    str(order.insert_time or ""),
+                    symbol_key(order.symbol),
+                    STATUS_TEXT.get(order.status, order.status),
+                    direction_cn(order.direction),
+                    offset_cn(order.offset),
+                    f"{order.price:g}" if order.price else "",
+                    str(order.volume),
+                    str(can_cancel),
+                    str(order.filled),
+                    str(cancelled_volume(order)),
+                    str(order.order_sys_id or "").strip(),
+                    hedge_cn(order.hedge),
+                    str(order.order_ref).strip(),
+                )
+            )
+        rows.sort(key=_order_row_sort_key, reverse=True)
+        return rows
+
+    def _trd_rows(self, gateway) -> list[tuple[str, ...]]:
+        rows: list[tuple[str, ...]] = []
+        for item in gateway.trades:
+            close_pnl = float(item.get("close_profit") or 0)
+            fee = float(item.get("commission") or 0)
+            rows.append(
+                (
+                    str(item.get("time") or ""),
+                    str(item.get("symbol") or ""),
+                    direction_cn(str(item.get("direction") or "")),
+                    offset_cn(str(item.get("offset") or "")),
+                    f"{float(item.get('price') or 0):g}",
+                    str(item.get("volume") or ""),
+                    money_text(close_pnl) if abs(close_pnl) > 1e-9 else "—",
+                    money_text(fee) if abs(fee) > 1e-9 else "—",
+                    str(item.get("order_sys_id") or ""),
+                    hedge_cn(str(item.get("hedge") or "")),
+                    str(item.get("order_ref") or ""),
+                )
+            )
+        rows.sort(key=_order_row_sort_key, reverse=True)
+        self._fill_footer(self.trd_tree, trade_footer(rows))
+        return rows
+
+    def _build_huatai_tab(self, book: ttk.Notebook) -> None:
+        """华泰程序化外接必测勾选。勾完后才能把①标成完成。"""
+        frame = ttk.Frame(book)
+        book.add(frame, text="华泰必测")
+        ttk.Label(
+            frame,
+            text="除「重复报单」「批量撤单」外都必须勾上。截图要带时间戳或电脑右下角时间。",
+            wraplength=860,
+        ).pack(anchor="w", padx=8, pady=6)
+        ticks = (self._go_live.get("huatai") or {})
+        for key, title in HUATAI_REQUIRED:
+            var = tk.BooleanVar(value=bool(ticks.get(key)))
+            self._huatai_vars[key] = var
+            ttk.Checkbutton(frame, text=title, variable=var, command=self._save_huatai).pack(
+                anchor="w", padx=12, pady=1
+            )
+        ttk.Button(frame, text="保存勾选", command=self._save_huatai).pack(anchor="w", padx=8, pady=8)
+
+    def _save_huatai(self) -> None:
+        latest = load_state(self._root)
+        latest.setdefault("huatai", {})
+        for key, var in self._huatai_vars.items():
+            latest["huatai"][key] = bool(var.get())
+        save_state(self._root, latest)
+        self._go_live = latest
+        self._say("华泰必测勾选已保存。全部勾完后，请到运行页点「本阶段完成」。")
+
+    def _block_symbol(self) -> None:
+        self.symbol.set("XXXX")
+        self.price.set(self.price.get() or "1")
+        self._say("将用错误合约报单，应被本机拦住，不会发到柜台。")
+        self._send("buy_open")
+
+    def _block_tick(self) -> None:
+        trader = self._ensure()
+        tick = float(trader.settings.price_tick) if trader is not None else 1.0
+        raw = self.price.get() or "0"
+        try:
+            price = float(raw)
+        except ValueError:
+            price = 0.0
+        bad = price + tick / 2 if tick > 0 else price + 0.5
+        self.price.set(str(bad))
+        self._say("将用错误价位报单，应被本机拦住，不会发到柜台。")
+        self._send("buy_open")
+
+    def _block_lots(self) -> None:
+        trader = self._ensure()
+        limit = int(trader.settings.max_order_volume) if trader is not None else 2
+        self.volume.set(str(limit + 1))
+        self.price.set(self.price.get() or "1")
+        self._say(f"将用 {limit + 1} 手报单，超过本机单笔 {limit} 手，应被拦住。")
+        self._send("buy_open")
 
     def _pause(self) -> None:
         trader = self._ensure()
         if trader is None:
             return
         trader.gateway.trading_paused = True
-        self._say("已暂停报单。之后的开平仓不会发到柜台。点「停止」也能停掉常驻策略。")
+        self._say("已暂停报单。")
 
     def _resume(self) -> None:
         trader = self._ensure()
@@ -298,32 +1092,270 @@ class CtpProbeWindow(tk.Toplevel):
         trader.gateway.trading_paused = False
         self._say("已恢复报单。")
 
+    def _query_positions(self) -> None:
+        trader = self._need_login()
+        if trader is None:
+            return
+
+        def work() -> None:
+            self._show_positions(trader)
+
+        self._run_in_background("正在查询持仓和资金。", work)
+
+    def _show_positions(self, trader: CtpTrader) -> None:
+        ok, text = trader.fetch_account_snapshot()
+        self._say(text if ok else ("查询失败：" + text))
+
+    def _query_orders(self) -> None:
+        trader = self._need_login()
+        if trader is None:
+            return
+
+        def work() -> None:
+            self._show_orders(trader)
+
+        self._run_in_background("正在查询委托。", work)
+
+    def _show_orders(self, trader: CtpTrader) -> None:
+        ok, text = trader.fetch_working_orders()
+        self._say(text if ok else ("查询失败：" + text))
+
+    def _query_trades(self) -> None:
+        trader = self._need_login()
+        if trader is None:
+            return
+
+        def work() -> None:
+            self._show_trades(trader)
+
+        self._run_in_background("正在查询成交。", work)
+
+    def _show_trades(self, trader: CtpTrader) -> None:
+        ok, text = trader.fetch_trades()
+        self._say(text if ok else ("查询失败：" + text))
+
     def _buy_open(self) -> None:
         self._send("buy_open")
+
+    def _sell_open(self) -> None:
+        self._send("sell_open")
+
+    def _buy_close(self) -> None:
+        self._send("close", position_side="short")
 
     def _sell_close(self) -> None:
         self._send("close", position_side="long")
 
+    def _flatten(self) -> None:
+        """平掉当前合约每一边持仓。锁仓时买开、卖开都会发平仓，和策略收盘清仓同一套报单。"""
+        trader = self._need_login()
+        if trader is None:
+            return
+        name = symbol_key(self.symbol.get())
+        view = trader.gateway.positions.get(name)
+        steps = flatten_order_steps(view)
+        if not steps:
+            self._say("这个合约没有持仓，不能点平仓。")
+            return
+        self._place_chain(steps)
+
+    def _reverse(self) -> None:
+        """模拟策略反手：先平旧仓，再开反向。步骤与常驻相同，都进 place_order。"""
+        trader = self._need_login()
+        if trader is None:
+            return
+        name = symbol_key(self.symbol.get())
+        view = trader.gateway.positions.get(name)
+        error, steps = reverse_order_steps(view)
+        if error:
+            self._say(error)
+            return
+        self._place_chain(steps)
+
+    def _fill_auto_price(self, side: str, position_side: str | None) -> bool:
+        mode = self.price_mode.get()
+        if mode == "手动":
+            return True
+        if mode == "最新价":
+            text = self.last.get()
+        elif side == "buy_open" or (side == "close" and position_side == "short"):
+            text = self.ask.get()
+        else:
+            text = self.bid.get()
+        if not text or text == "—":
+            self._say("还没有报价，请先订阅行情，或改回手动填价格。")
+            return False
+        self.price.set(text)
+        return True
+
+    def _pick_position(self) -> None:
+        if self._filling_tree:
+            return
+        chosen = self.pos_tree.selection()
+        if not chosen:
+            return
+        code = self._cell(self.pos_tree, chosen[0], "合约")
+        if not code:
+            return
+        side = self._cell(self.pos_tree, chosen[0], "买卖") or "买"
+        try:
+            lots = int(self._cell(self.pos_tree, chosen[0], "手数") or 0)
+        except ValueError:
+            lots = 0
+        self._fill_symbol_box(code, lots)
+        if self._note_pick(f"pos|{code}|{side}"):
+            close_hint = "买平" if side == "卖" else "卖平"
+            self._say(f"已选中{side}仓 {code}，手数 {lots or self.volume.get()}。可点「{close_hint}」或「平仓」。")
+
+    def _query_contracts(self) -> None:
+        trader = self._need_login()
+        if trader is None:
+            return
+        keyword = contract_search_key(self.contract_q.get(), self.symbol.get())
+
+        def work() -> None:
+            ok, text = trader.fetch_contracts(keyword)
+            self._say(text if ok else ("查询失败：" + text))
+            self._on_ui(self._paint_contracts)
+
+        self._run_in_background(f"正在查询合约 {keyword}。", work)
+
+    def _pick_contract(self) -> None:
+        if self._filling_tree:
+            return
+        chosen = self.ins_tree.selection()
+        if not chosen:
+            return
+        code = self._cell(self.ins_tree, chosen[0], "交易代码")
+        if not code:
+            return
+        self.contract_q.set(code)
+        self._fill_symbol_box(code)
+        name = self._cell(self.ins_tree, chosen[0], "合约名称")
+        if self._note_pick(f"ins|{code}"):
+            self._say(f"已选中合约 {code}{(' ' + name) if name else ''}，已填进上方。")
+        trader = self.trader
+        if trader is None or not trader.gateway.session.ready:
+            return
+        if code in self._cost_loaded:
+            row = next(
+                (item for item in trader.gateway.contracts if symbol_key(str(item.get("symbol") or "")) == symbol_key(code)),
+                None,
+            )
+            if row:
+                self.contract_detail.set(describe_contract(row))
+            return
+
+        def work() -> None:
+            try:
+                self._load_price_band(trader)
+                time.sleep(1.1)
+                ok, row = trader.fetch_contract_costs(code)
+                if not ok or not row:
+                    self._say(f"已选 {code}，但保证金或手续费这次没查到。")
+                    return
+                self._cost_loaded.add(code)
+                text = describe_contract(row)
+                self._say(text)
+                self._on_ui(lambda: self.contract_detail.set(text))
+                self._on_ui(self._paint_contracts)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("点选合约后查资料失败: {}", exc)
+
+        threading.Thread(target=work, daemon=True, name="ctp-contract-pick").start()
+
+    def _pick_order(self) -> None:
+        if self._filling_tree:
+            return
+        chosen = self.ord_tree.selection()
+        if not chosen:
+            return
+        code = self._cell(self.ord_tree, chosen[0], "合约")
+        ref = self._cell(self.ord_tree, chosen[0], "编号").strip()
+        status = self._cell(self.ord_tree, chosen[0], "状态")
+        if code:
+            self._fill_symbol_box(code)
+        self._picked_order_ref = ref
+        if not ref or not self._note_pick(f"ord|{ref}"):
+            return
+        if status in {"撤单", "全部成交", "拒单"}:
+            self._say(f"已选中委托 {ref}（{status}），这一笔不能再撤。")
+            return
+        self._say(f"已选中委托 {ref} {code}。点「撤选中委托」或双击这一行即可撤单。")
+
     def _send(self, side: str, position_side: str | None = None) -> None:
+        self._place_chain([{"side": side, "position_side": position_side}])
+
+    def _place_chain(self, steps: list[dict]) -> None:
+        """
+        按顺序发几笔限价单。反手是两笔：先平、再开。
+
+        每一笔都走 CtpTrader.place_order，和常驻策略相同。前一笔失败就停下，避免平仓失败又开反向。
+        """
         trader = self._ensure()
         if trader is None:
             return
-        try:
-            price = float(self.price.get())
-            volume = int(self.volume.get())
-        except ValueError:
-            self._say("价格和手数要填数字。")
-            return
-        request = OrderRequest(self.symbol.get().strip(), side, volume, price, position_side=position_side)
 
         def work() -> None:
-            result = trader.place_order(request)
-            self._say(f"{side}：{result.message}")
+            self._follow_symbol(trader)
+            labels = {"buy_open": "买开", "sell_open": "卖开", "close": "平仓"}
+            for index, step in enumerate(steps):
+                side = str(step.get("side") or "")
+                position_side = step.get("position_side")
+                if not self._fill_auto_price(side, position_side):
+                    return
+                try:
+                    price = float(self.price.get())
+                    volume = int(step["volume"]) if step.get("volume") is not None else int(self.volume.get())
+                except (TypeError, ValueError, KeyError):
+                    self._say("价格和手数要填数字。点买一或卖一可以把价格填进来。")
+                    return
+                request = ctp_order(
+                    self.symbol.get().strip(),
+                    side,  # type: ignore[arg-type]
+                    volume,
+                    price,
+                    position_side=position_side,
+                    remark="交易台手工",
+                )
+                result = trader.place_order(request)
+                label = labels.get(side, side)
+                self._say(f"{label}：{result.message}")
+                note = trader.gateway.activity.describe()
+                if "阈值" in note:
+                    self._say(note)
+                if not result.ok:
+                    if index + 1 < len(steps):
+                        self._say("这一笔没有成功，后面的反手开仓没有发。")
+                    return
 
         self._run_in_background("正在把这笔单发给柜台。", work)
 
+    def _cancel_selected(self) -> None:
+        trader = self._need_login()
+        if trader is None:
+            return
+        chosen = self.ord_tree.selection()
+        ref = ""
+        if chosen:
+            ref = self._cell(self.ord_tree, chosen[0], "编号").strip()
+        if not ref:
+            ref = str(self._picked_order_ref or "").strip()
+        if not ref:
+            self._say("请先在委托表点中要撤的那一笔，再点「撤选中委托」，或直接双击那一行。")
+            return
+
+        def work() -> None:
+            result = trader.cancel_ref(ref)
+            self._say(result.message if result.ok else ("撤单失败：" + result.message))
+            note = trader.gateway.activity.describe()
+            if "阈值" in note:
+                self._say(note)
+
+        self._run_in_background(f"正在撤销编号 {ref}。", work)
+
     def _cancel(self) -> None:
-        trader = self._ensure()
+        trader = self._need_login()
         if trader is None:
             return
         symbol = self.symbol.get().strip()
@@ -334,42 +1366,25 @@ class CtpProbeWindow(tk.Toplevel):
 
         self._run_in_background("正在撤销最近一笔。", work)
 
-    def _bad_symbol(self) -> None:
-        self._reject("ABC", self._price_or_one(), 1)
-
-    def _bad_price(self) -> None:
-        trader = self._ensure()
-        tick = trader.settings.price_tick if trader is not None else 1
-        self._reject(self.symbol.get().strip() or "bu2612", float(tick) / 2, 1)
-
-    def _too_big(self) -> None:
-        trader = self._ensure()
-        limit = trader.settings.max_order_volume if trader is not None else 2
-        self._reject(self.symbol.get().strip() or "bu2612", self._price_or_one(), int(limit) + 1)
-
-    def _reject(self, symbol: str, price: float, volume: int) -> None:
-        trader = self._ensure()
+    def _cancel_all(self) -> None:
+        trader = self._need_login()
         if trader is None:
             return
-        reason = check_order_instruction(
-            symbol,
-            price,
-            volume,
-            price_tick=trader.settings.price_tick,
-            max_volume=trader.settings.max_order_volume,
-        )
-        self._say(reason or "这笔没有被拦住，请检查阈值。")
 
-    def _price_or_one(self) -> float:
-        try:
-            return float(self.price.get())
-        except ValueError:
-            return 1.0
+        def work() -> None:
+            result = trader.cancel_all_working()
+            self._say(result.message)
+            note = trader.gateway.activity.describe()
+            if "阈值" in note:
+                self._say(note)
+
+        self._run_in_background("正在撤销全部未成交委托。", work)
 
     def _close(self) -> None:
         if self._busy:
             self._say("柜台还在回应，等下面出现结果后再关窗口。")
             return
+        self._quote_pump_on = False
         if self.md is not None:
             self.md.close()
             self.md = None

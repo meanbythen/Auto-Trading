@@ -27,7 +27,19 @@ OFFSET_CLOSE_YESTERDAY = "4"
 DIRECTION_BUY = "0"
 DIRECTION_SELL = "1"
 
-# 需要单独报平今、平昨的品种。bu 是上期所沥青，c 是大商所玉米。
+
+def direction_cn(code: str) -> str:
+    """柜台买卖方向：0 买，1 卖。"""
+    flag = str(code or "").strip()[:1]
+    return {"0": "买", "1": "卖"}.get(flag, str(code or ""))
+
+
+def offset_cn(code: str) -> str:
+    """柜台开平：0 开仓，1 平仓，3 平今，4 平昨。"""
+    flag = str(code or "").strip()[:1]
+    return {"0": "开仓", "1": "平仓", "3": "平今", "4": "平昨"}.get(flag, str(code or ""))
+
+# 需要单独报平今、平昨的品种。配置里可再追加；上期所、能源中心、大商所即使没写也会拆。
 # 用完整字母前缀比较，避免把沪铜 cu 当成玉米 c。
 DEFAULT_CLOSE_SPLIT_PRODUCTS = ("bu", "c")
 
@@ -73,6 +85,112 @@ _CTP_EXCHANGE_BY_PRODUCT: dict[str, str] = {
 def ctp_exchange_id(symbol: str) -> str:
     """bu2612 -> SHFE，SA2701 -> CZCE。不认识的品种留空，让柜台按合约自己判断。"""
     return _CTP_EXCHANGE_BY_PRODUCT.get(product_code(symbol).upper(), "")
+
+
+def needs_close_split(symbol: str) -> bool:
+    """
+    上期所、能源中心、大商所不能报普通平仓，必须拆成平今或平昨。
+
+    燃油 fu 和沥青 bu 一样在上期所。报「平仓」柜台会回「平仓位不足」。
+    """
+    return ctp_exchange_id(symbol) in {"SHFE", "INE", "DCE"}
+
+
+def keep_order_sys_id(sys_id: str) -> str:
+    """
+    撤单用的柜台编号。
+
+    上期所编号常带前导空格。存盘时若已经带空格就原样保留；
+    若只剩数字，右对齐补到 12 位，柜台才能找到那一笔。
+    """
+    text = str(sys_id or "")
+    body = text.strip()
+    if not body:
+        return ""
+    if text != body:
+        return text
+    return body.rjust(12)
+
+
+def describe_working_orders(orders: list[Any]) -> str:
+    """把还没完结的委托写成一句话，方便对照无限易。"""
+    live = [row for row in orders if not is_terminal(str(getattr(row, "status", "") or ""))]
+    if not live:
+        return "柜台没有未成交委托。"
+    parts: list[str] = []
+    for row in live:
+        ref = str(getattr(row, "order_ref", "") or "").strip()
+        name = symbol_key(str(getattr(row, "symbol", "") or ""))
+        price = float(getattr(row, "price", 0) or 0)
+        volume = int(getattr(row, "volume", 0) or 0)
+        note = str(getattr(row, "message", "") or "") or str(getattr(row, "status", "") or "")
+        piece = f"编号 {ref} {name} {volume} 手"
+        if price > 0:
+            piece += f" @{price:g}"
+        if note:
+            piece += f" {note}"
+        parts.append(piece)
+    return f"未成交 {len(live)} 笔：" + "；".join(parts)
+
+
+def ctp_field_symbol(data: Any) -> str:
+    """
+    从柜台一条行情/报单里取出合约代码。
+
+    6.7 起旧字段改名叫 reserve1，新字段才叫 InstrumentID。
+    华泰仿真行情经常只填 reserve1，只读新字段会把整条跳动丢掉。
+    """
+    if data is None:
+        return ""
+    for name in ("InstrumentID", "reserve1"):
+        text = str(getattr(data, name, "") or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def ctp_quote_clock(data: Any) -> str:
+    """行情时间。带上毫秒，同一秒内的跳动也能看出来。"""
+    if data is None:
+        return ""
+    clock = str(getattr(data, "UpdateTime", "") or "").strip()
+    try:
+        ms = int(getattr(data, "UpdateMillisec", 0) or 0)
+    except (TypeError, ValueError):
+        ms = 0
+    if clock and ms:
+        return f"{clock}.{ms:03d}"
+    return clock
+
+
+def ctp_depth_row(data: Any) -> dict[str, Any] | None:
+    """把柜台盘口结构收成窗口用的一行。没有数据就返回空。"""
+    if data is None:
+        return None
+
+    def _num(name: str) -> float:
+        try:
+            return float(getattr(data, name, 0) or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _lots(name: str) -> int:
+        try:
+            return int(getattr(data, name, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "symbol": ctp_field_symbol(data),
+        "last": _num("LastPrice"),
+        "bid": _num("BidPrice1"),
+        "ask": _num("AskPrice1"),
+        "bid_volume": _lots("BidVolume1"),
+        "ask_volume": _lots("AskVolume1"),
+        "upper": _num("UpperLimitPrice"),
+        "lower": _num("LowerLimitPrice"),
+        "time": ctp_quote_clock(data),
+    }
 
 
 def ctp_instrument_id(symbol: str) -> str:
@@ -125,6 +243,80 @@ def check_order_instruction(
     return ""
 
 
+CTP_KIND_SIM = "sim"
+CTP_KIND_LIVE = "live"
+CTP_KIND_LABELS = {CTP_KIND_SIM: "仿真账号", CTP_KIND_LIVE: "真实账号"}
+
+
+def normalize_ctp_kind(value: Any) -> str:
+    """把界面上的「仿真账号 / 真实账号」收成 sim 或 live。"""
+    text = str(value or "").strip().lower()
+    if text in {"live", "real", "prod", "实盘", "真实", "真实账号"}:
+        return CTP_KIND_LIVE
+    return CTP_KIND_SIM
+
+
+def ctp_kind_label(value: Any) -> str:
+    """给界面显示用的中文名。"""
+    return CTP_KIND_LABELS[normalize_ctp_kind(value)]
+
+
+def overlay_ctp_profile(
+    ctp: dict[str, Any] | None,
+    kind: Any = None,
+    account: dict[str, Any] | None = None,
+    account_user_id: str = "",
+    account_password: str = "",
+) -> dict[str, Any]:
+    """
+    把仿真或实盘账号叠到共用参数上。
+
+    窗口和策略走同一套字段。
+    仿真：只用 sim 小节（默认 28077 + 仿真前置），不会去用资金账号。
+    真实：资金账号就是配置页「资金账号」（同花顺登录的那一个，例如 20318052）；
+    交易/行情前置只用 live 小节，不会把仿真前置抄过去。
+    """
+    raw = dict(ctp or {})
+    acc = account if isinstance(account, dict) else {}
+    # 资金账号只在配置页填一次；CTP 真实通道跟这一号走。
+    fund_id = str(account_user_id or acc.get("user_id") or "").strip()
+    fund_pw = str(account_password or acc.get("resolved_password") or "").strip()
+    chosen = normalize_ctp_kind(kind if kind is not None else raw.get("account_kind"))
+    nested = raw.get(chosen)
+    nested = dict(nested) if isinstance(nested, dict) else {}
+    merged = dict(raw)
+    keys = ("td_front", "md_front", "user_id", "broker_id")
+    if chosen == CTP_KIND_LIVE:
+        # 前置必须是华泰给你的实盘地址，缺了就空着，让登录提示去填。
+        merged["td_front"] = str(nested.get("td_front") or "").strip()
+        merged["md_front"] = str(nested.get("md_front") or "").strip()
+        merged["broker_id"] = str(
+            nested.get("broker_id") or raw.get("broker_id") or ""
+        ).strip()
+        # 真实资金账号 = 上面的资金账号。live.user_id 只是保存时的副本，不再单独填。
+        merged["user_id"] = fund_id or str(nested.get("user_id") or "").strip()
+        # 实盘密码优先用单独写的 ctp_live_password；没写就用同一份交易密码。
+        merged["resolved_password"] = str(
+            raw.get("resolved_live_password")
+            or nested.get("resolved_password")
+            or fund_pw
+            or ""
+        ).strip()
+    else:
+        for key in keys:
+            overlay = str(nested.get(key) or "").strip()
+            if overlay:
+                merged[key] = overlay
+        merged["resolved_password"] = str(
+            raw.get("resolved_sim_password")
+            or raw.get("resolved_password")
+            or nested.get("resolved_password")
+            or ""
+        ).strip()
+    merged["account_kind"] = chosen
+    return merged
+
+
 def test_front_blocks_live_account(td_front: str, user_id: str, live_user_id: str) -> str:
     """华泰仿真前置不能拿实盘资金账号去登录。"""
     front = str(td_front or "")
@@ -145,19 +337,24 @@ class OrderActivity:
     cancels: int = 0
 
     def note_order(self) -> str:
-        """记一笔已经发往柜台的报单，并在达到阈值时附上警示。"""
+        """记一笔已经发往柜台的报单，并在达到阈值时附上警示。只提醒，不拦住下一笔。"""
         self.orders += 1
-        return self._text(self.orders, self.order_warn, "报单")
+        return self.describe(kind="报单")
 
     def note_cancel(self) -> str:
-        """记一笔撤单请求，并在达到阈值时附上警示。"""
+        """记一笔撤单请求，并在达到阈值时附上警示。只提醒，不拦住下一笔。"""
         self.cancels += 1
-        return self._text(self.cancels, self.cancel_warn, "撤单")
+        return self.describe(kind="撤单")
 
-    def _text(self, count: int, warn: int, name: str) -> str:
+    def describe(self, kind: str | None = None) -> str:
+        """窗口和日志共用的笔数说明。到了阈值只写「请停止」，不会禁止再报。"""
         text = f"今日报单笔数 {self.orders}，撤单笔数 {self.cancels}"
-        if warn > 0 and count >= warn:
-            text += f"。{name}笔数已达到阈值 {warn}，请停止继续{name}"
+        show_order = kind in {None, "", "报单"}
+        show_cancel = kind in {None, "", "撤单"}
+        if show_order and self.order_warn > 0 and self.orders >= self.order_warn:
+            text += f"。报单笔数已达到阈值 {self.order_warn}，请停止继续报单"
+        if show_cancel and self.cancel_warn > 0 and self.cancels >= self.cancel_warn:
+            text += f"。撤单笔数已达到阈值 {self.cancel_warn}，请停止继续撤单"
         return text
 
 
@@ -180,14 +377,15 @@ def plan_close(
     """
     把要平的手数拆成柜台认的开平标志。
 
-    沥青、玉米先平昨仓，剩下的再平今仓。
+    上期所、能源中心、大商所先平昨仓，剩下的再平今仓。
     昨仓和今仓都不够时，多出来的仍按平今报，让柜台拒单，避免悄悄少平。
-    其他品种用普通平仓，由交易所自己处理今昨。
+    郑商所、中金所用普通平仓，由交易所自己处理今昨。
     """
     lots = max(0, int(volume))
     if lots <= 0:
         return []
-    if product_code(symbol) not in {p.lower() for p in split_products}:
+    listed = {p.lower() for p in split_products}
+    if product_code(symbol) not in listed and not needs_close_split(symbol):
         return [CloseSlice(OFFSET_CLOSE, lots)]
     yd = max(0, int(yesterday))
     td = max(0, int(today))
@@ -246,6 +444,9 @@ class TrackedOrder:
     order_sys_id: str = ""
     front_id: int = 0
     session_id: int = 0
+    insert_time: str = ""
+    hedge: str = "1"
+    remaining: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -341,13 +542,55 @@ class PositionView:
     long_yesterday: int = 0
     short_today: int = 0
     short_yesterday: int = 0
+    # 柜台持仓查询自带：开仓成本（用来算均价）、持仓盈亏（浮盈）。
+    long_open_cost: float = 0.0
+    short_open_cost: float = 0.0
+    long_profit: float = 0.0
+    short_profit: float = 0.0
+    long_margin: float = 0.0
+    short_margin: float = 0.0
+    hedge: str = "1"
+
+    @property
+    def long_lots(self) -> int:
+        """这一边买开还剩几手（今仓加昨仓）。"""
+        return int(self.long_today) + int(self.long_yesterday)
+
+    @property
+    def short_lots(self) -> int:
+        """这一边卖开还剩几手（今仓加昨仓）。"""
+        return int(self.short_today) + int(self.short_yesterday)
 
     @property
     def net(self) -> int:
         """多仓减空仓。和程序里的净持仓同一套符号。"""
-        long_qty = self.long_today + self.long_yesterday
-        short_qty = self.short_today + self.short_yesterday
-        return long_qty - short_qty
+        return self.long_lots - self.short_lots
+
+
+def close_sides_for_view(view: PositionView | None) -> list[str]:
+    """
+    交易台「平仓」要平哪几边。
+
+    锁仓时净持仓是 0，但仍有买开和卖开，必须两边都发平仓，不能当成空仓。
+    返回值给 place_order 的 position_side：long=平多，short=平空。
+    """
+    if view is None:
+        return []
+    sides: list[str] = []
+    if view.long_lots > 0:
+        sides.append("long")
+    if view.short_lots > 0:
+        sides.append("short")
+    return sides
+
+
+def reverse_open_side(position_side: str) -> str:
+    """
+    策略反手：先平旧仓，再开反向。
+
+    手里是多仓就卖开；手里是空仓就买开。锁仓时不要调用，应先平掉一边。
+    """
+    return "sell_open" if str(position_side) == "long" else "buy_open"
 
 
 def absorb_position_row(view: PositionView, row: dict[str, Any]) -> None:
@@ -379,12 +622,81 @@ def absorb_position_row(view: PositionView, row: dict[str, Any]) -> None:
         add_yd = yesterday
         if add_td == 0 and add_yd == 0:
             add_yd = position
+    # 开仓成本和浮盈跟这一行的方向走。上期所今昨拆成两行时，两边各自加一次。
+    cost = float(row.get("open_cost") or 0)
+    profit = float(row.get("position_profit") or 0)
+    margin = float(row.get("use_margin") or 0)
+    hedge = str(row.get("hedge") or "").strip()
+    if hedge:
+        view.hedge = hedge
     if direction in {"3", "short", "sell"}:
         view.short_today += add_td
         view.short_yesterday += add_yd
+        view.short_open_cost += cost
+        view.short_profit += profit
+        view.short_margin += margin
     else:
         view.long_today += add_td
         view.long_yesterday += add_yd
+        view.long_open_cost += cost
+        view.long_profit += profit
+        view.long_margin += margin
+
+
+def describe_positions(positions: dict[str, PositionView], available: float | None = None) -> str:
+    """把柜台持仓写成人能看懂的一句话，方便对照无限易。"""
+    money = f"{available:.2f}" if available is not None else "未知"
+    parts: list[str] = []
+    for name in sorted(positions):
+        view = positions[name]
+        long_qty = int(view.long_today) + int(view.long_yesterday)
+        short_qty = int(view.short_today) + int(view.short_yesterday)
+        if long_qty <= 0 and short_qty <= 0:
+            continue
+        bits: list[str] = []
+        if long_qty > 0:
+            bits.append(f"买 {long_qty} 手")
+        if short_qty > 0:
+            bits.append(f"卖 {short_qty} 手")
+        parts.append(f"{name} " + "，".join(bits))
+    if not parts:
+        return f"柜台现在没有持仓。可用资金 {money}"
+    return "柜台持仓：" + "；".join(parts) + f"。可用资金 {money}"
+
+
+def position_avg_price(open_cost: float, lots: int, multiplier: float) -> float | None:
+    """
+    用柜台开仓成本反推持仓均价。
+
+    持仓查询没有「上一笔成交价」。OpenCost 一般是 均价 × 手数 × 合约乘数。
+    成本是 0、手数或乘数不对时，算不出来，返回空。
+    """
+    if lots <= 0 or multiplier <= 0 or abs(float(open_cost)) < 1e-9:
+        return None
+    return float(open_cost) / (float(lots) * float(multiplier))
+
+
+def format_position_marks(view: PositionView, multiplier: float) -> tuple[str, str]:
+    """
+    给持仓表用的均价、浮盈两列文字。
+
+    均价来自开仓成本，不是成交页那一笔的成交价。
+    浮盈来自柜台 PositionProfit，刷新持仓时更新，不是我们用买一卖一现算的。
+    """
+    long_qty = int(view.long_today) + int(view.long_yesterday)
+    short_qty = int(view.short_today) + int(view.short_yesterday)
+    both = long_qty > 0 and short_qty > 0
+    bits: list[str] = []
+    long_px = position_avg_price(view.long_open_cost, long_qty, multiplier)
+    short_px = position_avg_price(view.short_open_cost, short_qty, multiplier)
+    if long_qty > 0 and long_px is not None:
+        bits.append(f"买 {long_px:g}" if both else f"{long_px:g}")
+    if short_qty > 0 and short_px is not None:
+        bits.append(f"卖 {short_px:g}" if both else f"{short_px:g}")
+    avg_text = " / ".join(bits) if bits else "—"
+    profit = float(view.long_profit) + float(view.short_profit)
+    pnl_text = f"{profit:+.2f}"
+    return avg_text, pnl_text
 
 
 def book_differences(internal: dict[str, int], remote: dict[str, PositionView]) -> list[str]:
@@ -469,6 +781,16 @@ class SessionTracker:
         return self.phase == "ready"
 
 
+def _canon_order_ref(order_ref: str) -> str:
+    """把柜台回报里的报单编号收成程序能对上的样子。"""
+    text = str(order_ref or "").strip()
+    if not text:
+        return ""
+    if text.isdigit():
+        return str(int(text))
+    return text
+
+
 @dataclass
 class OrderTable:
     """按报单编号记住每一笔，避免同一笔成交回报记两次账。"""
@@ -485,7 +807,26 @@ class OrderTable:
         self.orders[order.order_ref] = order
 
     def get(self, order_ref: str) -> TrackedOrder | None:
-        return self.orders.get(str(order_ref))
+        """
+        按报单编号找回这一笔。
+
+        柜台回报常把编号补空格或前导零，例如发出去是 1，回来是 '           1'。
+        对不上就会一直显示「待报」，撤单也找不到。
+        """
+        raw = str(order_ref or "")
+        found = self.orders.get(raw)
+        if found is not None:
+            return found
+        key = _canon_order_ref(raw)
+        if not key:
+            return None
+        found = self.orders.get(key)
+        if found is not None:
+            return found
+        for stored, order in self.orders.items():
+            if _canon_order_ref(stored) == key:
+                return order
+        return None
 
     def unfinished(self) -> list[TrackedOrder]:
         return [row for row in self.orders.values() if not is_terminal(row.status)]

@@ -17,10 +17,13 @@ import pandas as pd
 from loguru import logger
 
 from src.backtest.metrics import MARGIN_RATE, Performance, TradeRecord, calc_performance, peak_margin
+from src.strategy.cta_factors import factor_fields_for_trade
 from src.data.kline import KlineProvider
-from src.data.periods import canonical_period, drop_forming_bar, period_label
+from src.data.periods import canonical_period, drop_forming_bar, last_ohlc_price, period_label, unique_ohlc_columns
 from src.risk.commission import fee_close, fee_open, is_close_today
-from src.strategy import StrategyAction, create_strategy
+from src.strategy import StrategyAction, StrategyDecision, create_strategy
+from src.strategy.generic_stop import GenericStopOverlay, generic_stop_snapshot
+from src.strategy.session_scope import session_kind
 from src.strategy.types import PositionState, config_flag
 from src.utils.trading_day import futures_trading_day
 
@@ -54,6 +57,22 @@ def _net_pnl_after_fees(
 
 
 @dataclass
+class RejectedSignal:
+    """一次出现了开仓信号、但没有开成的记录。成交明细之外单独列，方便查为什么没做。"""
+
+    symbol: str
+    time: str
+    side: str  # 多 / 空
+    price: float | None  # 信号价（下一根开盘时就是准备成交的价）
+    stop: float | None  # 如果开了，止损放在哪
+    stage: str  # 策略过滤 / 风控手数 / 开仓限制 / 已有持仓
+    reason: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
 class BacktestResult:
     symbol: str
     timeframe: str
@@ -63,6 +82,8 @@ class BacktestResult:
     trades: list[TradeRecord] = field(default_factory=list)
     equity: list[float] = field(default_factory=list)
     params_snapshot: dict[str, Any] = field(default_factory=dict)
+    # 有信号但没开成的记录。为空表示这段行情里每个开仓信号都成交了。
+    rejected: list[RejectedSignal] = field(default_factory=list)
     # 这次回测跑完的本地时间。导出 Excel 时原样写进每一行，用来区分前后几次回测。
     ran_at: str = ""
 
@@ -75,6 +96,7 @@ class BacktestResult:
             "ran_at": self.ran_at,
             "performance": self.performance.to_dict(),
             "trades": [asdict(t) for t in self.trades],
+            "rejected": [r.to_dict() for r in self.rejected],
             "equity_last": self.equity[-1] if self.equity else None,
             "params_snapshot": self.params_snapshot,
         }
@@ -97,7 +119,7 @@ class FillModel:
     """
     回测成交近似。
 
-    - on_next_open：信号在当根收盘后才确认，按下一根开盘成交（只在连续交易时段内）。
+    - on_next_open：信号在当根收盘后才确认，按下一根开盘成交（跨休市也按下一根开盘）。
     - slippage_ticks：成交价按买卖方向各让几跳，模拟挂单排队和盘口差价。
     - price_tick：一跳多少钱，默认取交易配置里的 price_tick。
     """
@@ -154,7 +176,7 @@ class FillModel:
 
     def describe(self) -> str:
         """回测结果里说明这次是怎么成交的。"""
-        parts = ["信号确认后按下一根开盘成交" if self.on_next_open else "成交按策略价，未给则当根收盘"]
+        parts = ["信号确认后按下一根开盘成交（跨休市也按下一根开盘）" if self.on_next_open else "成交按策略价，未给则当根收盘"]
         if self.slip > 0:
             parts.append(f"滑点 {self.slippage_ticks:g} 跳（每跳 {self.price_tick:g}）")
         else:
@@ -163,18 +185,53 @@ class FillModel:
         return "成交近似  " + "；".join(parts)
 
 
+def _make_trade_record(
+    *,
+    symbol: str,
+    side: str,
+    entry_time: str,
+    exit_time: str,
+    entry_price: float,
+    exit_price: float,
+    volume: int,
+    pnl: float,
+    reason_entry: str,
+    reason_exit: str,
+    commission: float,
+    open_meta: dict[str, Any],
+    multiplier: float,
+) -> TradeRecord:
+    """记一笔已平仓交易；多因子会附上四因子得分和分摊盈亏。"""
+    extra = factor_fields_for_trade(open_meta, pnl)
+    return TradeRecord(
+        symbol=symbol,
+        side=side,
+        entry_time=entry_time,
+        exit_time=exit_time,
+        entry_price=entry_price,
+        exit_price=exit_price,
+        volume=volume,
+        pnl=pnl,
+        reason_entry=reason_entry,
+        reason_exit=reason_exit,
+        commission=commission,
+        multiplier=float(multiplier or 0.0) or None,
+        **extra,
+    )
+
+
 def _next_open_price(bars: pd.DataFrame, i: int, period: str) -> float | None:
-    """下一根开盘价。两根之间不是连续交易时段时返回 None，退回当根收盘价。"""
+    """下一根开盘价。
+
+    跨休市也按下一根开盘成交：真实下单就是等下一次开盘，不能拿上一段收盘价顶替，
+    否则跳空低开时会出现当天根本没成交过的开仓价。
+    """
     if bars is None or i + 1 >= len(bars):
         return None
     code = canonical_period(period)
     if code in ("D", "W"):
         return float(bars["open"].iloc[i + 1])
     if not code.isdigit():
-        return None
-    step = int(code)
-    gap = (pd.Timestamp(bars.index[i + 1]) - pd.Timestamp(bars.index[i])) / pd.Timedelta(minutes=1)
-    if gap > step:
         return None
     return float(bars["open"].iloc[i + 1])
 
@@ -234,15 +291,18 @@ def _exit_fill_price(
     next_open: float | None,
     close_px: float,
     fill: FillModel,
+    touch_stop: bool = True,
 ) -> float:
     """
     平仓成交价。
 
-    这根K线已经打穿止损时按止损价成交（跳空按开盘价，更差）；
-    否则按下一根开盘价、最后退回当根收盘价。两种都再按买卖方向让滑点。
+    touch_stop=True（触及即止损）：这根K线已经打穿止损时按止损价成交（跳空按开盘价，更差）。
+    touch_stop=False（收盘价确认）：这次平仓是收盘后才决定的，不能按止损价成交，
+    退回下一根开盘价 / 当根收盘价，避免回测把收盘确认方式算得过于理想。
+    两种都再按买卖方向让滑点。
     """
     ref = None
-    if _stop_breached(side, stop, bar):
+    if touch_stop and _stop_breached(side, stop, bar):
         bar_open = float(bar["open"].iloc[-1])
         ref = min(stop, bar_open) if side == "long" else max(stop, bar_open)
     if ref is None:
@@ -472,6 +532,22 @@ def filter_bars_by_range(
     return out
 
 
+def skip_reason_key(reason: str) -> str:
+    """把没开成的原因归成稳定的类别，同一时段同一类只记一次。"""
+    text = (reason or "未开仓").strip()
+    if "止损过宽" in text or "低于最小" in text or "只允许约" in text:
+        return "止损过宽，手数不够"
+    if "熔断" in text or "当日亏损" in text:
+        return "当日亏损达到上限"
+    if "开仓次数" in text:
+        return "当天开仓次数达到上限"
+    if "间隔" in text:
+        return "两笔开仓间隔太近"
+    if "仓位上限" in text or "保证金" in text:
+        return "仓位上限/保证金不够"
+    return text[:24] or "未开仓"
+
+
 class BacktestLimits:
     """
     回测用的开仓限制，算法和实盘相同。
@@ -488,6 +564,8 @@ class BacktestLimits:
 
         self.sizer = PositionSizer(cfg)
         self.guard = RiskGuardian.from_config(cfg)
+        # 回测里日亏熔断只拦这一次回测的开仓，不要写进运行台的「最近告警」。
+        self.guard.write_alerts = False
         # 关掉时固定 1 手，不再因为止损远、日亏损或开仓次数把信号丢掉。
         from src.strategy.types import config_flag
 
@@ -495,6 +573,19 @@ class BacktestLimits:
         self.day: Any = None
         self.last_open_at: datetime | None = None
         self.skipped: dict[str, int] = {}
+        self.closed_pnls: list[float] = []
+        self.closed_ats: list[datetime] = []
+        # 账户权益最高点，给回撤减仓用。开跑时用初始资金垫上。
+        self.equity: float = 0.0
+        self.peak_equity: float = 0.0
+        self.cfg = cfg
+
+    def note_equity(self, equity: float) -> None:
+        """记下当前权益；创新高就抬峰值。回撤按峰值往下量。"""
+        now_eq = float(equity)
+        self.equity = now_eq
+        if now_eq > self.peak_equity:
+            self.peak_equity = now_eq
 
     def on_bar(self, now: datetime) -> None:
         """新交易日开始时，当日亏损和开仓次数清零，熔断解除。持仓不动。"""
@@ -545,28 +636,18 @@ class BacktestLimits:
 
     def note_skip(self, reason: str) -> None:
         """记下没开成的原因，回测结果里汇总给用户看。"""
-        text = (reason or "未开仓").strip()
-        if "止损过宽" in text or "低于最小" in text or "只允许约" in text:
-            key = "止损过宽，手数不够"
-        elif "熔断" in text or "当日亏损" in text:
-            key = "当日亏损达到上限"
-        elif "开仓次数" in text:
-            key = "当天开仓次数达到上限"
-        elif "间隔" in text:
-            key = "两笔开仓间隔太近"
-        elif "仓位上限" in text or "保证金" in text:
-            key = "仓位上限/保证金不够"
-        else:
-            key = text[:24] or "未开仓"
+        key = skip_reason_key(reason)
         self.skipped[key] = self.skipped.get(key, 0) + 1
 
     def on_open(self, now: datetime, side: str, volume: int, symbol: str) -> None:
         self.last_open_at = now
         self.guard.on_order_filled(side, volume, symbol=symbol)
 
-    def on_close(self, pnl: float, volume: int, symbol: str) -> None:
+    def on_close(self, pnl: float, volume: int, symbol: str, at: datetime | None = None) -> None:
         self.guard.update_pnl(pnl)
         self.guard.on_order_filled("close", volume, symbol=symbol)
+        self.closed_pnls.append(float(pnl))
+        self.closed_ats.append(at if at is not None else datetime.now())
 
 
 def _cap_open_volume(allowed: int, meta_volume: Any, *, limits_apply: bool) -> tuple[int, str]:
@@ -587,6 +668,23 @@ def _cap_open_volume(allowed: int, meta_volume: Any, *, limits_apply: bool) -> t
         return want, f"策略指定{want}手（未启用开仓限制）"
     vol = min(int(allowed), want)
     return vol, f"策略指定{want}手，风控允许{allowed}手 → 取小{vol}手"
+
+
+def _apply_size_scale(volume: int, meta_scale: Any) -> tuple[int, str]:
+    """混合版多因子按信号强弱把手数再打一折，不能超过已经算好的风控手数。"""
+    if meta_scale is None or int(volume) <= 0:
+        return int(volume), ""
+    try:
+        ratio = float(meta_scale)
+    except (TypeError, ValueError):
+        return int(volume), ""
+    if ratio <= 0:
+        return 0, f"信号强度×{ratio:.2f}→0手"
+    if ratio >= 0.999:
+        return int(volume), ""
+    scaled = max(1, int(int(volume) * ratio))
+    vol = min(int(volume), scaled)
+    return vol, f"信号强度×{ratio:.2f}→{vol}手"
 
 
 def _coverage_with_gaps(
@@ -669,6 +767,14 @@ def run_backtest(
     bt_cfg = cfg.get("backtest") or {}
     max_bars = int(bt_cfg.get("max_bars", 1200))
     warmup = int(bt_cfg.get("warmup", warmup))
+    # 策略自带的最少 K 线（含行情过滤回看窗口）比默认预热更长时，把前面那些根直接跳过，
+    # 不参加回测循环。不这么做也能跑，只是会重复回放一堆「K线不足」的空决策。
+    need = getattr(strategy, "required_bars", None)
+    if need is not None:
+        try:
+            warmup = max(warmup, int(need))
+        except (TypeError, ValueError):
+            pass
     # 成交近似：下一根开盘、破止损按止损价、按跳滑点。
     fill = FillModel.from_cfg(cfg, symbol)
 
@@ -710,10 +816,10 @@ def run_backtest(
             bars_trend = None
     # 最后一根可能还没走完（行情源会给正在走的那根）。回测只用收盘价，先去掉；
     # 各行情源口径统一，不用每家自己删一次。
-    bars_signal = drop_forming_bar(bars_signal)
-    bars_trail = drop_forming_bar(bars_trail)
+    bars_signal = unique_ohlc_columns(drop_forming_bar(bars_signal))
+    bars_trail = unique_ohlc_columns(drop_forming_bar(bars_trail))
     if bars_trend is not None:
-        bars_trend = drop_forming_bar(bars_trend)
+        bars_trend = unique_ohlc_columns(drop_forming_bar(bars_trend))
     # 先记下行情实际能给的头尾，再按用户日期截。截完后的区间可能比填写的短。
     available_from = str(bars_signal.index[0]) if bars_signal is not None and len(bars_signal) else ""
     available_to = str(bars_signal.index[-1]) if bars_signal is not None and len(bars_signal) else ""
@@ -747,26 +853,66 @@ def run_backtest(
     strategy.positions[symbol] = PositionState(symbol=symbol)
     if hasattr(strategy, "_last_entry_bar"):
         strategy._last_entry_bar[symbol] = ""
+    # 通用止损：和策略自身止损相互独立，谁先触发就按谁平。
+    generic_stop = GenericStopOverlay(cfg)
 
     trades: list[TradeRecord] = []
     equity = [capital0]
     cash = capital0
     open_meta: dict[str, Any] = {}
     limits = BacktestLimits(cfg)
+    limits.note_equity(capital0)
     contracts = (cfg.get("risk") or {}).get("contracts") or {}
+    # 有开仓信号但没开成的记录。成交明细只写真正成交的，这里把「为什么没做」也留下来。
+    rejected: list[RejectedSignal] = []
+    # 同一交易时段里，同一层、同方向、同一类原因只留第一条，避免每根K线都重复一遍。
+    seen_rejects: set[tuple[str, str, str, str, str]] = set()
+
+    def _note_reject(
+        stage: str,
+        reason: str,
+        side: str,
+        *,
+        at: datetime,
+        price: float | None,
+        stop: float | None,
+        key: str = "",
+    ) -> None:
+        session = f"{futures_trading_day(at)}|{session_kind(at)}"
+        template = (key or "").strip() or (reason or "未开仓").strip()
+        dedupe = (session, stage, side, template)
+        if dedupe in seen_rejects:
+            return
+        seen_rejects.add(dedupe)
+        rejected.append(
+            RejectedSignal(
+                symbol=symbol,
+                time=at.isoformat(timespec="seconds"),
+                side=side,
+                price=float(price) if price is not None and float(price) > 0 else None,
+                stop=float(stop) if stop is not None and float(stop) > 0 else None,
+                stage=stage,
+                reason=(reason or "未开仓").strip(),
+            )
+        )
 
     n = len(bars_signal)
     # 回测循环里策略会狂打 info，先关掉这几个模块日志，结束再打开
     for _mod in (
         "src.strategy.trend_follow",
         "src.strategy.supertrend",
-        "src.strategy.single_ma",
         "src.strategy.dual_ma",
+        "src.strategy.bollinger_break",
+        "src.strategy.sar_trend",
+        "src.strategy.multi_factor",
+        "src.strategy.multi_factor_adapt",
+        "src.strategy.adaptive_weights",
         "src.strategy.daily_body",
         "src.strategy.morning_edge",
         "src.strategy.swing_trend",
         "src.risk.sizing",
         "src.risk.guardian",
+        "src.risk.dynamic",
     ):
         logger.disable(_mod)
 
@@ -786,12 +932,61 @@ def run_backtest(
                 )
             else:
                 decision = strategy.evaluate(symbol, signal_df, now=now, trail_bars=trail_df)
-            px = float(signal_df["close"].iloc[-1])
+            px = last_ohlc_price(signal_df, "close")
+            if px is None:
+                continue
+            # 先按现金+浮动权益更新峰值，再决定这一根能不能开，回撤才跟得上浮亏。
+            _pos_eq = strategy.positions.get(symbol)
+            _upnl = 0.0
+            if _pos_eq and _pos_eq.side == "long" and _pos_eq.volume:
+                _upnl = (px - float(_pos_eq.entry_price or 0)) * int(_pos_eq.volume) * mult
+            elif _pos_eq and _pos_eq.side == "short" and _pos_eq.volume:
+                _upnl = (float(_pos_eq.entry_price or 0) - px) * int(_pos_eq.volume) * mult
+            limits.note_equity(cash + _upnl)
+            # 通用止损：策略自身止损之外的公共止损，策略没让平仓时由它补一刀。
+            held_pos = strategy.positions.get(symbol)
+            gs_bar = None
+            if (
+                decision.action == StrategyAction.HOLD
+                and held_pos is not None
+                and held_pos.side != "flat"
+            ):
+                gs_hit = generic_stop.check(
+                    symbol,
+                    held_pos,
+                    trail_df if trail_df is not None and len(trail_df) > 0 else signal_df,
+                    mode=getattr(strategy, "stop_mode", "touch"),
+                )
+                if gs_hit is not None:
+                    # 记住触发的那根止损周期K线，成交按它判跳空，而不是按信号K线。
+                    gs_bar = gs_hit.bar
+                    decision = StrategyDecision(
+                        StrategyAction.CLOSE,
+                        symbol,
+                        gs_hit.reason,
+                        stop_price=gs_hit.stop,
+                        # 标一下：这是通用止损打掉的，不是策略自己让平。
+                        # 成交价要按止损线算，不能退回下一根开盘。
+                        meta={"generic_stop": True},
+                    )
             # 下一根开盘价用来成交；断开或已到最后一根时退回当根收盘价。
             next_open = _next_open_price(bars_signal, i, tf) if fill.on_next_open else None
             limits.on_bar(now)
             meta = decision.meta or {}
             scale = str(meta.get("scale") or "")
+
+            if decision.action == StrategyAction.HOLD and meta.get("blocked"):
+                # 策略已经看到开仓信号，但被自己的一条过滤规则挡回去了
+                # （箱体太宽、开盘跳空太大、急破不追等）。没成交也要记下来。
+                _note_reject(
+                    str(meta.get("block_stage") or "策略过滤"),
+                    decision.reason,
+                    "多" if str(meta.get("side") or "") == "long" else "空",
+                    at=now,
+                    price=px,
+                    stop=decision.stop_price,
+                    key=str(meta.get("block_key") or ""),
+                )
 
             if decision.action in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN):
                 pos = strategy.positions.get(symbol)
@@ -807,6 +1002,7 @@ def run_backtest(
                         next_open=next_open,
                         close_px=px,
                         fill=fill,
+                        touch_stop=bool(getattr(strategy, "stop_on_touch", True)),
                     )
                     entry_px = float(pos.entry_price or open_meta.get("entry_price") or exit_px)
                     vol_now = int(pos.volume or 0)
@@ -826,7 +1022,7 @@ def run_backtest(
                     )
                     cash += pnl
                     trades.append(
-                        TradeRecord(
+                        _make_trade_record(
                             symbol=symbol,
                             side=held,
                             entry_time=str(open_meta.get("entry_time", "")),
@@ -838,24 +1034,50 @@ def run_backtest(
                             reason_entry=str(open_meta.get("reason", "")),
                             reason_exit=decision.reason,
                             commission=fee,
+                            open_meta=open_meta,
+                            multiplier=mult,
                         )
                     )
                     strategy.on_filled(symbol, StrategyAction.CLOSE, exit_px, vol_now)
-                    limits.on_close(pnl, vol_now, symbol)
+                    if hasattr(strategy, "on_trade_closed"):
+                        try:
+                            strategy.on_trade_closed(
+                                symbol,
+                                float(pnl),
+                                volume=int(vol_now),
+                                side=str(held or ""),
+                                entry_price=float(entry_px or 0),
+                                exit_price=float(exit_px or 0),
+                            )
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("{} 平仓后进化没跑完: {}", symbol, exc)
+                    limits.on_close(pnl, vol_now, symbol, at=now)
+                    limits.note_equity(cash)
                     open_meta = {}
                     pos = strategy.positions.get(symbol)
                 # 同向加仓：已有仓且 meta.scale=add 时允许继续开；其它情况有仓就跳过。
                 is_add = bool(pos and pos.side == want and scale == "add")
                 if pos and pos.side != "flat" and not is_add:
+                    held = "多" if pos.side == "long" else "空"
+                    _note_reject(
+                        "已有持仓",
+                        f"手里还拿着{held}单，这根的同向开仓不再重复做",
+                        "多" if want == "long" else "空",
+                        at=now,
+                        price=px,
+                        stop=decision.stop_price,
+                        key="已有持仓",
+                    )
                     continue
-                # 成交口径统一：开了「下一根开盘」就按下一根开盘，
-                # 没有下一根（最后一根/跨休市）才退回策略价或当根收盘。
+                # 成交口径统一：开了「下一根开盘」就按下一根开盘（跨休市也一样），
+                # 只有最后一根没有下一根时才按当根收盘成交。
+                # 不能再用策略内部价顶替，否则跳空时会报出当天根本没成交过的开仓价。
                 if fill.on_next_open and next_open is not None:
                     entry_ref = next_open
-                elif decision.entry_price is not None and float(decision.entry_price) > 0:
-                    entry_ref = float(decision.entry_price)
+                    entry_ts = bars_signal.index[i + 1]
                 else:
-                    entry_ref = next_open if next_open is not None else px
+                    entry_ref = px
+                    entry_ts = bars_signal.index[i]
                 # 开多=买入，开空=卖出，都要让滑点。
                 entry = (
                     fill.buy(float(entry_ref))
@@ -868,16 +1090,46 @@ def run_backtest(
                 open_vol, cap_note = _cap_open_volume(
                     allowed_vol, meta.get("volume"), limits_apply=bool(limits.apply)
                 )
-                if cap_note:
-                    size_reason = f"{cap_note}（{allowed_reason}）" if allowed_reason else cap_note
+                open_vol, scale_note = _apply_size_scale(open_vol, meta.get("size_scale"))
+                from src.risk.dynamic import apply_dynamic_open
+
+                open_vol, dyn_note = apply_dynamic_open(
+                    limits.cfg,
+                    open_vol,
+                    signal_df,
+                    equity=limits.equity,
+                    peak=limits.peak_equity,
+                )
+                notes = [item for item in (cap_note, scale_note, dyn_note) if item]
+                if notes:
+                    joined = "；".join(notes)
+                    size_reason = f"{joined}（{allowed_reason}）" if allowed_reason else joined
                 else:
                     size_reason = allowed_reason
                 if open_vol <= 0:
                     limits.note_skip(size_reason)
+                    _note_reject(
+                        "风控手数",
+                        size_reason,
+                        "多" if want == "long" else "空",
+                        at=now,
+                        price=entry,
+                        stop=stop,
+                        key=skip_reason_key(size_reason),
+                    )
                     continue
                 allowed, block_reason = limits.allow_open(now, open_vol)
                 if not allowed:
                     limits.note_skip(block_reason)
+                    _note_reject(
+                        "开仓限制",
+                        block_reason,
+                        "多" if want == "long" else "空",
+                        at=now,
+                        price=entry,
+                        stop=stop,
+                        key=skip_reason_key(block_reason),
+                    )
                     continue
                 strategy.on_filled(
                     symbol,
@@ -888,21 +1140,37 @@ def run_backtest(
                 )
                 limits.on_open(now, decision.action.value, open_vol, symbol)
                 pos_after = strategy.positions.get(symbol)
+                # 有些策略（日内实体、早盘箱体）开仓时用真实时钟记 opened_at；
+                # 回测里必须改成这根K线的模拟时间，否则通用止损会把这些历史K线
+                # 全当成「开仓之前」，整段回测都不会生效。
+                if pos_after is not None and pos_after.side != "flat" and not is_add:
+                    pos_after.opened_at = now.isoformat(timespec="seconds")
                 open_fee = fee_open(contracts, symbol, open_vol)
                 if is_add and open_meta:
-                    # 加仓后均价已在策略里更新；开仓时间仍记第一笔。
-                    open_meta["entry_price"] = float(getattr(pos_after, "entry_price", entry) or entry)
+                    # 加仓后按真实成交价重算均价；不再用策略内部的信号价。
+                    prev_vol = int(open_meta.get("open_volume") or 0)
+                    prev_avg = float(open_meta.get("entry_price") or entry)
+                    total_vol = prev_vol + open_vol
+                    open_meta["entry_price"] = (
+                        (prev_avg * prev_vol + entry * open_vol) / total_vol if total_vol else entry
+                    )
                     open_meta["reason"] = decision.reason
                     open_meta["open_fee"] = float(open_meta.get("open_fee") or 0) + open_fee
-                    open_meta["open_volume"] = int(open_meta.get("open_volume") or 0) + open_vol
+                    open_meta["open_volume"] = total_vol
                 else:
                     open_meta = {
                         "side": "long" if decision.action == StrategyAction.BUY_OPEN else "short",
-                        "entry_time": now.isoformat(timespec="seconds"),
-                        "entry_price": float(getattr(pos_after, "entry_price", entry) or entry),
+                        "entry_time": _ts_to_dt(entry_ts).isoformat(timespec="seconds"),
+                        "entry_price": float(entry),
                         "reason": decision.reason,
                         "open_fee": open_fee,
                         "open_volume": open_vol,
+                        "score": meta.get("score"),
+                        "score_ma": meta.get("score_ma"),
+                        "score_turtle": meta.get("score_turtle"),
+                        "score_boll": meta.get("score_boll"),
+                        "score_sar": meta.get("score_sar"),
+                        "atr": meta.get("atr"),
                     }
                 if hasattr(strategy, "_last_entry_bar"):
                     bar_id = str(meta.get("bar_id", ""))
@@ -915,13 +1183,19 @@ def run_backtest(
                     continue
                 side = pos.side
                 pos_stop = _position_stop(pos, decision.stop_price)
+                # 通用止损有明确的止损线，按这条线成交；策略自己平仓才用持仓的尾随止损。
+                if meta.get("generic_stop") and decision.stop_price:
+                    pos_stop = float(decision.stop_price)
+                # 触发它的那根止损周期K线（比如 15 分钟）决定跳空多少，不能用信号K线代判。
+                fill_bar = signal_df if gs_bar is None else gs_bar.to_frame().T
                 exit_px = _exit_fill_price(
                     side=side,
                     stop=pos_stop,
-                    bar=signal_df,
+                    bar=fill_bar,
                     next_open=next_open,
                     close_px=px,
                     fill=fill,
+                    touch_stop=bool(getattr(strategy, "stop_on_touch", True)),
                 )
                 entry = float(pos.entry_price or open_meta.get("entry_price") or exit_px)
                 held = int(pos.volume or 0)
@@ -947,7 +1221,7 @@ def run_backtest(
                 )
                 cash += pnl
                 trades.append(
-                    TradeRecord(
+                    _make_trade_record(
                         symbol=symbol,
                         side=side,
                         entry_time=str(open_meta.get("entry_time", "")),
@@ -959,10 +1233,25 @@ def run_backtest(
                         reason_entry=str(open_meta.get("reason", "")),
                         reason_exit=decision.reason,
                         commission=fee,
+                        open_meta=open_meta,
+                        multiplier=mult,
                     )
                 )
                 strategy.on_filled(symbol, StrategyAction.CLOSE, exit_px, vol)
-                limits.on_close(pnl, vol, symbol)
+                if hasattr(strategy, "on_trade_closed"):
+                    try:
+                        strategy.on_trade_closed(
+                            symbol,
+                            float(pnl),
+                            volume=int(vol),
+                            side=str(side or ""),
+                            entry_price=float(entry or 0),
+                            exit_price=float(exit_px or 0),
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.warning("{} 平仓后进化没跑完: {}", symbol, exc)
+                limits.on_close(pnl, vol, symbol, at=now)
+                limits.note_equity(cash)
                 pos_left = strategy.positions.get(symbol)
                 if not pos_left or pos_left.side == "flat" or int(pos_left.volume or 0) <= 0:
                     open_meta = {}
@@ -982,8 +1271,12 @@ def run_backtest(
         for _mod in (
             "src.strategy.trend_follow",
             "src.strategy.supertrend",
-            "src.strategy.single_ma",
             "src.strategy.dual_ma",
+            "src.strategy.bollinger_break",
+            "src.strategy.sar_trend",
+            "src.strategy.multi_factor",
+            "src.strategy.multi_factor_adapt",
+            "src.strategy.adaptive_weights",
             "src.strategy.daily_body",
             "src.strategy.morning_edge",
             "src.strategy.swing_trend",
@@ -997,7 +1290,8 @@ def run_backtest(
     if pos and pos.side != "flat" and pos.volume:
         px = float(bars_signal["close"].iloc[-1])
         now = _ts_to_dt(bars_signal.index[-1])
-        entry = float(pos.entry_price)
+        # 用实际成交价算盈亏；策略里的 entry_price 可能是信号价，和真实成交不一致。
+        entry = float(open_meta.get("entry_price") or pos.entry_price)
         side = pos.side
         vol = int(pos.volume)
         # 强平同样按卖出/买入方向让滑点，避免把最后一笔算得过于理想。
@@ -1015,7 +1309,7 @@ def run_backtest(
         )
         cash += pnl
         trades.append(
-            TradeRecord(
+            _make_trade_record(
                 symbol=symbol,
                 side=side,
                 entry_time=str(open_meta.get("entry_time", "")),
@@ -1027,6 +1321,8 @@ def run_backtest(
                 reason_entry=str(open_meta.get("reason", "")),
                 reason_exit="回测结束强平",
                 commission=fee,
+                open_meta=open_meta,
+                multiplier=mult,
             )
         )
         equity.append(cash)
@@ -1067,6 +1363,12 @@ def run_backtest(
         # 日内实体相关：ETH 观察分钟、箱沿让跳（写在 daily_body 小节）。
         "eth_minutes": (st.get("daily_body") or {}).get("eth_minutes"),
         "stop_extra_ticks": (st.get("daily_body") or {}).get("stop_extra_ticks"),
+        # 止损触发方式（全策略共用）：touch=触及即止损，close=收盘价确认。
+        "stop_mode": getattr(strategy, "stop_mode", None),
+        # 开仓触发方式（全策略共用）：trigger=触到即进，close=收盘确认（默认保守）。
+        "entry_mode": getattr(strategy, "entry_mode", None),
+        # 通用止损（独立于策略自身止损）：记下这次用的是哪一种，结果能对齐。
+        "generic_stop": generic_stop_snapshot(cfg),
         "apply_limits": bool(limits.apply),
         # 成交近似参数，结果区会原样说明，避免历史结果和新规则混在一起看不出原因。
         "fill_on_next_open": fill.on_next_open,
@@ -1105,6 +1407,7 @@ def run_backtest(
         trades=trades,
         equity=equity,
         params_snapshot=snap,
+        rejected=rejected,
         # 记到秒。同一次回测的摘要和每一笔成交共用这个时间，再导出也不会变。
         ran_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )

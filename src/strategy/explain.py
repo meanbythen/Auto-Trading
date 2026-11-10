@@ -39,7 +39,21 @@ def _bar_shape(row: pd.Series) -> str:
     )
 
 
-def _entry_verdict(decision: StrategyDecision) -> str:
+def _is_holding(strategy: Any, symbol: str) -> bool:
+    """按策略里的真实持仓判断，不拿 reason 里的字眼去猜。"""
+    positions = getattr(strategy, "positions", None) or {}
+    pos = positions.get(symbol)
+    if pos is None:
+        key = next((name for name in positions if str(name).lower() == str(symbol).lower()), None)
+        pos = positions.get(key) if key is not None else None
+    if pos is None:
+        return False
+    side = str(getattr(pos, "side", "flat") or "flat")
+    volume = int(getattr(pos, "volume", 0) or 0)
+    return side != "flat" and volume > 0
+
+
+def _entry_verdict(decision: StrategyDecision, holding: bool) -> str:
     """是否符合开仓：直接翻译决策动作。"""
     if decision.action == StrategyAction.BUY_OPEN:
         return f"符合开仓条件 → 做多 | {decision.reason}"
@@ -47,9 +61,9 @@ def _entry_verdict(decision: StrategyDecision) -> str:
         return f"符合开仓条件 → 做空 | {decision.reason}"
     if decision.action == StrategyAction.CLOSE:
         return f"持仓平仓信号（非新开仓）| {decision.reason}"
-    # HOLD：可能是空仓观望，也可能是持仓中继续拿着
+    # HOLD：持仓中继续拿着，还是空仓观望，看真实持仓，不看文字。
     reason = decision.reason or "无信号"
-    if "持有" in reason or "持仓" in reason or "trail" in reason.lower() or "止损" in reason:
+    if holding:
         return f"已有持仓，继续持有 | {reason}"
     return f"不符合开仓条件（观望）| {reason}"
 
@@ -79,9 +93,7 @@ def log_scan_brief(
     last = bars.iloc[-1]
     ts = str(bars.index[-1])
     shape = _bar_shape(last)
-    verdict = _entry_verdict(decision)
-    # strategy 先留着，解说以后如果要按策略补充文字，不用改调用处。
-    _ = strategy
+    verdict = _entry_verdict(decision, _is_holding(strategy, symbol))
     logger.info(
         "{} 扫描解说 | 信号{}m 最新已收盘 {} | {} | {}",
         symbol,

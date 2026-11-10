@@ -35,6 +35,8 @@ class RiskGuardian:
     halted: bool = False
     halt_reason: str = ""
     extra: dict[str, Any] = field(default_factory=dict)
+    # 实盘熔断才写运行台告警。回测/测试关掉，避免把模拟里的「限额 50」刷到界面上。
+    write_alerts: bool = True
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any]) -> "RiskGuardian":
@@ -58,6 +60,7 @@ class RiskGuardian:
             self.halted = True
             self.halt_reason = f"当日亏损 {self.daily_pnl:.2f} 已超过限额 {self.max_daily_loss}"
             logger.error("风控熔断: {}", self.halt_reason)
+            self._emit_halt()
 
     def set_daily_pnl(self, value: float) -> None:
         """
@@ -72,6 +75,18 @@ class RiskGuardian:
             self.halted = True
             self.halt_reason = f"当日亏损 {self.daily_pnl:.2f} 已超过限额 {self.max_daily_loss}"
             logger.error("风控熔断: {}", self.halt_reason)
+            self._emit_halt()
+
+    def _emit_halt(self) -> None:
+        """熔断时记一条告警，十分钟内相同内容只写一次。回测不写。"""
+        if not self.write_alerts:
+            return
+        try:
+            from src.ops.alerts import emit_alert
+
+            emit_alert("halt", self.halt_reason, level="error")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("熔断告警没写上: {}", exc)
 
     def allow(
         self,
@@ -84,7 +99,7 @@ class RiskGuardian:
         if volume <= 0:
             return False, "手数必须大于 0"
 
-        # 强制平仓（紧急清仓）始终放行
+        # 强制平仓始终放行（收盘清仓等场景使用 force=True）
         if force and side == "close":
             return True, "强制平仓"
 
