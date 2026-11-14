@@ -6,15 +6,18 @@
 开仓手数最终取下面几项的最小值（算出来少于最小手数就不开）：
 
 1) 意图手数（想开多少）
+   - 凯利开关打开：用回测胜率/盈亏比算出每笔风险%，再按止损距离换手数
    - risk_pct：floor(权益 × 每笔风险% ÷ (止损距离 × 合约乘数))
    - fixed：固定手数
    - 缺入场/止损价：退回固定手数
 
 2) 仓位上限（保证金占用，公共设置）
-   - 有每手保证金时：
-     floor( (权益 × 仓位上限% − 已占用保证金) ÷ 每手保证金 )
-   - 仓位上限% ≤ 0，或本品种没填保证金：本层不限制（≤0 时仍按全部权益估买得起几手）
-   - 例：权益 21373、上限 80%、保证金 10500 → 预算约 17098 → 最多 1 手
+   - 填了保证金比例：每手占用 = 开仓价 × 每手数量 × 比例%
+     价格高了同一手要交的钱也变多
+   - 没填比例、只写了每手保证金金额：仍按那个固定金额
+   - 有占用数时：floor( (权益 × 仓位上限% − 已占用) ÷ 这一手占用 )
+   - 仓位上限% ≤ 0，或本品种没填比例也没填金额：本层不限制
+   - 例：燃油 4000 点、每手 10 吨、比例 23% → 每手 9200 元
 
 开仓前另外还要过（不算进手数，只决定能不能下单）：
    - 日最大亏损熔断（只拦开新仓，不自动平仓）
@@ -44,17 +47,18 @@ DEFAULT_MARGIN_USAGE_PCT = 80.0
 
 def bind_run_margin(cfg: dict[str, Any], margin_per_lot: float) -> None:
     """
-    回测或优化这一次只认传入的每手保证金。
+    这一次运行改成同一个每手保证金金额，并关掉品种比例。
 
-    配置页可以按品种写不同保证金，那是实盘用的。
-    回测页只有一个输入框，所以这一次先把副本里的品种保证金清成 0，
-    再使用输入框上的数字。填 0 就是这次不看保证金。不写磁盘。
+    交叉测试要比策略、不要被高保证金品种卡住时，传入 0。
+    历史回测跟品种表走时不要调用这里，否则价格一变手数还是按死金额算。
+    不写磁盘。
     """
     risk = cfg.setdefault("risk", {})
     risk["margin_per_lot"] = max(0.0, float(margin_per_lot or 0))
     for item in (risk.get("contracts") or {}).values():
         if isinstance(item, dict):
             item["margin"] = 0
+            item["margin_rate_pct"] = 0
 
 
 @dataclass
@@ -74,6 +78,7 @@ class PositionSizer:
     """根据配置与止损距离计算开仓手数。"""
 
     def __init__(self, cfg: dict[str, Any]) -> None:
+        self._cfg = cfg
         risk = cfg.get("risk", {})
         trade = cfg.get("trade", {})
         # fixed = 固定手数；risk_pct = 按风险百分比（推荐）
@@ -103,6 +108,7 @@ class PositionSizer:
                     "multiplier": float(v.get("multiplier", 10)),
                     "name": str(v.get("name", k)),
                     "margin": float(v.get("margin", 0) or 0),
+                    "margin_rate_pct": float(v.get("margin_rate_pct", 0) or 0),
                 }
             else:
                 contracts[str(k).lower()] = {"multiplier": float(v), "name": str(k)}
@@ -125,14 +131,25 @@ class PositionSizer:
         key = self._product_key(symbol)
         return float(self.contracts.get(key, {}).get("multiplier", 10))
 
-    def margin_for(self, symbol: str) -> float:
+    def margin_for(self, symbol: str, price: float | None = None) -> float:
         """
-        这个品种 1 手要占用多少保证金。
+        这个品种 1 手现在要占用多少保证金。
 
-        品种自己写了数就用自己的。没写就用「每手保证金」那个统一数字。都是 0 就不限制。
+        填了比例：开仓价 × 每手数量 × 比例%。没填比例：用表里的固定金额。
+        再没有就用配置页兜底金额。都是 0 就不限制。
         """
         key = self._product_key(symbol)
-        specific = float(self.contracts.get(key, {}).get("margin", 0) or 0)
+        box = self.contracts.get(key, {})
+        rate = float(box.get("margin_rate_pct", 0) or 0)
+        qty = float(box.get("multiplier", 10) or 10)
+        if rate > 0 and price is not None:
+            try:
+                px = float(price)
+            except (TypeError, ValueError):
+                px = 0.0
+            if px > 0 and qty > 0:
+                return px * qty * (rate / 100.0)
+        specific = float(box.get("margin", 0) or 0)
         if specific > 0:
             return specific
         return self.margin_per_lot
@@ -159,7 +176,7 @@ class PositionSizer:
             symbol, entry_price, stop_price
         )
         margin_lots, lot_margin, margin_note = self._lots_by_margin_cap(
-            symbol, current_abs_position, positions
+            symbol, current_abs_position, positions, entry_price
         )
 
         caps = [intent]
@@ -182,7 +199,10 @@ class PositionSizer:
             )
 
         if vol < self.min_volume:
-            if self.mode != "fixed" and intent < self.min_volume and stop_dist > 0:
+            from src.risk.kelly import kelly_enabled
+
+            using_pct = self.mode != "fixed" or kelly_enabled(self._cfg)
+            if using_pct and intent < self.min_volume and stop_dist > 0:
                 why = (
                     f"按风险{self.risk_pct}%只允许约{intent}手，低于最小{self.min_volume}手"
                     f"（止损距{stop_dist:.2f}点，每手亏≈{risk_per_lot:.0f}元，"
@@ -227,7 +247,19 @@ class PositionSizer:
         stop_price: float | None,
     ) -> tuple[int, str, float, float, float]:
         """意图手数：风险百分比或固定手数。返回 (手数, 说明, 风险预算, 每手风险, 止损距)。"""
-        if self.mode == "fixed":
+        from src.risk.kelly import kelly_enabled, plan_from_config
+
+        risk_pct = self.risk_pct
+        kelly_note = ""
+        if kelly_enabled(self._cfg):
+            plan = plan_from_config(self._cfg)
+            if not plan.ok:
+                return 0, plan.reason, 0.0, 0.0, 0.0
+            risk_pct = plan.risk_pct
+            self.risk_pct = risk_pct
+            kelly_note = plan.reason + "；"
+
+        if self.mode == "fixed" and not kelly_enabled(self._cfg):
             vol = max(0, self.fixed_volume)
             return vol, f"固定手数模式 volume={vol}", 0.0, 0.0, 0.0
 
@@ -241,13 +273,13 @@ class PositionSizer:
 
         mult = self.multiplier_for(symbol)
         risk_per_lot = stop_dist * mult
-        risk_cash = self.capital * (self.risk_pct / 100.0)
+        risk_cash = self.capital * (risk_pct / 100.0)
         if risk_per_lot <= 0:
             return 0, "每手风险异常，跳过开仓", risk_cash, 0.0, stop_dist
 
         raw = int(risk_cash // risk_per_lot)
         note = (
-            f"风险仓位: 权益{self.capital:.0f}×{self.risk_pct}%={risk_cash:.0f}元 "
+            f"{kelly_note}风险仓位: 权益{self.capital:.0f}×{risk_pct:g}%={risk_cash:.0f}元 "
             f"/ 每手≈{risk_per_lot:.0f}元 → 意图{raw}手"
             f"（止损距{stop_dist:.2f}，乘数{mult}）"
         )
@@ -258,15 +290,17 @@ class PositionSizer:
         symbol: str,
         current_abs_position: int,
         positions: dict[str, int] | None,
+        entry_price: float | None = None,
     ) -> tuple[int | None, float, str]:
         """
         仓位上限层：还能再开几手。
 
         预算 = 权益 × 仓位上限%。已占用按各品种自己的保证金扣。
+        有比例时按这笔开仓价现算每手占用。
         没填保证金 → 返回 None（本层不限制）。
         仓位上限% ≤ 0 → 仍按全部权益估买得起几手（兼容旧「钱够就开」）。
         """
-        need = self.margin_for(symbol)
+        need = self.margin_for(symbol, entry_price)
         if need <= 0:
             return None, 0.0, ""
 
@@ -281,8 +315,10 @@ class PositionSizer:
 
         if positions:
             used = 0.0
+            this_key = self._product_key(symbol)
             for held, vol in positions.items():
-                held_margin = self.margin_for(str(held))
+                held_price = entry_price if self._product_key(str(held)) == this_key else None
+                held_margin = self.margin_for(str(held), held_price)
                 if held_margin <= 0:
                     held_margin = need
                 used += abs(int(vol)) * held_margin

@@ -32,6 +32,18 @@ from src.strategy.session_scope import normalize_scope
 from src.strategy.types import normalize_stop_mode
 
 
+def _opt_bool(value: Any, default: bool = False) -> bool:
+    """优化网格里的开关。认 true/false、是/否、开/关。"""
+    if isinstance(value, bool):
+        return value
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "y", "是", "开", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "否", "关", "off"}:
+        return False
+    return bool(default)
+
+
 # 趋势跟随只搜进场看多长、止损放几倍波动。出场通道保持更短的默认，避免和进场通道拧在一起。
 GRID_TREND_LIGHT: dict[str, list[Any]] = {
     "entry_bars": [24, 36, 48],
@@ -62,6 +74,30 @@ GRID_DUAL_MA: dict[str, list[Any]] = {
     "long_period": [60, 80, 120],
     "reverse_on_cross": [True, False],
     "atr_stop_mult": [1.5, 2.0, 3.0],
+}
+
+# 均线波段网格。想试 EMA(21)/EMA(122) 这类任意根数，改 config/优化参数.xlsx 或配置文件即可，不必改代码。
+GRID_MACD_SWING_LIGHT: dict[str, list[Any]] = {
+    "timeframe": ["5"],
+    "dir_ema_pair": ["60/120"],
+    "sig_ema_triple": ["5/10/30", "5/10/20"],
+    "stop_ema": [120],
+    "side_ema": [120],
+    "slope_ema": [120],
+    "slope_min_deg": [2.0, 3.0, 5.0],
+    "slope_exit": [False, True],
+}
+GRID_MACD_SWING: dict[str, list[Any]] = {
+    "timeframe": ["5", "15"],
+    "dir_ema_pair": ["20/60", "60/120"],
+    "sig_ema_triple": ["5/10/20", "5/10/30"],
+    "stop_ema": [60, 120],
+    "side_ema": [60, 120],
+    "slope_ema": [60, 120],
+    "slope_min_deg": [2.0, 3.0, 5.0, 8.0],
+    "slope_lookback": [10, 20],
+    "slope_exit": [False, True],
+    "stop_mode": ["touch", "close"],
 }
 
 # 布林突破：轨道宽度和止损倍数。轨道周期只在常用档里比（20/26/30）。
@@ -96,30 +132,10 @@ GRID_MULTI: dict[str, list[Any]] = {
     "atr_stop_mult": [1.5, 2.0, 2.5],
 }
 
-GRID_VOTE_LIGHT: dict[str, list[Any]] = {
-    "min_votes": [2, 3],
-}
-GRID_VOTE: dict[str, list[Any]] = {
-    "min_votes": [2, 3],
-    "min_vote_diff": [1, 2],
-    "atr_stop_mult": [1.5, 2.0, 2.5],
-}
-
-GRID_HYBRID_LIGHT: dict[str, list[Any]] = {
-    "threshold": [0.5, 0.6],
-    "min_votes": [2, 3],
-}
-GRID_HYBRID: dict[str, list[Any]] = {
-    "threshold": [0.5, 0.6, 0.7],
-    "min_votes": [2, 3],
-    "min_vote_diff": [1, 2],
-    "atr_stop_mult": [1.5, 2.0, 2.5],
-}
-
 # 日内实体：只搜少数结构旋钮，避免又变成影线细则过拟合。
 # 精简 24 组；标准 2592 组；完整约 398 万组（都再被「最多试几组」抽样）。
 # 通用止损另由 _with_generic_stop 接到所有策略上，见下方公共旋钮。
-# eth_minutes / eth_minutes2 写回 daily_body（和配置页「ETH分钟数」同一处）。
+# eth_minutes / eth_minutes2 写回 daily_body（和配置页「第一/第二ETH窗口」同一处）。
 # timeframe 写回 strategy.timeframe；优化拉 K 线时用网格里最细的一档，策略内部再收成信号周期。
 GRID_BODY_LIGHT: dict[str, list[Any]] = {
     "eth_minutes": [15, 20, 30],
@@ -130,7 +146,7 @@ GRID_BODY_LIGHT: dict[str, list[Any]] = {
 
 GRID_BODY: dict[str, list[Any]] = {
     "eth_minutes": [15, 20, 30],
-    # 日盘第二段 ETH：0=只开一次，30=第一段止损后再用 30 分钟箱体开一次。
+    # 第二ETH窗口：0=只用第一窗口；30=从开盘起另算 30 分钟箱子，过点后丢掉第一窗口。
     "eth_minutes2": [0, 30],
     "timeframe": ["5", "15"],
     # 开仓截止钟点：过点就不追，日盘、夜盘各搜三档（都对齐 5/15 分钟的收盘）。
@@ -145,16 +161,39 @@ GRID_BODY: dict[str, list[Any]] = {
 }
 
 # 完整：把配置页里适合搜的项目都放进来。组合很多，靠「最多试几组」随机抽样。
+# 日内浮盈飘单：晚开仓、ATR 止损/保本、跳空顺向。
+GRID_FLOAT_LIGHT: dict[str, list[Any]] = {
+    "eth_minutes": [30, 60],
+    "stop_atr_mult": [1.0, 1.5, 2.0],
+    "flatten_at_close": [True, False],
+    "stop_mode": ["touch", "close"],
+}
+GRID_FLOAT: dict[str, list[Any]] = {
+    "eth_minutes": [20, 45, 60],
+    "stop_atr_mult": [1.0, 1.5, 2.0],
+    "be_atr_mult": [2.0, 3.0],
+    "flatten_at_close": [True, False],
+    "stop_mode": ["touch", "close"],
+    "day_cutoff": ["10:45", "14:45"],
+    "session_scope": ["all", "day", "night"],
+}
+GRID_FLOAT_FULL: dict[str, list[Any]] = {
+    **GRID_FLOAT,
+    "macd_timeframe": ["1", "5"],
+    "macd_combo": ["12/26/9", "5/34/5"],
+    "dir_ema_pair": ["5/20", "20/60", "60/120"],
+}
+
 GRID_BODY_FULL: dict[str, list[Any]] = {
     **GRID_BODY,
     # 箱沿止损再让几跳。
     "stop_extra_ticks": [1, 2],
-    # 开盘跳空超过几跳不开（0=关闭）。太大时箱沿会被缺口一次打穿。
-    "skip_gap_ticks": [0, 50],
-    # 箱体总宽超过几跳不开（0=关闭）。
-    "max_box_ticks": [150, 200],
-    # 急破箱体不追的跳数（0=关闭）。
-    "max_chase_ticks": [0, 20],
+    # 开盘跳空超过几倍开盘前 ATR 不开（0=关闭）。
+    "skip_gap_atr_mult": [0, 2.5],
+    # 箱体总宽超过几倍开盘前 ATR 不开（0=关闭）。
+    "max_box_atr_mult": [5.0, 8.0],
+    # 急破超过几倍开盘前 ATR 不追（0=关闭）。
+    "max_chase_atr_mult": [0, 1.0],
     # 等回抽时看哪条 EMA（0=关闭），以及有效打穿要几跳。
     "ema_period": [20, 60],
     "ema_buffer_ticks": [2, 4],
@@ -174,10 +213,10 @@ GENERIC_STOP_PARAMS: dict[str, list[Any]] = {
     "generic_stop.atr_mult": [2.0, 3.0],
 }
 
-# 早盘箱体A：先按出厂规则跑，不额外搜参数。
+# 未知引擎：不搜参数，避免误改别的策略小节。
 GRID_FIXED: dict[str, list[Any]] = {}
 
-# 长线趋势：主要搜仓位门槛，不乱搜周期（周期固定日线+60分钟）。
+# 长线趋势：主要搜仓位门槛。信号/止损周期跟配置页，优化网格不另搜。
 GRID_SWING_LIGHT: dict[str, list[Any]] = {
     "daily_ma": [20, 40],
     "add_min_atr": [0.8, 1.2],
@@ -189,19 +228,15 @@ GRID_SWING: dict[str, list[Any]] = {
     "reduce_extend_atr": [2.0, 2.5, 3.5],
     "max_adds": [1, 2],
 }
-GRID_JESSE_LIGHT: dict[str, list[Any]] = {
-    "vol_mult": [1.3, 1.5],
-    "lookback_liq": [15, 20],
+GRID_SWING_BOX_LIGHT: dict[str, list[Any]] = {
+    "lookback": [30, 40],
+    "adx_min": [18, 22],
 }
-GRID_JESSE: dict[str, list[Any]] = {
-    "vol_mult": [1.2, 1.3, 1.5],
-    "lookback_liq": [15, 20, 25],
-    "min_rr": [3.0, 4.0],
-}
-
-_FIXED_RULE_ENGINES = {
-    "morning_box_a",
-    "morning_a",
+GRID_SWING_BOX: dict[str, list[Any]] = {
+    "lookback": [30, 40, 60],
+    "height_atr": [1.0, 1.2],
+    "trail_atr": [2.0, 2.5],
+    "adx_min": [18, 20],
 }
 
 
@@ -239,23 +274,16 @@ _ENGINE_PARAM_SECTION = {
     "st": "supertrend",
     "dual_ma": "dual_ma",
     "ma_cross": "dual_ma",
+    "ema_swing": "ema_swing",
+    "macd_swing": "ema_swing",
     "bollinger": "bollinger",
     "boll": "bollinger",
     "sar_trend": "sar_trend",
     "parabolic_sar": "sar_trend",
     "multi_factor": "multi_factor",
     "cta": "multi_factor",
-    "multi_factor_adapt": "multi_factor_adapt",
-    "multi_vote": "multi_vote",
-    "vote": "multi_vote",
-    "multi_hybrid": "multi_hybrid",
-    "hybrid": "multi_hybrid",
-    "jesse_casper": "jesse_casper",
-    "casper": "jesse_casper",
-    "jesse": "jesse_casper",
-    "morning_box_a": "morning_box_a",
-    "morning_a": "morning_box_a",
     "swing_trend": "swing_trend",
+    "swing_box": "swing_box",
 }
 
 # 默认网格跟主策略日内实体一致
@@ -281,7 +309,7 @@ DEFAULT_WALK_STEPS = 3
 
 # 参数中文说明（界面展示用）。只保留现有策略还会搜到的项。
 PARAM_LABELS_CN: dict[str, str] = {
-    "eth_minutes": "ETH开盘观察分钟",
+    "eth_minutes": "第一ETH窗口（分钟）",
     "entry_bars": "趋势进场看前几根",
     "exit_bars": "趋势出场看前几根",
     "atr_period": "ATR用几根K线",
@@ -300,8 +328,6 @@ PARAM_LABELS_CN: dict[str, str] = {
     "ma_short": "多因子短均线根数",
     "ma_long": "多因子长均线根数",
     "channel": "多因子唐奇安通道根数",
-    "min_votes": "多因子最少同向票",
-    "min_vote_diff": "多因子最少票数差",
     "use_sar": "多因子是否启用SAR",
     "disagree_max": "多因子分歧上限",
     "timeframe": "信号周期（分钟）",
@@ -313,17 +339,38 @@ PARAM_LABELS_CN: dict[str, str] = {
     "add_min_atr": "长线加仓最少浮盈（倍波动）",
     "reduce_extend_atr": "长线伸展减仓（倍波动）",
     "max_adds": "长线最多加仓次数",
-    "lookback_liq": "流动性回看根数",
     "vol_mult": "放量倍数",
-    "min_rr": "最低盈亏比",
+    "lookback": "长线箱子回看根数",
+    "height_atr": "箱子最矮几倍ATR",
+    "adx_min": "ADX下限",
+    "trail_atr": "长线跟踪ATR倍数",
+    "trail_start_h": "几倍箱高才跟踪",
     # 日内实体配置页上的结构旋钮。
-    "eth_minutes2": "日盘第二段ETH分钟（0=只开一次）",
+    "eth_minutes2": "第二ETH窗口（分钟，0=不用）",
     "stop_extra_ticks": "箱沿止损外扩跳数",
-    "skip_gap_ticks": "跳空超过几跳不开（0=关闭）",
-    "max_box_ticks": "箱体总宽上限跳数（0=关闭）",
-    "max_chase_ticks": "急破不追的跳数（0=关闭）",
+    "skip_gap_atr_mult": "跳空超过几倍ATR不开（0=关闭）",
+    "max_box_atr_mult": "箱体超过几倍ATR不开（0=关闭）",
+    "max_chase_atr_mult": "急破超过几倍ATR不追（0=关闭）",
     "ema_period": "等回抽参考的EMA根数",
     "ema_buffer_ticks": "EMA 有效打穿跳数",
+    "be_atr_mult": "浮盈几倍ATR后保本",
+    "stop_atr_mult": "止损几倍开盘前ATR",
+    "slope_min_deg": "最小倾角(度)",
+    "slope_lookback": "斜率回看根数",
+    "slope_exit": "倾角不够就平仓",
+    "no_open_before_close_min": "尾盘不开仓(分钟)",
+    "swing_side_bars": "高低点左右各看几根",
+    "cluster_width": "快线聚合差价（已不用）",
+    "gap_align_atr_mult": "跳空超过几倍ATR只顺向（0=关闭）",
+    "macd_timeframe": "MACD周期（分钟）",
+    "macd_combo": "MACD参数（快/慢/平滑）",
+    "dir_ema_pair": "方向选择器（两根均线）",
+    "sig_ema_triple": "信号发生器（三根均线）",
+    "stop_ema": "止损均线根数",
+    "side_ema": "多空分界线根数",
+    "slope_ema": "倾角均线根数",
+    "flatten_at_close": "收盘清仓",
+    "direction": "方向选择器",
     # 通用止损（全策略公共设置，写回 strategy.generic_stop）。
     "generic_stop.kind": "通用止损类型",
     "generic_stop.lookback": "通用止损回看根数",
@@ -350,27 +397,22 @@ def default_grid_for_engine(engine: str, depth: str = "标准") -> dict[str, lis
         return _depth_grid(GRID_ST_LIGHT, GRID_ST, None, d)
     if e in ("dual_ma", "ma_cross"):
         return _depth_grid(GRID_DUAL_MA_LIGHT, GRID_DUAL_MA, None, d)
+    if e in ("ema_swing", "macd_swing"):
+        return _depth_grid(GRID_MACD_SWING_LIGHT, GRID_MACD_SWING, None, d)
     if e in ("bollinger", "boll"):
         return _depth_grid(GRID_BOLL_LIGHT, GRID_BOLL, None, d)
     if e in ("sar_trend", "parabolic_sar"):
         return _depth_grid(GRID_SAR_LIGHT, GRID_SAR, None, d)
     if e in ("multi_factor", "cta"):
         return _depth_grid(GRID_MULTI_LIGHT, GRID_MULTI, None, d)
-    if e == "multi_factor_adapt":
-        # 只搜阈值，不搜权重和回看笔数，避免为了曲线好看把进化拧过头。
-        return _depth_grid(GRID_MULTI_LIGHT, GRID_MULTI_LIGHT, None, d)
-    if e in ("multi_vote", "vote"):
-        return _depth_grid(GRID_VOTE_LIGHT, GRID_VOTE, None, d)
-    if e in ("multi_hybrid", "hybrid"):
-        return _depth_grid(GRID_HYBRID_LIGHT, GRID_HYBRID, None, d)
     if e == "daily_body":
         return _depth_grid(GRID_BODY_LIGHT, GRID_BODY, GRID_BODY_FULL, d)
+    if e == "float_hold":
+        return _depth_grid(GRID_FLOAT_LIGHT, GRID_FLOAT, GRID_FLOAT_FULL, d)
     if e == "swing_trend":
         return _depth_grid(GRID_SWING_LIGHT, GRID_SWING, None, d)
-    if e in ("jesse_casper", "casper", "jesse"):
-        return _depth_grid(GRID_JESSE_LIGHT, GRID_JESSE, None, d)
-    if e in _FIXED_RULE_ENGINES:
-        return copy.deepcopy(GRID_FIXED)
+    if e == "swing_box":
+        return _depth_grid(GRID_SWING_BOX_LIGHT, GRID_SWING_BOX, None, d)
     # 未知引擎：不搜参数，避免误改别的策略小节
     return copy.deepcopy(GRID_FIXED)
 
@@ -445,18 +487,49 @@ def describe_grid(grid: dict[str, list[Any]]) -> str:
 # 几个开关型参数的取值中文，优化结果里「值（代号）」一起写，方便对照配置页下拉。
 PARAM_VALUE_LABELS_CN: dict[str, dict[str, str]] = {
     "stop_mode": {"touch": "触及即止损", "close": "收盘价确认"},
-    "session_scope": {"all": "全时段", "day": "只做日盘", "night": "只做夜盘"},
+    "session_scope": {
+        "all": "全时段",
+        "day": "只做日盘",
+        "night": "只做夜盘",
+        "linked": "夜日连续（跳空小）",
+    },
     "generic_stop.kind": {
         "off": "关闭",
         "sar": "SAR 移动止损",
         "prior_extreme": "前高低点",
         "chandelier": "ATR 吊灯",
     },
+    "macd_timeframe": {"1": "1分钟", "5": "5分钟"},
+    "macd_combo": {
+        "12/26/9": "12 / 26 / 9（常用）",
+        "5/34/5": "5 / 34 / 5",
+        "8/17/9": "8 / 17 / 9",
+        "6/13/5": "6 / 13 / 5",
+    },
+    "dir_ema_pair": {
+        "5/20": "EMA5 / EMA20",
+        "20/60": "EMA20 / EMA60",
+        "60/120": "EMA60 / EMA120",
+    },
+    "direction": {
+        "eth_trend": "观察结束顺大方向",
+        "day_cluster": "观察结束看昨日密集区",
+        "opening_box": "开盘箱体突破",
+        "macd_cycle": "MACD一轮循环",
+    },
+    "flatten_at_close": {"true": "当天清仓", "false": "可拿到隔夜"},
+    "slope_exit": {"true": "倾角不够就平仓", "false": "只拦新开仓"},
 }
 
 
 def format_param_value(key: str, value: Any) -> str:
     """参数值的中文写法。开关型参数写成「中文（代号）」，其余按原值。"""
+    if key == "flatten_at_close":
+        on = value if isinstance(value, bool) else _opt_bool(value, True)
+        return "当天清仓" if on else "可拿到隔夜"
+    if key == "slope_exit":
+        on = value if isinstance(value, bool) else _opt_bool(value, False)
+        return "倾角不够就平仓" if on else "只拦新开仓"
     if isinstance(value, bool):
         return "是" if value else "否"
     table = _table_value_labels(key) or PARAM_VALUE_LABELS_CN.get(key) or {}
@@ -487,6 +560,7 @@ def _finest_grid_timeframe(grid: dict[str, list[Any]] | None, fallback: str) -> 
     原理：5 分钟可以收成 15 分钟再判断；若只拉 15 分钟，无法公平试 5 分钟。
     """
     vals = list((grid or {}).get("timeframe") or [])
+    vals.extend((grid or {}).get("macd_timeframe") or [])
     minutes: list[int] = []
     for raw in vals:
         period = canonical_period(str(raw))
@@ -779,6 +853,7 @@ def format_perf_block(
     训练成绩、检验成绩并排对照时用这一份，避免一边写简略、一边写详细。
     盈利覆盖、每笔收益、日均和交叉测试同一套算法，方便对照。
     """
+    from src.backtest.metrics import format_expectancy_line, format_payoff_lines
     from src.screen.picker import format_cover_lines
 
     p = perf or {}
@@ -792,6 +867,16 @@ def format_perf_block(
             f"成交      {int(p.get('trades') or 0)} 笔"
             f"（赢{int(p.get('wins') or 0)} / 亏{int(p.get('losses') or 0)}）",
             f"胜率      {float(p.get('win_rate') or 0):.0%}",
+            *format_payoff_lines(
+                float(p.get("avg_win") or 0),
+                float(p.get("avg_loss") or 0),
+                p.get("payoff"),
+            ),
+            format_expectancy_line(
+                float(p.get("win_rate") or 0),
+                float(p.get("avg_win") or 0),
+                float(p.get("avg_loss") or 0),
+            ),
             f"净盈亏    {float(p.get('net_pnl') or 0):.0f} 元",
             f"盈利因子  {float(p.get('profit_factor') or 0):.2f}",
             f"最大回撤  {float(p.get('max_drawdown') or 0):.0f} 元"
@@ -843,6 +928,41 @@ def _factory_values(engine: str) -> dict[str, Any]:
             values["stop_mode"] = snap["stop_mode"]
         # 交易时段写在 schedule 小节，出厂是全时段。
         values.setdefault("session_scope", "all")
+    if engine == "float_hold":
+        hold = snap.get("float_hold") or {}
+        values.setdefault("macd_timeframe", hold.get("macd_timeframe", "5"))
+        values.setdefault(
+            "macd_combo",
+            f"{hold.get('macd_fast', 12)}/{hold.get('macd_slow', 26)}/{hold.get('macd_signal', 9)}",
+        )
+        values.setdefault(
+            "dir_ema_pair",
+            f"{hold.get('dir_ema_fast', 5)}/{hold.get('dir_ema_slow', 20)}",
+        )
+        values.setdefault("flatten_at_close", bool(snap.get("flatten_at_close", True)))
+        if "stop_mode" not in values and "stop_mode" in snap:
+            values["stop_mode"] = snap["stop_mode"]
+    if engine in ("ema_swing", "macd_swing"):
+        box = snap.get("ema_swing") or snap.get("macd_swing") or {}
+        values.setdefault("timeframe", snap.get("timeframe", "5"))
+        values.setdefault(
+            "dir_ema_pair",
+            f"{box.get('dir_ema_fast', 60)}/{box.get('dir_ema_slow', 120)}",
+        )
+        values.setdefault(
+            "sig_ema_triple",
+            f"{box.get('sig_ema_a', 5)}/{box.get('sig_ema_b', 10)}/{box.get('sig_ema_c', 30)}",
+        )
+        values.setdefault("stop_ema", box.get("stop_ema", 120))
+        values.setdefault("side_ema", box.get("side_ema", box.get("stop_ema", 120)))
+        values.setdefault("slope_ema", box.get("slope_ema", box.get("stop_ema", 120)))
+        values.setdefault("slope_exit", bool(box.get("slope_exit", False)))
+        values.setdefault(
+            "no_open_before_close_min",
+            box.get("no_open_before_close_min", 30),
+        )
+        if "stop_mode" not in values and "stop_mode" in snap:
+            values["stop_mode"] = snap["stop_mode"]
     return values
 
 
@@ -1097,19 +1217,20 @@ def _apply_params(cfg: dict[str, Any], params: dict[str, Any], engine: str | Non
         box = st.setdefault("dual_ma", {})
         for k, v in params.items():
             box[k] = v
-    elif engine == "daily_body":
-        body = st.setdefault("daily_body", {})
+    elif engine in ("daily_body", "float_hold"):
+        body = st.setdefault(engine, {})
+        eth_fallback = 60 if engine == "float_hold" else 20
         for k, v in params.items():
             if k == "eth_minutes":
-                # 与配置页「ETH分钟数」同一项；写在 daily_body 小节。
+                # 与配置页「第一ETH窗口」同一项；写在对应策略小节。
                 try:
                     body["eth_minutes"] = max(0, int(v))
                 except (TypeError, ValueError):
-                    body["eth_minutes"] = 20
+                    body["eth_minutes"] = eth_fallback
             elif k == "timeframe":
                 tf = str(v).strip() or "5"
                 st["timeframe"] = tf
-                # 日内实体止损不另用更粗周期，跟信号周期保持一致，避免优出一套用不上的止损周期。
+                # 止损不另用更粗周期，跟信号周期保持一致，避免优出一套用不上的止损周期。
                 st["trail_timeframe"] = tf
             elif k == "session_scope":
                 # 公共设置，写在 schedule 小节；和配置页「交易时段」同一项。
@@ -1120,11 +1241,130 @@ def _apply_params(cfg: dict[str, Any], params: dict[str, Any], engine: str | Non
             elif k == "stop_mode":
                 # 止损触发方式，全策略共用，写在 strategy 根；和配置页同一项。
                 st["stop_mode"] = normalize_stop_mode(v)
+            elif engine == "float_hold" and k == "flatten_at_close":
+                # 可搜「当天清仓」或「拿到隔夜」，写在策略公共开关上。
+                st["flatten_at_close"] = _opt_bool(v, True)
+            elif engine == "float_hold" and k == "direction":
+                from src.strategy.float_hold import normalize_direction_key
+
+                body["direction"] = normalize_direction_key(v)
+            elif engine == "float_hold" and k == "macd_combo":
+                from src.strategy.float_hold import parse_macd_combo
+
+                fast, slow, signal = parse_macd_combo(v)
+                body["macd_fast"] = fast
+                body["macd_slow"] = slow
+                body["macd_signal"] = signal
+                body["macd_combo"] = f"{fast}/{slow}/{signal}"
+                if "direction" not in params:
+                    body["direction"] = "macd_cycle"
+            elif engine == "float_hold" and k == "dir_ema_pair":
+                from src.strategy.float_hold import parse_ema_pair_label
+
+                ema_fast, ema_slow = parse_ema_pair_label(v)
+                body["dir_ema_fast"] = ema_fast
+                body["dir_ema_slow"] = ema_slow
+                body["dir_ema_pair"] = f"{ema_fast}/{ema_slow}"
+                if "direction" not in params:
+                    body["direction"] = "macd_cycle"
+            elif engine == "float_hold" and k == "macd_timeframe":
+                from src.strategy.float_hold import normalize_macd_timeframe
+
+                tf = normalize_macd_timeframe(v)
+                body["macd_timeframe"] = tf
+                if "direction" not in params:
+                    body["direction"] = "macd_cycle"
+                st["timeframe"] = tf
+                st["trail_timeframe"] = tf
             else:
                 body[k] = v
     elif engine in _ENGINE_PARAM_SECTION:
         box = st.setdefault(_ENGINE_PARAM_SECTION[engine], {})
         for k, v in params.items():
+            # 长线箱体的周期写在公共项，不写进自己那一节，否则回测页改了也读不到。
+            if engine in ("swing_box", "swing_trend") and k == "timeframe":
+                fallback = "D" if engine == "swing_box" else "60"
+                tf = str(v).strip() or fallback
+                st["timeframe"] = tf
+                if "trail_timeframe" not in params:
+                    st["trail_timeframe"] = tf
+                continue
+            if engine in ("swing_box", "swing_trend") and k == "trail_timeframe":
+                fallback = "D" if engine == "swing_box" else "60"
+                st["trail_timeframe"] = str(v).strip() or st.get("timeframe") or fallback
+                continue
+            if engine in ("ema_swing", "macd_swing") and k == "timeframe":
+                tf = str(v).strip() or "5"
+                st["timeframe"] = tf
+                st["trail_timeframe"] = tf
+                continue
+            if engine in ("ema_swing", "macd_swing") and k == "stop_mode":
+                st["stop_mode"] = normalize_stop_mode(v)
+                continue
+            if engine in ("ema_swing", "macd_swing") and k in (
+                "dir_ema_pair",
+                "dir_ema_fast",
+                "dir_ema_slow",
+            ):
+                from src.strategy.macd_swing import parse_dir_pair, parse_ema_len
+
+                # 优化表可写 21/122，也可分开写两根。短的会排到前面。
+                if k == "dir_ema_pair":
+                    a, b = parse_dir_pair(v, box.get("dir_ema_fast", 60), box.get("dir_ema_slow", 120))
+                elif k == "dir_ema_fast":
+                    a, b = parse_dir_pair(
+                        None,
+                        parse_ema_len(v, 60),
+                        parse_ema_len(box.get("dir_ema_slow", 120), 120),
+                    )
+                else:
+                    a, b = parse_dir_pair(
+                        None,
+                        parse_ema_len(box.get("dir_ema_fast", 60), 60),
+                        parse_ema_len(v, 120),
+                    )
+                box["dir_ema_fast"] = a
+                box["dir_ema_slow"] = b
+                box["dir_ema_pair"] = f"{a}/{b}"
+                box["ema_fast"] = a
+                box["ema_slow"] = b
+                continue
+            if engine in ("ema_swing", "macd_swing") and k in (
+                "sig_ema_triple",
+                "sig_ema_a",
+                "sig_ema_b",
+                "sig_ema_c",
+            ):
+                from src.strategy.macd_swing import format_sig_triple, parse_ema_len, parse_sig_triple
+
+                if k == "sig_ema_triple":
+                    a, b, c = parse_sig_triple(v)
+                else:
+                    box[k] = parse_ema_len(v, {"sig_ema_a": 5, "sig_ema_b": 10, "sig_ema_c": 30}[k])
+                    a, b, c = parse_sig_triple(
+                        None,
+                        box.get("sig_ema_a", 5),
+                        box.get("sig_ema_b", 10),
+                        box.get("sig_ema_c", 30),
+                    )
+                box["sig_ema_a"] = a
+                box["sig_ema_b"] = b
+                box["sig_ema_c"] = c
+                box["sig_ema_triple"] = format_sig_triple(a, b, c)
+                continue
+            if engine in ("ema_swing", "macd_swing") and k == "slope_exit":
+                box["slope_exit"] = _opt_bool(v, False)
+                continue
+            if engine in ("ema_swing", "macd_swing") and k == "no_open_before_close_min":
+                from src.strategy.macd_swing import parse_close_guard_min
+
+                box["no_open_before_close_min"] = parse_close_guard_min(v, 30)
+                continue
+            if engine in ("ema_swing", "macd_swing") and k in ("stop_ema", "side_ema", "slope_ema"):
+                from src.strategy.macd_swing import parse_ema_len
+
+                box[k] = parse_ema_len(v, 120)
+                continue
             box[k] = v
     else:
         # 未单独列出的引擎：参数写在 strategy 根上
@@ -1924,10 +2164,9 @@ def apply_run_switches(
     name = str(engine or "")
     if name in (
         "daily_body",
+        "float_hold",
         "dual_ma",
         "ma_cross",
-        "morning_box_a",
-        "morning_a",
     ):
         st["flatten_at_close"] = bool(flatten_at_close)
     return out
@@ -1950,6 +2189,12 @@ def describe_run_switches(
             f"收盘清仓  {flat}\n"
             "双均线趋势听配置页「收盘清仓」总开关；短线上穿长线做多、下穿做空，止损跟长均线。"
         )
+    if name in ("ema_swing", "macd_swing"):
+        return (
+            "开关      均线波段默认可隔夜，不听收盘清仓总开关。\n"
+            "入场：方向均线定大方向；信号三均线排好；价格在多空分界线正确一侧。"
+            "倾角均线走平不开。空仓时收盘前若干分钟不开（出厂 30，可改）。周期和仓位用公共项。"
+        )
     if name in ("bollinger", "boll", "bollinger_break"):
         return (
             "开关      布林带突破用它自己的设置，不跟收盘清仓总开关。\n"
@@ -1965,34 +2210,7 @@ def describe_run_switches(
             "开关      多因子 CTA 用它自己的设置，不跟收盘清仓总开关。\n"
             "入场：均线 / 唐奇安 / 布林 / SAR 加权打分，日线定方向，总分越过阈值才开仓。"
         )
-    if name == "multi_factor_adapt":
-        return (
-            "开关      自适应对照用它自己的设置，不跟收盘清仓总开关。\n"
-            "入场：和主推同一套打分；权重只在平仓后慢改。优化只搜阈值，不搜权重。"
-        )
-    if name in ("multi_vote", "vote"):
-        return (
-            "开关      多因子投票用它自己的设置，不跟收盘清仓总开关。\n"
-            "入场：同一套四个因子等权投票，同向票数和票差都够才开仓。"
-        )
-    if name in ("multi_hybrid", "hybrid"):
-        return (
-            "开关      多因子混合用它自己的设置，不跟收盘清仓总开关。\n"
-            "入场：投票决定开不开，加权总分决定开几成仓。"
-        )
-    if name in ("jesse_casper", "casper", "jesse"):
-        return (
-            "开关      Jesse Casper 用它自己的设置，默认收盘清仓。\n"
-            "入场：15分钟定方向，扫流动性后放量大实体，回踩入场区；"
-            "上一时段价值区里当震荡不开。没有足迹图。"
-        )
     flat = "开" if flatten_at_close else "关"
-    if name in ("morning_box_a", "morning_a"):
-        return (
-            f"收盘清仓  {flat}\n"
-            "09:00–09:30 记箱体；之后放量收盘突破定方向；回踩边界入场；"
-            "浮盈达箱体高度比例后移损到成本；否则拿到收盘。单日最多两笔。"
-        )
     if name == "daily_body":
         return (
             f"收盘清仓  {flat}\n"
@@ -2002,6 +2220,20 @@ def describe_run_switches(
             "触发方式可搜「触及即止损」或「收盘价确认」，中间不做回撤止损，没触发就拿到收盘。\n"
             "优化按深度搜：精简只比 ETH、信号周期、止损触发方式和通用止损开关；"
             "标准再加截止钟点、交易时段；完整再放开箱体过滤项和通用止损参数。"
+        )
+    if name == "float_hold":
+        return (
+            f"收盘清仓  {flat}（优化可搜当天清仓或拿到隔夜）\n"
+            "开仓：MACD一轮循环可搜 1/5 分钟、常见 MACD 参数、均线对 EMA5/20、20/60、60/120；"
+            "走完一轮红绿柱后再按均线对定方向。"
+            "止损离进场价大约 0.5 倍开盘前波动；浮盈大约 2 倍波动后保本。"
+            "开盘箱体那一套仍可手选，不在这几项优化里。"
+        )
+    if name == "swing_box":
+        return (
+            "收盘清仓  本策略默认关（仓可隔夜）\n"
+            "震荡箱子，收盘走出箱子才顺着做；开仓后箱子冻住；假突破收回箱子就走。"
+            "浮盈够一个箱子高度后用 ATR 跟踪。信号周期、止损周期跟配置页/回测页走。"
         )
     return f"收盘清仓  {flat}"
 
@@ -2068,6 +2300,19 @@ def current_params_from_config(
             continue
         if key == "stop_mode" and st.get("stop_mode") is not None:
             out[key] = st.get("stop_mode")
+            continue
+        if key == "flatten_at_close":
+            out[key] = bool(st.get("flatten_at_close", True))
+            continue
+        if key == "macd_combo":
+            out[key] = (
+                f"{int(box.get('macd_fast', 12))}/"
+                f"{int(box.get('macd_slow', 26))}/"
+                f"{int(box.get('macd_signal', 9))}"
+            )
+            continue
+        if key == "dir_ema_pair":
+            out[key] = f"{int(box.get('dir_ema_fast', 5))}/{int(box.get('dir_ema_slow', 20))}"
             continue
         if key == "session_scope":
             out[key] = schedule.get("session_scope", "all")

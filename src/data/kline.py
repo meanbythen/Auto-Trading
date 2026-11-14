@@ -20,7 +20,13 @@ import pandas as pd
 import requests
 from loguru import logger
 
-from src.data.bar_store import BarStore, RawBarStore, aligned_bars, merge_local_and_download
+from src.data.bar_store import (
+    BarStore,
+    RawBarStore,
+    aligned_bars,
+    merge_local_and_download,
+    rows_needing_write,
+)
 from src.data.periods import (
     bars_from_minutes,
     cache_tag,
@@ -497,10 +503,14 @@ class KlineProvider:
         # 库里只放已经收盘的K线。正在走的那根只给这一轮判断用（持仓看影线），
         # 不写进去，免得下次回测把它当成收盘价。
         stored = drop_forming_bar(merged)
-        to_write = stored if full_history else drop_forming_bar(pieces)
-        self.store.upsert(stored_name, period, to_write)
         if full_history:
+            self.store.upsert(stored_name, period, stored)
             self._save_cache(stored_name, period, stored)
+        else:
+            # 实盘这段下载窗口每轮都一样。库里已经有且一样的不再重写，只补新K线和变化的那根。
+            pending = rows_needing_write(drop_forming_bar(pieces), local)
+            if pending is not None and len(pending) > 0:
+                self.store.upsert(stored_name, period, pending)
         added = len(merged) - before
         fresh_from = fresh.index.min() if len(fresh) else ""
         local_from = "" if local is None or len(local) == 0 else local.index.min()
@@ -608,9 +618,11 @@ class KlineProvider:
             recent = self._recent_minutes(sina_code)
             if recent is not None and len(recent) > 0:
                 pieces.append(recent)
-                # 顺手把最近 1 分钟写入库存，下次回测也能补齐
+                # 顺手把最近 1 分钟写入库存，下次回测也能补齐。库里已经一样的行不再重写。
                 try:
-                    self.store.upsert(self._stored_symbol(symbol), "1", recent)
+                    pending = rows_needing_write(recent, local)
+                    if pending is not None and len(pending) > 0:
+                        self.store.upsert(self._stored_symbol(symbol), "1", pending)
                     self._save_cache(self._stored_symbol(symbol), "1", recent)
                 except Exception:  # noqa: BLE001
                     pass
@@ -914,15 +926,15 @@ class KlineProvider:
                 o = price
                 c = price + drift + float(rng.normal(0, 0.8))
                 h = max(o, c) + abs(float(rng.normal(0.5, 0.3)))
-                l = min(o, c) - abs(float(rng.normal(0.5, 0.3)))
+                low = min(o, c) - abs(float(rng.normal(0.5, 0.3)))
                 price = c
             else:
                 # 明显长下影 Pinbar
                 o = price
                 c = price + 2.0
                 h = max(o, c) + 0.5
-                l = min(o, c) - 12.0
-            rows.append({"open": o, "high": h, "low": l, "close": c, "volume": 100 + i})
+                low = min(o, c) - 12.0
+            rows.append({"open": o, "high": h, "low": low, "close": c, "volume": 100 + i})
 
         df = pd.DataFrame(rows, index=pd.DatetimeIndex(idx, name="datetime"))
         self._save_cache(symbol, period, df)

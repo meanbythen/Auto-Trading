@@ -9,12 +9,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime
 from typing import Any
 
 import pandas as pd
 from loguru import logger
 
+from .base import StrategyBase
 from .indicators import average_true_range, ema_series
 from .market_state import MarketFilter, trend_params_for_section
 from .session_scope import scope_allows, scope_from_cfg
@@ -34,10 +35,11 @@ def _parse_hhmm(value: str) -> dtime:
     return dtime(int(hour), int(minute))
 
 
-class DualMaStrategy:
+class DualMaStrategy(StrategyBase):
     """短均线与长均线交叉开仓；长均线当移动止损。"""
 
     def __init__(self, cfg: dict[str, Any]) -> None:
+        super().__init__()
         self.cfg = cfg
         st = cfg.get("strategy", {}) or {}
         box = st.get("dual_ma") or {}
@@ -89,8 +91,6 @@ class DualMaStrategy:
             s: PositionState(symbol=s) for s in self.symbols
         }
         self._pending: dict[str, dict[str, Any]] = {}
-        self._last_entry_bar: dict[str, str] = {}
-        self._signaled_bar: dict[str, str] = {}
         self._close_side: dict[str, str] = {}
         self._close_entry: dict[str, float] = {}
 
@@ -202,6 +202,7 @@ class DualMaStrategy:
                 f"收盘清仓时间到，双均线{self.short_period}/{self.long_period}强制平仓",
             )
 
+        pad = self._atr_stop_pad(bars, close)
         if pos.side != "flat":
             return self._manage(
                 symbol,
@@ -215,6 +216,7 @@ class DualMaStrategy:
                 low=float(bar["low"]),
                 cross_up=cross_up,
                 cross_down=cross_down,
+                stop_pad=pad,
             )
 
         if self.is_flatten_time(now):
@@ -234,15 +236,7 @@ class DualMaStrategy:
                 stop_price=l_now,
             )
 
-        atr = float(
-            average_true_range(
-                bars["high"], bars["low"], bars["close"], period=self.atr_period
-            ).iloc[-1]
-        )
-        if not pd.isna(atr) and atr > 0:
-            pad = self.atr_stop_mult * atr
-        else:
-            pad = max(abs(close) * 0.005, 1.0)
+        pad = self._atr_stop_pad(bars, close)
 
         # 文档方向过滤：金叉还要站上长均线才多，死叉还要跌破长均线才空。
         if cross_up and close >= l_now:
@@ -276,6 +270,7 @@ class DualMaStrategy:
         low: float = 0.0,
         cross_up: bool,
         cross_down: bool,
+        stop_pad: float = 0.0,
     ) -> StrategyDecision:
         # 止损跟长均线，只往有利方向收
         if pos.side == "long":
@@ -298,7 +293,8 @@ class DualMaStrategy:
                 and not self.is_flatten_time(now)
             ):
                 new_side = "long" if cross_up else "short"
-                pad = max(abs(close) * 0.001, 1.0)
+                # 反手止损和首次开仓同一套：2×ATR，不要贴着现价，否则手数会被放大。
+                pad = float(stop_pad or 0) or max(abs(close) * 0.005, 1.0)
                 new_stop = close - pad if new_side == "long" else close + pad
                 return self._open(
                     symbol,
@@ -323,17 +319,18 @@ class DualMaStrategy:
                 ),
             )
 
-        # 止损触发方式（全策略共用）：touch 时影线碰到长均线就平；close 时等收盘穿越确认。
+        # 真正触发用已经收紧的跟踪止损，和界面上看到的止损价同一条。
         # 反向交叉优先，避免反手被止损抢走。
+        stop_line = float(pos.trail_stop or 0) or long_now
         if self.stop_on_touch and stop_triggered(
-            side=pos.side, stop=long_now, close=close, high=high, low=low, mode=self.stop_mode
+            side=pos.side, stop=stop_line, close=close, high=high, low=low, mode=self.stop_mode
         ):
             return self._close_decision(
                 symbol,
                 pos,
                 now,
                 bar_id,
-                f"盘中触及{self.long_period}长均线 {long_now:.2f}，先平",
+                f"盘中触及跟踪止损 {stop_line:.2f}，先平",
             )
 
         # 短线已回到长线错误一侧（未等到完整交叉判定时的保险）
@@ -364,6 +361,17 @@ class DualMaStrategy:
             stop_price=pos.trail_stop or long_now,
             entry_price=pos.entry_price,
         )
+
+    def _atr_stop_pad(self, bars: pd.DataFrame, close: float) -> float:
+        """开仓和反手共用的止损距离：优先 2×ATR，算不出时用价格的千分之五。"""
+        atr = float(
+            average_true_range(
+                bars["high"], bars["low"], bars["close"], period=self.atr_period
+            ).iloc[-1]
+        )
+        if not pd.isna(atr) and atr > 0:
+            return self.atr_stop_mult * atr
+        return max(abs(close) * 0.005, 1.0)
 
     def _open(
         self,

@@ -81,10 +81,10 @@ def parse_margin_map(raw: str) -> dict[str, float]:
 
 def margin_text_for_symbol(symbol: str, generic_margin: str, margin_map_text: str) -> str:
     """
-    回测页只有一个「每手保证金」。
+    回测页只有一个兜底「每手保证金」金额。
 
-    这个品种在「品种保证金」里写了大于 0 的数，就用它，这样和实盘算手数一致。
-    没写就用配置页那个统一的每手保证金。
+    品种表写了保证金比例时，手数按开仓价现算，不用这个框。
+    没写比例、只写了金额时，才用这个品种的固定金额。
     """
     specific = parse_margin_map(margin_map_text).get(product_key(symbol), 0.0)
     if specific > 0:

@@ -102,6 +102,9 @@ def price_1d(values: Any) -> pd.Series:
         if values.shape[1] == 0:
             return pd.Series(dtype=float)
         values = values.iloc[:, -1]
+    # 本来就是数字列时 pd.to_numeric 也是原样返回，省掉这一趟转换。
+    if isinstance(values, pd.Series) and values.dtype.kind in "fiu":
+        return values
     series = pd.to_numeric(values, errors="coerce")
     if not isinstance(series, pd.Series):
         series = pd.Series(series)
@@ -358,12 +361,30 @@ def average_true_range(
     high_f = price_1d(high)
     low_f = price_1d(low)
     close_f = price_1d(close)
-    prev = close_f.shift(1)
-    tr = pd.concat(
-        [(high_f - low_f), (high_f - prev).abs(), (low_f - prev).abs()],
-        axis=1,
-    ).max(axis=1)
-    return tr.rolling(max(2, int(period)), min_periods=max(2, int(period))).mean()
+    window = max(2, int(period))
+    if (
+        len(high_f) > 0
+        and len(high_f) == len(low_f) == len(close_f)
+        and high_f.index.equals(low_f.index)
+        and high_f.index.equals(close_f.index)
+    ):
+        # 三列同一套索引时按位置算，不建中间小表。np.fmax 与 pandas 的
+        # max(axis=1, skipna=True) 一样：遇到 NaN 就取另一边的值。
+        highs = high_f.to_numpy(dtype=float, na_value=np.nan, copy=False)
+        lows = low_f.to_numpy(dtype=float, na_value=np.nan, copy=False)
+        closes = close_f.to_numpy(dtype=float, na_value=np.nan, copy=False)
+        prev = np.empty_like(closes)
+        prev[0] = np.nan
+        prev[1:] = closes[:-1]
+        tr = np.fmax(highs - lows, np.fmax(np.abs(highs - prev), np.abs(lows - prev)))
+        tr = pd.Series(tr, index=high_f.index)
+    else:
+        prev = close_f.shift(1)
+        tr = pd.concat(
+            [(high_f - low_f), (high_f - prev).abs(), (low_f - prev).abs()],
+            axis=1,
+        ).max(axis=1)
+    return tr.rolling(window, min_periods=window).mean()
 
 
 def supertrend(

@@ -9,12 +9,13 @@ SuperTrend 趋势跟随。
 
 from __future__ import annotations
 
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime
 from typing import Any
 
 import pandas as pd
 from loguru import logger
 
+from .base import StrategyBase
 from .indicators import supertrend as calc_supertrend
 from .market_state import MarketFilter, trend_params_for_section
 from .session_scope import scope_allows, scope_from_cfg
@@ -34,10 +35,11 @@ def _parse_hhmm(value: str) -> dtime:
     return dtime(int(hour), int(minute))
 
 
-class SuperTrendStrategy:
+class SuperTrendStrategy(StrategyBase):
     """SuperTrend 翻转开仓；线本身当移动止损；默认可隔夜。"""
 
     def __init__(self, cfg: dict[str, Any]) -> None:
+        super().__init__()
         self.cfg = cfg
         st = cfg.get("strategy", {}) or {}
         box = st.get("supertrend") or {}
@@ -74,8 +76,6 @@ class SuperTrendStrategy:
             s: PositionState(symbol=s) for s in self.symbols
         }
         self._pending: dict[str, dict[str, Any]] = {}
-        self._last_entry_bar: dict[str, str] = {}
-        self._signaled_bar: dict[str, str] = {}
         self._close_side: dict[str, str] = {}
         self._close_entry: dict[str, float] = {}
 

@@ -529,16 +529,21 @@ def test_strategy_compare_keeps_one_symbol_and_ranks_each_engine() -> None:
     assert "mean_reversion" not in engines
     assert "sar_flip" not in engines
     assert "morning_gap_c" not in engines
+    assert "morning_box_a" not in engines
     # 含长线趋势加减仓和布林/SAR/多因子；以后再加策略时这里要跟着 SCREEN_STRATEGIES 变。
     assert "swing_trend" in engines
+    assert "ema_swing" in engines
     assert "bollinger" in engines
     assert "sar_trend" in engines
     assert "multi_factor" in engines
-    assert "multi_vote" in engines
-    assert "multi_hybrid" in engines
-    assert "jesse_casper" in engines
-    assert len(engines) == len(set(engines)) == 12
-    assert [item[0] for item in seen] == ["rb2701"] * 12
+    assert "multi_vote" not in engines
+    assert "multi_hybrid" not in engines
+    assert "jesse_casper" not in engines
+    assert "daily_body_expand" not in engines
+    assert "swing_box" in engines
+    assert "float_hold" in engines
+    assert len(engines) == len(set(engines)) == 11
+    assert [item[0] for item in seen] == ["rb2701"] * 11
     assert [item[1] for item in seen] == engines
     shown = list_rows(result)
     assert shown[0]["symbol"] == "日内实体"
@@ -688,7 +693,7 @@ def test_market_snapshot_scores_by_engine_and_skips_unfiltered_ones() -> None:
     assert isinstance(row["market_ok"], bool)
     assert row["market_note"]
 
-    box = _market_snapshot(cfg, lambda symbol, tf, n: bars, "fu2701", "5", "morning_box_a")
+    box = _market_snapshot(cfg, lambda symbol, tf, n: bars, "fu2701", "5", "swing_box")
     assert box == {"market_score": None, "market_ok": None, "market_note": "未接入行情过滤"}
 
     missing = _market_snapshot(cfg, lambda symbol, tf, n: None, "fu2701", "5", "multi_factor")
@@ -736,12 +741,11 @@ def test_cross_uses_config_contracts_and_strategies() -> None:
     engines = engines_for_cross(
         {"strategy": {"cross_engines": ["daily_body", "supertrend", "custom", "nope", "daily_body"]}}
     )
-    # 配置里点名的排前面；程序还认识的其它策略自动补在后面。已删的名字忽略。
+    # 配置里点名的就测这些；已删的名字忽略。没写名单时才用全部策略。
     codes = [code for code, _label in engines]
-    assert codes[:2] == ["daily_body", "supertrend"]
+    assert codes == ["daily_body", "supertrend"]
     assert "custom" not in codes
     assert "sar_flip" not in codes
-    assert set(codes) == {code for code, _label in SCREEN_STRATEGIES}
     assert len(engines_for_cross({})) == len(SCREEN_STRATEGIES)
 
     # 交叉测试本体只跑这两套，用来核对合约名单，不把补全后的整份名单再测一遍。
@@ -761,6 +765,7 @@ def test_cross_uses_config_contracts_and_strategies() -> None:
         ("wr2601", "daily_body"),
         ("wr2601", "supertrend"),
     ]
+    assert {row["timeframe"] for row in result["rows"]} == {"5"}
     assert "rb0" not in {row["symbol"] for row in result["rows"]}
     by_symbol = {row["symbol"]: row for row in result["rows"]}
     assert by_symbol["wr2601"]["liquidity"] == "偏少"
@@ -768,3 +773,104 @@ def test_cross_uses_config_contracts_and_strategies() -> None:
     assert "rb0" in note
     assert "不跑这一份" in note
     assert "rb2701" not in note
+
+
+def test_cross_matches_strategy_symbol_and_period() -> None:
+    """勾选多档周期时，策略×合约×周期都跑；信号和止损是同一个周期。"""
+
+    class Perf:
+        trades = 0
+        win_rate = 0.0
+        profit_factor = 0.0
+        max_drawdown = 0.0
+        net_pnl = 0.0
+        score = 0.0
+
+    class Result:
+        performance = Perf()
+        params_snapshot = {}
+        bars = 0
+
+    seen: list[tuple[str, str, str, str]] = []
+
+    def runner(cfg, *, symbol, volume, start_date, end_date, engine):
+        st = cfg.get("strategy") or {}
+        seen.append((symbol, engine, str(st.get("timeframe")), str(st.get("trail_timeframe"))))
+        return Result()
+
+    result = screen_cross(
+        {"strategy": {}, "trade": {}, "risk": {}},
+        {"fixed_volume": 1},
+        universe=contracts_for_cross(["rb2701", "SA2701"]),
+        engines=[("daily_body", "日内实体"), ("swing_box", "长线箱体突破")],
+        periods=["15", "60"],
+        runner=runner,
+    )
+    assert seen == [
+        ("rb2701", "daily_body", "15", "15"),
+        ("rb2701", "swing_box", "15", "15"),
+        ("SA2701", "daily_body", "15", "15"),
+        ("SA2701", "swing_box", "15", "15"),
+        ("rb2701", "daily_body", "60", "60"),
+        ("rb2701", "swing_box", "60", "60"),
+        ("SA2701", "daily_body", "60", "60"),
+        ("SA2701", "swing_box", "60", "60"),
+    ]
+    assert len(result["rows"]) == 8
+    shown = list_rows(result)
+    assert {row["period"] for row in shown} == {"15分钟", "60分钟"}
+
+
+def test_cross_list_rows_show_payoff() -> None:
+    """交叉测试结果表写出盈亏比。没有亏损笔时显示横杠，不是盈利因子。"""
+    row = {
+        "symbol": "rb0",
+        "product": "螺纹",
+        "strategy": "日内实体",
+        "trades": 8,
+        "win_rate": 0.5,
+        "profit_factor": 6.0,
+        "payoff": 3.0,
+        "max_drawdown": 100,
+        "net_pnl": 500,
+        "picked": "较好",
+        "rank": 1,
+        "liquidity": "正常",
+        "frequency": "8笔",
+    }
+    shown = list_rows({"mode": "cross", "rows": [row], "settings": {"timeframe": "5"}})
+    assert shown[0]["payoff"] == "3.00"
+    assert shown[0]["profit_factor"] == "6.00"
+    none = dict(row)
+    none["payoff"] = 0
+    blank = list_rows({"mode": "cross", "rows": [none], "settings": {"timeframe": "5"}})
+    assert blank[0]["payoff"] == "—"
+
+
+def test_cross_list_rows_show_expectancy() -> None:
+    """交叉测试写出无单位收益期望：胜率×盈亏比 − 败率。没有亏损笔时横杠。"""
+    row = {
+        "symbol": "rb0",
+        "product": "螺纹",
+        "strategy": "日内实体",
+        "trades": 8,
+        "win_rate": 0.5,
+        "profit_factor": 6.0,
+        "payoff": 3.0,
+        "max_drawdown": 100,
+        "net_pnl": 500,
+        "picked": "较好",
+        "rank": 1,
+        "liquidity": "正常",
+        "frequency": "8笔",
+    }
+    shown = list_rows({"mode": "cross", "rows": [row], "settings": {"timeframe": "5"}})
+    # 胜率 0.5、盈亏比 3 → 0.5×3 − 0.5 = 1；每笔收益仍是盈利覆盖÷笔数。
+    assert shown[0]["expectancy"] == "1.00"
+    assert shown[0]["pnl_per_trade"] == "50.00元"
+    empty = dict(row)
+    empty["trades"] = 0
+    empty["net_pnl"] = 0
+    empty["payoff"] = 0
+    blank = list_rows({"mode": "cross", "rows": [empty], "settings": {"timeframe": "5"}})
+    assert blank[0]["expectancy"] == "—"

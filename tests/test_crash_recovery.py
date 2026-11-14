@@ -2,7 +2,10 @@
 
 import json
 
+import pytest
+
 from src.scheduler.runner import TradingBot
+from src.strategy.types import StrategyAction, StrategyDecision
 from src.utils.state_store import default_state_path, load_state
 
 
@@ -131,6 +134,40 @@ def test_close_intent_matches_manual_close_without_comparing_volume(tmp_path):
     assert bot.pending_intent_matches("bu2612", "close", 1)
     assert bot.pending_intent_matches("bu2612", "close", 3)
     assert bot.pending_intent_matches("bu2612", "buy_open", 1) is None
+
+
+def test_order_intent_context_clears_after_normal_exit(tmp_path):
+    """正常走完（成功或明确失败）后意图文件自动清掉，不用每个分支手写清理。"""
+    bot = TradingBot(_cfg(tmp_path))
+    decision = StrategyDecision(
+        StrategyAction.BUY_OPEN,
+        "bu2612",
+        "测试",
+        entry_price=4000,
+        meta={"bar_id": "2026-11-04 09:15"},
+    )
+    with bot._order_intent(decision, 1):
+        assert _intent_path(tmp_path).exists()
+    assert not _intent_path(tmp_path).exists()
+
+
+def test_order_intent_context_keeps_file_when_body_raises(tmp_path):
+    """点击后抛异常要保留意图文件，下次启动按未完成委托熔断，避免重复下单。"""
+    bot = TradingBot(_cfg(tmp_path))
+    decision = StrategyDecision(
+        StrategyAction.BUY_OPEN,
+        "bu2612",
+        "测试",
+        entry_price=4000,
+        meta={"bar_id": "2026-11-04 09:15"},
+    )
+    with pytest.raises(RuntimeError):
+        with bot._order_intent(decision, 1):
+            raise RuntimeError("点击后崩溃")
+    assert _intent_path(tmp_path).exists()
+    payload = json.loads(_intent_path(tmp_path).read_text(encoding="utf-8"))
+    assert payload["symbol"] == "bu2612"
+    assert payload["volume"] == 1
 
 
 def test_event_log_rotates_when_file_gets_too_large(tmp_path, monkeypatch) -> None:

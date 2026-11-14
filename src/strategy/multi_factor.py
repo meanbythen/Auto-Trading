@@ -1,12 +1,8 @@
 """
-多因子复合 CTA（三套对照）
+多因子复合 CTA（加权打分）
 
-功能：
-  1. 加权打分（本文件主推，engine=multi_factor）：四因子按固定权重合成总分，过阈值才开。
-  2. 等权投票（engine=multi_vote）：至少两票同向且票数差够才开。
-  3. 打分+投票混合（engine=multi_hybrid）：投票决定能不能开，总分决定开几成仓。
-原理：四个因子的打分规则完全一样，只改合成方式，方便对照。信号周期跟配置页公共项走。
-     SAR 开不开关在多因子自己的配置里，关掉后权重摊给剩下三个因子。
+功能：四因子按固定权重合成总分，过阈值才开（engine=multi_factor）。
+原理：信号周期跟配置页公共项走。SAR 开不开关在多因子自己的配置里，关掉后权重摊给剩下三个因子。
 """
 
 from __future__ import annotations
@@ -20,7 +16,6 @@ from .cta_factors import (
     FactorParams,
     FactorSnapshot,
     compute_factors,
-    position_ratio,
 )
 from .cta_filter import CtaFilterParams, CtaGate, evaluate_cta_filter
 from .market_state import MarketFilter, MarketFilterParams
@@ -28,30 +23,15 @@ from .trend_base import TrendStrategyBase
 from .types import PositionState, StrategyAction, config_flag
 
 
-def _merge_cta_box(cfg: dict[str, Any], section: str) -> dict[str, Any]:
-    """
-    投票/混合先抄加权版那一组因子参数，再用自己这一节覆盖。
-
-    原理：对照时均线根数、SAR 开关应该一致，只改合成规则；
-    各自节里的 min_votes、仓位系数仍以自己为准。
-    """
+def _load_cta_box(cfg: dict[str, Any], section: str) -> dict[str, Any]:
+    """读这一套多因子自己的配置小节。"""
     st = cfg.get("strategy") or {}
-    shared = st.get("multi_factor") if isinstance(st.get("multi_factor"), dict) else {}
     own = st.get(section) if isinstance(st.get(section), dict) else {}
-    if section == "multi_factor":
-        return dict(own)
-    merged = {**shared, **own}
-    # 行情闸门是各对照自己的，不能把加权版那一份抄过来（弱趋势加严方式不同）。
-    own_filter = own.get("cta_filter") if isinstance(own.get("cta_filter"), dict) else None
-    if own_filter is not None:
-        merged["cta_filter"] = own_filter
-    else:
-        merged.pop("cta_filter", None)
-    return merged
+    return dict(own)
 
 
 class CtaFactorStrategy(TrendStrategyBase):
-    """三套多因子共用的骨架：算因子、日线过滤、2 倍 ATR 只往有利方向收止损。"""
+    """多因子加权打分骨架：算因子、日线过滤、2 倍 ATR 只往有利方向收止损。"""
 
     uses_trend_bars = True
     mode = "score"
@@ -59,7 +39,7 @@ class CtaFactorStrategy(TrendStrategyBase):
 
     def __init__(self, cfg: dict[str, Any]) -> None:
         super().__init__(cfg)
-        self.box = _merge_cta_box(cfg, self.section)
+        self.box = _load_cta_box(cfg, self.section)
         self.params = FactorParams.from_box(self.box)
         self.atr_period = self.params.atr_period
         self.threshold = min(0.95, max(0.1, float(self.box.get("threshold", 0.6) or 0.6)))
@@ -70,8 +50,6 @@ class CtaFactorStrategy(TrendStrategyBase):
         # 本策略自己的行情闸门；不再套页面底下那张公共趋势过滤器，避免拦两次。
         self.cta_filter = CtaFilterParams.from_box(self.box, kind=self.section)
         self.market_filter = MarketFilter(MarketFilterParams(enabled=False, mode="trend"))
-        self.min_votes = max(1, int(self.box.get("min_votes", 2) or 2))
-        self.min_vote_diff = max(0, int(self.box.get("min_vote_diff", 2) or 2))
         self.min_position_ratio = float(self.box.get("min_position_ratio", 0.5) or 0.5)
         self.max_position_ratio = float(self.box.get("max_position_ratio", 1.0) or 1.0)
         # 日线周期写在策略自己这一节；信号周期仍是配置页公共项 timeframe。
@@ -189,32 +167,10 @@ class CtaFactorStrategy(TrendStrategyBase):
         return gate is not None and not gate.ok
 
     def _gray_need_score(self, gate: CtaGate | None) -> float:
-        """弱趋势时加权/混合要把总分抬到资料里的 0.75。"""
+        """弱趋势时要把总分抬到资料里的 0.75。"""
         if gate is None or not gate.gray:
             return 0.0
         return float(self.cta_filter.weak_score or 0.0)
-
-    def _gray_need_votes(self, gate: CtaGate | None) -> int:
-        """弱趋势时投票/混合至少要这么多同向票。"""
-        if gate is None or not gate.gray:
-            return self.min_votes
-        extra = int(self.cta_filter.weak_votes or 0)
-        return max(self.min_votes, extra) if extra else self.min_votes
-
-    def _vote_side_for_gate(self, snap: FactorSnapshot, gate: CtaGate | None):
-        """投票方向；弱趋势时临时抬高最少票数。"""
-        need = self._gray_need_votes(gate)
-        if (
-            snap.long_votes >= need
-            and (snap.long_votes - snap.short_votes) >= self.min_vote_diff
-        ):
-            return "long"
-        if (
-            snap.short_votes >= need
-            and (snap.short_votes - snap.long_votes) >= self.min_vote_diff
-        ):
-            return "short"
-        return None
 
     def _merge_size(self, gate: CtaGate | None, extra: dict[str, Any] | None) -> dict[str, Any]:
         """弱趋势把仓位打成数写进开仓备注，1 手账户仍会开成 1 手。"""
@@ -223,20 +179,6 @@ class CtaFactorStrategy(TrendStrategyBase):
             prev = float(out.get("size_scale") or 1.0)
             out["size_scale"] = round(min(prev, gate.size_scale), 4)
         return out
-
-    def _vote_side(self, snap: FactorSnapshot) -> str | None:
-        """等权投票有没有形成方向。"""
-        if (
-            snap.long_votes >= self.min_votes
-            and (snap.long_votes - snap.short_votes) >= self.min_vote_diff
-        ):
-            return "long"
-        if (
-            snap.short_votes >= self.min_votes
-            and (snap.short_votes - snap.long_votes) >= self.min_vote_diff
-        ):
-            return "short"
-        return None
 
     def _open_pack(
         self,
@@ -324,7 +266,6 @@ class CtaFactorStrategy(TrendStrategyBase):
         pos = self.positions.get(symbol)
         if pos is not None and pos.side != "flat":
             return decision
-        ind = getattr(self, "_last_ind", None)
         # super().evaluate 没有把 prepare 结果留下来，这里再算一次太贵；
         # 改成：若 reason 仍是默认等待，用最新 bars 补一句更准的原因。
         if "空仓等待" not in str(decision.reason):
@@ -430,102 +371,6 @@ class MultiFactorStrategy(CtaFactorStrategy):
             return f"多因子平多 {self._score_text(snap)} 反向穿阈值"
         if pos.side == "short" and snap.total >= self.threshold:
             return f"多因子平空 {self._score_text(snap)} 反向穿阈值"
-        return None
-
-    def evaluate(self, symbol: str, bars: pd.DataFrame, now=None, trail_bars=None, trend_bars=None):
-        decision = super().evaluate(
-            symbol, bars, now=now, trail_bars=trail_bars, trend_bars=trend_bars
-        )
-        if decision.action in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN):
-            _stash_open_meta(self, symbol, decision.meta or {})
-        return decision
-
-
-class MultiVoteStrategy(CtaFactorStrategy):
-    """等权投票：每个因子投多/空/弃权，票数和票差都够才开。"""
-
-    section = "multi_vote"
-    label = "多因子投票"
-    mode = "vote"
-
-    def _entry_from_snap(self, close: float, snap: FactorSnapshot, gate: CtaGate | None = None):
-        side = self._vote_side_for_gate(snap, gate)
-        if side is None:
-            return None
-        word = "做多" if side == "long" else "做空"
-        pad = self.atr_stop_mult * snap.atr
-        stop = close - pad if side == "long" else close + pad
-        tag = f" {gate.describe()}" if gate and gate.ok else ""
-        return self._open_pack(
-            side,
-            close,
-            snap,
-            f"多因子投票{word} {self._vote_text(snap)} {self._score_text(snap)}{tag} 止损{stop:.2f}",
-            extra=self._merge_size(gate, None) or None,
-        )
-
-    def _exit_from_snap(self, pos: PositionState, snap: FactorSnapshot) -> str | None:
-        side = self._vote_side(snap)
-        if pos.side == "long" and side == "short":
-            return f"多因子投票平多 {self._vote_text(snap)} 反向占优"
-        if pos.side == "short" and side == "long":
-            return f"多因子投票平空 {self._vote_text(snap)} 反向占优"
-        return None
-
-    def evaluate(self, symbol: str, bars: pd.DataFrame, now=None, trail_bars=None, trend_bars=None):
-        decision = super().evaluate(
-            symbol, bars, now=now, trail_bars=trail_bars, trend_bars=trend_bars
-        )
-        if decision.action in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN):
-            _stash_open_meta(self, symbol, decision.meta or {})
-        return decision
-
-
-class MultiHybridStrategy(CtaFactorStrategy):
-    """投票决定开不开，加权总分决定开几成仓（0.5～1.0 倍风控手数）。"""
-
-    section = "multi_hybrid"
-    label = "多因子混合"
-    mode = "hybrid"
-
-    def _entry_from_snap(self, close: float, snap: FactorSnapshot, gate: CtaGate | None = None):
-        side = self._vote_side_for_gate(snap, gate)
-        if side is None:
-            return None
-        if abs(snap.total) < max(self.threshold, self._gray_need_score(gate)) and gate and gate.gray:
-            # 弱趋势时混合版既要票够，也要总分够高，和资料「只收极高分」一致。
-            return None
-        ratio = position_ratio(
-            abs(snap.total),
-            self.threshold,
-            self.min_position_ratio,
-            self.max_position_ratio,
-        )
-        extra = self._merge_size(gate, {"size_scale": round(ratio, 4)})
-        ratio = float(extra.get("size_scale") or ratio)
-        word = "做多" if side == "long" else "做空"
-        pad = self.atr_stop_mult * snap.atr
-        stop = close - pad if side == "long" else close + pad
-        tag = f" {gate.describe()}" if gate and gate.ok else ""
-        return self._open_pack(
-            side,
-            close,
-            snap,
-            f"多因子混合{word} {self._vote_text(snap)} {self._score_text(snap)}{tag} "
-            f"仓位{ratio:.0%} 止损{stop:.2f}",
-            extra=extra,
-        )
-
-    def _exit_from_snap(self, pos: PositionState, snap: FactorSnapshot) -> str | None:
-        vote_side = self._vote_side(snap)
-        if pos.side == "long" and (
-            vote_side == "short" or snap.total <= -self.threshold
-        ):
-            return f"多因子混合平多 {self._vote_text(snap)} {self._score_text(snap)}"
-        if pos.side == "short" and (
-            vote_side == "long" or snap.total >= self.threshold
-        ):
-            return f"多因子混合平空 {self._vote_text(snap)} {self._score_text(snap)}"
         return None
 
     def evaluate(self, symbol: str, bars: pd.DataFrame, now=None, trail_bars=None, trend_bars=None):

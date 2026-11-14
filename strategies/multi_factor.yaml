@@ -48,6 +48,5 @@ defaults:
     weak_votes: 0
 
 notes:
-  - 对照策略：multi_vote（投票）、multi_hybrid（投票+打分）
   - 权重不参与自动优化，避免四个数字把曲线拟合坏
   - 天勤这一版没有日线时，方向过滤会拦住新开仓

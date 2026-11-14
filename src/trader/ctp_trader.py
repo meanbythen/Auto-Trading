@@ -273,8 +273,8 @@ class CtpTrader(TraderBase):
         if blocked:
             logger.error(blocked)
             return OrderResult(ok=False, message=blocked, assumed_fill=False)
-        if self.gateway.trading_paused:
-            text = "已暂停报单，本笔没有发到柜台"
+        if self.gateway.trading_paused and req.side != "close":
+            text = "已暂停开新仓，本笔没有发到柜台"
             logger.warning(text)
             return OrderResult(ok=False, message=text, assumed_fill=False)
         if not self.settings.desk_session and self.has_working_order(req.symbol):

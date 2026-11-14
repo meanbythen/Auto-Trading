@@ -1,0 +1,19 @@
+# 提交前自动检查。用的是 requirements-dev.txt 里装的 ruff / mypy，
+# 不另外下载钩子环境，国内网络也能直接跑。
+# 第一次用先执行：python -m pre_commit install
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: ruff check
+        entry: python -m ruff check --fix --force-exclude
+        language: system
+        types: [python]
+        require_serial: true
+      - id: mypy
+        name: mypy
+        entry: python -m mypy
+        language: system
+        types: [python]
+        pass_filenames: false
+        require_serial: true

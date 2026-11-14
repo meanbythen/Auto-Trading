@@ -41,6 +41,9 @@ COLUMNS = [
     "得分",
     "成交笔数",
     "胜率",
+    "平均盈利",
+    "平均亏损",
+    "盈亏比",
     "净盈亏",
     "盈利因子",
     "优化参数JSON",
@@ -78,6 +81,9 @@ def version_to_row(v: dict[str, Any], *, exported_at: str | None = None) -> dict
         "得分": v.get("score"),
         "成交笔数": perf.get("trades"),
         "胜率": perf.get("win_rate"),
+        "平均盈利": perf.get("avg_win"),
+        "平均亏损": perf.get("avg_loss"),
+        "盈亏比": perf.get("payoff"),
         "净盈亏": perf.get("net_pnl"),
         "盈利因子": perf.get("profit_factor"),
         "优化参数JSON": json.dumps(v.get("opt_params") or {}, ensure_ascii=False),
@@ -127,6 +133,9 @@ def row_to_version(row: dict[str, Any]) -> dict[str, Any] | None:
     performance = {
         "trades": int(trades) if trades is not None else None,
         "win_rate": _num("胜率", "win_rate"),
+        "avg_win": _num("平均盈利", "avg_win"),
+        "avg_loss": _num("平均亏损", "avg_loss"),
+        "payoff": _num("盈亏比", "payoff"),
         "net_pnl": _num("净盈亏", "net_pnl"),
         "profit_factor": _num("盈利因子", "profit_factor"),
     }
@@ -308,7 +317,7 @@ def export_append_excel(
                 if x is not None and str(x).strip() and str(x).lower() != "nan"
             }
     merged = merged_param_frame(root, path, include_factory=include_factory)
-    write_sheet(path, SHEET_PARAMS, merged)
+    path = write_sheet(path, SHEET_PARAMS, merged)
     new_ids = {
         str(x).strip()
         for x in merged["版本ID"].tolist()

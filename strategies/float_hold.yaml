@@ -1,0 +1,24 @@
+# 日内浮盈飘单
+name: float_hold
+route: |
+  配置页策略引擎选「日内浮盈飘单」，或 config.yaml 写 strategy.engine: float_hold。
+  不会改掉正在用的日内实体。两套可以分开回测、分开优化。
+principle:
+  - 这一版尽量简单：观察窗口走完，顺着 EMA60/120 开仓。弱反转、下午走平靠止损认小亏；碰到单边日拿到收盘。
+  - 拆成四块：方向选择器、仓位（公共凯利/风控）、开仓窗口与清仓、ATR 止损。
+  - 出厂方向是「观察结束顺大方向」。也可以改成昨日密集区、开盘箱体突破或 MACD 一轮循环。
+  - 昨日密集区：上一交易日被反复摸到、宽度不超过 cluster_max_width 点的价格带。观察结束后站上做多、跌破做空。
+  - 跳空过大不开、跳空只顺向、箱太宽、急破不追，出厂全关，避免过滤把单边日挡掉。
+  - 止损从进场价往回留 1.5 倍开盘前 ATR。浮盈达到 2 倍 ATR 后保本。
+  - 日盘截止出厂 14:45，夜盘 22:50。日盘止损后截止前还可以再试一次。
+  - 不做反向的震荡单。收盘清仓听配置页总开关。
+params:
+  direction: 方向选择器。eth_trend=观察结束顺大方向（出厂）；day_cluster=观察结束看昨日密集区；opening_box=开盘箱体突破；macd_cycle=MACD一轮循环。
+  cluster_max_width: 昨日密集区最宽点数。出厂 10。
+  eth_minutes: 从这段开盘起观察几分钟。出厂 60。对 eth_trend、昨日密集区和箱子有效。
+  day_cutoff / night_cutoff: 过点不再开新仓。出厂 14:45 / 22:50。
+  stop_atr_mult: 止损离进场价几倍开盘前 ATR。出厂 1.5。
+  be_atr_mult: 浮盈几倍开盘前 ATR 后保本。出厂 2，0=关。
+  trend_slope_min_deg: 均线最小倾角。出厂 0=只看谁在上面。
+  skip_gap_atr_mult / gap_align_atr_mult / max_box_atr_mult / max_chase_atr_mult: 出厂 0=关。
+  macd_timeframe / macd_fast / macd_slow / macd_signal / dir_ema_fast / dir_ema_slow: 只给 MACD 循环用。

@@ -53,6 +53,24 @@ def test_filter_bars_by_range_uses_futures_trading_day() -> None:
     assert pd.Timestamp("2026-09-18 21:15") not in cut.index
 
 
+def test_filter_bars_keep_before_leaves_lookback() -> None:
+    """开始日之前留下的K线只给均线预热，结束日不变。"""
+    import pandas as pd
+
+    from src.backtest.engine import filter_bars_by_range
+
+    idx = pd.date_range("2026-09-17 09:00", "2026-09-18 15:00", freq="15min")
+    close = pd.Series(1.0, index=idx)
+    df = pd.DataFrame(
+        {"open": close, "high": close, "low": close, "close": close, "volume": 1}
+    )
+    tight = filter_bars_by_range(df, "2026-09-18", "2026-09-18")
+    wide = filter_bars_by_range(df, "2026-09-18", "2026-09-18", keep_before=3)
+    assert wide.index[-1] == tight.index[-1]
+    assert len(wide) == len(tight) + 3
+    assert wide.index[0] < tight.index[0]
+
+
 def test_filled_dates_cut_bars_and_early_start_is_explained() -> None:
     """开始日期早于行情时，结果要说明实际从哪天开始；区间落在行情内时必须截短。"""
     import pandas as pd

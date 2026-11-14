@@ -27,6 +27,11 @@ def _cfg() -> dict:
             "daily_body": {
                 "eth_minutes": 20,
                 "regime_filter": False,
+                # 测试数据短、ATR 不稳定：默认关掉三道 ATR 闸，需要时再单独打开。
+                "skip_gap_atr_mult": 0,
+                "max_box_atr_mult": 0,
+                "max_chase_atr_mult": 0,
+                "filter_atr_period": 4,
             },
         },
         "trade": {"symbol": "bu2612", "volume": 1},
@@ -102,10 +107,10 @@ def _cfg5() -> dict:
     return cfg
 
 
-def _cfg_chase(chase: int = 5) -> dict:
-    """急破不追：收盘离破位超过 chase 跳就先等回抽。"""
+def _cfg_chase(chase: float = 5.0) -> dict:
+    """急破不追：收盘离破位超过 chase 倍开盘前 ATR 就先等回抽。"""
     cfg = _cfg5()
-    cfg["strategy"]["daily_body"]["max_chase_ticks"] = chase
+    cfg["strategy"]["daily_body"]["max_chase_atr_mult"] = float(chase)
     return cfg
 
 
@@ -438,7 +443,7 @@ def test_box_stop_exits_without_waiting_for_the_close() -> None:
     # 止损后、截止前，反向突破第二段箱体可以再开一次（日盘上限两次）。
     again = strategy.evaluate("bu2612", crash, now=datetime(2026, 10, 23, 10, 15))
     assert again.action == StrategyAction.SELL_OPEN
-    assert "第二次开仓" in again.reason
+    assert "第二ETH窗口开仓" in again.reason
 
 
 def test_pullback_inside_box_does_not_exit() -> None:
@@ -490,14 +495,20 @@ def _gap_bars(end: str, close: float, prev_close: float) -> pd.DataFrame:
     end_ts = pd.Timestamp(end)
     opened = end_ts.normalize() + pd.Timedelta(hours=21 if end_ts.hour >= 21 else 9)
     prior = bars.index <= opened
-    bars.loc[prior, ["open", "high", "low", "close"]] = prev_close
+    # 上一段收在 prev_close，但仍留一点高低，好让开盘前 ATR 算得出来。
+    bars.loc[prior, "open"] = prev_close
+    bars.loc[prior, "close"] = prev_close
+    bars.loc[prior, "high"] = prev_close + 1.0
+    bars.loc[prior, "low"] = prev_close - 1.0
     return bars
 
 
 def test_big_gap_blocks_the_open() -> None:
-    """上一段收 40、这一段开 100，跳空 60 点超过默认 50，方向出来了也不追。"""
+    """上一段收 40、这一段开 100，跳空远大于 2.5 倍开盘前 ATR，方向出来了也不追。"""
+    cfg = _cfg()
+    cfg["strategy"]["daily_body"]["skip_gap_atr_mult"] = 2.5
     bars = _gap_bars("2026-10-23 09:45", 105.0, 40.0)
-    decision = DailyBodyStrategy(_cfg()).evaluate("bu2612", bars, now=datetime(2026, 10, 23, 9, 45))
+    decision = DailyBodyStrategy(cfg).evaluate("bu2612", bars, now=datetime(2026, 10, 23, 9, 45))
     assert decision.action == StrategyAction.HOLD
     assert "跳空" in decision.reason
     assert "不追" in decision.reason
@@ -506,16 +517,18 @@ def test_big_gap_blocks_the_open() -> None:
 
 
 def test_small_gap_still_opens() -> None:
-    """跳空 20 点，在默认 50 以内，照常开。"""
-    bars = _gap_bars("2026-10-23 09:45", 105.0, 80.0)
-    decision = DailyBodyStrategy(_cfg()).evaluate("bu2612", bars, now=datetime(2026, 10, 23, 9, 45))
+    """跳空大约 2 点，小于 2.5 倍开盘前 ATR，照常开。"""
+    cfg = _cfg()
+    cfg["strategy"]["daily_body"]["skip_gap_atr_mult"] = 2.5
+    bars = _gap_bars("2026-10-23 09:45", 105.0, 98.0)
+    decision = DailyBodyStrategy(cfg).evaluate("bu2612", bars, now=datetime(2026, 10, 23, 9, 45))
     assert decision.action == StrategyAction.BUY_OPEN
 
 
 def test_gap_filter_off_opens_anyway() -> None:
-    """skip_gap_ticks=0 时关闭过滤，60 点跳空也照开。"""
+    """skip_gap_atr_mult=0 时关闭过滤，60 点跳空也照开。"""
     cfg = _cfg()
-    cfg["strategy"]["daily_body"]["skip_gap_ticks"] = 0
+    cfg["strategy"]["daily_body"]["skip_gap_atr_mult"] = 0
     bars = _gap_bars("2026-10-23 09:45", 105.0, 40.0)
     decision = DailyBodyStrategy(cfg).evaluate("bu2612", bars, now=datetime(2026, 10, 23, 9, 45))
     assert decision.action == StrategyAction.BUY_OPEN
@@ -531,8 +544,10 @@ def test_no_previous_session_does_not_block() -> None:
 
 def test_gap_filter_also_applies_to_the_night() -> None:
     """夜盘同样按日盘最后一根收盘算跳空。"""
+    cfg = _cfg()
+    cfg["strategy"]["daily_body"]["skip_gap_atr_mult"] = 2.5
     bars = _gap_bars("2026-10-23 21:45", 98.0, 160.0)
-    decision = DailyBodyStrategy(_cfg()).evaluate("bu2612", bars, now=datetime(2026, 10, 23, 21, 45))
+    decision = DailyBodyStrategy(cfg).evaluate("bu2612", bars, now=datetime(2026, 10, 23, 21, 45))
     assert decision.action == StrategyAction.HOLD
     assert "跳空" in decision.reason
 
@@ -550,28 +565,32 @@ def _wide_box(end: str, close: float, width: float) -> pd.DataFrame:
 
 
 def test_too_wide_box_blocks_the_open() -> None:
-    """箱体宽 110 点，超过默认上限 100，方向出来了也不开。"""
-    bars = _wide_box("2026-10-23 09:45", 157.0, 110.0)
-    decision = DailyBodyStrategy(_cfg()).evaluate("bu2612", bars, now=datetime(2026, 10, 23, 9, 45))
+    """箱体宽 20 点，超过 5 倍开盘前 ATR，方向出来了也不开。"""
+    cfg = _cfg()
+    cfg["strategy"]["daily_body"]["max_box_atr_mult"] = 5.0
+    bars = _wide_box("2026-10-23 09:45", 157.0, 20.0)
+    decision = DailyBodyStrategy(cfg).evaluate("bu2612", bars, now=datetime(2026, 10, 23, 9, 45))
     assert decision.action == StrategyAction.HOLD
     assert "箱体" in decision.reason
-    assert "宽 110" in decision.reason
+    assert "宽 20" in decision.reason
     # 标成「有信号但被过滤」，回测结果才能把这条和原因一起列出来。
     assert decision.meta.get("blocked") is True
     assert decision.meta.get("side") == "long"
 
 
 def test_narrow_box_still_opens() -> None:
-    """箱体宽 80 点，在上限以内，照常开。"""
-    bars = _wide_box("2026-10-23 09:45", 143.0, 80.0)
-    decision = DailyBodyStrategy(_cfg()).evaluate("bu2612", bars, now=datetime(2026, 10, 23, 9, 45))
+    """箱体宽 3 点，在 5 倍开盘前 ATR 以内，照常开。"""
+    cfg = _cfg()
+    cfg["strategy"]["daily_body"]["max_box_atr_mult"] = 5.0
+    bars = _wide_box("2026-10-23 09:45", 143.0, 3.0)
+    decision = DailyBodyStrategy(cfg).evaluate("bu2612", bars, now=datetime(2026, 10, 23, 9, 45))
     assert decision.action == StrategyAction.BUY_OPEN
 
 
 def test_max_box_off_opens_anyway() -> None:
-    """max_box_ticks=0 时关闭这条限制，110 点的箱体也照开。"""
+    """max_box_atr_mult=0 时关闭这条限制，110 点的箱体也照开。"""
     cfg = _cfg()
-    cfg["strategy"]["daily_body"]["max_box_ticks"] = 0
+    cfg["strategy"]["daily_body"]["max_box_atr_mult"] = 0
     bars = _wide_box("2026-10-23 09:45", 157.0, 110.0)
     decision = DailyBodyStrategy(cfg).evaluate("bu2612", bars, now=datetime(2026, 10, 23, 9, 45))
     assert decision.action == StrategyAction.BUY_OPEN
@@ -658,7 +677,7 @@ def _stop_out_long(strategy: DailyBodyStrategy, at: datetime) -> None:
 
 
 def test_day_second_open_after_stop_uses_the_eth2_box() -> None:
-    """日盘第一次止损后、截止前，用第二段 ETH 箱体再开一次。"""
+    """日盘第一窗口止损后、截止前，用第二ETH窗口的箱子再开一次。"""
     strategy = DailyBodyStrategy(_cfg())
     opened = _open_long_at_0945(strategy)
     assert opened.action == StrategyAction.BUY_OPEN
@@ -667,7 +686,7 @@ def test_day_second_open_after_stop_uses_the_eth2_box() -> None:
         "bu2612", _breakout("2026-10-23 10:00", 105.0), now=datetime(2026, 10, 23, 10, 0)
     )
     assert second.action == StrategyAction.BUY_OPEN
-    assert "第二次开仓" in second.reason
+    assert "第二ETH窗口开仓" in second.reason
 
 
 def test_second_stop_ends_the_day_session() -> None:
@@ -721,7 +740,7 @@ def test_a_non_stop_exit_does_not_unlock_a_second_open() -> None:
 
 
 def test_eth_minutes2_zero_disables_the_second_open() -> None:
-    """eth_minutes2 填 0：关闭二次开仓，日盘回到只开一次。"""
+    """eth_minutes2 填 0：关掉第二ETH窗口，日盘回到只开一次。"""
     cfg = _cfg()
     cfg["strategy"]["daily_body"]["eth_minutes2"] = 0
     strategy = DailyBodyStrategy(cfg)
@@ -735,7 +754,7 @@ def test_eth_minutes2_zero_disables_the_second_open() -> None:
 
 
 def test_second_open_waits_until_the_eth2_finishes() -> None:
-    """第二段 ETH 没走完，第二次开仓也要等。"""
+    """第二ETH窗口没走完，止损后再开也要等。"""
     cfg = _cfg()
     cfg["strategy"]["daily_body"]["eth_minutes2"] = 60
     strategy = DailyBodyStrategy(cfg)
@@ -745,12 +764,98 @@ def test_second_open_waits_until_the_eth2_finishes() -> None:
         "bu2612", _breakout("2026-10-23 09:55", 105.0), now=datetime(2026, 10, 23, 9, 55)
     )
     assert waiting.action == StrategyAction.HOLD
-    assert "第二段 ETH" in waiting.reason
+    assert "第二ETH窗口" in waiting.reason
     assert "10:00" in waiting.reason
     opened = strategy.evaluate(
         "bu2612", _breakout("2026-10-23 10:15", 105.0), now=datetime(2026, 10, 23, 10, 15)
     )
     assert opened.action == StrategyAction.BUY_OPEN
+
+
+def _breakout_eth2_lower(end: str, close: float, extra_low: float = 95.0) -> pd.DataFrame:
+    """第一段 ETH 仍是 99～101；9:20 到 9:30 把最低打到 extra_low，第二段箱子更宽。"""
+    bars = _breakout(end, close)
+    opened = pd.Timestamp(end).normalize() + pd.Timedelta(hours=9)
+    eth1 = opened + pd.Timedelta(minutes=20)
+    eth2 = opened + pd.Timedelta(minutes=30)
+    for stamp in bars.index:
+        if eth1 < stamp <= eth2:
+            bars.at[stamp, "low"] = extra_low
+            bars.at[stamp, "high"] = max(float(bars.at[stamp, "high"]), 101.0)
+    last = bars.index[-1]
+    bars.at[last, "close"] = close
+    bars.at[last, "high"] = max(float(bars.at[last, "high"]), close + 0.2)
+    bars.at[last, "low"] = min(float(bars.at[last, "low"]), close - 0.2)
+    return bars
+
+
+def test_eth1_breakout_before_eth2_still_uses_the_first_box() -> None:
+    """第一个窗口走完、第二个还没到：有突破仍按第一段箱子开，不等第二段。"""
+    strategy = DailyBodyStrategy(_cfg5())
+    decision = strategy.evaluate(
+        "bu2612", _breakout("2026-10-23 09:25", 105.0), now=datetime(2026, 10, 23, 9, 25)
+    )
+    assert decision.action == StrategyAction.BUY_OPEN
+    assert "丢掉第一窗口" not in decision.reason
+    assert decision.stop_price is not None
+    assert abs(decision.stop_price - 98.0) < 1e-6
+
+
+def test_no_open_in_eth1_then_reassess_with_eth2() -> None:
+    """第一窗口没开成，过了第二ETH窗口之后，丢掉第一窗口，只认第二口箱子。"""
+    strategy = DailyBodyStrategy(_cfg5())
+    waiting = strategy.evaluate(
+        "bu2612", _breakout("2026-10-23 09:25", 100.0), now=datetime(2026, 10, 23, 9, 25)
+    )
+    assert waiting.action == StrategyAction.HOLD
+    opened = strategy.evaluate(
+        "bu2612",
+        _breakout_eth2_lower("2026-10-23 09:35", 105.0, extra_low=95.0),
+        now=datetime(2026, 10, 23, 9, 35),
+    )
+    assert opened.action == StrategyAction.BUY_OPEN
+    assert "丢掉第一窗口" in opened.reason
+    assert "第二ETH窗口" in opened.reason
+    assert opened.stop_price is not None
+    # 第二段最低 95，再减 1 跳 → 94；若还用第一段箱子会是 98。
+    assert abs(opened.stop_price - 94.0) < 1e-6
+
+
+def test_before_eth2_still_uses_eth1_even_if_eth1_had_no_fill() -> None:
+    """第一窗口没开成，但还没到第二ETH窗口：有突破仍按第一口箱子开。"""
+    cfg = _cfg5()
+    cfg["strategy"]["daily_body"]["eth_minutes2"] = 60
+    strategy = DailyBodyStrategy(cfg)
+    still = strategy.evaluate(
+        "bu2612", _breakout("2026-10-23 09:25", 100.0), now=datetime(2026, 10, 23, 9, 25)
+    )
+    assert still.action == StrategyAction.HOLD
+    too_soon = strategy.evaluate(
+        "bu2612", _breakout("2026-10-23 09:40", 105.0), now=datetime(2026, 10, 23, 9, 40)
+    )
+    assert too_soon.action == StrategyAction.BUY_OPEN
+    assert "丢掉第一窗口" not in too_soon.reason
+    assert too_soon.stop_price is not None
+    assert abs(too_soon.stop_price - 98.0) < 1e-6
+
+
+def test_eth1_chase_wait_is_dropped_after_eth2() -> None:
+    """过了第二ETH窗口后，第一窗口留下的急破等待一并丢掉。"""
+    strategy = DailyBodyStrategy(_cfg_chase())
+    first = strategy.evaluate(
+        "bu2612", _breakout("2026-10-23 09:25", 90.0), now=datetime(2026, 10, 23, 9, 25)
+    )
+    assert first.action == StrategyAction.HOLD
+    assert "急破不追" in first.reason
+    assert "bu2612" in strategy._chase_wait
+    later = strategy.evaluate(
+        "bu2612",
+        _breakout_eth2_lower("2026-10-23 09:35", 105.0, extra_low=95.0),
+        now=datetime(2026, 10, 23, 9, 35),
+    )
+    assert "bu2612" not in strategy._chase_wait
+    assert later.action == StrategyAction.BUY_OPEN
+    assert "丢掉第一窗口" in later.reason
 
 
 def test_second_open_still_respects_the_day_cutoff() -> None:
@@ -939,33 +1044,6 @@ def test_stop_mode_accepts_config_words_and_labels() -> None:
     assert DailyBodyStrategy(legacy).stop_mode == "close"
 
 
-def test_daily_body_blocks_strong_trend_even_if_public_filter_off() -> None:
-    """公共过滤关掉时，强单边仍被日内实体自己的区间过滤拦住，不能开新仓。"""
-    import numpy as np
-
-    rng = np.random.default_rng(21)
-    closes = (100 + np.arange(160) * 0.8 + rng.normal(0, 1.0, 160)).tolist()
-    index = pd.date_range("2026-10-23 09:00", periods=len(closes), freq="5min")
-    close = np.array(closes, dtype=float)
-    bars = pd.DataFrame(
-        {
-            "open": close,
-            "high": close + 3.0,
-            "low": close - 3.0,
-            "close": close,
-            "volume": [100.0] * len(closes),
-        },
-        index=index,
-    )
-    cfg = _cfg()
-    cfg["strategy"]["market_filter"] = {"enabled": False}
-    cfg["strategy"]["daily_body"]["regime_filter"] = True
-    cfg["strategy"]["daily_body"]["filter_adx_upper"] = 30
-    decision = DailyBodyStrategy(cfg).evaluate("bu2612", bars, now=datetime(2026, 10, 23, 9, 45))
-    assert decision.action == StrategyAction.HOLD
-    assert "行情不匹配" in decision.reason or "强单边" in decision.reason
-
-
 def test_duplicate_close_column_does_not_raise_ambiguous() -> None:
     """两列都叫 close 时仍能判断，不能弹出 array ambiguous。"""
     bars = _breakout("2026-10-23 09:45:00", 103.0)
@@ -1019,3 +1097,93 @@ def test_night_cutoff_blocks_chase_after_midnight() -> None:
     )
     assert decision.action == StrategyAction.HOLD
     assert "不再追" in decision.reason or "过了" in decision.reason
+
+
+def _linked_cfg() -> dict:
+    """交易时段选夜日连续。"""
+    cfg = _cfg()
+    cfg["schedule"]["session_scope"] = "linked"
+    return cfg
+
+
+def test_linked_does_not_flatten_at_night_close() -> None:
+    """夜日连续：夜盘 22:55 不平仓，避免方向对了却在夜盘收盘丢掉跳空。"""
+    cfg = _linked_cfg()
+    strategy = DailyBodyStrategy(cfg)
+    strategy.positions["bu2612"].side = "long"
+    strategy.positions["bu2612"].volume = 1
+    strategy.positions["bu2612"].initial_stop = 90.0
+    bars = _bars("2026-10-23 22:40", [100, 101, 102, 103])
+    night = strategy.evaluate("bu2612", bars, now=datetime(2026, 10, 23, 22, 56))
+    assert night.action == StrategyAction.HOLD
+    assert "拿着" in night.reason
+
+
+def test_linked_flattens_at_day_close_not_weekend() -> None:
+    """夜日连续：日盘 14:55 才清仓；周末白天的 14:55 不算。"""
+    cfg = _linked_cfg()
+    strategy = DailyBodyStrategy(cfg)
+    strategy.positions["bu2612"].side = "long"
+    strategy.positions["bu2612"].volume = 1
+    strategy.positions["bu2612"].initial_stop = 90.0
+    bars = _bars("2026-10-24 14:40", [100, 101, 102, 103])
+    weekend = strategy.evaluate("bu2612", bars, now=datetime(2026, 10, 24, 14, 56))
+    assert weekend.action == StrategyAction.HOLD
+    monday_bars = _bars("2026-10-26 14:40", [100, 101, 102, 103])
+    monday = strategy.evaluate("bu2612", monday_bars, now=datetime(2026, 10, 26, 14, 56))
+    assert monday.action == StrategyAction.CLOSE
+    assert "收盘" in monday.reason
+
+
+def test_linked_night_stop_then_day_eth1_can_open() -> None:
+    """夜盘开过并止损后，日盘按 9:00+ETH1 再画箱子，不算夜盘第二次。"""
+    strategy = DailyBodyStrategy(_linked_cfg())
+    opened = strategy.evaluate(
+        "bu2612", _breakout("2026-10-23 21:45", 98.0), now=datetime(2026, 10, 23, 21, 45)
+    )
+    assert opened.action == StrategyAction.SELL_OPEN
+    strategy.on_filled("bu2612", opened.action, opened.entry_price, 1, opened.stop_price)
+    bars = _bars("2026-10-23 21:45", [100, 101.0])
+    stopped = strategy.evaluate("bu2612", bars, now=datetime(2026, 10, 23, 21, 50))
+    assert stopped.action == StrategyAction.CLOSE
+    strategy.on_filled("bu2612", StrategyAction.CLOSE, 101.0, 1)
+    night_again = strategy.evaluate(
+        "bu2612", _breakout("2026-10-23 22:00", 98.0), now=datetime(2026, 10, 23, 22, 0)
+    )
+    assert night_again.action == StrategyAction.HOLD
+    assert "等到日盘" in night_again.reason
+    day = strategy.evaluate(
+        "bu2612", _breakout("2026-10-26 09:45", 105.0), now=datetime(2026, 10, 26, 9, 45)
+    )
+    assert day.action == StrategyAction.BUY_OPEN
+    assert "第一ETH窗口" in day.reason
+
+
+def test_linked_three_windows_then_stop() -> None:
+    """夜日连续整段最多三次：夜盘、日盘ETH1、日盘ETH2。"""
+    strategy = DailyBodyStrategy(_linked_cfg())
+    night = strategy.evaluate(
+        "bu2612", _breakout("2026-10-23 21:45", 98.0), now=datetime(2026, 10, 23, 21, 45)
+    )
+    strategy.on_filled("bu2612", night.action, night.entry_price, 1, night.stop_price)
+    bars = _bars("2026-10-23 21:45", [100, 101.0])
+    strategy.evaluate("bu2612", bars, now=datetime(2026, 10, 23, 21, 50))
+    strategy.on_filled("bu2612", StrategyAction.CLOSE, 101.0, 1)
+    first = strategy.evaluate(
+        "bu2612", _breakout("2026-10-26 09:45", 105.0), now=datetime(2026, 10, 26, 9, 45)
+    )
+    assert first.action == StrategyAction.BUY_OPEN
+    strategy.on_filled("bu2612", first.action, first.entry_price, 1, first.stop_price)
+    _stop_out_long(strategy, datetime(2026, 10, 26, 9, 50))
+    second = strategy.evaluate(
+        "bu2612", _breakout("2026-10-26 10:00", 108.0), now=datetime(2026, 10, 26, 10, 0)
+    )
+    assert second.action == StrategyAction.BUY_OPEN
+    assert "第二ETH窗口" in second.reason
+    strategy.on_filled("bu2612", second.action, second.entry_price, 1, second.stop_price)
+    _stop_out_long(strategy, datetime(2026, 10, 26, 10, 10))
+    third = strategy.evaluate(
+        "bu2612", _breakout("2026-10-26 10:15", 110.0), now=datetime(2026, 10, 26, 10, 15)
+    )
+    assert third.action == StrategyAction.HOLD
+    assert "开满" in third.reason

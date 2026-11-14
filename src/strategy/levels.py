@@ -43,11 +43,11 @@ def find_swing_levels(
         window_high = highs.iloc[i - lookback : i + lookback + 1]
         window_low = lows.iloc[i - lookback : i + lookback + 1]
         h = float(highs.iloc[i])
-        l = float(lows.iloc[i])
+        low = float(lows.iloc[i])
         if h >= float(window_high.max()) - 1e-12:
             levels.append(KeyLevel(price=h, kind="resistance", index=i))
-        if l <= float(window_low.min()) + 1e-12:
-            levels.append(KeyLevel(price=l, kind="support", index=i))
+        if low <= float(window_low.min()) + 1e-12:
+            levels.append(KeyLevel(price=low, kind="support", index=i))
 
     # 越靠近当前K线越重要
     levels.sort(key=lambda x: x.index, reverse=True)

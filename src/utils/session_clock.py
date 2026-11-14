@@ -10,7 +10,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from datetime import datetime, time as dtime, timedelta
+from functools import lru_cache
 from typing import Any
 
 
@@ -228,7 +230,7 @@ def in_trading_sessions(
 
 
 def split_day_night_sessions(
-    sessions: list[list[str]] | list[tuple[Any, Any]] | None,
+    sessions: Sequence[Sequence[Any]] | None,
 ) -> tuple[list[list[str]], list[list[str]]]:
     """
     把品种表时段拆成日盘、夜盘。
@@ -250,15 +252,24 @@ def split_day_night_sessions(
     return day, night
 
 
-def session_bounds(sessions: list[list[str]] | None) -> dict[str, dtime | None]:
-    """
-    从品种表时段读出日盘开/收、夜盘开/收。
+def _session_rows_key(
+    sessions: Sequence[Sequence[Any]] | None,
+) -> tuple[tuple[str, str], ...]:
+    """把时段表收成可缓存的键：只看文字，和调用方传的容器无关。"""
+    rows: list[tuple[str, str]] = []
+    for row in sessions or []:
+        if not row or len(row) < 2:
+            continue
+        rows.append((str(row[0]).strip()[:5], str(row[1]).strip()[:5]))
+    return tuple(rows)
 
-    日盘开 = 日盘各段里最早的开始（商品一般 09:00，股指可能 09:30）。
-    日盘收 = 日盘各段里最晚的结束（一般 15:00）。
-    没有夜盘时 night_open / night_close 为空。
-    """
-    day, night = split_day_night_sessions(sessions)
+
+@lru_cache(maxsize=128)
+def _session_bounds_cached(
+    key: tuple[tuple[str, str], ...],
+) -> tuple[dtime, dtime, dtime | None, dtime | None]:
+    """同一份时段文字只解析一次开收钟点，品种表没改就不重复拆字符串。"""
+    day, night = split_day_night_sessions(key)
     day_open = min((parse_hhmm(r[0]) for r in day), default=dtime(9, 0))
     day_close = max((parse_hhmm(r[1]) for r in day), default=dtime(15, 0))
     night_open: dtime | None = None
@@ -267,6 +278,20 @@ def session_bounds(sessions: list[list[str]] | None) -> dict[str, dtime | None]:
         night_open = min(parse_hhmm(r[0]) for r in night)
         overnight = [parse_hhmm(r[1]) for r in night if parse_hhmm(r[1]) < parse_hhmm(r[0])]
         night_close = overnight[0] if overnight else max(parse_hhmm(r[1]) for r in night)
+    return day_open, day_close, night_open, night_close
+
+
+def session_bounds(sessions: Sequence[Sequence[Any]] | None) -> dict[str, dtime | None]:
+    """
+    从品种表时段读出日盘开/收、夜盘开/收。
+
+    日盘开 = 日盘各段里最早的开始（商品一般 09:00，股指可能 09:30）。
+    日盘收 = 日盘各段里最晚的结束（一般 15:00）。
+    没有夜盘时 night_open / night_close 为空。
+    """
+    day_open, day_close, night_open, night_close = _session_bounds_cached(
+        _session_rows_key(sessions)
+    )
     return {
         "day_open": day_open,
         "day_close": day_close,
@@ -278,6 +303,51 @@ def session_bounds(sessions: list[list[str]] | None) -> dict[str, dtime | None]:
 def bounds_for_symbol(cfg: dict[str, Any] | None, symbol: Any) -> dict[str, dtime | None]:
     """当前合约在品种表里的日夜盘开收。"""
     return session_bounds(sessions_for_symbol(cfg, symbol))
+
+
+def near_session_close(
+    now: datetime | None,
+    sessions: list[list[str]] | list[tuple[Any, Any]] | None,
+    *,
+    minutes: int = 10,
+) -> bool:
+    """
+    是不是已经到了「这一段真正收盘」前的几分钟。
+
+    日盘收盘用下午最晚那一下（一般 15:00），夜盘收盘用夜盘结束（23:00 或 02:30）。
+    上午 11:30 是午休，不是收盘，这里不算。
+    已经过了收盘钟点也算「太晚了」，空仓时不要再开。
+    """
+    if minutes <= 0:
+        return False
+    stamp = now or datetime.now()
+    stamp = stamp.replace(microsecond=0)
+    day, night = split_day_night_sessions(sessions)
+    bounds = session_bounds(sessions)
+    # 判断现在落在日盘还是夜盘，不用宽限秒，免得刚收盘还当成「还早」。
+    in_day = in_trading_sessions(day, stamp, grace_sec=0)
+    in_night = in_trading_sessions(night, stamp, grace_sec=0)
+    close: dtime | None = None
+    overnight = False
+    night_open: dtime | None = None
+    if in_day:
+        close = bounds.get("day_close")
+    elif in_night:
+        close = bounds.get("night_close")
+        night_open = bounds.get("night_open")
+        if close is not None and night_open is not None and close < night_open:
+            overnight = True
+    if close is None:
+        return False
+    if overnight:
+        if night_open is not None and stamp.time() >= night_open:
+            close_at = datetime.combine(stamp.date() + timedelta(days=1), close)
+        else:
+            close_at = datetime.combine(stamp.date(), close)
+    else:
+        close_at = datetime.combine(stamp.date(), close)
+    begin = close_at - timedelta(minutes=int(minutes))
+    return stamp >= begin
 
 
 def session_tuples(

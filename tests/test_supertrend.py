@@ -39,15 +39,15 @@ def _trend_up_then_down() -> pd.DataFrame:
         o = price
         c = price + 15
         h = c + 5
-        l = o - 3
-        rows.append((t0 + pd.Timedelta(days=i), o, h, l, c, 1000.0))
+        low = o - 3
+        rows.append((t0 + pd.Timedelta(days=i), o, h, low, c, 1000.0))
         price = c
     for i in range(20):
         o = price
         c = price - 18
         h = o + 3
-        l = c - 5
-        rows.append((t0 + pd.Timedelta(days=30 + i), o, h, l, c, 1000.0))
+        low = c - 5
+        rows.append((t0 + pd.Timedelta(days=30 + i), o, h, low, c, 1000.0))
         price = c
     return pd.DataFrame(rows, columns=["ts", "open", "high", "low", "close", "volume"]).set_index("ts")
 

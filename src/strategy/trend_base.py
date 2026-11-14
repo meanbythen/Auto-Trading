@@ -9,12 +9,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime
 from typing import Any
 
 import pandas as pd
 from loguru import logger
 
+from .base import StrategyBase
 from .indicators import average_true_range
 from .market_state import MarketFilter, trend_params_for_section
 from .session_scope import scope_allows, scope_from_cfg
@@ -34,7 +35,7 @@ def _parse_hhmm(value: str) -> dtime:
     return dtime(int(hour), int(minute))
 
 
-class TrendStrategyBase:
+class TrendStrategyBase(StrategyBase):
     """趋势类策略公共骨架。子类继承并实现四个钩子。"""
 
     #: 配置里策略自己那一节的键名，也用来写日志
@@ -42,6 +43,7 @@ class TrendStrategyBase:
     label = "趋势策略"
 
     def __init__(self, cfg: dict[str, Any]) -> None:
+        super().__init__()
         st = cfg.get("strategy", {}) or {}
         self.cfg = cfg
         self.box: dict[str, Any] = st.get(self.section) or {}
@@ -79,8 +81,6 @@ class TrendStrategyBase:
             s: PositionState(symbol=s) for s in self.symbols
         }
         self._pending: dict[str, dict[str, Any]] = {}
-        self._last_entry_bar: dict[str, str] = {}
-        self._signaled_bar: dict[str, str] = {}
         self._close_side: dict[str, str] = {}
         self._close_entry: dict[str, float] = {}
 

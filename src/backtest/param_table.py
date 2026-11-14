@@ -38,21 +38,19 @@ DEPTHS = ("精简", "标准", "完整")
 # 写进 Excel / 从 Excel 读回时用的策略引擎键。界面里的旧名字会先换成这里的键。
 ENGINE_NAMES: dict[str, str] = {
     "daily_body": "日内实体（主推）",
-    "morning_box_a": "早盘箱体突破A",
+    "float_hold": "日内浮盈飘单",
     "trend_follow": "趋势跟随",
     "supertrend": "SuperTrend趋势",
     "dual_ma": "双均线趋势",
+    "ema_swing": "均线波段",
     "bollinger": "布林带突破",
     "sar_trend": "SAR波段趋势",
     "multi_factor": "多因子CTA（加权打分）",
-    "multi_factor_adapt": "多因子CTA（自适应权重·对照）",
-    "multi_vote": "多因子投票",
-    "multi_hybrid": "多因子混合",
     "swing_trend": "长线趋势加减仓",
+    "swing_box": "长线箱体突破",
 }
 
 _ENGINE_ALIASES = {
-    "morning_a": "morning_box_a",
     "st": "supertrend",
     "ma_cross": "dual_ma",
     "boll": "bollinger",
@@ -60,8 +58,7 @@ _ENGINE_ALIASES = {
     "sar": "sar_trend",
     "parabolic_sar": "sar_trend",
     "cta": "multi_factor",
-    "vote": "multi_vote",
-    "hybrid": "multi_hybrid",
+    "macd_swing": "ema_swing",
 }
 
 _DEPTH_ALIASES = {
@@ -81,12 +78,16 @@ _TEXT_PARAMS = {
     "stop_mode",
     "session_scope",
     "generic_stop.kind",
+    "macd_timeframe",
+    "macd_combo",
+    "dir_ema_pair",
+    "sig_ema_triple",
 }
 
 _TRUE_WORDS = {"true", "yes", "y", "1", "是", "启用", "on"}
 _FALSE_WORDS = {"false", "no", "n", "0", "否", "停用", "off"}
 # 开关型参数：0/1 也按 true/false 理解。
-_BOOL_PARAMS = {"reverse_on_cross", "reverse_on_flip"}
+_BOOL_PARAMS = {"reverse_on_cross", "reverse_on_flip", "flatten_at_close", "trend_align_enabled"}
 _SPLIT_RE = re.compile(r"[，,、;；]+")
 
 
@@ -487,10 +488,10 @@ def _notes_rows() -> list[tuple[str, str]]:
         ("这张表做什么", "改策略优化（网格搜索）试哪些参数、每档试哪几个值。程序每次开始优化前读一次，保存即生效，不用重启。"),
         ("不要改什么", "不要改四张工作表的名字，也不要删掉第一行表头；认不出表头时程序会整表回退内置默认。"),
         ("打包后的位置", "改程序旁的 config/优化参数.xlsx。_internal 里也有一份，那份只是首次启动的种子；要改就改外面这一份。"),
-        ("参数网格 · 策略引擎", "用表里的键：daily_body / morning_box_a / trend_follow / supertrend / dual_ma / bollinger / sar_trend / multi_factor / multi_vote / multi_hybrid / swing_trend。"),
+        ("参数网格 · 策略引擎", "用表里的键：daily_body / float_hold / trend_follow / supertrend / dual_ma / ema_swing / bollinger / sar_trend / multi_factor / swing_trend / swing_box。"),
         ("参数网格 · 搜索深度", "精简 / 标准 / 完整。三档各写各的行；界面选哪一档就只读那一档。"),
         ("参数网格 · 参数键", "程序认识的键，见「参数名称」页。不要自己发明；认不出的行会被忽略。"),
-        ("参数网格 · 取值", "逗号分隔即可：15,20,30；文字参数直接写：touch,close；开关写 true,false。也支持 JSON 数组 [15, 20, 30]。"),
+        ("参数网格 · 取值", "逗号分隔即可：15,20,30；文字参数直接写：touch,close；开关写 true,false。也支持 JSON 数组 [15, 20, 30]。均线波段的方向选择器可写 21/122、60/120 这类任意两根；信号发生器写 5/10/30。"),
         ("参数网格 · 启用", "填「否」可临时关掉一个旋钮，同策略同深度其余参数照常搜；整段都填「否」等于这一档不搜参数。"),
         ("参数网格 · 说明", "最后一列随便写备注，程序不读，方便自己记为什么这样填。"),
         ("缺行怎么办", "某个策略 + 深度一行都没有时，程序回退到内置默认，不会因为误删整段而静默不搜参数。"),

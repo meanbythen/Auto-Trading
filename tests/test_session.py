@@ -96,3 +96,25 @@ def test_session_bounds_follow_the_table() -> None:
     assert ag["night_close"] == dtime(2, 30)
     assert in_flatten_window([dtime(2, 25)], datetime(2026, 11, 10, 2, 26)) is True
     assert in_flatten_window([dtime(22, 55)], datetime(2026, 11, 10, 0, 1)) is False
+
+
+def test_near_session_close_uses_real_close_not_lunch() -> None:
+    """日盘收盘 15:00、夜盘 23:00；上午 11:30 午休还可以开。"""
+    from src.utils.session_clock import near_session_close
+
+    sessions = [["09:00", "11:30"], ["13:30", "15:00"], ["21:00", "23:00"]]
+    assert near_session_close(datetime(2026, 11, 13, 14, 50), sessions, minutes=10) is True
+    assert near_session_close(datetime(2026, 11, 13, 14, 40), sessions, minutes=10) is False
+    assert near_session_close(datetime(2026, 11, 13, 11, 25), sessions, minutes=10) is False
+    assert near_session_close(datetime(2026, 11, 13, 22, 51), sessions, minutes=10) is True
+    assert near_session_close(datetime(2026, 11, 13, 22, 40), sessions, minutes=10) is False
+
+
+def test_near_session_close_overnight_uses_next_morning() -> None:
+    """白银夜盘收到 02:30：晚上 22 点还早，凌晨 02:22 才算收盘前。"""
+    from src.utils.session_clock import near_session_close
+
+    sessions = [["09:00", "11:30"], ["13:30", "15:00"], ["21:00", "02:30"]]
+    assert near_session_close(datetime(2026, 11, 13, 22, 55), sessions, minutes=10) is False
+    assert near_session_close(datetime(2026, 11, 14, 2, 20), sessions, minutes=10) is True
+    assert near_session_close(datetime(2026, 11, 14, 2, 10), sessions, minutes=10) is False

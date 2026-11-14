@@ -9,6 +9,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
+.ruff_cache/
 
 # PyInstaller 打包产物
 build/
@@ -16,11 +17,12 @@ dist/
 
 # 运行产物
 logs/
-data/*.jsonl
-data/account_ledger.json
-data/accounts/
-data/Auto-Trading导出.xlsx
+data/
+@AutomationLog.txt
 *.log
+
+# 第三方二进制（华泰提供的 CTP dll 自行放到 ctp/api，不入库）
+ctp/api/*.dll
 
 # 系统文件
 Thumbs.db

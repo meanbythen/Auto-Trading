@@ -149,8 +149,10 @@ def test_night_session_does_not_reset_counters_at_midnight() -> None:
 
 
 def _daily_body_bars(day: str = "2026-10-23") -> pd.DataFrame:
-    """09:00 起 5 分钟一根。ETH 20 分钟箱体 99~101，09:25 收盘 95 跌破。"""
+    """前一晚先铺一段，再接 09:00 起 5 分钟。ETH 20 分钟箱体 99~101，09:25 收盘 95 跌破。"""
+    pre = pd.date_range("2026-10-22 21:05", "2026-10-22 22:55", freq="5min")
     idx = pd.date_range(f"{day} 09:00", f"{day} 11:00", freq="5min")
+    pre_rows = [(100.0, 100.3, 99.7, 100.0)] * len(pre)
     rows: list[tuple[float, float, float, float]] = []
     rise = 0.0
     for stamp in idx:
@@ -161,15 +163,17 @@ def _daily_body_bars(day: str = "2026-10-23") -> pd.DataFrame:
         else:
             rise += 0.1
             rows.append((95.0 + rise, 95.3 + rise, 94.8 + rise, 95.1 + rise))
+    all_rows = pre_rows + rows
+    all_idx = pd.DatetimeIndex(list(pre) + list(idx))
     return pd.DataFrame(
         {
-            "open": [r[0] for r in rows],
-            "high": [r[1] for r in rows],
-            "low": [r[2] for r in rows],
-            "close": [r[3] for r in rows],
-            "volume": [100.0] * len(rows),
+            "open": [r[0] for r in all_rows],
+            "high": [r[1] for r in all_rows],
+            "low": [r[2] for r in all_rows],
+            "close": [r[3] for r in all_rows],
+            "volume": [100.0] * len(all_rows),
         },
-        index=idx,
+        index=all_idx,
     )
 
 
@@ -186,7 +190,7 @@ def _daily_body_cfg() -> dict:
             "flatten_at_close": False,
             "daily_body": {
                 "eth_minutes": 20,
-                "max_box_ticks": 1,
+                "max_box_atr_mult": 1.0,
                 "stop_extra_ticks": 1,
                 "regime_filter": False,
             },

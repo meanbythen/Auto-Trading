@@ -4,7 +4,13 @@ from datetime import datetime
 
 import pandas as pd
 
-from src.data.bar_store import BarStore, aligned_bars, merge_bars, merge_local_and_download
+from src.data.bar_store import (
+    BarStore,
+    aligned_bars,
+    merge_bars,
+    merge_local_and_download,
+    rows_needing_write,
+)
 from src.data.kline import KlineProvider
 from src.data.tq_source import session_open_minutes
 
@@ -70,6 +76,44 @@ def test_fetch_keeps_older_bars_when_the_next_download_is_shorter(tmp_path) -> N
     live = provider.fetch("bu2612", "5")
     assert len(live) == 2
     assert provider.store.count("bu2612", "5") == 4
+
+
+def test_rows_needing_write_skips_rows_already_stored() -> None:
+    """库里已经一样的K线不重写；新的一根和改动过的一根仍要写。"""
+    stored = _frame([("2026-10-16 09:05:00", 100), ("2026-10-16 09:10:00", 101)])
+    incoming = _frame(
+        [
+            ("2026-10-16 09:05:00", 100),  # 一样
+            ("2026-10-16 09:10:00", 103),  # 改过
+            ("2026-10-16 09:15:00", 104),  # 新的
+        ]
+    )
+    pending = rows_needing_write(incoming, stored)
+    assert pending is not None
+    assert list(pending.index.strftime("%H:%M")) == ["09:10", "09:15"]
+
+
+def test_live_fetch_does_not_grow_store_when_download_is_unchanged(tmp_path) -> None:
+    """实盘每轮都会重复下载同一段K线，库存不应因此越写越多。"""
+    cfg = {
+        "_project_root": str(tmp_path),
+        "data": {"source": "akshare", "cache_dir": "data/klines", "min_bars": 1, "live_max_bars": 3},
+        "strategy": {"timeframe": "5"},
+    }
+    provider = KlineProvider(cfg)
+    downloaded = _frame(
+        [
+            ("2026-10-16 21:55:00", 100),
+            ("2026-10-16 22:00:00", 101),
+            ("2026-10-16 22:05:00", 102),
+        ]
+    )
+    provider._fetch_akshare = lambda *_args, **_kwargs: downloaded  # type: ignore[method-assign]
+    first = provider.fetch("bu2612", "5")
+    stored_after_first = provider.store.count("bu2612", "5")
+    second = provider.fetch("bu2612", "5")
+    assert provider.store.count("bu2612", "5") == stored_after_first
+    pd.testing.assert_frame_equal(first, second)
 
 
 def test_aligned_bars_drop_demo_rows_between_real_15m_bars() -> None:

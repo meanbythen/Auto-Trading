@@ -32,15 +32,10 @@ from .market_state import (
     trend_params_for_section,
 )
 
-# 三套多因子走自己小节里的行情闸门，不看公共 market_filter。
+# 加权打分走自己小节里的行情闸门，不看公共 market_filter。
 CTA_OWN_FILTER = {
     "multi_factor",
     "cta",
-    "multi_factor_adapt",
-    "multi_vote",
-    "vote",
-    "multi_hybrid",
-    "hybrid",
 }
 
 
@@ -48,58 +43,46 @@ CTA_OWN_FILTER = {
 # - daily_body 日内实体 → range（写在策略自己里）
 # - 海龟 / SuperTrend / 双均线 / 布林 / SAR / 长线 → trend（各自 filter_*）
 # - 多因子 → 自己的 cta_filter
-# - morning_box_a / jesse_casper → 不走 ADX 这一层
+# - swing_box → 箱子和 ADX 写在策略里
 ENGINE_AUDIT_MODES: dict[str, MarketFilterMode | None] = {
     "daily_body": "range",
-    "morning_box_a": None,  # 早盘独立时段，不走 market_filter
-    "morning_a": None,      # 旧别名，也跳过
+    "float_hold": None,  # 过滤默认关；方向交给方向选择器，默认开盘箱体 + 跳空顺向
     "trend_follow": "trend",
     "supertrend": "trend",
     "st": "trend",          # 别名
     "dual_ma": "trend",
     "ma_cross": "trend",    # 别名
+    "ema_swing": None,  # 只用均线斜率，不用公共 ADX 过滤
+    "macd_swing": None,
     "bollinger": "trend",
     "boll": "trend",        # 别名
     "sar_trend": "trend",
     "parabolic_sar": "trend",  # 别名
     "multi_factor": "trend",
     "cta": "trend",         # 别名
-    "multi_factor_adapt": "trend",
-    "multi_vote": "trend",
-    "vote": "trend",
-    "multi_hybrid": "trend",
-    "hybrid": "trend",
     "swing_trend": "trend",
-    "jesse_casper": None,  # 用价值区自己判断，不走公共 ADX 过滤
-    "casper": None,
-    "jesse": None,
+    "swing_box": None,  # 箱子和 ADX 写在策略里
 }
 
 # 策略中文名（和 ENGINE_LABELS 一致，这里单独放一份避免循环 import）
 ENGINE_NAMES: dict[str, str] = {
     "daily_body": "日内实体",
-    "morning_box_a": "早盘箱体A",
-    "morning_a": "早盘箱体A",
+    "float_hold": "日内浮盈飘单",
     "trend_follow": "趋势跟随",
     "supertrend": "SuperTrend",
     "st": "SuperTrend",
     "dual_ma": "双均线",
     "ma_cross": "双均线",
+    "ema_swing": "均线波段",
+    "macd_swing": "均线波段",
     "bollinger": "布林突破",
     "boll": "布林突破",
     "sar_trend": "SAR波段",
     "parabolic_sar": "SAR波段",
     "multi_factor": "多因子CTA（加权打分）",
     "cta": "多因子CTA（加权打分）",
-    "multi_factor_adapt": "多因子CTA（自适应权重·对照）",
-    "multi_vote": "多因子投票",
-    "vote": "多因子投票",
-    "multi_hybrid": "多因子混合",
-    "hybrid": "多因子混合",
     "swing_trend": "长线加减仓",
-    "jesse_casper": "Jesse Casper（简化SMC）",
-    "casper": "Jesse Casper（简化SMC）",
-    "jesse": "Jesse Casper（简化SMC）",
+    "swing_box": "长线箱体突破",
 }
 
 
@@ -181,18 +164,16 @@ def run_pre_session_audit(
     # 主推引擎名（不含别名）
     PRIMARY = {
         "daily_body",
-        "morning_box_a",
+        "float_hold",
         "trend_follow",
         "supertrend",
         "dual_ma",
+        "ema_swing",
         "bollinger",
         "sar_trend",
         "multi_factor",
-        "multi_factor_adapt",
-        "multi_vote",
-        "multi_hybrid",
         "swing_trend",
-        "jesse_casper",
+        "swing_box",
     }
     all_engines = list(engines) if engines is not None else list(
         ENGINE_AUDIT_MODES.keys() if include_aliases else PRIMARY
@@ -205,11 +186,12 @@ def run_pre_session_audit(
             eng_name = ENGINE_NAMES.get(eng, eng)
 
             if expected_mode is None:
-                # 早盘箱体 A、Jesse Casper 等不走公共 ADX 过滤
-                if eng in {"jesse_casper", "casper", "jesse"}:
-                    skip_note = "用上一时段价值区判断平衡/失衡，不走公共行情过滤"
+                if eng == "swing_box":
+                    skip_note = "日线箱子和 ADX 写在策略里，不走公共行情过滤"
+                elif eng == "float_hold":
+                    skip_note = "行情过滤默认关，方向靠观察窗口和跳空顺向"
                 else:
-                    skip_note = "未接入行情过滤（早盘独立时段）"
+                    skip_note = "未接入行情过滤"
                 rows.append(
                     SymbolAuditRow(
                         symbol=symbol,
@@ -227,8 +209,6 @@ def run_pre_session_audit(
                 st = cfg.get("strategy") or {}
                 kind = {
                     "cta": "multi_factor",
-                    "vote": "multi_vote",
-                    "hybrid": "multi_hybrid",
                 }.get(eng, eng)
                 box = st.get(kind) if isinstance(st.get(kind), dict) else {}
                 cta_params = CtaFilterParams.from_box(box, kind=kind)
@@ -274,41 +254,28 @@ def run_pre_session_audit(
                 )
                 continue
 
-            # 日内实体的区间过滤写在策略里；趋势策略看各自小节。
+            # 日内实体的箱体突破过滤写在策略里；趋势策略看各自小节。
             if eng == "daily_body":
                 params = range_params_for_daily_body(cfg)
-                if not params.enabled:
-                    rows.append(
-                        SymbolAuditRow(
-                            symbol=symbol,
-                            engine=eng,
-                            engine_name=eng_name,
-                            expected_mode=expected_mode,
-                            state=None,
-                            ok=True,
-                            note="本策略行情过滤已关闭",
-                        )
-                    )
-                    continue
             else:
                 section = ENGINE_TREND_SECTION.get(eng)
                 if section:
                     params = trend_params_for_section(cfg, section)
                 else:
                     params = MarketFilterParams(enabled=False, mode=expected_mode or "trend")
-                if not params.enabled:
-                    rows.append(
-                        SymbolAuditRow(
-                            symbol=symbol,
-                            engine=eng,
-                            engine_name=eng_name,
-                            expected_mode=expected_mode,
-                            state=None,
-                            ok=True,
-                            note="本策略行情过滤已关闭",
-                        )
+            if not params.enabled:
+                rows.append(
+                    SymbolAuditRow(
+                        symbol=symbol,
+                        engine=eng,
+                        engine_name=eng_name,
+                        expected_mode=expected_mode,
+                        state=None,
+                        ok=True,
+                        note="本策略行情过滤已关闭",
                     )
-                    continue
+                )
+                continue
             bars = bars_fn(symbol, tf, params.need_bars)
             if bars is None or len(bars) < params.need_bars:
                 rows.append(
@@ -348,7 +315,10 @@ def run_pre_session_audit(
 def _note_ok(state: MarketState, mode: MarketFilterMode) -> str:
     """ok=True 时拼一句人类可读的说明。"""
     mood = "趋势" if state.adx >= 25 else ("偏弱" if state.adx >= 20 else "震荡")
-    tag = "区间" if mode == "range" else "趋势"
+    if mode == "range":
+        tag = "区间"
+    else:
+        tag = "趋势"
     return (
         f"[{tag}] 行情适配：ADX={state.adx:.1f}({mood}) "
         f"ATR分位={state.atr_rank:.0%}"

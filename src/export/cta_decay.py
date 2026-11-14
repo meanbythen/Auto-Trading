@@ -37,10 +37,6 @@ _FILE_BAD = re.compile(r'[<>:"/\\|?*]')
 _ENGINE_FILE_NAMES = {
     "multi_factor": "加权打分",
     "cta": "加权打分",
-    "multi_vote": "投票",
-    "vote": "投票",
-    "multi_hybrid": "混合",
-    "hybrid": "混合",
 }
 
 # 交易明细：第 1～3 行是标题，第 4 行起是数据，最后两行是说明不要动。

@@ -80,16 +80,21 @@ def lot_margin(
     margins: dict[str, float] | None = None,
     default_margin: float = 0.0,
     rate: float = 0.1,
+    margin_rates: dict[str, float] | None = None,
 ) -> float:
     """
     这一手占用多少保证金。
 
-    品种单独写了大于 0 的每手保证金就用那个数。
-    没有的话用配置里的默认每手保证金。两个都没有，就按价格乘乘数乘手数再乘 10%。
+    填了保证金比例：开仓价 × 每手数量 × 比例% × 手数。
+    没填比例、写了每手金额：用那个固定金额 × 手数。
+    再没有就用配置页兜底金额。都没有时按价格乘乘数乘手数再乘默认 10%。
     """
     product = "".join(ch for ch in str(symbol) if ch.isalpha()).lower()
-    per = float((margins or {}).get(product) or 0)
     lots = max(0, int(volume))
+    rate_pct = float((margin_rates or {}).get(product) or 0)
+    if rate_pct > 0 and float(price) > 0 and float(multiplier) > 0:
+        return float(price) * float(multiplier) * lots * (rate_pct / 100.0)
+    per = float((margins or {}).get(product) or 0)
     if per > 0:
         return per * lots
     if default_margin > 0:
@@ -105,6 +110,7 @@ def analyze_book(
     margins: dict[str, float] | None = None,
     default_margin: float = 0.0,
     margin_rate: float = 0.1,
+    margin_rates: dict[str, float] | None = None,
 ) -> SignalReport:
     """
     统计一本信号账户。
@@ -129,6 +135,7 @@ def analyze_book(
         margins=margins,
         default_margin=default_margin,
         margin_rate=margin_rate,
+        margin_rates=margin_rates,
     )
     account = _slice_from_closes(chosen, [point for _moment, point in equity])
     account.utilization = _ratio(max_margin, base)
@@ -275,6 +282,7 @@ def _margin_peaks(
     margins: dict[str, float] | None,
     default_margin: float,
     margin_rate: float,
+    margin_rates: dict[str, float] | None = None,
 ) -> tuple[float, dict[str, float]]:
     """
     按开平仓重放，记下这段时间里保证金最高占到多少。
@@ -299,6 +307,7 @@ def _margin_peaks(
                 margins=margins,
                 default_margin=default_margin,
                 rate=margin_rate,
+                margin_rates=margin_rates,
             )
             held.append({**row, "left": int(row.get("volume") or 0), "margin_left": margin})
             total = round(total + margin, 2)

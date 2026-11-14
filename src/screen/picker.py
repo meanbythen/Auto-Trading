@@ -1,8 +1,8 @@
 """
 交叉测试
-功能：配置里的每个合约，配配置里的每套参与策略回测一次，再标出这一轮里相对较好的组合。
-      全品种主力连续只留着备查，这一轮不用那份。
-原理：这是「策略×合约」对照筛选，用的是配置里的固定参数，不是多品种交叉验证。
+功能：勾选的策略、合约、周期两两交叉，每组跑一遍历史回测，再标出这一轮里相对较好的组合。
+      信号周期和止损周期用同一个。全品种主力连续只留着备查，这一轮不用那份。
+原理：这是「策略×合约×周期」对照筛选，用的是配置里的固定参数，不是多品种交叉验证。
       要验优化参数稳不稳，请用策略优化页自动带上的其它关注品种验收，
       或交叉测试页的「用最近优化参数做多品种验收」。
       得分看盈利因子和净赚能不能盖住回撤，不看胜率。
@@ -308,6 +308,7 @@ def prepare_screen_cfg(
             for box in (risk.get("contracts") or {}).values():
                 if isinstance(box, dict):
                     box["margin"] = 0
+                    box["margin_rate_pct"] = 0
             risk["capital"] = CROSS_COMPARE_CAPITAL
             # 开几手仍是持仓手数。每笔风险记下来，但不拿它按权益重算手数。
             if "risk_per_trade_pct" in spec:
@@ -356,17 +357,16 @@ def _attach_universe_contracts(risk: dict[str, Any]) -> None:
 # 比策略时按这个顺序，每套只测一次。旧的短名字不单独测，避免同一套跑两遍。
 SCREEN_STRATEGIES: list[tuple[str, str]] = [
     ("daily_body", "日内实体"),
-    ("morning_box_a", "早盘箱体突破A"),
+    ("float_hold", "日内浮盈飘单"),
     ("trend_follow", "趋势跟随"),
     ("supertrend", "SuperTrend趋势"),
     ("dual_ma", "双均线趋势"),
+    ("ema_swing", "均线波段"),
     ("bollinger", "布林带突破"),
     ("sar_trend", "SAR波段趋势"),
     ("multi_factor", "多因子CTA（加权打分）"),
-    ("multi_vote", "多因子投票"),
-    ("multi_hybrid", "多因子混合"),
     ("swing_trend", "长线趋势加减仓"),
-    ("jesse_casper", "Jesse Casper（简化SMC）"),
+    ("swing_box", "长线箱体突破"),
 ]
 
 # 配置里可能写着旧的短名字。交叉测试只认左边这一套，避免同一套跑两遍。
@@ -379,25 +379,31 @@ _ENGINE_ALIAS = {
     "parabolic_sar": "sar_trend",
     "multi": "multi_factor",
     "cta": "multi_factor",
-    "vote": "multi_vote",
-    "hybrid": "multi_hybrid",
-    "morning_a": "morning_box_a",
-    "casper": "jesse_casper",
-    "jesse": "jesse_casper",
+    "macd_swing": "ema_swing",
 }
+
+
+# 交叉测试可勾选的周期。信号和止损用同一个，不再分开。
+CROSS_PERIODS: list[tuple[str, str]] = [
+    ("5", "5分钟"),
+    ("15", "15分钟"),
+    ("30", "30分钟"),
+    ("60", "60分钟"),
+    ("D", "日线"),
+    ("W", "周线"),
+]
 
 
 def engines_for_cross(cfg: dict[str, Any] | None) -> list[tuple[str, str]]:
     """
     这一轮要测的策略。
 
-    读配置里的 cross_engines。没写、或写的名字都对不上时，用上面那一整份。
-    配置名单里缺了程序新加的策略时，自动补在末尾，避免交叉测试页一直停在旧名单。
-    自定义和旧短名字不会单独再测一遍。
+    读配置里的 cross_engines。没写或写空时，用上面那一整份。
+    写了哪些就测哪些，不再自动把没勾的补回来。自定义和旧短名字忽略。
     """
     known = {code: label for code, label in SCREEN_STRATEGIES}
     raw = ((cfg or {}).get("strategy") or {}).get("cross_engines")
-    if not isinstance(raw, list):
+    if not isinstance(raw, list) or not raw:
         return list(SCREEN_STRATEGIES)
     chosen: list[tuple[str, str]] = []
     seen: set[str] = set()
@@ -407,25 +413,53 @@ def engines_for_cross(cfg: dict[str, Any] | None) -> list[tuple[str, str]]:
             continue
         seen.add(name)
         chosen.append((name, known[name]))
-    # 程序里新登记的策略，配置还没写上时自动跟上
-    for code, label in SCREEN_STRATEGIES:
-        if code not in seen:
-            seen.add(code)
-            chosen.append((code, label))
     return chosen or list(SCREEN_STRATEGIES)
 
 
-def sync_cross_engines_in_cfg(cfg: dict[str, Any]) -> list[str]:
-    """
-    把当前程序认识的策略写进 cfg['strategy']['cross_engines']。
+def engines_from_codes(codes: list[str] | None) -> list[tuple[str, str]]:
+    """把勾选的引擎名收成（代号, 中文名）。不认识的丢掉。"""
+    known = {code: label for code, label in SCREEN_STRATEGIES}
+    chosen: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for item in codes or []:
+        name = _ENGINE_ALIAS.get(str(item).strip(), str(item).strip())
+        if not name or name in seen or name not in known:
+            continue
+        seen.add(name)
+        chosen.append((name, known[name]))
+    return chosen
 
-    保留配置里原有顺序，只把缺的补在后面。返回补全后的引擎名列表。
+
+def normalize_cross_periods(raw: list[Any] | None) -> list[str]:
+    """勾选的周期收成 5 / 15 / D 这种代码。信号和止损共用。"""
+    from src.data.periods import canonical_period
+
+    known = {code for code, _label in CROSS_PERIODS}
+    out: list[str] = []
+    seen: set[str] = set()
+    for item in raw or []:
+        code = canonical_period(str(item or "").strip())
+        if code not in known or code in seen:
+            continue
+        seen.add(code)
+        out.append(code)
+    return out
+
+
+def sync_cross_engines_in_cfg(cfg: dict[str, Any], codes: list[str] | None = None) -> list[str]:
     """
-    engines = engines_for_cross(cfg)
-    codes = [code for code, _label in engines]
+    把勾选的策略写进 cfg['strategy']['cross_engines']。
+
+    传入 codes 时按勾选写入；没传时只整理现有名单，空名单才填全部。
+    """
     st = cfg.setdefault("strategy", {})
-    st["cross_engines"] = codes
-    return codes
+    if codes is not None:
+        engines = engines_from_codes(codes)
+    else:
+        engines = engines_for_cross(cfg)
+    names = [code for code, _label in engines]
+    st["cross_engines"] = names
+    return names
 
 
 def contracts_for_cross(symbols: list[str] | None) -> list[tuple[str, str, float, bool]]:
@@ -532,6 +566,8 @@ def screen_symbols(
             "trades": 0,
             "win_rate": 0.0,
             "profit_factor": 0.0,
+            "payoff": 0.0,
+            "expectancy": 0.0,
             "max_drawdown": 0.0,
             "net_pnl": 0.0,
             "error": "",
@@ -555,6 +591,12 @@ def screen_symbols(
             row["trades"] = int(perf.trades)
             row["win_rate"] = float(perf.win_rate)
             row["profit_factor"] = float(perf.profit_factor)
+            row["payoff"] = float(getattr(perf, "payoff", 0.0) or 0.0)
+            row["avg_win"] = float(getattr(perf, "avg_win", 0.0) or 0.0)
+            row["avg_loss"] = float(getattr(perf, "avg_loss", 0.0) or 0.0)
+            row["losses"] = int(getattr(perf, "losses", 0) or 0)
+            _exp = getattr(perf, "expectancy", None)
+            row["expectancy"] = 0.0 if _exp is None else float(_exp)
             row["max_drawdown"] = float(perf.max_drawdown)
             row["net_pnl"] = float(getattr(perf, "net_pnl", 0.0) or 0.0)
             row["score"] = float(getattr(perf, "score", 0.0) or 0.0)
@@ -663,6 +705,8 @@ def screen_strategies(
             "trades": 0,
             "win_rate": 0.0,
             "profit_factor": 0.0,
+            "payoff": 0.0,
+            "expectancy": 0.0,
             "max_drawdown": 0.0,
             "net_pnl": 0.0,
             "error": "",
@@ -684,6 +728,12 @@ def screen_strategies(
             row["trades"] = int(perf.trades)
             row["win_rate"] = float(perf.win_rate)
             row["profit_factor"] = float(perf.profit_factor)
+            row["payoff"] = float(getattr(perf, "payoff", 0.0) or 0.0)
+            row["avg_win"] = float(getattr(perf, "avg_win", 0.0) or 0.0)
+            row["avg_loss"] = float(getattr(perf, "avg_loss", 0.0) or 0.0)
+            row["losses"] = int(getattr(perf, "losses", 0) or 0)
+            _exp = getattr(perf, "expectancy", None)
+            row["expectancy"] = 0.0 if _exp is None else float(_exp)
             row["max_drawdown"] = float(perf.max_drawdown)
             row["net_pnl"] = float(getattr(perf, "net_pnl", 0.0) or 0.0)
             row["score"] = float(getattr(perf, "score", 0.0) or 0.0)
@@ -777,16 +827,17 @@ def screen_cross(
     *,
     universe: list[tuple] | None = None,
     engines: list[tuple[str, str]] | None = None,
+    periods: list[str] | None = None,
     runner: Callable[..., Any] | None = None,
     on_progress: Callable[[int, int, str], None] | None = None,
     cancel: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """
-    品种和策略交叉测试。
+    策略 × 合约 × 周期 交叉测试。
 
-    配置里的每个合约，都配参与策略回测一次。周期、日期和手数用本页填的数字。
+    每一组都用同一套手数、日期和开仓限制。信号和止损用同一个周期。
     全品种主力连续只留着备查，这一轮不用那份。
-    不跟某一次历史回测比。同一个品种的 K 线下载一次后，后面的策略接着用。
+    不跟某一次历史回测比。同一个品种、同一个周期的 K 线下载一次后，后面的策略接着用。
     不改正在用的策略，也不写历史回测那份结果。
     """
     if runner is None:
@@ -803,99 +854,123 @@ def screen_cross(
     spec["fair_compare"] = True
     spec["ignore_equity"] = True
     spec.pop("engine", None)
+    from src.data.periods import period_label
+
     strategies = list(engines or SCREEN_STRATEGIES)
     items, skipped_thin = _without_thin(list(universe or MAIN_UNIVERSE))
+    period_codes = normalize_cross_periods(periods)
+    if not period_codes:
+        fallback = str(spec.get("timeframe") or "5")
+        period_codes = normalize_cross_periods([fallback]) or ["5"]
     # 每个品种只拉一次最新 K 线，给「当下行情」列用；和回测那份数据分开取，避免把回测末日当成现在。
     from src.strategy.session_audit import make_bars_provider
 
     bars_fn = make_bars_provider(cfg)
     rows: list[dict[str, Any]] = []
     stopped = False
-    total = len(items) * len(strategies)
+    total = max(1, len(items) * len(strategies) * len(period_codes))
     step = 0
     volume = 1
 
-    for item in items:
+    for period in period_codes:
         if stopped:
             break
-        code, product, _mult, _thin = _contract(item)
-        for engine, label in strategies:
-            step += 1
-            if cancel is not None and cancel():
-                stopped = True
+        for item in items:
+            if stopped:
                 break
-            if on_progress is not None:
-                on_progress(step, total, f"{product} · {label}")
-            one = dict(spec)
-            one["engine"] = engine
-            prepared, volume = prepare_screen_cfg(cfg, settings=one)
-            row: dict[str, Any] = {
-                "symbol": code,
-                "product": product,
-                "strategy": label,
-                "engine": engine,
-                "trades": 0,
-                "win_rate": 0.0,
-                "profit_factor": 0.0,
-                "max_drawdown": 0.0,
-                "net_pnl": 0.0,
-                "error": "",
-                # 成交好不好按品种字母去全品种名单里认。你点名的合约即使偏少也照样测。
-                "liquidity": liquidity_text(code),
-            }
-            try:
-                # 始终把固定手数传进去。不能改回按权益算仓，否则保证金高的品种会被账户拦住。
-                result = runner(
-                    prepared,
-                    symbol=code,
-                    volume=volume,
-                    start_date=one.get("start_date") or None,
-                    end_date=one.get("end_date") or None,
-                    engine=engine,
-                )
-                perf = result.performance
-                row["trades"] = int(perf.trades)
-                row["win_rate"] = float(perf.win_rate)
-                row["profit_factor"] = float(perf.profit_factor)
-                row["max_drawdown"] = float(perf.max_drawdown)
-                row["net_pnl"] = float(getattr(perf, "net_pnl", 0.0) or 0.0)
-                row["score"] = float(getattr(perf, "score", 0.0) or 0.0)
-                snap = getattr(result, "params_snapshot", None) or {}
-                margin_used = float(snap.get("margin_used") or 0)
-                row["margin_used"] = margin_used
-                row["return_rate"] = (row["net_pnl"] / margin_used) if margin_used > 0 else None
-                row["data_from"] = str(snap.get("data_from") or "")
-                row["data_to"] = str(snap.get("data_to") or "")
-                row["bars"] = int(getattr(result, "bars", 0) or 0)
-            except Exception as exc:  # noqa: BLE001
-                # 某一个组合拉不到 K 线，只记这一行，后面的品种和策略继续测。
-                row["error"] = str(exc)
-            row["frequency"] = trade_frequency(
-                int(row.get("trades") or 0),
-                str(row.get("data_from") or ""),
-                str(row.get("data_to") or ""),
-            )
-            try:
-                row.update(
-                    _market_snapshot(
-                        cfg,
-                        bars_fn,
-                        code,
-                        str((prepared.get("strategy") or {}).get("timeframe") or "5"),
-                        engine,
+            code, product, _mult, _thin = _contract(item)
+            for engine, label in strategies:
+                step += 1
+                if cancel is not None and cancel():
+                    stopped = True
+                    break
+                if on_progress is not None:
+                    on_progress(step, total, f"{product} · {label} · {period_label(period)}")
+                one = dict(spec)
+                one["engine"] = engine
+                # 信号和止损用同一个周期，这是这一轮的对照变量。
+                one["timeframe"] = period
+                one["trail_timeframe"] = period
+                prepared, volume = prepare_screen_cfg(cfg, settings=one)
+                row: dict[str, Any] = {
+                    "symbol": code,
+                    "product": product,
+                    "strategy": label,
+                    "engine": engine,
+                    "timeframe": period,
+                    "trades": 0,
+                    "win_rate": 0.0,
+                    "profit_factor": 0.0,
+                    "payoff": 0.0,
+                    "expectancy": 0.0,
+                    "max_drawdown": 0.0,
+                    "net_pnl": 0.0,
+                    "error": "",
+                    # 成交好不好按品种字母去全品种名单里认。你点名的合约即使偏少也照样测。
+                    "liquidity": liquidity_text(code),
+                }
+                try:
+                    # 始终把固定手数传进去。不能改回按权益算仓，否则保证金高的品种会被账户拦住。
+                    result = runner(
+                        prepared,
+                        symbol=code,
+                        volume=volume,
+                        start_date=one.get("start_date") or None,
+                        end_date=one.get("end_date") or None,
+                        engine=engine,
                     )
+                    perf = result.performance
+                    row["trades"] = int(perf.trades)
+                    row["win_rate"] = float(perf.win_rate)
+                    row["profit_factor"] = float(perf.profit_factor)
+                    row["payoff"] = float(getattr(perf, "payoff", 0.0) or 0.0)
+                    row["avg_win"] = float(getattr(perf, "avg_win", 0.0) or 0.0)
+                    row["avg_loss"] = float(getattr(perf, "avg_loss", 0.0) or 0.0)
+                    row["losses"] = int(getattr(perf, "losses", 0) or 0)
+                    _exp = getattr(perf, "expectancy", None)
+                    row["expectancy"] = 0.0 if _exp is None else float(_exp)
+                    row["max_drawdown"] = float(perf.max_drawdown)
+                    row["net_pnl"] = float(getattr(perf, "net_pnl", 0.0) or 0.0)
+                    row["score"] = float(getattr(perf, "score", 0.0) or 0.0)
+                    snap = getattr(result, "params_snapshot", None) or {}
+                    margin_used = float(snap.get("margin_used") or 0)
+                    row["margin_used"] = margin_used
+                    row["return_rate"] = (row["net_pnl"] / margin_used) if margin_used > 0 else None
+                    row["data_from"] = str(snap.get("data_from") or "")
+                    row["data_to"] = str(snap.get("data_to") or "")
+                    row["bars"] = int(getattr(result, "bars", 0) or 0)
+                except Exception as exc:  # noqa: BLE001
+                    # 某一个组合拉不到 K 线，只记这一行，后面的品种和策略继续测。
+                    row["error"] = str(exc)
+                row["frequency"] = trade_frequency(
+                    int(row.get("trades") or 0),
+                    str(row.get("data_from") or ""),
+                    str(row.get("data_to") or ""),
                 )
-            except Exception:  # noqa: BLE001
-                # 附加信息，拿不到就留空，不能让它把整行回测结果带崩。
-                row.update({"market_score": None, "market_ok": None, "market_note": "取数失败"})
-            row["better"] = []
-            row["picked"] = "没测成" if row.get("error") else ""
-            rows.append(row)
+                try:
+                    row.update(
+                        _market_snapshot(
+                            cfg,
+                            bars_fn,
+                            code,
+                            period,
+                            engine,
+                        )
+                    )
+                except Exception:  # noqa: BLE001
+                    # 附加信息，拿不到就留空，不能让它把整行回测结果带崩。
+                    row.update({"market_score": None, "market_ok": None, "market_note": "取数失败"})
+                row["better"] = []
+                row["picked"] = "没测成" if row.get("error") else ""
+                rows.append(row)
 
     mark_relative_better(rows)
     candidates = [row for row in rows if row.get("picked") == "较好"]
     candidates.sort(key=lambda row: int(row.get("rank") or 999))
     spec["strategies"] = [engine for engine, _label in strategies]
+    spec["periods"] = period_codes
+    spec["timeframe"] = period_codes[0] if period_codes else spec.get("timeframe")
+    spec["trail_timeframe"] = spec["timeframe"]
     return {
         "baseline": {},
         "volume": volume,
@@ -929,6 +1004,7 @@ def _market_snapshot(
         evaluate_market_state,
         ENGINE_TREND_SECTION,
         range_params_for_daily_body,
+        range_params_for_opening_break,
         score_market_state,
         trend_params_for_section,
     )
@@ -941,7 +1017,7 @@ def _market_snapshot(
     if engine in CTA_OWN_FILTER:
         from src.strategy.cta_filter import CtaFilterParams, evaluate_cta_filter
 
-        kind = {"cta": "multi_factor", "vote": "multi_vote", "hybrid": "multi_hybrid"}.get(
+        kind = {"cta": "multi_factor"}.get(
             engine, engine
         )
         st = cfg.get("strategy") or {}
@@ -962,6 +1038,10 @@ def _market_snapshot(
 
     if engine == "daily_body":
         params = range_params_for_daily_body(cfg)
+        if not params.enabled:
+            params = replace(params, enabled=True, mode="range")
+    elif engine == "float_hold":
+        params = range_params_for_opening_break(cfg, "float_hold", default_enabled=False)
         if not params.enabled:
             params = replace(params, enabled=True, mode="range")
     else:
@@ -1043,14 +1123,16 @@ def list_rows(result: dict[str, Any]) -> list[dict[str, str]]:
 
     带基准时，第一行是基准。入选的排在前面。
     打分排名时没有基准行，按名次从第 1 名往下排。
-    每一行都有胜率、盈利因子、最大回撤、净盈亏、盈利覆盖、收益率、交易频率、笔数、每笔收益、
+    每一行都有胜率、盈利因子、盈亏比、收益期望、最大回撤、净盈亏、盈利覆盖、收益率、交易频率、笔数、每笔收益、
     实际测试时段、起止日、天数、日均、K 线根数、得分和结果。
-    净盈亏、覆盖相关列、收益率、实际时段和根数只给人看，不参与入选，也不参与排名。
+    净盈亏、覆盖相关列、收益率、实际时段、根数和收益期望只给人看，不参与入选，也不参与排名。
     """
     base = result.get("baseline") or {}
     ranking = result.get("mode") in ("rank", "strategy")
     by_strategy = result.get("mode") == "strategy"
     by_cross = result.get("mode") == "cross"
+    from src.data.periods import period_label
+
     period = str((result.get("settings") or {}).get("timeframe") or "")
     if not period:
         period = str(base.get("timeframe") or "")
@@ -1099,8 +1181,12 @@ def list_rows(result: dict[str, Any]) -> list[dict[str, str]]:
             shown.append({
                 "symbol": name or "-",
                 "strategy": strategy_text,
+                "period": period_label(str(row.get("timeframe") or period or "")) or "—",
+                "timeframe": str(row.get("timeframe") or period or ""),
                 "win_rate": "—",
                 "profit_factor": "—",
+                "payoff": "—",
+                "expectancy": "—",
                 "max_drawdown": "—",
                 "net_pnl": "—",
                 "profit_cover": empty["profit_cover"],
@@ -1132,6 +1218,9 @@ def list_rows(result: dict[str, Any]) -> list[dict[str, str]]:
             period,
         )
         item["strategy"] = strategy_text
+        tf = str(row.get("timeframe") or period or "")
+        item["timeframe"] = tf
+        item["period"] = period_label(tf) if tf else "—"
         shown.append(item)
     return shown
 
@@ -1202,7 +1291,7 @@ def board_summary(result: dict[str, Any]) -> str:
         tail = "点「开始交叉测试」后，下表按组合列出结果。" if not tested else f"已测 {len(tested)} 个组合，较好 {better} 个。"
         return (
             f"交叉测试 · 每个组合固定 {lots} 手 · 区间 {span}\n"
-            f"不看账户权益，也不看保证金。只测配置里的合约，每套参与策略都配一遍。全品种名单只备查，不参加这一轮。用本页的周期和日期，不跟某一次回测比。"
+            f"不看账户权益，也不看保证金。只测你勾选的策略、合约和周期。信号和止损用同一个周期。全品种名单只备查，不参加这一轮。日期和手数用本页，不跟某一次回测比。"
             f"较好的条件：净赚、盈利因子大于 1、成交不少于 5 笔，并且得分排在这些组合的前四分之一。"
             f"得分看盈利因子和净赚能不能盖住回撤，不看胜率。这只是这段历史上相对好看，不代表以后会赚钱。"
             f"正在用的策略不会被换掉。{thin_note}{tail}{stopped}"
@@ -1251,6 +1340,8 @@ def _display_row(
         "symbol": name or "-",
         "win_rate": _pct(source.get("win_rate")),
         "profit_factor": _num(source.get("profit_factor")),
+        "payoff": _payoff_text(source.get("payoff")),
+        "expectancy": _expectancy_text(source),
         "max_drawdown": _money(source.get("max_drawdown")),
         "net_pnl": _money(source.get("net_pnl")),
         "profit_cover": cover["profit_cover"],
@@ -1528,7 +1619,7 @@ def format_report(result: dict[str, Any]) -> str:
     """把结果表收成一段文字，写入优选记录，方便以后打开还能对上同一张表。"""
     lines = [board_summary(result), ""]
     lines.append(
-        "品种 | 策略 | 胜率 | 盈利因子 | 最大回撤 | 净盈亏 | 盈利覆盖 | 收益率 | 交易频率 | 笔数 | "
+        "品种 | 策略 | 胜率 | 盈利因子 | 盈亏比 | 收益期望 | 最大回撤 | 净盈亏 | 盈利覆盖 | 收益率 | 交易频率 | 笔数 | "
         "每笔收益 | 实际测试时段 | 开始时间 | 结束时间 | 天数 | 日均 | K线根数 | 得分 | 流动性 | 结果"
     )
     for row in list_rows(result):
@@ -1539,6 +1630,8 @@ def format_report(result: dict[str, Any]) -> str:
                     row.get("strategy") or "—",
                     row["win_rate"],
                     row["profit_factor"],
+                    row.get("payoff") or "—",
+                    row.get("expectancy") or "—",
                     row["max_drawdown"],
                     row["net_pnl"],
                     row.get("profit_cover") or "—",
@@ -1576,6 +1669,68 @@ def _num(value: Any) -> str:
         return f"{float(value):.2f}"
     except (TypeError, ValueError):
         return "-"
+
+
+def _payoff_text(value: Any) -> str:
+    """
+    盈亏比：平均盈利÷平均亏损。和历史回测同一口径。
+
+    没有亏损笔时算不出，格子里写横杠，避免和盈利因子混在一起。
+    """
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return "—"
+    if number <= 1e-9:
+        return "—"
+    return f"{number:.2f}"
+
+
+def _expectancy_text(source: dict[str, Any]) -> str:
+    """
+    无单位收益期望：胜率×盈亏比 − 败率。每亏 1 元风险期望赚多少。
+
+    有平均盈亏就当场算，避免旧结果里还是「元/笔」的数字。
+    没有亏损笔时写横杠。0 也是有效结果，写成 0.00。
+    """
+    from src.backtest.metrics import unit_expectancy
+
+    try:
+        trades = int(source.get("trades") or 0)
+    except (TypeError, ValueError):
+        trades = 0
+    if trades <= 0:
+        return "—"
+    try:
+        win_rate = float(source.get("win_rate") or 0)
+    except (TypeError, ValueError):
+        win_rate = 0.0
+    avg_win = source.get("avg_win")
+    avg_loss = source.get("avg_loss")
+    if avg_win not in (None, "") and avg_loss not in (None, ""):
+        try:
+            loss = float(avg_loss)
+        except (TypeError, ValueError):
+            return "—"
+        if loss <= 1e-9:
+            return "—"
+        value = unit_expectancy(win_rate, avg_win, avg_loss)
+        return f"{value:.2f}"
+    try:
+        payoff = float(source.get("payoff") or 0)
+    except (TypeError, ValueError):
+        payoff = 0.0
+    if payoff > 1e-9:
+        value = win_rate * payoff - (1.0 - win_rate)
+        return f"{value:.2f}"
+    try:
+        losses = int(source.get("losses") or 0)
+    except (TypeError, ValueError):
+        losses = 0
+    if losses > 0:
+        value = unit_expectancy(win_rate, 0.0, 1.0)
+        return f"{value:.2f}"
+    return "—"
 
 
 def _score(value: Any) -> str:

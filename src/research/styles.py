@@ -47,13 +47,12 @@ ENGINES_BY_STYLE: dict[str, tuple[tuple[str, str], ...]] = {
     ),
     STYLE_BREAKOUT: (
         ("daily_body", "日内实体（开盘箱体收盘突破）"),
-        ("morning_box_a", "早盘箱体 A"),
         ("bollinger", "布林突破"),
         ("trend_follow", "海龟突破"),
     ),
     STYLE_REVERSION: (),
     STYLE_SWING: (
-        ("jesse_casper", "Jesse Casper 简化 SMC"),
+        ("ema_swing", "均线波段"),
         ("swing_trend", "长线趋势加减仓"),
     ),
 }

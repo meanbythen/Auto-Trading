@@ -104,6 +104,9 @@ def test_perf_block_matches_overall_fields() -> None:
             "wins": 6,
             "losses": 4,
             "win_rate": 0.6,
+            "avg_win": 300,
+            "avg_loss": 150,
+            "payoff": 2.0,
             "net_pnl": 1200,
             "profit_factor": 1.8,
             "max_drawdown": 300,
@@ -116,6 +119,8 @@ def test_perf_block_matches_overall_fields() -> None:
     )
     text = "\n".join(lines)
     assert "训练成绩" in text
+    assert "盈亏比    2.00" in text
+    assert "收益期望  0.80" in text
     assert "净盈亏" in text
     assert "盈利因子" in text
     assert "最大回撤" in text
@@ -227,9 +232,9 @@ def test_daily_body_grid_stays_small() -> None:
     assert standard["day_cutoff"] == ["09:45", "10:15", "10:45"]
     assert set(full) == set(standard) | {
         "stop_extra_ticks",
-        "skip_gap_ticks",
-        "max_box_ticks",
-        "max_chase_ticks",
+        "skip_gap_atr_mult",
+        "max_box_atr_mult",
+        "max_chase_atr_mult",
         "ema_period",
         "ema_buffer_ticks",
         "generic_stop.lookback",
@@ -249,6 +254,22 @@ def test_daily_body_grid_stays_small() -> None:
     assert light_n <= 30
     assert standard_n <= 3000
     assert full_n > 100000
+
+
+def test_float_hold_grid_has_late_window_and_be() -> None:
+    """浮盈飘单精简搜观察窗口、止损宽度、是否收盘清仓。"""
+    from src.backtest.optimizer import default_grid_for_engine
+
+    light = default_grid_for_engine("float_hold", "精简")
+    standard = default_grid_for_engine("float_hold", "标准")
+    assert 60 in light["eth_minutes"]
+    assert 1.5 in light["stop_atr_mult"]
+    assert False in light["flatten_at_close"]
+    assert "be_atr_mult" in standard
+    assert "14:45" in standard["day_cutoff"]
+    assert "eth_minutes2" not in standard
+    assert "be_r_mult" not in standard
+    assert "stop_extra_ticks" not in standard
 
 
 def test_daily_body_params_write_eth_and_timeframe() -> None:
@@ -278,6 +299,40 @@ def test_daily_body_params_write_eth_and_timeframe() -> None:
 def test_finest_grid_timeframe_picks_five() -> None:
     """网格里有 5 和 15 时，拉 K 线用 5 分钟。"""
     assert _finest_grid_timeframe({"timeframe": ["15", "5"]}, "15") == "5"
+    assert _finest_grid_timeframe({"macd_timeframe": ["5", "1"]}, "5") == "1"
+
+
+def test_float_hold_params_write_macd_pair_and_flatten() -> None:
+    """MACD 组合拆成三根参数；均线对拆开；收盘清仓写到公共开关，并可关掉拿到隔夜。"""
+    cfg = {
+        "strategy": {
+            "engine": "float_hold",
+            "timeframe": "15",
+            "flatten_at_close": True,
+            "float_hold": {},
+        }
+    }
+    out = _apply_params(
+        cfg,
+        {
+            "macd_timeframe": "1",
+            "macd_combo": "5/34/5",
+            "dir_ema_pair": "20/60",
+            "flatten_at_close": False,
+        },
+        "float_hold",
+    )
+    st = out["strategy"]
+    hold = st["float_hold"]
+    assert hold["direction"] == "macd_cycle"
+    assert hold["macd_timeframe"] == "1"
+    assert hold["macd_fast"] == 5
+    assert hold["macd_slow"] == 34
+    assert hold["macd_signal"] == 5
+    assert hold["dir_ema_fast"] == 20
+    assert hold["dir_ema_slow"] == 60
+    assert st["timeframe"] == "1"
+    assert st["flatten_at_close"] is False
 
 
 def test_cutoff_and_scope_write_where_the_strategy_reads() -> None:
@@ -309,13 +364,13 @@ def test_settings_outside_the_grid_stay_as_the_config_page() -> None:
             "engine": "daily_body",
             "timeframe": "15",
             "trail_timeframe": "15",
-            "daily_body": {"day_cutoff": "10:30", "night_cutoff": "22:15", "max_box_ticks": 80},
+            "daily_body": {"day_cutoff": "10:30", "night_cutoff": "22:15", "max_box_atr_mult": 4.0},
         },
         "schedule": {"session_scope": "day"},
     }
     out = _apply_params(cfg, {"eth_minutes": 30, "timeframe": "5"}, "daily_body")
     assert out["schedule"]["session_scope"] == "day"
-    assert out["strategy"]["daily_body"]["max_box_ticks"] == 80
+    assert out["strategy"]["daily_body"]["max_box_atr_mult"] == 4.0
     assert out["strategy"]["daily_body"]["day_cutoff"] == "10:30"
 
 
@@ -331,9 +386,9 @@ def test_every_optimized_param_is_a_config_page_item() -> None:
         "session_scope",
         "stop_mode",
         "stop_extra_ticks",
-        "skip_gap_ticks",
-        "max_box_ticks",
-        "max_chase_ticks",
+        "skip_gap_atr_mult",
+        "max_box_atr_mult",
+        "max_chase_atr_mult",
         "ema_period",
         "ema_buffer_ticks",
         # 通用止损（止损设置页）
@@ -352,6 +407,17 @@ def test_every_optimized_param_is_a_config_page_item() -> None:
         "long_period",
         "reverse_on_cross",
         "atr_stop_mult",
+        "slope_min_deg",
+        "slope_lookback",
+        "slope_exit",
+        "no_open_before_close_min",
+        "macd_combo",
+        "dir_ema_pair",
+        "sig_ema_triple",
+        "stop_ema",
+        "side_ema",
+        "slope_ema",
+        "swing_side_bars",
         "boll_window",
         "boll_dev",
         "ma_filter",
@@ -360,30 +426,29 @@ def test_every_optimized_param_is_a_config_page_item() -> None:
         "ma_short",
         "ma_long",
         "channel",
-        "min_votes",
-        "min_vote_diff",
         # 长线趋势加减仓
         "daily_ma",
         "add_min_atr",
         "reduce_extend_atr",
         "max_adds",
-        "lookback_liq",
         "vol_mult",
-        "min_rr",
+        "lookback",
+        "height_atr",
+        "adx_min",
+        "trail_atr",
+        "trail_start_h",
     }
     for engine in (
         "daily_body",
         "trend_follow",
         "supertrend",
         "dual_ma",
+        "ema_swing",
         "bollinger",
         "sar_trend",
         "multi_factor",
-        "multi_factor_adapt",
-        "multi_vote",
-        "multi_hybrid",
         "swing_trend",
-        "jesse_casper",
+        "swing_box",
     ):
         for depth in ("精简", "标准", "完整"):
             assert set(grid_for_engine(engine, depth)) <= ui_covered, (engine, depth)
@@ -416,13 +481,13 @@ def test_generic_stop_params_write_under_strategy_root() -> None:
 
 def test_factory_values_cover_generic_stop() -> None:
     """出厂值要覆盖新加的通用止损项，分数接近时才能正确比较距离。"""
-    for engine in ("daily_body", "trend_follow", "supertrend", "dual_ma", "swing_trend"):
+    for engine in ("daily_body", "trend_follow", "supertrend", "dual_ma", "ema_swing", "swing_trend"):
         factory = _factory_values(engine)
         assert factory["generic_stop.kind"] == "off"
         assert factory["generic_stop.lookback"] == 20
     body_factory = _factory_values("daily_body")
-    assert body_factory["skip_gap_ticks"] == 50
-    assert body_factory["max_box_ticks"] == 100
+    assert body_factory["skip_gap_atr_mult"] == 2.5
+    assert body_factory["max_box_atr_mult"] == 5.0
     assert body_factory["ema_buffer_ticks"] == 2
 
 
@@ -438,7 +503,7 @@ def test_describe_params_writes_chinese_labels_and_values() -> None:
             "generic_stop.atr_mult": 2.5,
         }
     )
-    assert "ETH开盘观察分钟=15" in text
+    assert "第一ETH窗口（分钟）=15" in text
     assert "信号周期（分钟）=5" in text
     assert "止损触发方式=收盘价确认（close）" in text
     assert "交易时段=只做夜盘（night）" in text
@@ -494,7 +559,7 @@ def test_param_table_defaults_match_builtin(tmp_path) -> None:
 
     path = build_default_table(tmp_path / "优化参数.xlsx")
     table = read_param_table(path)
-    assert table.labels["eth_minutes"] == "ETH开盘观察分钟"
+    assert table.labels["eth_minutes"] == "第一ETH窗口（分钟）"
     for engine in ENGINE_NAMES:
         for depth in DEPTHS:
             default_grid = default_grid_for_engine(engine, depth)
@@ -563,10 +628,10 @@ def test_label_sheet_rows_are_split_by_strategy(tmp_path) -> None:
         daily_keys.update(default_grid_for_engine("daily_body", depth))
     daily_rows = {key for name, key, _ in rows if name == "日内实体（主推）"}
     assert daily_rows == daily_keys
-    assert ("日内实体（主推）", "eth_minutes", "ETH开盘观察分钟") in rows
+    assert ("日内实体（主推）", "eth_minutes", "第一ETH窗口（分钟）") in rows
     # 同一策略内同一个参数键只出现一次；读表仍能拿到中文名。
     assert len(rows) == len({(name, key) for name, key, _ in rows})
-    assert read_param_table(path).labels["eth_minutes"] == "ETH开盘观察分钟"
+    assert read_param_table(path).labels["eth_minutes"] == "第一ETH窗口（分钟）"
 
 
 def test_param_table_without_rows_falls_back_to_builtin(tmp_path) -> None:

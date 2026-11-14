@@ -27,28 +27,31 @@ from src.strategy.types import PositionState
 ENGINE_BY_LABEL = {
     "只看盘面（不套策略）": None,
     "日内实体": "daily_body",
+    "日内实体（主推）": "daily_body",
+    "日内浮盈飘单": "float_hold",
     "趋势跟随": "trend_follow",
     "SuperTrend趋势": "supertrend",
     "SuperTrend": "supertrend",
     "双均线趋势": "dual_ma",
-    "早盘箱体突破A": "morning_box_a",
+    "MACD波段": "ema_swing",
+    "均线波段": "ema_swing",
     "布林带突破": "bollinger",
     "SAR波段趋势": "sar_trend",
     "多因子CTA": "multi_factor",
     "多因子CTA（加权打分）": "multi_factor",
-    "多因子CTA（自适应权重·对照）": "multi_factor_adapt",
-    "多因子投票": "multi_vote",
-    "多因子混合": "multi_hybrid",
     "长线趋势加减仓": "swing_trend",
-    "Jesse Casper（简化SMC）": "jesse_casper",
-    "Jesse Casper": "jesse_casper",
+    "长线箱体突破": "swing_box",
 }
 LABEL_BY_ENGINE = {v: k for k, v in ENGINE_BY_LABEL.items() if v}
 # 旧配置里的短名字，显示成同一套策略。
 LABEL_BY_ENGINE.update({
+    "daily_body": "日内实体",
+    "float_hold": "日内浮盈飘单",
+    "ema_swing": "均线波段",
+    "macd_swing": "均线波段",
+    "swing_box": "长线箱体突破",
     "st": "SuperTrend趋势",
     "ma_cross": "双均线趋势",
-    "morning_a": "早盘箱体突破A",
     "boll": "布林带突破",
     "bollinger_break": "布林带突破",
     "sar": "SAR波段趋势",
@@ -256,8 +259,7 @@ def _walk(
     strategy = create_strategy(local)
     strategy.positions[symbol] = PositionState(symbol=symbol)
     trend_tf = str(getattr(strategy, "trend_timeframe", "") or "")
-    if hasattr(strategy, "_last_entry_bar"):
-        strategy._last_entry_bar[symbol] = ""
+    strategy.set_last_entry_bar(symbol, "")
 
     opens: list[ReplayEvent] = []
     closes: list[ReplayEvent] = []
@@ -269,8 +271,9 @@ def _walk(
         "src.strategy.trend_follow",
         "src.strategy.supertrend",
         "src.strategy.dual_ma",
-        "src.strategy.morning_edge",
+        "src.strategy.macd_swing",
         "src.strategy.swing_trend",
+        "src.strategy.swing_box",
     )
     for mod in modules:
         logger.disable(mod)
@@ -311,10 +314,9 @@ def _walk(
                     int(getattr(strategy, "volume", 1) or 1),
                     initial_stop=decision.stop_price,
                 )
-                if hasattr(strategy, "_last_entry_bar"):
-                    bar_id = str((decision.meta or {}).get("bar_id", ""))
-                    if bar_id:
-                        strategy._last_entry_bar[symbol] = bar_id
+                bar_id = str((decision.meta or {}).get("bar_id", ""))
+                if bar_id:
+                    strategy.set_last_entry_bar(symbol, bar_id)
                 side = "开多" if decision.action == StrategyAction.BUY_OPEN else "开空"
                 stop_px = decision.stop_price
                 try:

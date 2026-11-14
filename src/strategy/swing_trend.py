@@ -7,20 +7,23 @@
   - 趋势还在时，浮盈够了、又出现回调，可以加仓（有次数上限）
   - 价格离均线冲太远时先减仓锁定一部分；大周期翻向或止损触发再清掉剩余
 原理：
-  - 同一套逻辑可缩放：默认「日线 + 60 分钟」；也可选「60 分钟 + 15 分钟」
+  - 大周期定方向仍用本小节的搭配（日线或 60 分钟）
+  - 回调进出跟配置页「信号周期」；跟踪止损跟「止损周期」
   - 大趋势不是「错过一根突破就整段放弃」，而是持续看阶段：回调可进、伸展可减
   - 仓位管理比信号更重要：有加有减，不是一路加到底
-  - 配置页的「信号周期」对这套不生效，只看本小节的周期搭配
 """
 
 from __future__ import annotations
 
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime
 from typing import Any, Literal
 
 import pandas as pd
 from loguru import logger
 
+from src.data.periods import canonical_period, period_label
+
+from .base import StrategyBase
 from .indicators import ema_series
 from .market_state import MarketFilter, trend_params_for_section
 from .session_scope import scope_allows, scope_from_cfg
@@ -42,8 +45,8 @@ SCALE_PAIRS: dict[str, tuple[str, str]] = {
     "60_15": ("60", "15"),
 }
 SCALE_LABELS: dict[str, str] = {
-    "D_60": "日线定方向 + 60分钟回调",
-    "60_15": "60分钟定方向 + 15分钟回调",
+    "D_60": "日线定方向",
+    "60_15": "60分钟定方向",
 }
 DEFAULT_SCALE = "D_60"
 
@@ -106,9 +109,9 @@ def _atr(bars: pd.DataFrame, period: int) -> float | None:
     return value
 
 
-class SwingTrendStrategy:
+class SwingTrendStrategy(StrategyBase):
     """
-    日线大方向 + 60 分钟回调进出，支持有限次加仓与伸展减仓。
+    大周期定方向 + 信号周期回调进出，支持有限次加仓与伸展减仓。
 
     决策通过 meta.scale / meta.volume 告诉执行层：首开、加仓、减仓、全平。
     """
@@ -116,6 +119,7 @@ class SwingTrendStrategy:
     uses_trend_bars = True
 
     def __init__(self, cfg: dict[str, Any]) -> None:
+        super().__init__()
         self.cfg = cfg
         st = cfg.get("strategy", {}) or {}
         box = st.get("swing_trend") or {}
@@ -123,11 +127,20 @@ class SwingTrendStrategy:
             box = {}
         trade = cfg.get("trade", {}) or {}
 
-        # 大小周期自相似：默认日线+60；可选 60+15。不跟配置页总信号周期走。
-        self.scale, self.trend_timeframe, signal_tf = resolve_scale_pair(box)
-        self.timeframe = signal_tf
-        self.trail_timeframe = self.timeframe
-        self.trend_name = "日线" if self.trend_timeframe.upper() in {"D", "W"} else f"{self.trend_timeframe}分钟"
+        # 大周期定方向看搭配；回调看公共信号周期，止损看公共止损周期。
+        # 没填公共周期时，退回搭配里的小周期（旧 yaml 仍是 60 分钟）。
+        self.scale, self.trend_timeframe, scale_signal = resolve_scale_pair(box)
+        raw_tf = st.get("timeframe")
+        if raw_tf in (None, ""):
+            self.timeframe = canonical_period(str(scale_signal or "60"))
+        else:
+            self.timeframe = canonical_period(str(raw_tf))
+        raw_trail = st.get("trail_timeframe")
+        if raw_trail in (None, ""):
+            self.trail_timeframe = self.timeframe
+        else:
+            self.trail_timeframe = canonical_period(str(raw_trail))
+        self.trend_name = period_label(self.trend_timeframe)
 
         self.symbols: list[str] = list(st.get("symbols") or [trade.get("symbol", "bu2612")])
         self.volume = int(trade.get("volume", 1))
@@ -169,8 +182,6 @@ class SwingTrendStrategy:
             s: PositionState(symbol=s) for s in self.symbols
         }
         self._pending: dict[str, dict[str, Any]] = {}
-        self._last_entry_bar: dict[str, str] = {}
-        self._signaled_bar: dict[str, str] = {}
         # 每个品种：已加仓次数、最近一次加减仓的 K 线、持仓以来最好价、是否刚做过伸展减仓。
         self._adds_done: dict[str, int] = {}
         self._best_price: dict[str, float] = {}
@@ -271,21 +282,24 @@ class SwingTrendStrategy:
         trail_bars: pd.DataFrame | None = None,
         trend_bars: pd.DataFrame | None = None,
     ) -> StrategyDecision:
-        """先看日线方向，再在 60 分钟上找回调开仓 / 加减仓 / 离场。"""
-        _ = trail_bars
+        """先看大周期方向，再在信号周期上找回调开仓 / 加减仓 / 离场。"""
         now = now or datetime.now()
         pos = self.positions.setdefault(symbol, PositionState(symbol=symbol))
         need = max(self.signal_ma, self.atr_period, self.pullback_lookback) + 3
         if self.market_filter.enabled:
             need = max(need, self.market_filter.params.need_bars)
         if bars is None or len(bars) < need:
-            return StrategyDecision(StrategyAction.HOLD, symbol, "60分钟K线不足，长线趋势还算不出来")
+            return StrategyDecision(
+                StrategyAction.HOLD,
+                symbol,
+                f"{period_label(self.timeframe)}K线不足，长线趋势还算不出来",
+            )
 
         bias = self._daily_bias(trend_bars)
         if bias == "flat":
             if pos.side != "flat":
                 # 大周期看不清时，有仓先用止损管，不再加仓；这里不强制平。
-                return self._manage(symbol, bars, pos, bias, now)
+                return self._manage(symbol, bars, pos, bias, now, trail_bars)
             return StrategyDecision(
                 StrategyAction.HOLD,
                 symbol,
@@ -294,11 +308,16 @@ class SwingTrendStrategy:
 
         bar = bars.iloc[-1]
         bar_id = str(bar.name)
-        if self._signaled_bar.get(symbol) == bar_id:
-            return StrategyDecision(StrategyAction.HOLD, symbol, "这一根60分钟已经处理过")
-
+        # 有仓时先管止损、翻向、清仓。不能因为「这根已经开过/加过」就把后面几分钟的扫描跳掉。
         if pos.side != "flat":
-            return self._manage(symbol, bars, pos, bias, now)
+            return self._manage(symbol, bars, pos, bias, now, trail_bars)
+
+        if self._signaled_bar.get(symbol) == bar_id:
+            return StrategyDecision(
+                StrategyAction.HOLD,
+                symbol,
+                f"这一根{period_label(self.timeframe)}已经处理过",
+            )
 
         if self.is_flatten_time(now):
             return StrategyDecision(StrategyAction.HOLD, symbol, "收盘清仓时段，不再开新仓")
@@ -368,13 +387,11 @@ class SwingTrendStrategy:
             return StrategyDecision(
                 StrategyAction.HOLD,
                 symbol,
-                f"{self.trend_name}偏{side_txt}，等{self.timeframe}分钟回调靠近均线后再顺势确认"
-                if self.timeframe.isdigit()
-                else f"{self.trend_name}偏{side_txt}，等小周期回调靠近均线后再顺势确认",
+                f"{self.trend_name}偏{side_txt}，等{period_label(self.timeframe)}回调靠近均线后再顺势确认",
             )
 
         entry = float(close.iloc[-1])
-        sig_name = f"{self.timeframe}分钟" if self.timeframe.isdigit() else self.timeframe
+        sig_name = period_label(self.timeframe)
         if bias == "long":
             stop = entry - self.stop_atr * atr
             action = StrategyAction.BUY_OPEN
@@ -405,13 +422,21 @@ class SwingTrendStrategy:
         pos: PositionState,
         bias: Bias,
         now: datetime,
+        trail_bars: pd.DataFrame | None = None,
     ) -> StrategyDecision:
         bar = bars.iloc[-1]
         bar_id = str(bar.name)
         close = float(bar["close"])
-        atr = _atr(bars, self.atr_period)
+        # 加减仓用信号周期波动；止损 ATR 在止损周期不同时用止损那根 K 线。
+        sig_atr = _atr(bars, self.atr_period)
+        atr_src = trail_bars if trail_bars is not None and len(trail_bars) >= self.atr_period + 1 else bars
+        stop_atr = _atr(atr_src, self.atr_period)
+        if sig_atr is None:
+            sig_atr = stop_atr
+        if stop_atr is None:
+            stop_atr = sig_atr
         ma = _ema(bars["close"].astype(float), self.signal_ma)
-        if atr is None:
+        if sig_atr is None or stop_atr is None:
             return StrategyDecision(StrategyAction.HOLD, symbol, "波动还算不出来，先持仓观望")
 
         # 刷新持仓以来最好价，后面加仓/止损都用。
@@ -441,7 +466,7 @@ class SwingTrendStrategy:
             )
 
         # 2) 止损：用初始止损与「最好价回撤 stop_atr」里更紧的一侧。
-        stop = self._current_stop(pos, best, atr)
+        stop = self._current_stop(pos, best, stop_atr)
         pos.trail_stop = stop
         pos.trail_armed = True
         if not self._is_entry_bar(symbol, bar_id):
@@ -457,9 +482,19 @@ class SwingTrendStrategy:
                     symbol, now, bar_id, pos.volume, f"长线止损触发 {stop:.2f}", scale="exit"
                 )
 
+        # 这根已经开过/加过/减过：止损和清仓已经看过，不要同一根再加一次。
+        if self._signaled_bar.get(symbol) == bar_id:
+            return StrategyDecision(
+                StrategyAction.HOLD,
+                symbol,
+                f"长线持仓中（{scale_label(self.scale)}）均价{pos.entry_price:.2f} "
+                f"止损{stop:.2f} 已加仓{self._adds_done.get(symbol, 0)}次",
+                stop_price=stop,
+            )
+
         # 3) 伸展减仓：离均线太远，先减一单元，留下核心仓。
         if ma is not None and not self._reduced_on_extend.get(symbol, False):
-            extend = (close - ma) / atr if pos.side == "long" else (ma - close) / atr
+            extend = (close - ma) / sig_atr if pos.side == "long" else (ma - close) / sig_atr
             core = self.min_core_units * self.unit_volume
             if extend >= self.reduce_extend_atr and int(pos.volume) > core:
                 cut = min(self.unit_volume, int(pos.volume) - core)
@@ -476,13 +511,13 @@ class SwingTrendStrategy:
 
         # 价格回到均线附近后，允许下一轮再减（伸展标记清掉）。
         if ma is not None:
-            near = abs(close - ma) <= self.touch_atr * atr
+            near = abs(close - ma) <= self.touch_atr * sig_atr
             if near:
                 self._reduced_on_extend[symbol] = False
 
         # 4) 浮盈回调加仓：大周期方向仍同向，且又出现回调确认。
         if bias == pos.side and ma is not None and self.in_entry_session(now, symbol):
-            add_decision = self._try_add(symbol, bars, pos, bias, ma, atr, now, bar_id, close)
+            add_decision = self._try_add(symbol, bars, pos, bias, ma, sig_atr, now, bar_id, close)
             if add_decision is not None:
                 return add_decision
 
@@ -528,12 +563,12 @@ class SwingTrendStrategy:
         if pos.side == "long":
             action = StrategyAction.BUY_OPEN
             text = (
-                f"长线加仓多 浮盈约{profit_atr:.1f}倍波动，60分钟再次回调确认，加{unit}手"
+                f"长线加仓多 浮盈约{profit_atr:.1f}倍波动，{period_label(self.timeframe)}再次回调确认，加{unit}手"
             )
         else:
             action = StrategyAction.SELL_OPEN
             text = (
-                f"长线加仓空 浮盈约{profit_atr:.1f}倍波动，60分钟再次回调确认，加{unit}手"
+                f"长线加仓空 浮盈约{profit_atr:.1f}倍波动，{period_label(self.timeframe)}再次回调确认，加{unit}手"
             )
         return self._open_decision(
             symbol, now, bar_id, action, close, stop, text, scale="add", volume=unit

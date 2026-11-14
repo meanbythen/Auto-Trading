@@ -3,9 +3,11 @@
 
 功能：读 config/主力合约表.xlsx 的「主力时段」页，把一个品种的历史拆成若干段；
       每段用它当期的主力合约回测，换月时旧仓在段末按最后收盘价强平。
+      若强平时还拿着仓，下一段在新主力按同方向移仓（止损改挂新主力均线）。
       每段用同一份起始资金（便于和单合约回测对照），各段盈亏累计平移成一条净值曲线。
 原理：单合约回测仍用 run_backtest；这里只做分段、权益衔接和结果汇总。
       换月日当天仍用旧合约，下一交易日起才改用新合约，旧仓不会在换月前一天被提前强平。
+      新主力用它自己更早的K线把均线算热，再决定移仓或新开。
 """
 
 from __future__ import annotations
@@ -23,6 +25,7 @@ from loguru import logger
 from src.backtest.engine import BacktestResult, run_backtest
 from src.backtest.main_table import ManualRow, read_manual_rows
 from src.backtest.metrics import TradeRecord, calc_performance, peak_margin
+from src.risk.delivery import apply_delivery_cutoff, extend_last_before_delivery
 from src.risk.sizing import PositionSizer
 from src.risk.universe_table import product_key
 from src.utils.paths import project_root, resource_root
@@ -93,6 +96,11 @@ def resolve_main_table(
             if found:
                 return found[0]
     return None
+
+
+def _today() -> date:
+    """回测「到最新」用的日历日。单独写成函数，方便测试把今天固定住。"""
+    return date.today()
 
 
 def _as_date(value: Any) -> date | None:
@@ -260,6 +268,25 @@ def clip_periods(
     return out
 
 
+def _carry_from_result(result: BacktestResult) -> dict[str, Any] | None:
+    """上一段最后一笔如果是「回测结束强平」，说明换月时还拿着仓，下一段要移过去。"""
+    if result is None or not result.trades:
+        return None
+    last = result.trades[-1]
+    reason = str(last.reason_exit or "")
+    # 段末因交割月提前平掉，和「回测结束强平」一样：仓还在，要移到下一手。
+    if "回测结束强平" not in reason and "交割月" not in reason:
+        return None
+    side = str(last.side or "").strip().lower()
+    if side not in {"long", "short"}:
+        return None
+    try:
+        volume = max(1, int(last.volume or 1))
+    except (TypeError, ValueError):
+        volume = 1
+    return {"side": side, "volume": volume}
+
+
 def _fallback(
     cfg: dict[str, Any],
     symbol: str,
@@ -271,6 +298,7 @@ def _fallback(
     start_date: str | None,
     end_date: str | None,
     engine: str | None,
+    chain_capital: bool = False,
 ) -> BacktestResult:
     """表里没有可用时段时，仍按原来的单合约方式回测，只补一句说明。"""
     result = run_backtest(
@@ -282,6 +310,7 @@ def _fallback(
         start_date=start_date,
         end_date=end_date,
         engine=engine,
+        chain_capital=bool(chain_capital),
     )
     snap = dict(result.params_snapshot or {})
     snap["rollover"] = False
@@ -309,10 +338,10 @@ def run_backtest_rollover(
     参数与 run_backtest 一致。找不到表、表里没有这个品种、或所选区间和表不重叠时，
     自动退回单合约回测，并在 params_snapshot 里写明原因。
 
-    chain_capital=False（默认）：每段用同一份起始资金算手数，段内结果可直接和单合约
-    回测对照；各段盈亏累计平移成一条净值曲线。
-    chain_capital=True（真实账户口径）：上一段结束时的权益接到下一段，段内手数随
-    连续盈亏变化；前面亏多了后面的段可能开不了仓。
+    chain_capital=False（默认，真实账户口径关）：每段用同一份起始资金，段内每一笔
+    也按这份资金算手数，可直接和单合约、和当时实盘对照；各段盈亏累计平移成一条净值曲线。
+    chain_capital=True（真实账户口径开）：上一段剩余权益接到下一段，段内手数也跟着
+    剩余权益走；前面亏多了后面可能开不了仓。
     """
     st = (cfg.get("strategy") or {}) if isinstance(cfg, dict) else {}
     trade = (cfg.get("trade") or {}) if isinstance(cfg, dict) else {}
@@ -325,6 +354,7 @@ def run_backtest_rollover(
         start_date=start_date,
         end_date=end_date,
         engine=engine,
+        chain_capital=bool(chain_capital),
     )
 
     table = resolve_main_table(cfg, table_path)
@@ -347,6 +377,8 @@ def run_backtest_rollover(
 
     # 换月日当天仍用旧合约：旧段多做一天，新段从次日开始，避免提前平掉旧仓。
     periods = keep_old_contract_on_rollover_day(periods)
+    # 任何合约都不把交易留进自己的交割月；多出来的日子交给下一手。
+    periods = apply_delivery_cutoff(periods)
     segments = clip_periods(periods, start_date, end_date)
     if not segments:
         note = "所选区间与主力合约表的时段不重叠，这次按原合约回测。"
@@ -358,16 +390,25 @@ def run_backtest_rollover(
     # 11月3日那笔就没了」。表过期时结果里会提示去更新表。
     tail_note = ""
     req_end = _as_date(end_date)
+    # 结束日空着 = 测到今天。主力表常常只更新到上一个交易日，不顺延就会少后面几天。
+    empty_end = req_end is None
+    if empty_end:
+        req_end = _today()
     if req_end is not None:
         last_period, seg_start, seg_end = segments[-1]
         covered = _as_date(seg_end)
         if covered is not None and covered < req_end:
-            segments[-1] = (last_period, seg_start, req_end.isoformat())
-            tail_note = (
-                f"主力合约表最后一段只到 {covered.isoformat()}，"
-                f"{(covered + timedelta(days=1)).isoformat()}~{req_end.isoformat()} "
-                f"按 {last_period.symbol} 顺延；表过期时请点「更新主力合约表」。"
+            # 顺延不得进入交割月：旧合约停在交割月前一天，余下日子改用下一手。
+            stretched, tail_note = extend_last_before_delivery(
+                [replace(last_period, start=_as_date(seg_start) or last_period.start, end=covered)],
+                req_end,
             )
+            rebuilt: list[tuple[MainPeriod, str, str]] = [
+                (row, row.start.isoformat(), row.end.isoformat()) for row in stretched
+            ]
+            segments = segments[:-1] + rebuilt
+            if empty_end and tail_note:
+                tail_note = "结束日空着，按今天测到最新。" + tail_note
 
     run = RolloverRun(table_path=str(table))
     trades: list[TradeRecord] = []
@@ -387,6 +428,8 @@ def run_backtest_rollover(
     capital = start_capital
     # 各段盈亏仍累计到同一条净值曲线：段间只做平移，不影响段内手数。
     equity_offset = 0.0
+    # 上一段结束还持仓时，把方向和手数交给下一段，在新主力同方向开。
+    inherit: dict[str, Any] | None = None
 
     for period, seg_start, seg_end in segments:
         try:
@@ -399,6 +442,8 @@ def run_backtest_rollover(
                 start_date=seg_start,
                 end_date=seg_end,
                 engine=engine,
+                chain_capital=bool(chain_capital),
+                inherit_position=inherit,
             )
         except Exception as e:  # noqa: BLE001
             reason = str(e).strip() or type(e).__name__
@@ -418,6 +463,7 @@ def run_backtest_rollover(
         total_bars += int(result.bars)
         trades.extend(result.trades)
         rejected.extend(result.rejected)
+        inherit = _carry_from_result(result)
         if result.equity:
             # 固定资金口径：段内从同一份起始资金起算，拼总曲线时把本段整体平移到
             # 上一段的落点；真实账户口径：段内起点已是上段落点，直接接上。
@@ -466,11 +512,17 @@ def run_backtest_rollover(
             "symbol": f"{product}主力连续",
             "rollover": True,
             "rollover_chain": bool(chain_capital),
+            "chain_capital": bool(chain_capital),
             "rollover_table": str(table),
             "rollover_segments": run.segments,
             "rollover_skipped": run.skipped,
             "rollover_manual": manual_count,
             "rollover_note": (tail_note + manual_note + skipped_note).strip(),
+            "rollover_carry": True,
+            # 外层写用户选的起止。不要用最后一段自己的日期，否则结束日空着
+            # 也会显示成主力表最后一天（例如 10-30），看起来像没测到最新。
+            "start_date": start_date or "",
+            "end_date": end_date or "",
             "bars": total_bars,
             "data_from": min((r.params_snapshot.get("data_from", "") for r in lasts), default=""),
             "data_to": max((r.params_snapshot.get("data_to", "") for r in lasts), default=""),
@@ -523,7 +575,10 @@ def format_rollover_lines(snap: dict[str, Any] | None) -> str:
         return note
     segments = snap.get("rollover_segments") or []
     mode = "真实账户口径，资金连续" if snap.get("rollover_chain") else "每段固定起始资金"
-    lines = [f"主力切换  按主力时段换月，共 {len(segments)} 段（{mode}）"]
+    lines = [
+        f"主力切换  按主力时段换月，共 {len(segments)} 段（{mode}；"
+        "旧仓还在则次日移到新主力；交割月不再交易旧合约）"
+    ]
     for row in segments[:MAX_LISTED_SEGMENTS]:
         mark = "（手动）" if row.get("manual") else ""
         lines.append(

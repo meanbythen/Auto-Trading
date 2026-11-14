@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import shutil
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,14 +33,14 @@ def _readme_txt(version: str) -> str:
 - 「复盘」页含成绩单、信号质量、缺陷诊断；基本面补充框下有按品种推荐的手动来源
 - 运行页「测试工具」含：试跑一轮信号、点击下单自检、完整自检（三项分选）
 - 历史回测「把本页参数写入配置页」会写回策略、品种、周期、开关和开仓限制（不改实盘余额）
-- 当前策略：日内实体、早盘箱体A、趋势跟随、SuperTrend、双均线、长线趋势加减仓、多因子、Jesse
+- 当前策略：日内实体、趋势跟随、SuperTrend、双均线、长线趋势加减仓、长线箱体突破、多因子
 - 日内实体怎么挂机：看 docs\\日内实体操作说明书.md
 - 日期用日历选择，查看/删除本地K线用时分下拉；同花顺图只给回测，不写进实盘来源
 - 已删除的策略（如均线Pin动量、缺口C、SAR、MACD 等）不会再出现在程序里；旧配置会回退到日内实体
 - 开平仓规则以当前版本说明书为准，换版本后请重新回测
 - 交叉测试 / 回测 / 优化导出含盈利覆盖、每笔收益、日均等列
 - 交易密码请在界面填写，或自建 config\\secrets.local.yaml（发布包故意不带密钥文件）
-- config\\品种与合约.xlsx 是保证金和乘数的唯一来源，请勿删除；删了会退回配置里的旧数字
+- config\\品种与合约.xlsx 是保证金比例和每手数量的来源，请勿删除；比例填 23 表示 23%，占用随开仓价变
 - config\\主力合约表.xlsx 是回测换月的依据：回测页「更新主力合约表」手动重算，「打开表格」可在「手动修正」页覆盖任意换月段，更新时该页保留
 - config\\优化参数.xlsx 是策略优化的网格档位和中文名：优化页「打开优化参数表」直接改，保存后下次优化生效
 
@@ -115,7 +114,14 @@ def main() -> int:
             shutil.copy2(src, DIST / name)
     docs_dst = DIST / "docs"
     docs_dst.mkdir(parents=True, exist_ok=True)
-    for doc_name in ("策略迭代进化说明.md", "日内实体操作说明书.md"):
+    for doc_name in (
+        "日内实体操作说明书.md",
+        "配置说明书.md",
+        "实盘交易简易说明书.md",
+        "CTP上线流程.md",
+        "华泰程序化外接测试操作说明.md",
+        "系统蓝图.md",
+    ):
         doc_src = ROOT / "docs" / doc_name
         if doc_src.exists():
             shutil.copy2(doc_src, docs_dst / doc_name)
@@ -143,16 +149,15 @@ def main() -> int:
     # 策略说明：只拷当前还在用的，已删策略的 yaml 不带进发布包
     _ACTIVE_STRATEGY_DOCS = {
         "daily_body.yaml",
-        "morning_box_a.yaml",
         "trend_follow.yaml",
         "supertrend.yaml",
         "dual_ma.yaml",
+        "ema_swing.yaml",
+        "macd_swing.yaml",
         "bollinger.yaml",
         "sar_trend.yaml",
         "multi_factor.yaml",
-        "multi_vote.yaml",
-        "multi_hybrid.yaml",
-        "jesse_casper.yaml",
+        "swing_box.yaml",
     }
     strat_dst = DIST / "strategies"
     strat_dst.mkdir(parents=True, exist_ok=True)

@@ -75,6 +75,61 @@ def test_covering_the_drawdown_beats_a_high_win_rate() -> None:
     assert sturdy.score > fragile.score
 
 
+def test_payoff_is_average_win_over_average_loss() -> None:
+    """盈亏比是平均盈利除以平均亏损，不是总盈利除以总亏损。"""
+    p = calc_performance(
+        [_trade(200, 1), _trade(100, 2), _trade(-50, 3)],
+        [10000, 10150],
+        min_trades=1,
+    )
+    # 两笔赢平均 150，一笔亏 50，盈亏比 3；盈利因子是 300/50=6。
+    assert p.avg_win == 150
+    assert p.avg_loss == 50
+    assert p.payoff == 3
+    assert p.profit_factor == 6
+    # 胜率 2/3、盈亏比 3 → 无单位期望 2 − 1/3 = 5/3。
+    assert abs(p.expectancy - 5 / 3) < 1e-9
+    from src.backtest.metrics import format_expectancy_line, format_payoff_lines
+
+    text = "\n".join(format_payoff_lines(p.avg_win, p.avg_loss, p.payoff))
+    assert "盈亏比    3.00" in text
+    assert "不是盈利因子" in text
+    expect_line = format_expectancy_line(p.win_rate, p.avg_win, p.avg_loss, p.expectancy)
+    assert "收益期望  1.67" in expect_line
+    assert "每亏1元" in expect_line
+    d = p.to_dict()
+    assert d["payoff"] == 3
+    assert abs(d["expectancy"] - round(5 / 3, 4)) < 1e-9
+
+
+def test_expectancy_is_unitless_r_multiple() -> None:
+    """无单位期望：胜率×盈亏比 − 败率。全亏是 −1。带成本时和参考函数的 e/净亏损一致。"""
+    from src.backtest.metrics import format_expectancy_line, unit_expectancy
+
+    p = calc_performance(
+        [_trade(-40, 1), _trade(-60, 2)],
+        [10000, 9900],
+        min_trades=1,
+    )
+    assert p.expectancy == -1
+    assert "没有亏损笔" in format_expectancy_line(0, 0, 0)
+    # 胜率 0.4、盈利 120、亏损 80、成本 15 → 净盈 105、净亏 95，带单位 e=-15，无单位 E=-15/95。
+    yuan = 0.4 * (120 - 15) - 0.6 * (80 + 15)
+    assert abs(yuan + 15) < 1e-9
+    value = unit_expectancy(0.4, 120, 80, 15)
+    assert abs(value - yuan / 95) < 1e-9
+
+
+def test_payoff_missing_when_no_losing_trades() -> None:
+    """全赢没有亏损笔，盈亏比算不出。"""
+    p = calc_performance([_trade(100, 1), _trade(80, 2)], [10000, 10180], min_trades=1)
+    assert p.payoff == 0
+    from src.backtest.metrics import format_payoff_lines
+
+    text = "\n".join(format_payoff_lines(p.avg_win, p.avg_loss, p.payoff))
+    assert "算不出" in text
+
+
 def test_fewer_trades_get_a_smaller_positive_score() -> None:
     """盈亏结构一样时，5 笔的正分低于 30 笔。"""
     few = calc_performance([_trade(100, i) for i in range(5)], [10000, 10500], min_trades=1)

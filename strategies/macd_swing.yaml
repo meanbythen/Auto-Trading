@@ -1,0 +1,9 @@
+# 旧名：请改用 strategies/ema_swing.yaml（界面叫「均线波段」）
+name: ema_swing
+route: |
+  旧配置 strategy.engine: macd_swing 会自动改成 ema_swing。
+  配置页选「均线波段」。
+principle:
+  - 同均线波段
+notes:
+  - 保留此文件只为旧发布包路径还能找到说明

@@ -157,6 +157,8 @@ def _fake_backtest(symbol: str, *, initial_capital: float, **kwargs) -> Backtest
         trades=[trade],
         equity=equity,
         params_snapshot={
+            "start_date": kwargs.get("start_date") or "",
+            "end_date": kwargs.get("end_date") or "",
             "data_from": "2026-01-05 09:00:00",
             "data_to": "2026-01-05 10:00:00",
             "available_from": "2026-01-05 09:00:00",
@@ -287,6 +289,62 @@ def test_rollover_extends_last_segment_to_requested_end(tmp_path, monkeypatch) -
     assert "顺延" in result.params_snapshot["rollover_note"]
 
 
+def test_rollover_empty_end_extends_to_today(tmp_path, monkeypatch) -> None:
+    """结束日空着=到最新。主力表只到 10-30 时，仍要按最后主力顺延到今天。"""
+    path = tmp_path / "2026年主力合约表.xlsx"
+    _write_table(path, _periods())
+    seen: list[tuple[str, str, str]] = []
+
+    def fake(
+        cfg, symbol: str, *, start_date=None, end_date=None, initial_capital=0.0, **kwargs
+    ) -> BacktestResult:
+        seen.append((symbol, str(start_date), str(end_date)))
+        return _fake_backtest(
+            symbol, initial_capital=initial_capital, start_date=start_date, end_date=end_date
+        )
+
+    monkeypatch.setattr(rollover, "run_backtest", fake)
+    monkeypatch.setattr(rollover, "_today", lambda: date(2026, 11, 14))
+
+    result = rollover.run_backtest_rollover(
+        {"risk": {"capital": 1000}},
+        symbol="rb2610",
+        start_date="2026-01-05",
+        end_date=None,
+        table_path=path,
+    )
+
+    assert seen[-1] == ("rb2701", "2026-08-29", "2026-11-14")
+    snap = result.params_snapshot
+    assert snap["start_date"] == "2026-01-05"
+    assert snap["end_date"] in ("", None)
+    assert "结束日空着" in snap["rollover_note"]
+    assert snap["rollover_segments"][-1]["end"] == "2026-11-14"
+
+
+def test_rollover_snapshot_keeps_user_range_not_last_segment(tmp_path, monkeypatch) -> None:
+    """结果里的「你选的区间」必须是整段回测的起止，不能写成最后一段主力自己的日期。"""
+    path = tmp_path / "2026年主力合约表.xlsx"
+    _write_table(path, _periods())
+
+    def fake(cfg, symbol: str, *, initial_capital=0.0, **kwargs) -> BacktestResult:
+        return _fake_backtest(symbol, initial_capital=initial_capital, **kwargs)
+
+    monkeypatch.setattr(rollover, "run_backtest", fake)
+
+    result = rollover.run_backtest_rollover(
+        {"risk": {"capital": 1000}},
+        symbol="rb2610",
+        start_date="2026-01-05",
+        end_date="2026-10-30",
+        table_path=path,
+    )
+
+    snap = result.params_snapshot
+    assert snap["start_date"] == "2026-01-05"
+    assert snap["end_date"] == "2026-10-30"
+
+
 def test_rollover_falls_back_when_product_missing(tmp_path, monkeypatch) -> None:
     path = tmp_path / "2026年主力合约表.xlsx"
     _write_table(path, _periods())
@@ -372,8 +430,101 @@ def test_format_rollover_lines_lists_segments() -> None:
     text = rollover.format_rollover_lines(snap)
 
     assert "共 2 段" in text
+    assert "移到新主力" in text
     assert "rb2605" in text and "rb2610" in text
     assert "+100元" in text and "-50元" in text
+
+
+def test_carry_from_end_flatten_only() -> None:
+    held = TradeRecord(
+        symbol="fu2611",
+        side="long",
+        entry_time="2026-09-30 11:00:00",
+        exit_time="2026-10-12 15:00:00",
+        entry_price=4400.0,
+        exit_price=5100.0,
+        volume=1,
+        pnl=7000.0,
+        reason_exit="回测结束强平",
+    )
+    stopped = replace_exit(held, "碰到 EMA120 止损")
+    assert rollover._carry_from_result(_result_with(held)) == {"side": "long", "volume": 1}
+    assert rollover._carry_from_result(_result_with(stopped)) is None
+    rolled = replace_exit(held, "fu2701 已到交割月（2027年1月），交割月不再开仓，有仓必须平掉并换到下一手")
+    assert rollover._carry_from_result(_result_with(rolled)) == {"side": "long", "volume": 1}
+
+
+def replace_exit(trade: TradeRecord, reason: str) -> TradeRecord:
+    return TradeRecord(
+        symbol=trade.symbol,
+        side=trade.side,
+        entry_time=trade.entry_time,
+        exit_time=trade.exit_time,
+        entry_price=trade.entry_price,
+        exit_price=trade.exit_price,
+        volume=trade.volume,
+        pnl=trade.pnl,
+        reason_exit=reason,
+    )
+
+
+def _result_with(trade: TradeRecord) -> BacktestResult:
+    equity = [1000.0, 1000.0 + float(trade.pnl)]
+    return BacktestResult(
+        symbol=trade.symbol,
+        timeframe="30",
+        trail_timeframe="30",
+        bars=10,
+        performance=calc_performance([trade], equity, min_trades=1),
+        trades=[trade],
+        equity=equity,
+    )
+
+
+def test_rollover_passes_carry_into_next_segment(tmp_path, monkeypatch) -> None:
+    """上一段结束强平还持仓时，下一段 run_backtest 要收到同方向移仓。"""
+    path = tmp_path / "2026年主力合约表.xlsx"
+    _write_table(path, _periods())
+    seen: list[object] = []
+
+    def fake(cfg, symbol: str, *, initial_capital: float, inherit_position=None, **kwargs) -> BacktestResult:
+        seen.append(inherit_position)
+        if symbol == "rb2605":
+            trade = TradeRecord(
+                symbol=symbol,
+                side="long",
+                entry_time="2026-01-05 09:00:00",
+                exit_time="2026-04-02 15:00:00",
+                entry_price=100.0,
+                exit_price=101.0,
+                volume=1,
+                pnl=100.0,
+                reason_exit="回测结束强平",
+            )
+            equity = [float(initial_capital), float(initial_capital) + 100.0]
+            perf = calc_performance([trade], equity, min_trades=1)
+            return BacktestResult(
+                symbol=symbol,
+                timeframe="15",
+                trail_timeframe="15",
+                bars=5,
+                performance=perf,
+                trades=[trade],
+                equity=equity,
+                params_snapshot={"skipped_opens": {}},
+            )
+        return _fake_backtest(symbol, initial_capital=initial_capital, **kwargs)
+
+    monkeypatch.setattr(rollover, "run_backtest", fake)
+    rollover.run_backtest_rollover(
+        {"risk": {"capital": 1000, "contracts": {"rb": {"multiplier": 10}}}},
+        symbol="rb2610",
+        start_date="2026-01-05",
+        end_date="2026-10-30",
+        table_path=path,
+    )
+    assert seen[0] is None
+    assert seen[1] == {"side": "long", "volume": 1}
 
 
 def test_format_rollover_lines_explains_fallback() -> None:

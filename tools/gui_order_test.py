@@ -3,7 +3,7 @@
 功能：激活期货通 → 鼠标先移到标定位置预览 → 倒计时后真实点击「买多1手」→ 再点「平仓」。
 用法:
     python tools/gui_order_test.py
-    或双击 试单测试.bat
+    或运行页「测试工具」→「点击下单自检」
 
 注意:
     - 会真实移动鼠标并点击（不受 config 里 dry_run 限制）
@@ -73,7 +73,7 @@ def main() -> None:
     missing = [k for k, _ in PREVIEW_KEYS if not gui.get(k)]
     if missing:
         print(f"坐标不完整，缺少: {missing}")
-        print("请先运行 标定坐标.bat")
+        print("请先在配置页点「标定下单坐标」")
         sys.exit(1)
 
     # 激活窗口（强制非 dry_run，否则 focus 会被跳过）

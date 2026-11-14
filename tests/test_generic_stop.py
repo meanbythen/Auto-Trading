@@ -339,9 +339,11 @@ def test_backtest_rewrites_wall_clock_entry_time_so_generic_stop_can_fire() -> N
             "generic_stop": {"kind": "prior_extreme", "lookback": 2},
             "daily_body": {
                 "eth_minutes": 20,
+                "eth_minutes2": 0,
                 "stop_extra_ticks": 1,
                 "ema_period": 20,
                 "ema_buffer_ticks": 2,
+                "filter_enabled": False,
                 "regime_filter": False,
             },
         },

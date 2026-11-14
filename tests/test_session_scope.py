@@ -9,6 +9,7 @@ from datetime import datetime, time as dtime
 from src.strategy.session_scope import (
     SCOPE_ALL,
     SCOPE_DAY,
+    SCOPE_LINKED,
     SCOPE_NIGHT,
     normalize_scope,
     scope_allows,
@@ -41,6 +42,8 @@ def test_scope_allows_by_selected_session() -> None:
     assert not scope_allows(SCOPE_DAY, night)
     assert scope_allows(SCOPE_NIGHT, night)
     assert not scope_allows(SCOPE_NIGHT, morning)
+    assert scope_allows(SCOPE_LINKED, morning)
+    assert scope_allows(SCOPE_LINKED, night)
 
 
 def test_normalize_scope_accepts_labels_and_unknown_falls_back() -> None:
@@ -48,6 +51,11 @@ def test_normalize_scope_accepts_labels_and_unknown_falls_back() -> None:
     assert normalize_scope("day") == SCOPE_DAY
     assert normalize_scope("只做日盘") == SCOPE_DAY
     assert normalize_scope("NIGHT") == SCOPE_NIGHT
+    assert normalize_scope("夜日连续") == SCOPE_LINKED
+    assert normalize_scope("夜日连续（跳空小）") == SCOPE_LINKED
+    assert scope_label("linked") == "夜日连续（跳空小）"
+    assert normalize_scope("夜盘+日盘连续时段") == SCOPE_LINKED
+    assert normalize_scope("linked") == SCOPE_LINKED
     assert normalize_scope("") == SCOPE_ALL
     assert normalize_scope("随便") == SCOPE_ALL
     assert scope_code("只做夜盘") == SCOPE_NIGHT

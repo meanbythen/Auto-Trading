@@ -107,7 +107,14 @@ class RiskGuardian:
         # 熔断不拦平仓。
         if side == "close":
             if symbol and self.positions:
-                if abs(int(self.positions.get(symbol, 0) or 0)) <= 0:
+                lots = abs(int(self.positions.get(symbol, 0) or 0))
+                if lots <= 0:
+                    key = next(
+                        (name for name in self.positions if str(name).lower() == str(symbol).lower()),
+                        None,
+                    )
+                    lots = abs(int(self.positions.get(key, 0) or 0)) if key is not None else 0
+                if lots <= 0:
                     return False, f"{symbol} 无持仓，无需平仓"
                 return True, "通过"
             if self.current_position == 0 and self.total_abs_position() <= 0:

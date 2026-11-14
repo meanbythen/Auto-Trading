@@ -5,6 +5,7 @@ from datetime import datetime
 import pandas as pd
 
 from src.data.periods import (
+    _session_open_edge_mask,
     bars_from_minutes,
     canonical_period,
     drop_forming_bar,
@@ -14,6 +15,36 @@ from src.data.periods import (
     resample_ohlc,
     ui_parts,
 )
+
+
+def test_session_open_edge_mask_flags_only_opening_bars() -> None:
+    """整批判断开盘边时，只认各段开盘后的第一根；21:00 这类整除开盘时刻也算。
+
+    商品 21:00 开盘，5 分钟的 21:05 是首根；21:00 本身能整除 5，规则里同样放行。
+    """
+    index = pd.to_datetime(
+        [
+            "2026-11-05 09:04:00",
+            "2026-11-05 09:05:00",
+            "2026-11-05 13:35:00",
+            "2026-11-05 21:00:00",
+            "2026-11-05 21:05:00",
+        ]
+    )
+    assert [bool(value) for value in _session_open_edge_mask(index, 5)] == [
+        False,
+        True,
+        True,
+        True,
+        True,
+    ]
+    assert [bool(value) for value in _session_open_edge_mask(index, 60)] == [
+        False,
+        False,
+        False,
+        True,
+        False,
+    ]
 
 
 def test_fix_gap_spanning_bar_removes_last_session_high() -> None:

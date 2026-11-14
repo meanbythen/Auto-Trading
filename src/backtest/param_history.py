@@ -72,6 +72,25 @@ FACTORY_DEFAULT_SNAPSHOT: dict[str, Any] = {
         "filter_adx_flat": 20,
         "filter_atr_low_pct": 0.2,
     },
+    "ema_swing": {
+        "ema_fast": 60,
+        "ema_slow": 120,
+        "dir_ema_fast": 60,
+        "dir_ema_slow": 120,
+        "dir_ema_pair": "60/120",
+        "sig_ema_a": 5,
+        "sig_ema_b": 10,
+        "sig_ema_c": 30,
+        "sig_ema_triple": "5/10/30",
+        "stop_ema": 120,
+        "side_ema": 120,
+        "slope_ema": 120,
+        "slope_min_deg": 3.0,
+        "slope_lookback": 20,
+        "slope_exit": False,
+        "no_open_before_close_min": 30,
+        "flatten_at_close": False,
+    },
     "bollinger": {
         "boll_window": 20,
         "boll_dev": 2.0,
@@ -130,60 +149,13 @@ FACTORY_DEFAULT_SNAPSHOT: dict[str, Any] = {
             "weak_votes": 0,
         },
     },
-    "multi_vote": {
-        "min_votes": 2,
-        "min_vote_diff": 2,
-        "disagree_max": 0.7,
-        "atr_stop_mult": 2.0,
-        "use_sar": True,
-        "flatten_at_close": True,
-        "cta_filter": {
-            "enabled": True,
-            "use_adx": True,
-            "use_atr": True,
-            "use_disagree": True,
-            "adx_period": 14,
-            "adx_flat": 20.0,
-            "adx_trend": 25.0,
-            "atr_lookback": 60,
-            "atr_low_pct": 0.2,
-            "weak_score": 0.0,
-            "weak_size": 1.0,
-            "weak_votes": 3,
-        },
-    },
-    "multi_hybrid": {
-        "min_votes": 2,
-        "min_vote_diff": 2,
-        "threshold": 0.6,
-        "min_position_ratio": 0.5,
-        "max_position_ratio": 1.0,
-        "disagree_max": 0.7,
-        "atr_stop_mult": 2.0,
-        "use_sar": True,
-        "flatten_at_close": True,
-        "cta_filter": {
-            "enabled": True,
-            "use_adx": True,
-            "use_atr": True,
-            "use_disagree": True,
-            "adx_period": 14,
-            "adx_flat": 20.0,
-            "adx_trend": 25.0,
-            "atr_lookback": 60,
-            "atr_low_pct": 0.2,
-            "weak_score": 0.75,
-            "weak_size": 0.5,
-            "weak_votes": 3,
-        },
-    },
     "daily_body": {
         "eth_minutes": 20,
         "eth_minutes2": 30,
         "stop_extra_ticks": 1,
-        "skip_gap_ticks": 50,
-        "max_box_ticks": 100,
-        "max_chase_ticks": 20,
+        "skip_gap_atr_mult": 2.5,
+        "max_box_atr_mult": 5.0,
+        "max_chase_atr_mult": 1.0,
         "ema_period": 20,
         "ema_buffer_ticks": 2,
         "day_cutoff": "10:30",
@@ -195,14 +167,38 @@ FACTORY_DEFAULT_SNAPSHOT: dict[str, Any] = {
         "filter_adx_upper": 30.0,
         "filter_atr_high_pct": 0.8,
     },
-    "morning_box_a": {
-        "be_box_mult": 0.9,
-        "vol_confirm_bars": 3,
-        "fake_break_bars": 2,
-        "max_trades_per_day": 2,
-        "stop_buffer_ticks": 2,
-        "enable_night": True,
-        "no_new_before_close_minutes": 15,
+    "float_hold": {
+        "eth_minutes": 60,
+        "eth_minutes2": 0,
+        "stop_atr_mult": 1.5,
+        "be_atr_mult": 2.0,
+        "skip_gap_atr_mult": 0.0,
+        "max_box_atr_mult": 0.0,
+        "max_chase_atr_mult": 0.0,
+        "direction": "eth_trend",
+        "macd_timeframe": "5",
+        "macd_fast": 12,
+        "macd_slow": 26,
+        "macd_signal": 9,
+        "dir_ema_fast": 5,
+        "dir_ema_slow": 20,
+        "trend_align_enabled": False,
+        "trend_align_fast": 60,
+        "trend_align_slow": 120,
+        "trend_slope_lookback": 5,
+        "trend_slope_min_deg": 0.0,
+        "cluster_max_width": 10,
+        "gap_align_atr_mult": 0.0,
+        "ema_period": 0,
+        "ema_buffer_ticks": 2,
+        "day_cutoff": "14:45",
+        "night_cutoff": "22:50",
+        "filter_enabled": False,
+        "filter_adx_period": 14,
+        "filter_atr_period": 14,
+        "filter_lookback": 60,
+        "filter_adx_upper": 30.0,
+        "filter_atr_high_pct": 0.8,
     },
     "swing_trend": {
         "scale": "D_60",
@@ -227,27 +223,19 @@ FACTORY_DEFAULT_SNAPSHOT: dict[str, Any] = {
         "filter_adx_flat": 20,
         "filter_atr_low_pct": 0.2,
     },
-    "jesse_casper": {
-        "trend_timeframe": "15",
-        "lookback_liq": 20,
-        "vol_ma_len": 20,
-        "vol_mult": 1.2,
-        "displacement_body_ratio": 0.5,
-        "min_rr": 3.0,
-        "price_tick": 1.0,
-        "va_pct": 0.70,
-        "use_va": True,
-        "use_kill_zone": True,
-        "use_daily_halt": True,
-        "max_losses_day": 2,
-        "max_wins_day": 1,
-        "kill_day_start": "09:00",
-        "kill_day_end": "10:00",
-        "kill_night_start": "21:00",
-        "kill_night_end": "22:30",
-        "setup_wait_bars": 16,
-        "target_lookback": 40,
-        "flatten_at_close": True,
+    "swing_box": {
+        "lookback": 40,
+        "peak_look": 2,
+        "min_gap": 5,
+        "atr_period": 20,
+        "height_atr": 1.2,
+        "adx_period": 14,
+        "adx_min": 20.0,
+        "stop_atr": 0.5,
+        "trail_atr": 2.0,
+        "trail_start_h": 1.0,
+        "vol_mult": 0.0,
+        "flatten_at_close": False,
     },
     "trade_symbol": "bu2612",
 }
@@ -264,6 +252,8 @@ _ENGINE_SECTION = {
     "st": "supertrend",
     "dual_ma": "dual_ma",
     "ma_cross": "dual_ma",
+    "ema_swing": "ema_swing",
+    "macd_swing": "ema_swing",
     "bollinger": "bollinger",
     "boll": "bollinger",
     "bollinger_break": "bollinger",
@@ -273,18 +263,10 @@ _ENGINE_SECTION = {
     "multi_factor": "multi_factor",
     "multi": "multi_factor",
     "cta": "multi_factor",
-    "multi_factor_adapt": "multi_factor_adapt",
-    "multi_vote": "multi_vote",
-    "vote": "multi_vote",
-    "multi_hybrid": "multi_hybrid",
-    "hybrid": "multi_hybrid",
     "daily_body": "daily_body",
-    "morning_box_a": "morning_box_a",
-    "morning_a": "morning_box_a",
+    "float_hold": "float_hold",
     "swing_trend": "swing_trend",
-    "jesse_casper": "jesse_casper",
-    "casper": "jesse_casper",
-    "jesse": "jesse_casper",
+    "swing_box": "swing_box",
 }
 # 自己起的名字最长这么多字，避免下拉菜单被一行撑爆。
 MAX_NAME_LENGTH = 60
@@ -440,15 +422,14 @@ def extract_strategy_snapshot(cfg: dict[str, Any]) -> dict[str, Any]:
         "trend_follow": st.get("trend_follow") or {},
         "supertrend": st.get("supertrend") or {},
         "dual_ma": st.get("dual_ma") or {},
+        "ema_swing": st.get("ema_swing") or st.get("macd_swing") or {},
         "bollinger": st.get("bollinger") or {},
         "sar_trend": st.get("sar_trend") or {},
         "multi_factor": st.get("multi_factor") or {},
-        "multi_factor_adapt": st.get("multi_factor_adapt") or {},
-        "multi_vote": st.get("multi_vote") or {},
-        "multi_hybrid": st.get("multi_hybrid") or {},
         "daily_body": st.get("daily_body") or {},
-        "morning_box_a": st.get("morning_box_a") or {},
+        "float_hold": st.get("float_hold") or {},
         "swing_trend": st.get("swing_trend") or {},
+        "swing_box": st.get("swing_box") or {},
         "trade_symbol": trade.get("symbol"),
         "data_source": (cfg.get("data") or {}).get("source") or "akshare",
     }
@@ -480,24 +461,26 @@ def apply_snapshot_to_config(cfg: dict[str, Any], snap: dict[str, Any]) -> dict[
         st["supertrend"] = copy.deepcopy(snap["supertrend"])
     if snap.get("dual_ma") is not None:
         st["dual_ma"] = copy.deepcopy(snap["dual_ma"])
+    swing_box = snap.get("ema_swing")
+    if swing_box is None:
+        swing_box = snap.get("macd_swing")
+    if swing_box is not None:
+        st["ema_swing"] = copy.deepcopy(swing_box)
+        st.pop("macd_swing", None)
     if snap.get("bollinger") is not None:
         st["bollinger"] = copy.deepcopy(snap["bollinger"])
     if snap.get("sar_trend") is not None:
         st["sar_trend"] = copy.deepcopy(snap["sar_trend"])
     if snap.get("multi_factor") is not None:
         st["multi_factor"] = copy.deepcopy(snap["multi_factor"])
-    if snap.get("multi_factor_adapt") is not None:
-        st["multi_factor_adapt"] = copy.deepcopy(snap["multi_factor_adapt"])
-    if snap.get("multi_vote") is not None:
-        st["multi_vote"] = copy.deepcopy(snap["multi_vote"])
-    if snap.get("multi_hybrid") is not None:
-        st["multi_hybrid"] = copy.deepcopy(snap["multi_hybrid"])
     if snap.get("daily_body") is not None:
         st["daily_body"] = copy.deepcopy(snap["daily_body"])
-    if snap.get("morning_box_a") is not None:
-        st["morning_box_a"] = copy.deepcopy(snap["morning_box_a"])
+    if snap.get("float_hold") is not None:
+        st["float_hold"] = copy.deepcopy(snap["float_hold"])
     if snap.get("swing_trend") is not None:
         st["swing_trend"] = copy.deepcopy(snap["swing_trend"])
+    if snap.get("swing_box") is not None:
+        st["swing_box"] = copy.deepcopy(snap["swing_box"])
     if snap.get("trade_symbol"):
         trade["symbol"] = snap["trade_symbol"]
     elif snap.get("symbols"):
@@ -527,12 +510,12 @@ def apply_engine_snapshot(cfg: dict[str, Any], snap: dict[str, Any], engine: str
     # 收盘清仓是总开关。只有听这个开关的策略回溯时才把它带回去，趋势跟随不碰。
     if section in (
         "daily_body",
+        "float_hold",
         "dual_ma",
-        "morning_box_a",
     ) and (snap or {}).get("flatten_at_close") is not None:
         st["flatten_at_close"] = bool(snap.get("flatten_at_close"))
-    # 止损触发方式是全策略公共设置；日内实体把它当优化参数，回溯这一套时一并带回。
-    if section == "daily_body" and (snap or {}).get("stop_mode") is not None:
+    # 止损触发方式是全策略公共设置；日内实体 / 浮盈飘单把它当优化参数，回溯这一套时一并带回。
+    if section in ("daily_body", "float_hold") and (snap or {}).get("stop_mode") is not None:
         st["stop_mode"] = snap["stop_mode"]
     # 通用止损是公共设置：回溯任何一套策略时都按快照恢复，保证结果可复现。
     if (snap or {}).get("generic_stop"):

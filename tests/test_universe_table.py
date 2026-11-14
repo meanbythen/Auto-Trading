@@ -37,6 +37,8 @@ def test_roundtrip_and_enabled(tmp_path: Path) -> None:
     assert symbols == ["fu2701", "c2701"]
     assert "bu" not in [s.lower() for s in symbols]
     assert contracts["fu"]["margin"] == 11232
+    assert float(contracts["fu"].get("margin_rate_pct") or 0) == 0
+    assert contracts["fu"]["multiplier"] == 10
     assert contracts["fu"]["commission"] == 2.63
     assert contracts["fu"]["commission_close_today"] == 0.0
     assert contracts["c"]["margin"] == 2220
@@ -98,6 +100,11 @@ def test_apply_to_cfg(tmp_path: Path) -> None:
     assert symbols == ["jm2701"]
     assert cfg["strategy"]["symbols"] == ["jm2701"]
     assert contracts["jm"]["multiplier"] == 60
+    # 几秒内再读一次应仍写进配置，但不再打开第二遍 Excel。
+    cfg2: dict = {"_project_root": str(tmp_path), "risk": {}, "strategy": {"symbols": ["xx"]}}
+    symbols2, _contracts2 = apply_universe_table_to_cfg(cfg2, path=path, create_if_missing=False)
+    assert symbols2 == ["jm2701"]
+    assert cfg2["strategy"]["symbols"] == ["jm2701"]
 
 
 def test_symbol_sessions_roundtrip(tmp_path: Path) -> None:
@@ -135,3 +142,49 @@ def test_symbol_sessions_roundtrip(tmp_path: Path) -> None:
     assert in_trading_sessions(sessions_for_symbol(cfg, "fu2701"), now) is False
     assert "02:30" in (contracts["ag"].get("trading_sessions") or "")
     assert "22:55" in (contracts["fu"].get("flatten_times") or "")
+
+
+def test_margin_rate_roundtrip(tmp_path: Path) -> None:
+    """新表用保证金比例%和每手数量；23 表示 23%，开仓时按价格现算。"""
+    from src.risk.universe_table import parse_margin_rate_pct
+
+    assert parse_margin_rate_pct(23) == 23
+    assert parse_margin_rate_pct("23%") == 23
+    assert parse_margin_rate_pct(0.23) == 23
+    assert parse_margin_rate_pct(9240) == 0
+
+    path = tmp_path / "rate.xlsx"
+    write_universe_table(
+        path,
+        [
+            {
+                "symbol": "fu2701",
+                "name": "燃油",
+                "margin_rate_pct": 23,
+                "multiplier": 10,
+                "enabled": True,
+            }
+        ],
+    )
+    rows = read_universe_table(path)
+    _symbols, contracts = parse_universe_rows(rows)
+    assert contracts["fu"]["margin_rate_pct"] == 23
+    assert contracts["fu"]["multiplier"] == 10
+    assert float(contracts["fu"].get("margin") or 0) == 0
+
+
+def test_read_old_header_file(tmp_path: Path) -> None:
+    """旧表还是「每手保证金 / 乘数」时也能读，金额当兜底。"""
+    import openpyxl
+
+    path = tmp_path / "old.xlsx"
+    book = openpyxl.Workbook()
+    sheet = book.active
+    sheet.append(["合约代码", "中文名", "每手保证金", "乘数", "启用"])
+    sheet.append(["fu2701", "燃油", 9240, 10, "是"])
+    book.save(path)
+    rows = read_universe_table(path)
+    _symbols, contracts = parse_universe_rows(rows)
+    assert contracts["fu"]["margin"] == 9240
+    assert contracts["fu"]["multiplier"] == 10
+    assert float(contracts["fu"].get("margin_rate_pct") or 0) == 0

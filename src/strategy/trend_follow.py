@@ -14,7 +14,7 @@
 3. 保护止损用平均真实波幅 ATR。开仓时放在 2 倍 ATR 外面。之后只往有利方向收紧：
    多单跟着持仓以来的最高价下移 2 倍 ATR，空单跟着最低价上移。止损不会放宽。
 4. 默认不按 14:55、22:55 清仓，仓可以留过午休、隔夜和周末，靠止损和更短的那段高低点离场。
-   这一套不跟配置页那个总开关走。总开关仍管日内实体、早盘、均线等。
+   这一套不跟配置页那个总开关走。总开关仍管日内实体、均线等。
    如果某次确实要到点平，把本策略的 flatten_at_close 写成 true。
 5. 开仓这根自己的高低点不算已经打到止损。
 
@@ -23,12 +23,13 @@
 
 from __future__ import annotations
 
-from datetime import datetime, time as dtime, timedelta
+from datetime import datetime, time as dtime
 from typing import Any
 
 import pandas as pd
 from loguru import logger
 
+from .base import StrategyBase
 from .market_state import MarketFilter, trend_params_for_section
 from .session_scope import scope_allows, scope_from_cfg
 from .types import (
@@ -47,10 +48,11 @@ def _parse_hhmm(value: str) -> dtime:
     return dtime(int(hour), int(minute))
 
 
-class TrendFollowStrategy:
+class TrendFollowStrategy(StrategyBase):
     """收盘突破最近一段高低点就跟上，用更短的一段和 ATR 止损结束这段行情。"""
 
     def __init__(self, cfg: dict[str, Any]) -> None:
+        super().__init__()
         self.cfg = cfg
         st = cfg.get("strategy", {})
         # 参数放在自己的小节里，不和别的策略混写。
@@ -83,7 +85,7 @@ class TrendFollowStrategy:
 
         live = self.symbols[0] if self.symbols else ""
         self.flatten_times = flatten_clocks_for_symbol(cfg, live)
-        # 不读 strategy.flatten_at_close。那个总开关管日内实体/早盘/均线。
+        # 不读 strategy.flatten_at_close。那个总开关管日内实体/均线。
         # 这里默认关掉：到点不平仓，才能把一段行情拿过收盘。
         self.flatten_at_close = config_flag(box.get("flatten_at_close", False), default=False)
         self.entry_sessions = session_tuples(cfg, live)
@@ -91,11 +93,9 @@ class TrendFollowStrategy:
 
         self.positions: dict[str, PositionState] = {s: PositionState(symbol=s) for s in self.symbols}
         self._pending: dict[str, dict[str, Any]] = {}
-        self._last_entry_bar: dict[str, str] = {}
         # 持仓以来顺着走得最远的价格。多单记最高价，空单记最低价，用来收紧止损。
         self._extreme: dict[str, float] = {}
-        # 同一根 K 线实盘会反复扫描，突破信号只报一次。
-        self._signaled_bar: dict[str, str] = {}
+        # 同一根 K 线实盘会反复扫描，突破信号只报一次（状态由公共基类保存）。
 
     def is_flatten_time(self, now: datetime | None = None) -> bool:
         """本策略自己的收盘清仓窗口。默认关着，所以到点也不会平。"""

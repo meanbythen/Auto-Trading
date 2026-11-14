@@ -1,0 +1,5 @@
+# 开发期工具。运行程序不需要这些包。
+-r requirements.lock
+ruff==0.17.5
+mypy==2.4.1
+pre-commit==4.7.0

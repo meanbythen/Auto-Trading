@@ -6,6 +6,7 @@ openpyxl>=3.1.0               # 优化参数导入导出 Excel
 akshare>=1.12.0               # 国内期货分钟K线（算Pinbar/SAR用）
 Pillow>=10.0.0                # 鼠标操作用到的图像库
 pyautogui>=0.9.54             # 鼠标键盘自动化（同花顺界面操作）
+pygetwindow>=0.0.9            # 找同花顺窗口并置顶；打包必须显式带上
 pyyaml>=6.0                   # 读取 YAML 配置
 schedule>=1.2.0               # 简易定时任务
 psutil>=5.9.0                 # 检测进程是否已启动

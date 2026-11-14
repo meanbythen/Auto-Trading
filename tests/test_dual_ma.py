@@ -5,7 +5,7 @@ from datetime import datetime
 import pandas as pd
 
 from src.strategy.dual_ma import DualMaStrategy
-from src.strategy.types import StrategyAction
+from src.strategy.types import PositionState, StrategyAction
 
 
 def _cfg(short: int = 3, long: int = 5, **box) -> dict:
@@ -16,6 +16,7 @@ def _cfg(short: int = 3, long: int = 5, **box) -> dict:
             "symbols": ["bu2612"],
             "flatten_times": ["14:55", "22:55"],
             "flatten_at_close": True,
+            "market_filter": {"enabled": False},
             "dual_ma": {"short_period": short, "long_period": long, **box},
         },
         "trade": {"symbol": "bu2612", "volume": 1},
@@ -83,3 +84,24 @@ def test_flatten_follows_global_switch() -> None:
     off = _cfg()
     off["strategy"]["flatten_at_close"] = False
     assert DualMaStrategy(off).is_flatten_time(datetime(2026, 10, 23, 14, 55)) is False
+
+
+def test_reverse_stop_uses_atr_not_a_tiny_pad() -> None:
+    """反手止损跟首次开仓一样用 ATR，不能贴着现价。"""
+    closes = [100, 101, 102, 103, 104, 105, 106, 107, 106, 90]
+    bars = _frame(closes, "2026-10-23 14:00")
+    s = DualMaStrategy(_cfg(atr_period=3, atr_stop_mult=2.0, reverse_on_cross=True))
+    s.positions["bu2612"] = PositionState(
+        symbol="bu2612",
+        side="long",
+        volume=1,
+        entry_price=105.0,
+        initial_stop=90.0,
+        trail_stop=100.0,
+        trail_armed=True,
+    )
+    decision = s.evaluate("bu2612", bars, now=datetime(2026, 10, 23, 14, 0))
+    assert decision.action == StrategyAction.SELL_OPEN
+    assert decision.stop_price is not None
+    # 贴着现价大约 90×0.001=0.09；2×ATR 远大于这个数。
+    assert float(decision.stop_price) - 90.0 > 1.0

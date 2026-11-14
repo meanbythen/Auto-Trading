@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+import pytest
 
 from src.strategy.market_state import (
     MarketFilter,
@@ -74,6 +75,21 @@ def test_low_atr_percentile_blocks_even_in_a_trend() -> None:
     assert "波动压缩" in state.reason
 
 
+def test_range_filter_recalculates_each_check_not_latched() -> None:
+    """同一份过滤器跟时间走：刚才拧来拧去还放行，换成强单边后要拦住，不能开盘锁死。"""
+    filt = MarketFilter(
+        MarketFilterParams(enabled=True, mode="range", adx_upper=30, atr_high_pct=1.0)
+    )
+    flat_rng = np.random.default_rng(11)
+    allowed = filt.check(_bars((100 + flat_rng.normal(0, 0.3, 120)).tolist(), 0.5))
+    assert allowed.ok is True
+    rng = np.random.default_rng(12)
+    trend = (100 + np.arange(160) * 0.8 + rng.normal(0, 1.0, 160)).tolist()
+    later = filt.check(_bars(trend, 3.0))
+    assert later.ok is False
+    assert later.adx > allowed.adx
+
+
 def test_disabled_filter_always_allows() -> None:
     rng = np.random.default_rng(13)
     bars = _bars((100 + rng.normal(0, 0.2, 80)).tolist(), 0.3)
@@ -128,14 +144,14 @@ def test_defaults_are_read_from_config() -> None:
 
 
 def test_strong_trend_is_blocked_in_range_mode() -> None:
-    """区间模式：强单边（ADX 高）拦掉，因为箱体突破易接逆势。"""
+    """主推日内实体：已经走出强单边（ADX 过高）不开。"""
     rng = np.random.default_rng(21)
     closes = (100 + np.arange(160) * 0.8 + rng.normal(0, 1.0, 160)).tolist()
-    params = MarketFilterParams(mode="range", adx_upper=30.0)
+    params = MarketFilterParams(mode="range", adx_upper=30.0, atr_high_pct=1.0)
     state = evaluate_market_state(_bars(closes, 3.0), params)
-    assert state.ok is False
-    assert "强单边" in state.reason
     assert state.adx > 30
+    assert state.ok is False
+    assert "强单边" in state.reason or "ADX" in state.reason
 
 
 def test_compressed_atr_is_allowed_in_range_mode() -> None:
@@ -146,7 +162,8 @@ def test_compressed_atr_is_allowed_in_range_mode() -> None:
     bars["high"] = bars["close"] + np.linspace(6.0, 0.2, len(bars))
     bars["low"] = bars["close"] - np.linspace(6.0, 0.2, len(bars))
     state = evaluate_market_state(
-        bars, MarketFilterParams(mode="range", atr_low_pct=0.2, lookback=60, adx_upper=80.0)
+        bars,
+        MarketFilterParams(mode="range", atr_low_pct=0.2, lookback=60, adx_upper=0.0),
     )
     assert state.atr_rank <= 0.2
     assert state.ok is True
@@ -154,22 +171,20 @@ def test_compressed_atr_is_allowed_in_range_mode() -> None:
 
 
 def test_flat_market_is_allowed_in_range_mode() -> None:
-    """区间模式：横盘震荡（ADX 低 + ATR 不窄不宽）放行——日内实体最该开仓的行情。"""
+    """主推日内实体：盘面拧来拧去（ADX 低）放行。"""
     rng = np.random.default_rng(22)
     closes = (100 + rng.normal(0, 0.5, 200)).tolist()
     bars = _bars(closes, 2.0)
-    # 让 ATR 分位落在中间（30%~70%）：前 150 根波动大一点，后 50 根小一点，
-    # 最近一根 ATR 落在中间分位。
     atr_series = 1.5 + rng.uniform(0.3, 3.0, 200)
-    # 最后一根用中间值（≈ 1.5），让 rank 约在 50% 附近。
     atr_series[-1] = 1.5
     half = len(atr_series) // 2
-    atr_series[:half] += 1.5  # 前半段 ATR 偏大
-    atr_series[half:-1] += 0.5  # 中间段偏小
+    atr_series[:half] += 1.5
+    atr_series[half:-1] += 0.5
     bars["high"] = bars["close"] + atr_series
     bars["low"] = bars["close"] - atr_series
-    params = MarketFilterParams(mode="range")
+    params = MarketFilterParams(mode="range", adx_upper=30.0)
     state = evaluate_market_state(bars, params)
+    assert state.adx < 30
     assert state.ok is True, f"reason={state.reason}, rank={state.atr_rank:.0%}, adx={state.adx:.1f}"
     assert state.mode == "range"
 
@@ -192,18 +207,22 @@ def test_with_mode_derives_range_from_trend_base() -> None:
     base = MarketFilterParams(mode="trend", adx_flat=20.0, adx_upper=30.0, atr_low_pct=0.2)
     range_p = MarketFilterParams.with_mode(base, "range")
     assert range_p.mode == "range"
-    assert range_p.adx_upper == base.adx_upper
     assert range_p.adx_flat == base.adx_flat  # 其他参数不变
 
 
 def test_daily_body_range_params_stay_on_when_public_filter_is_off() -> None:
     """公共行情过滤关掉时，日内实体仍用区间过滤，而且不拦波动压缩。"""
     params = range_params_for_daily_body(
-        {"strategy": {"market_filter": {"enabled": False, "adx_upper": 30, "atr_high_pct": 0.8}}}
+        {
+            "strategy": {
+                "market_filter": {"enabled": False},
+                "daily_body": {"filter_adx_upper": 0, "filter_atr_high_pct": 0.8},
+            }
+        }
     )
     assert params.enabled is True
     assert params.mode == "range"
-    assert params.adx_upper == 30
+    assert params.adx_upper == 0
     rng = np.random.default_rng(7)
     closes = (100 + np.cumsum(rng.normal(0, 0.15, 120))).tolist()
     bars = _bars(closes, 0.0)
@@ -233,6 +252,56 @@ def test_daily_body_filter_enabled_switch() -> None:
     )
     assert on.enabled is True
     assert on.mode == "range"
+    assert on.adx_upper == 30
+
+
+def test_adx_upper_zero_turns_off_strong_trend_block() -> None:
+    """ADX 上限填 0 表示关掉这一条。"""
+    params = range_params_for_daily_body(
+        {"strategy": {"daily_body": {"filter_adx_upper": 0}}}
+    )
+    assert params.adx_upper == 0
+
+
+def test_adx_upper_keeps_30() -> None:
+    """主推仍把 30 当强单边上限。"""
+    params = range_params_for_daily_body(
+        {"strategy": {"daily_body": {"filter_adx_upper": 30}}}
+    )
+    assert params.adx_upper == 30
+
+
+def test_incremental_check_matches_full_recalculation() -> None:
+    """回测逐根往前推时走增量缓存，每一步都要和整段重算给出一样的结果。"""
+    rng = np.random.default_rng(31)
+    bars = _bars((3000 + np.cumsum(rng.normal(0, 2.0, 400))).tolist(), 4.0)
+    filt = MarketFilter(
+        MarketFilterParams(enabled=True, mode="range", adx_upper=30, atr_high_pct=0.8)
+    )
+    need = filt.params.adx_period + 5
+    for end in range(need, len(bars) + 1):
+        window = bars.iloc[:end]
+        got = filt.check(window)
+        ref = evaluate_market_state(window, filt.params)
+        assert got.ok == ref.ok
+        assert got.reason == ref.reason
+        assert got.adx == pytest.approx(ref.adx, abs=1e-9)
+        assert got.atr == pytest.approx(ref.atr, abs=1e-9)
+        assert got.atr_rank == pytest.approx(ref.atr_rank, abs=1e-12)
+
+
+def test_incremental_check_rebuilds_when_bars_switch() -> None:
+    """换一段 K 线（不同品种、窗口滑过）时缓存要失效，不能拿上一段接着算。"""
+    rng = np.random.default_rng(32)
+    first = _bars((3000 + np.cumsum(rng.normal(0, 2.0, 200))).tolist(), 4.0)
+    second = _bars((4000 + np.cumsum(rng.normal(0, 2.0, 200))).tolist(), 4.0)
+    filt = MarketFilter(MarketFilterParams(enabled=True, mode="trend"))
+    filt.check(first)
+    got = filt.check(second)
+    ref = evaluate_market_state(second, filt.params)
+    assert got.ok == ref.ok
+    assert got.adx == pytest.approx(ref.adx, abs=1e-9)
+    assert got.atr_rank == pytest.approx(ref.atr_rank, abs=1e-12)
 
 
 def test_atr_high_zero_closes_upper_in_range_mode() -> None:

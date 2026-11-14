@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import json
 from pathlib import Path
 
@@ -19,6 +18,23 @@ DELETED_ENGINES = {
     "ma20",
     "morning_structure_b",
     "morning_b",
+    # 19.0.0 删除早盘箱体突破 A
+    "morning_box_a",
+    "morning_a",
+    # 23.0.0 删除 Jesse Casper
+    "jesse_casper",
+    "casper",
+    "jesse",
+    # 24.0.0 删除多因子自适应权重
+    "multi_factor_adapt",
+    # 25.0.0 删除多因子混合
+    "multi_hybrid",
+    "hybrid",
+    # 26.0.0 删除多因子投票
+    "multi_vote",
+    "vote",
+    # 27.0.0 删除日内实体·扩张
+    "daily_body_expand",
     # 更早删除的（顺手清，让文件更干净）
     "morning_gap_c",
     "morning_c",
@@ -67,10 +83,10 @@ def _clean_dict_keys(d: dict) -> tuple[dict, int]:
     return out, removed
 
 
-def _clean_list(l: list) -> tuple[list, int]:
+def _clean_list(items: list) -> tuple[list, int]:
     removed = 0
     out = []
-    for item in l:
+    for item in items:
         if isinstance(item, dict):
             d2, r2 = _clean_dict_keys(item)
             removed += r2

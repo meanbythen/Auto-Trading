@@ -60,6 +60,14 @@ def test_multiplier_does_not_treat_cu_as_corn() -> None:
     assert bare.multiplier_for("cu2612") == 10
 
 
+def test_close_symbol_match_ignores_letter_case() -> None:
+    """风控净仓和信号合约大小写不一致时，仍应允许平仓。"""
+    g = RiskGuardian(min_order_interval_sec=0)
+    g.on_order_filled("buy_open", 1, symbol="FU2701")
+    ok, _ = g.allow("close", 1, symbol="fu2701")
+    assert ok is True
+
+
 def test_block_when_daily_loss_halted() -> None:
     """当日亏损熔断后，不能再开新仓；平仓仍可。"""
     g = RiskGuardian(max_daily_loss=100, min_order_interval_sec=0)

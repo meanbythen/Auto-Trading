@@ -284,6 +284,47 @@ def build_config_tab(
             hint_wrap=int(hint_wrap) if hint_wrap else app._strategy_param_hint_wrap,
         )
 
+    def _ema_num_row(
+        parent: ctk.CTkFrame,
+        label: str,
+        vars_: list[ctk.StringVar],
+        hint: str = "",
+    ) -> None:
+        """均线波段：每个数字框前面写 EMA，框里填几就算几根指数均线。不加括号。"""
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", pady=5, padx=4)
+        ctk.CTkLabel(
+            row, text=label, font=T.FONT_BODY, text_color=T.TEXT_DIM, width=140, anchor="w"
+        ).pack(side="left", padx=(0, 8))
+        box_w = app._strategy_param_entry_w if len(vars_) == 1 else 56
+        for i, var in enumerate(vars_):
+            if i:
+                # 多根均线并排时用斜杠隔开，方便看出快慢顺序。
+                ctk.CTkLabel(
+                    row, text="/", font=T.FONT_BODY, text_color=T.TEXT_DIM
+                ).pack(side="left", padx=4)
+            ctk.CTkLabel(
+                row, text="EMA", font=T.FONT_BODY, text_color=T.TEXT
+            ).pack(side="left", padx=(0, 4))
+            ctk.CTkEntry(
+                row,
+                textvariable=var,
+                width=box_w,
+                fg_color=T.BG_ELEVATED,
+                border_color=T.BORDER,
+                text_color=T.TEXT,
+            ).pack(side="left")
+        if hint:
+            ctk.CTkLabel(
+                row,
+                text=hint,
+                font=T.FONT_SMALL,
+                text_color=T.TEXT_DIM,
+                wraplength=app._strategy_param_hint_wrap,
+                justify="left",
+                anchor="w",
+            ).pack(side="left", padx=(10, 0))
+
     def _switch_row(
         parent: ctk.CTkFrame,
         label: str,
@@ -312,11 +353,11 @@ def build_config_tab(
                 anchor="w",
             ).pack(side="left", padx=(10, 0))
 
-    # 多因子四套对照：说明比默认 200 宽一截，同一右边界；不铺满整框，避免再画出界面。
+    # 多因子两套对照：说明比默认 200 宽一截，同一右边界；不铺满整框，避免再画出界面。
     _CTA_HINT = 320
 
     def _cta_param(parent: ctk.CTkFrame, label: str, var: ctk.StringVar, hint: str = "") -> None:
-        """多因子参数行：说明宽度四套页面相同。"""
+        """多因子参数行：说明宽度两套页面相同。"""
         _param_entry(parent, label, var, hint=hint, hint_wrap=_CTA_HINT)
 
     def _cta_switch(parent: ctk.CTkFrame, label: str, var: ctk.BooleanVar, hint: str = "") -> None:
@@ -365,12 +406,17 @@ def build_config_tab(
         "日内实体",
         "ETH 开盘箱体 + 收盘突破。改左边引擎才会用到这里。",
     )
-    _param_entry(body_box, "ETH分钟数", app.eth_min_var, hint="开盘后观察多久再画箱体")
     _param_entry(
         body_box,
-        "二次开仓ETH分钟数",
+        "第一ETH窗口（分钟）",
+        app.eth_min_var,
+        hint="从这段开盘起算，观察这么多分钟再画第一口箱子。和第二个窗口分开判断",
+    )
+    _param_entry(
+        body_box,
+        "第二ETH窗口（分钟）",
         app.body_eth2_var,
-        hint="日盘第一段止损后、截止前，用这段更长的箱体再开一次；夜盘仍只开一次。默认 30，填 0 关闭",
+        hint="也从这段开盘起算，另画一口箱子。过了这个时间就丢掉第一窗口的判断，只认第二口。日盘止损后截止前也可按这口再开。夜盘不用。默认 30，填 0 关闭",
     )
     _param_entry(
         body_box,
@@ -392,21 +438,21 @@ def build_config_tab(
     )
     _param_entry(
         body_box,
-        "跳空超过几跳不开",
+        "跳空超过几倍ATR不开",
         app.body_skip_gap_var,
-        hint="这一段开盘相对上一段收盘跳空超过这个数就不开；0=关闭。每跳 1 点，50 就是 50 点",
+        hint="开盘相对上一段收盘的缺口，超过开盘前ATR这么多倍就不开；0=关。出厂 2.5。尺子是信号周期、开盘前的ATR，不含今天",
     )
     _param_entry(
         body_box,
-        "箱体超过几跳不开",
+        "箱体超过几倍ATR不开",
         app.body_max_box_var,
-        hint="开盘箱体最高-最低超过这个数就不开；0=关闭。箱体越宽，箱沿止损离进场价越远",
+        hint="开盘箱子最高-最低超过开盘前ATR这么多倍就不开；0=关。出厂 5。箱子越宽，箱沿止损离进场越远",
     )
     _param_entry(
         body_box,
-        "急破超过几跳不追",
+        "急破超过几倍ATR不追",
         app.body_max_chase_var,
-        hint="信号收盘离破位超过这个数就不当场开，等价格回到破位附近再按原方向开；0=关闭",
+        hint="信号收盘离破位超过开盘前ATR这么多倍就不当场开，等回到破位附近再按原方向开；0=关。出厂 1",
     )
     _param_entry(
         body_box,
@@ -423,7 +469,7 @@ def build_config_tab(
     _note_block(
         body_box,
         "止损固定在开盘箱体对沿。触发方式在左侧公共设置里选；没触发就拿到收盘。不做回撤止损。\n"
-        "策略优化会按深度搜这一块：精简只比 ETH、信号周期、止损触发方式和通用止损类型，"
+        "策略优化会按深度搜这一块：精简只比第一ETH窗口、信号周期、止损触发方式和通用止损类型，"
         "标准再加日盘/夜盘截止钟点和交易时段，完整才放开箱沿外扩、跳空、箱宽、急破、EMA 回抽过滤，"
         "以及通用止损的回看根数、SAR 步长和 ATR 参数。\n"
         "优化日盘截止时用 09:45 / 10:15 / 10:45 三档，避开 10:15～10:30 的上午休盘。",
@@ -437,20 +483,21 @@ def build_config_tab(
     ).pack(fill="x", padx=4, pady=(10, 0))
     _note_block(
         body_box,
-        "强单边或波动太极端时，开盘箱子突破容易接刀。不拦相对平静。已有持仓仍按箱沿止损。",
+        "箱子突破怕已经走出单边：ADX 高于上限就不开。盘面拧来拧去反而放行。\n"
+        "极端波动仍可拦。已有持仓仍按箱沿止损。每一轮用当时 K 线重算，不是开盘判一次就整天停手。",
         pady=(0, 4),
     )
     _switch_row(
         body_box,
         "启用行情过滤",
         app.body_filter_enabled_var,
-        hint="开=ADX 太高或波动太极端就不开新仓；关=这一层不看。默认开",
+            hint="开=每一轮看 ADX 是否已经单边、波动是否太极端；关=这一层不看。默认开",
     )
     _param_entry(
         body_box,
         "强单边ADX上限",
         app.body_filter_adx_upper_var,
-        hint="ADX 高于这个数就不开新仓。默认 30，填 0 关闭这一条",
+        hint="ADX 高于这个数当成已经单边，不开。默认 30。盘面拧来拧去会放行。填 0 关掉这一条",
     )
     _param_entry(
         body_box,
@@ -477,12 +524,157 @@ def build_config_tab(
         hint="默认 60，用来算 ATR 处于历史几分位",
     )
 
-    morning_box = _detail_panel(
-        "morning_box_a",
-        "早盘箱体 A",
-        "钟点和保本用出厂默认；配置页暂无单独旋钮。",
+    hold_box = _detail_panel(
+        "float_hold",
+        "日内浮盈飘单",
+        "等开盘噪音走完再定当天方向。止损和保本都按开盘前波动留宽度，否则拿到收盘。",
     )
-    _note_block(morning_box, "暂无额外旋钮。需要改观察时段等，可在配置文件对应小节里改。")
+    _note_block(
+        hold_box,
+        "和日内实体分开。这套现在尽量简单：等观察窗口走完，"
+        "EMA60 在 EMA120 上面就做多、下面就做空，错了用较宽的止损认赔。"
+        "跳空、倾角、急破这些闸默认关掉，好让单边日能开到仓。"
+        "还可以改成「观察结束看昨日密集区」、箱子或 MACD。"
+        "手数仍用左边公共的凯利或每笔风险。",
+        pady=(0, 4),
+    )
+    app._option_row(
+        hold_box,
+        "方向选择器",
+        app.float_direction_var,
+        getattr(app, "_float_direction_labels", ["开盘箱体突破"]),
+        width=220,
+    )
+    app._option_row(
+        hold_box,
+        "MACD周期",
+        app.float_macd_tf_var,
+        getattr(app, "_float_macd_tf_labels", ["1分钟", "5分钟"]),
+        width=220,
+    )
+    app._option_row(
+        hold_box,
+        "MACD参数组合",
+        app.float_macd_combo_var,
+        getattr(app, "_float_macd_combo_labels", ["12 / 26 / 9（常用）"]),
+        width=220,
+    )
+
+    def _sync_macd_combo(*_args: object) -> None:
+        """下拉常见组合时，同步改下面三格数字。"""
+        from src.strategy.float_hold import parse_macd_combo
+
+        fast, slow, signal = parse_macd_combo(app.float_macd_combo_var.get())
+        app.float_macd_fast_var.set(str(fast))
+        app.float_macd_slow_var.set(str(slow))
+        app.float_macd_signal_var.set(str(signal))
+
+    if not getattr(app, "_float_macd_combo_traced", False):
+        app.float_macd_combo_var.trace_add("write", _sync_macd_combo)
+        app._float_macd_combo_traced = True
+    _param_entry(
+        hold_box,
+        "MACD快线",
+        app.float_macd_fast_var,
+        hint="出厂 12。选上面常见组合会改这里，也可手填",
+    )
+    _param_entry(
+        hold_box,
+        "MACD慢线",
+        app.float_macd_slow_var,
+        hint="出厂 26，须大于快线",
+    )
+    _param_entry(
+        hold_box,
+        "MACD平滑",
+        app.float_macd_signal_var,
+        hint="出厂 9，柱子用这一根平滑",
+    )
+    app._option_row(
+        hold_box,
+        "定向均线对",
+        app.float_ema_pair_var,
+        getattr(app, "_float_ema_pair_labels", ["EMA5 / EMA20"]),
+        width=220,
+    )
+    _switch_row(
+        hold_box,
+        "大方向过滤",
+        app.float_trend_align_var,
+        hint="只给箱子/MACD 用。默认方向已经顺着 EMA60/120，不必再开。出厂关",
+    )
+    _param_entry(
+        hold_box,
+        "最小倾角(度)",
+        app.float_trend_slope_var,
+        hint="出厂 0=只看均线谁在上面。填大了会很少开仓",
+    )
+    _param_entry(
+        hold_box,
+        "斜率回看根数",
+        app.float_trend_lookback_var,
+        hint="看 EMA60、EMA120 自己往回几根，比均线现在和当时差多少。不是 K 线实体的斜。出厂 5",
+    )
+    _param_entry(
+        hold_box,
+        "观察几分钟再定方向",
+        app.float_eth_var,
+        hint="对「观察结束顺大方向」、昨日密集区和箱子有效。MACD循环不等。出厂 60",
+    )
+    _param_entry(
+        hold_box,
+        "密集区最宽点数",
+        app.float_cluster_width_var,
+        hint="上一交易日被反复摸到的窄价格带，最高减最低不超过这么多。出厂 10。只给「昨日密集区」用",
+    )
+    _param_entry(
+        hold_box,
+        "日盘开仓截止",
+        app.float_day_cutoff_var,
+        hint="过了这个钟点就停止开日盘新仓。出厂 14:45，好让观察结束后还能开",
+    )
+    _param_entry(
+        hold_box,
+        "夜盘开仓截止",
+        app.float_night_cutoff_var,
+        hint="过了这个钟点就停止开夜盘新仓。出厂 22:50",
+    )
+    _param_entry(
+        hold_box,
+        "止损几倍开盘前ATR",
+        app.float_stop_atr_var,
+        hint="从进场价往回留这么多倍开盘前波动。出厂 1.5。尺子不含今天早盘",
+    )
+    _param_entry(
+        hold_box,
+        "跳空超过几倍ATR不开",
+        app.float_skip_gap_var,
+        hint="缺口太大整段不做。出厂关（0）",
+    )
+    _param_entry(
+        hold_box,
+        "跳空超过几倍ATR只顺向",
+        app.float_gap_align_var,
+        hint="缺口够大时，高开只做多、低开只做空。出厂关（0）",
+    )
+    _param_entry(
+        hold_box,
+        "箱体超过几倍ATR不开",
+        app.float_max_box_var,
+        hint="箱子太宽不开。出厂关（0），默认方向不用箱子",
+    )
+    _param_entry(
+        hold_box,
+        "急破超过几倍ATR不追",
+        app.float_max_chase_var,
+        hint="收盘离破位太远就等回抽。出厂关（0），默认方向不用箱子",
+    )
+    _param_entry(
+        hold_box,
+        "浮盈几倍ATR后保本",
+        app.float_be_atr_var,
+        hint="收盘浮盈达到开盘前波动的这么多倍，止损提到开仓价。出厂 2，0=不做保本",
+    )
 
     trend_box = _detail_panel(
         "trend_follow",
@@ -563,6 +755,81 @@ def build_config_tab(
         "震荡里交叉特别多。没趋势时过滤能少做来回。默认关，需要再开。",
     )
 
+    macd_swing_box = _detail_panel(
+        "ema_swing",
+        "均线波段",
+        "方向均线定多空，信号三均线排好就开。建议左边信号/止损周期都用 15 分钟。多空分界线、止损、倾角可分开填根数。",
+    )
+    _note_block(
+        macd_swing_box,
+        "方向选择器金叉后只做多、死叉后只做空，没再叉就不改。框里填根数，比如 21 和 122。"
+        "开仓：三条信号均线按从快到慢排好，且收盘在多空分界线正确一侧。"
+        "做多要收盘站在分界线上面，做空要在下面；贴着也不开。"
+        "信号三根前面要比后面小，保存时会自动排好。"
+        "不用 MACD 柱子。跳空错过交叉那根也可以开。倾角均线太平或斜反了不开新仓。"
+        "「倾角不够就平仓」出厂关；打开后手里的仓也会平（不反手），用来对照收益。"
+        "多空分界线、止损、倾角出厂都是 120，可以分开填。"
+        "空仓时日盘/夜盘收盘前若干分钟不再开（出厂 30，可改；午休不算）。"
+        "仓位、信号周期都用配置页公共项。这套适合更大级别：建议信号和止损都用 15 分钟，5 分钟容易被影线扫止损。"
+        "主力连续换月时，旧仓还在会在新主力同方向移过去。"
+        "任何合约都不进入自己的交割月：交割月前一个月的日盘收盘必须平仓，之后改下一手。",
+        pady=(0, 4),
+    )
+    _ema_num_row(
+        macd_swing_box,
+        "方向选择器",
+        [app.macd_swing_dir_fast_var, app.macd_swing_dir_slow_var],
+        hint="出厂 60 / 120。前面要比后面小",
+    )
+    _ema_num_row(
+        macd_swing_box,
+        "信号发生器",
+        [app.macd_swing_sig_a_var, app.macd_swing_sig_b_var, app.macd_swing_sig_c_var],
+        hint="出厂 5 / 10 / 30。从快到慢",
+    )
+    _ema_num_row(
+        macd_swing_box,
+        "多空分界线",
+        [app.macd_swing_side_ema_var],
+        hint="做多要站上面、做空要在下面。出厂 120",
+    )
+    _ema_num_row(
+        macd_swing_box,
+        "止损均线",
+        [app.macd_swing_stop_ema_var],
+        hint="开仓后止损跟着它走。出厂 120",
+    )
+    _ema_num_row(
+        macd_swing_box,
+        "倾角均线",
+        [app.macd_swing_slope_ema_var],
+        hint="只看这根斜不斜。出厂 120",
+    )
+    _param_entry(
+        macd_swing_box,
+        "最小倾角(度)",
+        app.macd_swing_slope_var,
+        hint="看倾角均线自己斜不斜，不是 K 线的斜。出厂 3。填 0 关掉",
+    )
+    _param_entry(
+        macd_swing_box,
+        "斜率回看根数",
+        app.macd_swing_slope_lookback_var,
+        hint="用最近几根算倾角均线倾角。出厂 20",
+    )
+    _switch_row(
+        macd_swing_box,
+        "倾角不够就平仓",
+        app.macd_swing_slope_exit_var,
+        hint="关=只拦新开仓。开=倾角不够也平掉已有仓，不反手。用来对照收益。出厂关",
+    )
+    _param_entry(
+        macd_swing_box,
+        "尾盘不开仓(分钟)",
+        app.macd_swing_close_guard_var,
+        hint="空仓时收盘前这么多分钟不开。出厂 30。填 0 关掉。午休不算",
+    )
+
     boll_box = _detail_panel(
         "bollinger",
         "布林带突破",
@@ -591,8 +858,8 @@ def build_config_tab(
     )
 
     def _pack_cta_shared(parent: ctk.CTkFrame) -> None:
-        """三套多因子对照共用同一组因子参数，信号周期仍用左边公共项。"""
-        _cta_param(parent, "总分阈值", app.multi_threshold_var, hint="默认 0.6；加权打分过这条才开，混合版还用它映射仓位")
+        """多因子加权打分的因子参数，信号周期仍用左边公共项。"""
+        _cta_param(parent, "总分阈值", app.multi_threshold_var, hint="默认 0.6；加权打分过这条才开")
         _cta_param(parent, "短均线根数", app.multi_ma_short_var, hint="默认 20 根 EMA；跟左边信号周期走，不是写死 5 分钟")
         _cta_param(parent, "长均线根数", app.multi_ma_long_var, hint="默认 60 根 EMA，须大于短均线")
         _cta_param(parent, "唐奇安通道根数", app.multi_channel_var, hint="默认 20；比前 20 根高低点")
@@ -605,17 +872,12 @@ def build_config_tab(
             hint="关=不算 SAR，权重摊给均线/唐奇安/布林",
         )
 
-    def _pack_cta_vote(parent: ctk.CTkFrame) -> None:
-        _cta_param(parent, "最少同向票", app.multi_min_votes_var, hint="默认 2；四个因子里至少几票同向才开")
-        _cta_param(parent, "最少票数差", app.multi_vote_diff_var, hint="默认 2；多票减空票要够这个差，防止打架")
-
     def _pack_cta_filter(
         parent: ctk.CTkFrame,
         kind: str,
         *,
         show_score: bool,
         show_size: bool,
-        show_votes: bool,
         note: str,
     ) -> None:
         """每套多因子自己的行情闸门。"""
@@ -655,13 +917,6 @@ def build_config_tab(
                 vars_["weak_size"],
                 hint="ADX 20~25 时按几成风控手数，默认 0.5；1 手账户仍是 1 手",
             )
-        if show_votes:
-            _cta_param(
-                parent,
-                "弱趋势最少票",
-                vars_["weak_votes"],
-                hint="ADX 20~25 时至少几票同向，默认 3",
-            )
 
     multi_box = _detail_panel(
         "multi_factor",
@@ -674,81 +929,26 @@ def build_config_tab(
         "multi_factor",
         show_score=True,
         show_size=True,
-        show_votes=False,
         note="加权打分：ADX 太低或波动太缩就不开；弱趋势只收更高总分，并且仓位打成数。",
-    )
-
-    vote_box = _detail_panel(
-        "multi_vote",
-        "多因子投票",
-        "同一套四个因子改成等权投票。因子参数和加权版共用，下面只改投票门槛。",
-    )
-    _pack_cta_shared(vote_box)
-    _pack_cta_vote(vote_box)
-    _pack_cta_filter(
-        vote_box,
-        "multi_vote",
-        show_score=False,
-        show_size=False,
-        show_votes=True,
-        note="投票：同样用 ADX/ATR/分歧拦开仓；弱趋势时要更多同向票，不靠总分。",
-    )
-
-    hybrid_box = _detail_panel(
-        "multi_hybrid",
-        "多因子混合",
-        "投票决定开不开，加权总分决定开几成仓。因子参数仍和加权版共用。",
-    )
-    _pack_cta_shared(hybrid_box)
-    _pack_cta_vote(hybrid_box)
-    _cta_param(hybrid_box, "最低仓位成数", app.hybrid_min_ratio_var, hint="刚过门槛时用几成风控手数，默认 0.5")
-    _cta_param(hybrid_box, "最高仓位成数", app.hybrid_max_ratio_var, hint="满分时用几成，默认 1.0")
-    _pack_cta_filter(
-        hybrid_box,
-        "multi_hybrid",
-        show_score=True,
-        show_size=True,
-        show_votes=True,
-        note="混合：投票开门再叠加 ADX/ATR/分歧；弱趋势时票要更多、总分要更高，仓位再打成数。",
-    )
-
-    adapt_box = _detail_panel(
-        "multi_factor_adapt",
-        "多因子CTA（自适应权重·对照）",
-        "开平仓、止损和加权打分相同（均线/阈值/SAR 请到「加权打分」那一页改，保存时会抄一份到这里）。"
-        "只在平仓后按最近成交慢慢改四个因子的权重。不会自动替换正在用的加权打分。不要拿权重去网格穷搜。",
-    )
-    _cta_switch(
-        adapt_box,
-        "启用自适应权重",
-        app.adapt_enabled_var,
-        hint="关=和主推一样固定权重；开=平仓后才改，每根K线不改",
-    )
-    _cta_param(adapt_box, "回看成交笔数", app.adapt_lookback_var, hint="默认 20；不够这么多笔时权重不动")
-    _cta_param(adapt_box, "单因子下限", app.adapt_min_w_var, hint="默认 0.05，防止某个因子被清零")
-    _cta_param(adapt_box, "单因子上限", app.adapt_max_w_var, hint="默认 0.40，防止一个因子独吞")
-    _cta_param(adapt_box, "近期掺入比例", app.adapt_mix_var, hint="默认 0.30；其余仍按出厂底仓，减轻追涨")
-    _cta_param(adapt_box, "单次最多挪", app.adapt_step_var, hint="默认 0.03；一笔大盈亏也不能把权重拧飞")
-    _pack_cta_filter(
-        adapt_box,
-        "multi_factor_adapt",
-        show_score=True,
-        show_size=True,
-        show_votes=False,
-        note="和主推同一套闸门，数字存在自己的小节里，改主推不会改这一套。",
     )
 
     swing_box = _detail_panel(
         "swing_trend",
         "长线趋势加减仓",
-        "大周期定方向 + 小周期回调；可加可减。不跟左侧的「信号周期」走。",
+        "大周期定方向 + 信号周期回调；可加可减。回调跟左边信号周期，止损跟左边止损周期。",
     )
     app._option_row(
         swing_box,
-        "长线周期搭配",
+        "长线大周期",
         app.swing_scale_var,
         list(app._swing_label_by_scale.values()),
         width=260,
+    )
+    _note_block(
+        swing_box,
+        "上面只选「用日线还是 60 分钟来定方向」。\n"
+        "回调进出跟左边「信号周期」，止损跟左边「止损周期」。想用 60 分钟进出，把信号周期改成 60 分钟即可。",
+        pady=(0, 4),
     )
     _param_entry(
         swing_box,
@@ -786,54 +986,25 @@ def build_config_tab(
         "大周期没趋势时加减仓没意义。默认关，需要再开。",
     )
 
-    jesse_box = _detail_panel(
-        "jesse_casper",
-        "Jesse Casper（简化SMC）",
-        "抖音那套日内结构的阉割版：15分钟定方向，5分钟扫流动性后放量大实体，回踩才开。"
-        "用上一时段价值区过滤震荡。没有足迹图/CVD，假扫会比原版多。默认只在黄金时段开，收盘清仓。",
+    sbox = _detail_panel(
+        "swing_box",
+        "长线箱体突破",
+        "按左边信号周期画震荡箱子，收盘走出才顺着做。止损周期跟左边那一格。默认不收盘清仓。",
     )
-    _param_entry(
-        jesse_box,
-        "流动性回看根数",
-        app.jesse_lookback_var,
-        hint="前多少根高低点当流动性，默认 20",
+    _note_block(
+        sbox,
+        "和日内实体一样：只认收盘、开仓后箱子冻住、假突破收回箱子就走。\n"
+        "周期跟左边「信号周期 / 止损周期」。想测日线就把信号周期改成日线；想测 60 分钟就改成 60 分钟。\n"
+        "「箱子回看根数」是这个周期上的根数：日线 40 根大约两个月，60 分钟 40 根大约两周。\n"
+        "手数仍用左边的每笔风险%。ADX 只用来挡住完全没方向的行情，不会等趋势走完再追。",
+        pady=(0, 4),
     )
-    _param_entry(
-        jesse_box,
-        "放量倍数",
-        app.jesse_vol_mult_var,
-        hint="这根成交量要大于近20根均值的几倍，默认 1.2",
-    )
-    _param_entry(
-        jesse_box,
-        "最低盈亏比",
-        app.jesse_min_rr_var,
-        hint="目标至少是止损距离的几倍，默认 3",
-    )
-    _param_entry(
-        jesse_box,
-        "每跳价格",
-        app.jesse_tick_var,
-        hint="算价值区用。燃油常填 0.1，纯碱/玉米常填 1",
-    )
-    _switch_row(
-        jesse_box,
-        "启用价值区过滤",
-        app.jesse_use_va_var,
-        hint="开=价格还在上一时段价值区里就当震荡，不开仓",
-    )
-    _switch_row(
-        jesse_box,
-        "只用黄金时段",
-        app.jesse_use_kill_var,
-        hint="开=只在 09:00–10:00 和 21:00–22:30 开新仓",
-    )
-    _switch_row(
-        jesse_box,
-        "当日停手规则",
-        app.jesse_use_halt_var,
-        hint="开=亏两笔或赚一笔就今天不再开",
-    )
+    _param_entry(sbox, "箱子回看根数", app.sbox_lookback_var, hint="按信号周期计，默认 40 根")
+    _param_entry(sbox, "箱子最矮几倍ATR", app.sbox_height_atr_var, hint="太窄的箱子假突破多，默认 1.2")
+    _param_entry(sbox, "ADX下限", app.sbox_adx_min_var, hint="低于这个数当没方向，不开。默认 20。填 0 关掉")
+    _param_entry(sbox, "止损缓冲ATR", app.sbox_stop_atr_var, hint="多单止损在箱顶下面这么多倍 ATR，默认 0.5")
+    _param_entry(sbox, "跟踪ATR倍数", app.sbox_trail_atr_var, hint="浮盈够了以后，止损离新高/新低几倍 ATR，默认 2")
+    _param_entry(sbox, "几倍箱高才跟踪", app.sbox_trail_h_var, hint="浮盈达到箱子高度的几倍才开始跟踪，默认 1")
 
     try:
         app.engine_var.trace_add("write", app._refresh_strategy_param_panel)
@@ -905,11 +1076,13 @@ def build_config_tab(
         "交易时段",
         app.session_scope_var,
         list(SCOPE_LABELS.values()),
-        width=160,
+        width=200,
     )
     ctk.CTkLabel(
         left,
-        text="只决定能不能开新仓。已经拿着的仓仍按各自的止损和收盘清仓走。",
+        text="全时段 / 只做日盘 / 只做夜盘：只决定能不能开新仓，已经拿着的仓仍按止损和收盘清仓走。"
+        "夜日连续（跳空小）：只建议隔夜跳空不大的品种用。日内实体会把夜盘拿到日盘 14:55，"
+        "跳空大时最大回撤会明显变大。燃油这类常大幅跳空的，继续用全时段，让夜盘自己清仓。",
         font=T.FONT_SMALL,
         text_color=T.TEXT_DIM,
         wraplength=420,
@@ -934,9 +1107,9 @@ def build_config_tab(
     )
     app._entry_row(
         left,
-        "每手保证金(元)",
+        "兜底每手保证金(元)",
         app.margin_var,
-        hint="表里没写的品种用这个，0=不限制",
+        hint="品种表没填保证金比例时用这个固定金额；填了比例就按价格×每手数量×比例，0=不限制",
         width=160,
     )
     # 品种保证金+乘数只认 Excel，不再手打长串，避免和配置文件各改各的对不齐。
@@ -1190,7 +1363,9 @@ def build_config_tab(
     ctk.CTkLabel(
         box4,
         text=(
-            "开仓手数取小：①每笔风险%（或上面固定手数）②仓位上限%。"
+            "开仓手数取小：①每笔风险%（或上面固定手数，或凯利公式）②仓位上限%。"
+            "打开凯利后，请自己跑历史回测，把胜率和盈亏比填进下面两格，程序按凯利自动算手数。"
+            "仓位上限、日亏损、下单间隔、波动暂停仍照旧。"
             "三层风控不重复：日最大亏损管当天亏多少钱；"
             "账户从最高点回撤管整段本金；波动放大管市场突然变晃。"
             "都不要求再赚一笔才开。已经拿着的 1 手不会被强平。"
@@ -1200,11 +1375,67 @@ def build_config_tab(
         wraplength=520,
         justify="left",
     ).pack(anchor="w", pady=(0, 8))
+    from src.risk.kelly import FRACTION_LABELS
+
+    kelly_sw = ctk.CTkFrame(box4, fg_color="transparent")
+    kelly_sw.pack(fill="x", pady=4)
+    ctk.CTkLabel(
+        kelly_sw, text="凯利公式", font=T.FONT_BODY, text_color=T.TEXT_DIM, width=140, anchor="w"
+    ).pack(side="left", padx=(0, 8))
+    ctk.CTkSwitch(
+        kelly_sw,
+        text="打开后由凯利算意图手数",
+        variable=app.kelly_enabled_var,
+        progress_color=T.OK,
+        font=T.FONT_SMALL,
+        text_color=T.TEXT,
+        command=app._refresh_kelly_status,
+    ).pack(side="left")
+    app._option_row(
+        box4,
+        "凯利占用",
+        app.kelly_frac_var,
+        list(FRACTION_LABELS.keys()),
+        width=220,
+    )
+    app._entry_row(
+        box4,
+        "凯利每笔最多%",
+        app.kelly_max_var,
+        hint="默认2。全凯利再大，每笔也不超过本金的这么多",
+    )
+    app._entry_row(
+        box4,
+        "凯利胜率%",
+        app.kelly_win_var,
+        hint="从历史回测摘要抄，例如 46 表示 46%",
+    )
+    app._entry_row(
+        box4,
+        "凯利盈亏比",
+        app.kelly_payoff_var,
+        hint="抄历史回测摘要里单独一行「盈亏比」；不要填盈利因子",
+    )
+    ctk.CTkLabel(
+        box4,
+        textvariable=app.kelly_status_var,
+        font=T.FONT_SMALL,
+        text_color=T.TEXT,
+        wraplength=520,
+        justify="left",
+    ).pack(anchor="w", pady=(4, 8))
+    try:
+        app.kelly_frac_var.trace_add("write", app._refresh_kelly_status)
+        app.kelly_max_var.trace_add("write", app._refresh_kelly_status)
+        app.kelly_win_var.trace_add("write", app._refresh_kelly_status)
+        app.kelly_payoff_var.trace_add("write", app._refresh_kelly_status)
+    except Exception:  # noqa: BLE001
+        pass
     app._entry_row(
         box4,
         "每笔风险%",
         app.risk_pct_var,
-        hint="推荐0.5~1，止损远时自动少开",
+        hint="推荐0.5~1，止损远时自动少开；凯利打开时不用这项",
     )
     app._entry_row(
         box4,

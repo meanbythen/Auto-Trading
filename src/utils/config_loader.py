@@ -141,17 +141,24 @@ def save_secrets(password: str = "", extra: dict[str, Any] | None = None) -> Pat
         data["password"] = password
     if extra:
         data.update(extra)
+    text = yaml.safe_dump(data, allow_unicode=True, sort_keys=False)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(data, f, allow_unicode=True, sort_keys=False)
+    if path.exists() and path.read_text(encoding="utf-8") == text:
+        return path
+    path.write_text(text, encoding="utf-8")
     logger.info("本地密钥已保存: {}", path)
     return path
 
 
-def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
+def load_config(
+    config_path: str | Path | None = None,
+    *,
+    apply_universe: bool = True,
+) -> dict[str, Any]:
     """
     加载配置文件。
 
+    apply_universe=False 时不读品种表。保存前只合并同花顺坐标时用，避免又打开一遍 Excel。
     返回:
         解析后的字典；含 resolved_password（环境变量 > secrets.local.yaml）
     """
@@ -227,17 +234,18 @@ def load_config(config_path: str | Path | None = None) -> dict[str, Any]:
     cfg["_project_root"] = str(root)
     cfg["_config_path"] = str(path)
 
-    # 品种与合约总表：关注合约 + 保证金/乘数只认这一张 Excel。
-    try:
-        from src.risk.universe_table import apply_universe_table_to_cfg
+    if apply_universe:
+        # 品种与合约总表：关注合约 + 保证金/乘数只认这一张 Excel。
+        try:
+            from src.risk.universe_table import apply_universe_table_to_cfg
 
-        apply_universe_table_to_cfg(cfg, create_if_missing=True)
-    except Exception as exc:  # noqa: BLE001
-        logger.error(
-            "读取品种与合约表失败，暂时沿用配置文件里的名单和保证金。"
-            "配置文件里的乘数/保证金可能是旧值，请检查 config/品种与合约.xlsx: {}",
-            exc,
-        )
+            apply_universe_table_to_cfg(cfg, create_if_missing=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.error(
+                "读取品种与合约表失败，暂时沿用配置文件里的名单和保证金。"
+                "配置文件里的乘数/保证金可能是旧值，请检查 config/品种与合约.xlsx: {}",
+                exc,
+            )
 
     return cfg
 
@@ -282,8 +290,10 @@ def save_config(cfg: dict[str, Any], config_path: str | Path | None = None) -> P
     if isinstance(trade_dump, dict) and isinstance(trade_dump.get("ctp"), dict):
         trade_dump["ctp"] = _strip_ctp_runtime(trade_dump["ctp"])
 
+    text = yaml.safe_dump(dump, allow_unicode=True, sort_keys=False)
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        yaml.safe_dump(dump, f, allow_unicode=True, sort_keys=False)
+    if path.exists() and path.read_text(encoding="utf-8") == text:
+        return path
+    path.write_text(text, encoding="utf-8")
     logger.info("配置已保存: {}", path)
     return path

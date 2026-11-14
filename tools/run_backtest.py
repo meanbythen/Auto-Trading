@@ -35,6 +35,9 @@ def main() -> int:
     print(f"品种: {result.symbol}  信号周期: {result.timeframe}m  止损周期: {result.trail_timeframe}m")
     print(f"K线根数: {result.bars}")
     print(f"成交笔数: {p.trades}  胜率: {p.win_rate:.1%}  净盈亏: {p.net_pnl:.0f} 元")
+    print(f"平均盈利: {p.avg_win:.0f} 元  平均亏损: {p.avg_loss:.0f} 元")
+    print(f"盈亏比: {p.payoff:.2f}（平均盈利÷平均亏损，可填凯利；不是盈利因子）")
+    print(f"收益期望: {p.expectancy:.2f}（每亏1元期望赚多少：胜率×盈亏比 − 败率；大于0才有正期望）")
     print(f"盈利因子: {p.profit_factor:.2f}  最大回撤: {p.max_drawdown:.0f} 元 ({p.max_drawdown_pct:.1%})")
     print(f"综合得分: {p.score:.3f}")
     out = ROOT / "data" / "backtest_last.json"

@@ -11,9 +11,8 @@ from src.review.diagnose import diagnose
 from src.review.gap import GapReport
 from src.review.quality import SignalTrade, build_quality_report, enrich_round_trips
 from src.review.replay import ReplayEvent, StrategyReplay
-from src.review.scorecard import Scorecard, build_scorecard
+from src.review.scorecard import Scorecard
 from src.review.service import build_review
-from src.review.session import windows_for
 from src.review.technical import TechnicalView
 
 

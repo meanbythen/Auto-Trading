@@ -175,6 +175,10 @@ class PositionState:
     trail_stop: float = 0.0
     # 是否已用大周期 SAR「确认方向」并开始移动止损（确认前只守影线端初始止损）
     trail_armed: bool = False
+    # 长线箱体开仓时冻住的箱沿。其它策略保持 0。
+    box_high: float = 0.0
+    box_low: float = 0.0
+    box_height: float = 0.0
     symbol: str = ""
     opened_at: str = ""
 

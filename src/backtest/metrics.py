@@ -82,6 +82,10 @@ class Performance:
     profit_factor: float = 0.0
     avg_win: float = 0.0
     avg_loss: float = 0.0
+    # 平均盈利 ÷ 平均亏损。没有亏损笔时为 0，界面会写成「算不出」。
+    payoff: float = 0.0
+    # 无单位：胜率×净盈亏比 − (1−胜率)。每亏 1 元风险期望换回多少。没有亏损笔时为 0。
+    expectancy: float = 0.0
     max_drawdown: float = 0.0
     max_drawdown_pct: float = 0.0
     score: float = 0.0
@@ -98,10 +102,94 @@ class Performance:
             "profit_factor": round(self.profit_factor, 4),
             "avg_win": round(self.avg_win, 2),
             "avg_loss": round(self.avg_loss, 2),
+            "payoff": round(self.payoff, 4),
+            "expectancy": round(self.expectancy, 4),
             "max_drawdown": round(self.max_drawdown, 2),
             "max_drawdown_pct": round(self.max_drawdown_pct, 4),
             "score": round(self.score, 4),
         }
+
+
+def payoff_ratio(avg_win: float, avg_loss: float) -> float:
+    """盈亏比 = 平均盈利 ÷ 平均亏损。没有亏损笔时算不出，返回 0。"""
+    loss = float(avg_loss or 0)
+    if loss <= 1e-9:
+        return 0.0
+    return float(avg_win or 0) / loss
+
+
+def format_payoff_lines(
+    avg_win: float,
+    avg_loss: float,
+    payoff: float | None = None,
+) -> list[str]:
+    """
+    历史回测摘要里单独三行：平均盈利、平均亏损、盈亏比。
+
+    盈亏比给凯利公式手填用，不要和「总盈利÷总亏损」的盈利因子混在一起。
+    """
+    win = float(avg_win or 0)
+    loss = float(avg_loss or 0)
+    ratio = payoff_ratio(win, loss) if payoff is None else float(payoff or 0)
+    lines = [
+        f"平均盈利  {win:.0f} 元",
+        f"平均亏损  {loss:.0f} 元",
+    ]
+    if loss > 1e-9:
+        lines.append(
+            f"盈亏比    {ratio:.2f}（平均盈利÷平均亏损，可填凯利；不是盈利因子）"
+        )
+    else:
+        lines.append("盈亏比    —（没有亏损笔，算不出；不能填凯利）")
+    return lines
+
+
+def unit_expectancy(
+    win_rate: float,
+    avg_win: float,
+    avg_loss: float,
+    cost: float = 0.0,
+) -> float:
+    """
+    无单位收益期望：每亏 1 元风险，平均能换回多少。
+
+    先按你给的参考算法扣成本：
+    净盈利 = 平均盈利 − 成本，净亏损 = 平均亏损 + 成本，净盈亏比 R = 净盈利 ÷ 净亏损。
+    再写成无单位：E = 胜率 × R − (1 − 胜率)。
+
+    参考函数里带单位的 e（元/笔）等于 E × 净亏损。这里界面只展示 E。
+    回测成交已经扣过手续费和滑点，调用时 cost 默认 0，不要再减一次。
+    没有亏损（净亏损为 0）时算不出，返回 0，界面写成横杠。
+    """
+    p_win = float(win_rate or 0)
+    net_win = float(avg_win or 0) - float(cost or 0)
+    net_loss = float(avg_loss or 0) + float(cost or 0)
+    if net_loss <= 1e-9:
+        return 0.0
+    ratio = net_win / net_loss
+    return p_win * ratio - (1.0 - p_win)
+
+
+def format_expectancy_line(
+    win_rate: float,
+    avg_win: float,
+    avg_loss: float,
+    expectancy: float | None = None,
+    cost: float = 0.0,
+) -> str:
+    """历史回测摘要里单独一行收益期望（无单位）。"""
+    net_loss = float(avg_loss or 0) + float(cost or 0)
+    if net_loss <= 1e-9:
+        return "收益期望  —（没有亏损笔，算不出）"
+    value = (
+        float(expectancy)
+        if expectancy is not None
+        else unit_expectancy(win_rate, avg_win, avg_loss, cost)
+    )
+    return (
+        f"收益期望  {value:.2f}"
+        "（每亏1元期望赚多少：胜率×盈亏比 − 败率；大于0才有正期望）"
+    )
 
 
 def calc_performance(
@@ -129,6 +217,8 @@ def calc_performance(
     )
     p.avg_win = p.gross_profit / p.wins if p.wins else 0.0
     p.avg_loss = p.gross_loss / p.losses if p.losses else 0.0
+    p.payoff = payoff_ratio(p.avg_win, p.avg_loss)
+    p.expectancy = unit_expectancy(p.win_rate, p.avg_win, p.avg_loss)
 
     # 最大回撤（按权益曲线）
     if equity:

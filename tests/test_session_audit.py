@@ -8,10 +8,6 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.strategy.market_state import (
-    MarketFilterParams,
-    evaluate_market_state,
-)
 from src.strategy.session_audit import (
     ENGINE_AUDIT_MODES,
     ENGINE_NAMES,
@@ -79,6 +75,8 @@ def test_engine_names_match() -> None:
 
 def test_daily_body_is_range_mode() -> None:
     assert ENGINE_AUDIT_MODES["daily_body"] == "range"
+    assert ENGINE_AUDIT_MODES["float_hold"] is None
+    assert "daily_body_expand" not in ENGINE_AUDIT_MODES
 
 
 def test_trend_engines_use_trend_mode() -> None:
@@ -88,21 +86,18 @@ def test_trend_engines_use_trend_mode() -> None:
         "bollinger",
         "sar_trend",
         "multi_factor",
-        "multi_factor_adapt",
-        "multi_vote",
-        "multi_hybrid",
         "supertrend",
         "swing_trend",
     ):
         assert ENGINE_AUDIT_MODES[eng] == "trend", f"{eng} 应该用 trend 模式"
 
 
-def test_morning_box_a_is_skipped() -> None:
-    assert ENGINE_AUDIT_MODES["morning_box_a"] is None
-
-
-def test_jesse_casper_skips_public_filter() -> None:
-    assert ENGINE_AUDIT_MODES["jesse_casper"] is None
+def test_swing_box_skips_public_filter() -> None:
+    assert ENGINE_AUDIT_MODES["swing_box"] is None
+    assert ENGINE_AUDIT_MODES["float_hold"] is None
+    assert ENGINE_AUDIT_MODES["ema_swing"] is None
+    assert ENGINE_AUDIT_MODES["macd_swing"] is None
+    assert "jesse_casper" not in ENGINE_AUDIT_MODES
 
 
 # —— run_pre_session_audit 核心逻辑 ——
@@ -125,7 +120,7 @@ def test_disabled_filter_returns_ok_for_all() -> None:
         if r.ok is None:
             continue
         if r.engine == "daily_body":
-            assert r.ok is False, f"日内实体在强单边里应被自己的区间过滤拦住，note={r.note}"
+            assert r.ok is False, f"日内实体在强单边里应拦住，note={r.note}"
             continue
         assert r.ok is True, f"{r.engine} ok=False，note={r.note}"
 
@@ -159,8 +154,8 @@ def test_trending_bars_pass_for_trend_engines() -> None:
         assert r.ok is True, f"{r.engine} ok=False: {r.note}"
 
 
-def test_ranging_bars_pass_for_range_but_not_for_trend() -> None:
-    """震荡行情（ADX 低）→ range 策略放行，trend 策略被拦。"""
+def test_ranging_bars_block_trend_but_allow_range() -> None:
+    """震荡行情（ADX 低）→ 日内实体放行；趋势策略拦。"""
     closes = _ranging_closes(n=200)
     bars = _bars(closes, atr_half=1.5)
     bars_fn = _bars_provider_factory({"bu2612": bars})
@@ -178,10 +173,7 @@ def test_ranging_bars_pass_for_range_but_not_for_trend() -> None:
     range_rows = [r for r in rows if r.expected_mode == "range"]
     trend_rows = [r for r in rows if r.expected_mode == "trend"]
 
-    # 日内实体 range 模式：震荡行情（ADX 低 + ATR 中等）→ 放行
-    assert all(r.ok is True for r in range_rows), "日内实体 range 模式应该放行震荡行情"
-
-    # trend 模式：ADX 低 → 被拦
+    assert all(r.ok is True for r in range_rows), f"日内实体在震荡里应放行：{[r.note for r in range_rows]}"
     assert any(r.ok is False for r in trend_rows), "trend 策略在震荡行情里应该被拦"
 
 
@@ -236,20 +228,20 @@ def test_no_bars_provider_returns_skip() -> None:
     rows = run_pre_session_audit(cfg, bars_provider=lambda *_a, **_kw: None)
     for r in rows:
         if r.expected_mode is None:
-            continue  # morning_box_a 跳过
+            continue  # 长线箱体等不走公共 ADX 的策略跳过
         assert r.ok is None, f"{r.engine} ok 应该是 None（无数据）"
         assert "K线不足" in r.note
 
 
-def test_morning_box_a_skipped() -> None:
+def test_swing_box_skipped_in_audit() -> None:
     rows = run_pre_session_audit(
         {"strategy": {"symbols": ["bu2612"], "market_filter": {"enabled": True}}},
         bars_provider=lambda *_a, **_kw: _bars(_trending_closes()),
     )
-    mb = [r for r in rows if r.engine == "morning_box_a"]
-    assert mb, "应该有 morning_box_a 这一行"
-    assert mb[0].ok is None
-    assert "未接入" in mb[0].note
+    box = [r for r in rows if r.engine == "swing_box"]
+    assert box, "应该有 swing_box 这一行"
+    assert box[0].ok is None
+    assert "箱子" in box[0].note
 
 
 # —— format_audit_report ——
@@ -259,7 +251,7 @@ def test_report_counts_ok_block_skip() -> None:
     rows = [
         SymbolAuditRow("bu2612", "trend_follow", "趋势跟随", "trend", None, True, "[趋势] 行情适配"),
         SymbolAuditRow("bu2612", "dual_ma", "双均线", "trend", None, False, "ADX低…停手"),
-        SymbolAuditRow("bu2612", "morning_box_a", "早盘箱体A", None, None, None, "未接入"),
+        SymbolAuditRow("bu2612", "swing_box", "长线箱体突破", None, None, None, "未接入"),
     ]
     out = format_audit_report(rows, now=datetime(2026, 11, 5, 8, 55))
     text = "\n".join(out)

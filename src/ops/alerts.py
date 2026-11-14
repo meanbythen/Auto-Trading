@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -18,6 +19,8 @@ from loguru import logger
 FILE_NAME = "alerts.jsonl"
 _COOLDOWN_SEC = 600.0
 _last_emit: dict[str, float] = {}
+# 熔断告警正文里「已超过限额 100」这一段数字，用来对照现在配置页填的日最大亏损。
+_HALT_LIMIT_RE = re.compile(r"已超过限额\s*([0-9]+(?:\.[0-9]+)?)")
 
 
 def alerts_path(root: Path | str) -> Path:
@@ -59,11 +62,103 @@ def emit_alert(
     return True
 
 
-def last_alert(root: Path | str | None = None) -> dict[str, Any] | None:
-    """读文件里最后一条，给运行台显示。"""
+def halt_limit_in_message(message: str) -> float | None:
+    """
+    从日亏熔断那句话里取出当时的限额。
+
+    正文类似「当日亏损 -150.00 已超过限额 100」。对不上现在配置的，
+    就当过期记录，不再拿来吓人。
+    """
+    match = _HALT_LIMIT_RE.search(str(message or ""))
+    if not match:
+        return None
+    try:
+        return float(match.group(1))
+    except (TypeError, ValueError):
+        return None
+
+
+def is_stale_halt(row: dict[str, Any] | None, max_daily_loss: float | None) -> bool:
+    """
+    是不是「当时限额」已经不是配置页上那个数的熔断告警。
+
+    只动 code=halt 的行。对账、窗口丢失这类不删。没传现在限额时也不删，
+    避免误清。
+    """
+    if not isinstance(row, dict):
+        return False
+    if str(row.get("code") or "") != "halt":
+        return False
+    if max_daily_loss is None:
+        return False
+    parsed = halt_limit_in_message(str(row.get("message") or ""))
+    if parsed is None:
+        return False
+    # 50 和 50.0 算同一个数；100 对 3000 就算过期。
+    return abs(parsed - float(max_daily_loss)) > 0.5
+
+
+def prune_stale_halt_alerts(root: Path | str | None, max_daily_loss: float | None) -> int:
+    """
+    从 alerts.jsonl 里删掉限额已经对不上现在配置的日亏熔断行。
+
+    返回删了几条。文件没有、或现在限额读不出来时，什么也不改。
+    原理：一行一行读，过期 halt 丢掉，其它原样写回。只在真有删减时才覆盖，
+    避免运行台每几秒空写一遍。
+    """
+    if max_daily_loss is None:
+        return 0
     from src.utils.paths import project_root
 
     path = alerts_path(Path(root) if root else project_root())
+    if not path.exists():
+        return 0
+    raw_lines = path.read_text(encoding="utf-8").splitlines()
+    kept: list[str] = []
+    dropped = 0
+    for line in raw_lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            row = json.loads(stripped)
+        except json.JSONDecodeError:
+            kept.append(stripped)
+            continue
+        if isinstance(row, dict) and is_stale_halt(row, max_daily_loss):
+            dropped += 1
+            continue
+        kept.append(json.dumps(row, ensure_ascii=False) if isinstance(row, dict) else stripped)
+    if dropped <= 0:
+        return 0
+    text = "\n".join(kept)
+    if text:
+        text += "\n"
+    path.write_text(text, encoding="utf-8")
+    logger.info("已删掉 {} 条限额已过期的日亏熔断告警，现限额 {:.0f}", dropped, float(max_daily_loss))
+    return dropped
+
+
+def last_alert(
+    root: Path | str | None = None,
+    *,
+    max_daily_loss: float | None = None,
+) -> dict[str, Any] | None:
+    """
+    读文件里最后一条给运行台显示。
+
+    传入现在的日最大亏损时，先把限额对不上的熔断行从文件里删掉，
+    再返回剩下的最后一条。这样红字跟配置页是同一套数。
+    """
+    from src.utils.paths import project_root
+
+    base = Path(root) if root else project_root()
+    if max_daily_loss is not None:
+        try:
+            prune_stale_halt_alerts(base, max_daily_loss)
+        except OSError as exc:
+            logger.debug("过期熔断告警没删掉: {}", exc)
+    path = alerts_path(base)
     if not path.exists():
         return None
     last: dict[str, Any] | None = None
@@ -72,7 +167,12 @@ def last_alert(root: Path | str | None = None) -> dict[str, Any] | None:
         if not line:
             continue
         try:
-            last = json.loads(line)
+            row = json.loads(line)
         except json.JSONDecodeError:
             continue
-    return last if isinstance(last, dict) else None
+        if not isinstance(row, dict):
+            continue
+        if is_stale_halt(row, max_daily_loss):
+            continue
+        last = row
+    return last

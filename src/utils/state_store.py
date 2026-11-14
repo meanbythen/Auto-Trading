@@ -114,6 +114,9 @@ def snapshot_positions(strategy: Any) -> dict[str, dict[str, Any]]:
             "trail_stop": float(getattr(pos, "trail_stop", 0) or 0),
             "trail_armed": bool(getattr(pos, "trail_armed", False)),
             "opened_at": str(getattr(pos, "opened_at", "") or ""),
+            "box_high": float(getattr(pos, "box_high", 0) or 0),
+            "box_low": float(getattr(pos, "box_low", 0) or 0),
+            "box_height": float(getattr(pos, "box_height", 0) or 0),
         }
         # 趋势跟随用持仓以来的最远价格收紧止损。重启后要带上，不然隔夜之后会忘掉已经走过的距离。
         extremes = getattr(strategy, "_extreme", None) or {}
@@ -436,6 +439,9 @@ def restore_positions(strategy: Any, raw: dict[str, Any]) -> None:
             trail_armed=bool(d.get("trail_armed", False)),
             symbol=str(sym),
             opened_at=str(d.get("opened_at", "") or ""),
+            box_high=float(d.get("box_high", 0) or 0),
+            box_low=float(d.get("box_low", 0) or 0),
+            box_height=float(d.get("box_height", 0) or 0),
         )
         extremes = getattr(strategy, "_extreme", None)
         if isinstance(extremes, dict) and d.get("extreme") is not None and side != "flat":

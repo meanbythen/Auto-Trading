@@ -20,8 +20,8 @@ def _bars(n: int, *, start: float = 100.0, drift: float = 0.2, freq: str = "60mi
         o = price
         c = price + drift
         h = max(o, c) + 0.3
-        l = min(o, c) - 0.3
-        rows.append({"open": o, "high": h, "low": l, "close": c, "volume": 1000})
+        low = min(o, c) - 0.3
+        rows.append({"open": o, "high": h, "low": low, "close": c, "volume": 1000})
         price = c
     return pd.DataFrame(rows, index=idx)
 
@@ -67,19 +67,42 @@ def _cfg(**swing: object) -> dict:
 def test_factory_creates_swing_trend() -> None:
     s = create_strategy(_cfg())
     assert isinstance(s, SwingTrendStrategy)
-    assert s.timeframe == "60"
+    # _cfg 里公共信号周期是 5 分钟，不再被搭配写成 60。
+    assert s.timeframe == "5"
+    assert s.trail_timeframe == "5"
     assert s.trend_timeframe == "D"
     assert s.scale == "D_60"
     assert s.uses_trend_bars is True
 
 
-def test_scale_pair_60_15_is_self_similar() -> None:
-    """同一套逻辑可缩到 60 分钟定方向 + 15 分钟回调。"""
+def test_scale_pair_only_sets_trend_timeframe() -> None:
+    """搭配只决定大周期；回调和止损跟公共周期。"""
     s = create_strategy(_cfg(scale="60_15"))
     assert s.scale == "60_15"
     assert s.trend_timeframe == "60"
+    assert s.timeframe == "5"
+    assert s.trail_timeframe == "5"
+
+
+def test_missing_public_timeframe_falls_back_to_scale_signal() -> None:
+    """公共周期没写时，仍用搭配里的小周期，避免旧 yaml 突然没周期。"""
+    cfg = _cfg()
+    cfg["strategy"].pop("timeframe", None)
+    s = create_strategy(cfg)
+    assert s.timeframe == "60"
+    assert s.trail_timeframe == "60"
+    assert s.trend_timeframe == "D"
+
+
+def test_follows_public_timeframes() -> None:
+    """配置页/回测页的信号周期、止损周期对长线加减仓生效。"""
+    cfg = _cfg()
+    cfg["strategy"]["timeframe"] = "15"
+    cfg["strategy"]["trail_timeframe"] = "30"
+    s = create_strategy(cfg)
     assert s.timeframe == "15"
-    assert s.trail_timeframe == "15"
+    assert s.trail_timeframe == "30"
+    assert s.trend_timeframe == "D"
 
 
 def test_daily_flat_blocks_new_entry() -> None:
@@ -131,7 +154,7 @@ def test_add_and_reduce_volume_in_meta() -> None:
     s._units_held["bu2612"] = 2
     s._best_price["bu2612"] = float(minutes["close"].iloc[-1])
     s._reduced_on_extend["bu2612"] = False
-    s._last_entry_bar["bu2612"] = str(minutes.index[0])
+    s.set_last_entry_bar("bu2612", str(minutes.index[0]))
 
     # 把收盘拉到离均线很远，应触发减仓（不是全平）。
     far = minutes.copy()
@@ -142,3 +165,33 @@ def test_add_and_reduce_volume_in_meta() -> None:
     assert decision.action == StrategyAction.CLOSE
     assert (decision.meta or {}).get("scale") == "reduce"
     assert int((decision.meta or {}).get("volume") or 0) >= 1
+
+
+def test_same_bar_after_entry_still_flattens() -> None:
+    """这根已经开过仓，收盘清仓到点仍要平，不能因为「已经处理过」跳过。"""
+    s = create_strategy(_cfg(daily_ma=2, flatten_at_close=True, stop_atr=50.0))
+    minutes = _bars(40, start=100.0, drift=0.3)
+    daily = _daily_from_minutes(minutes)
+    last = str(minutes.index[-1])
+    from src.strategy.types import PositionState
+
+    s.positions["bu2612"] = PositionState(
+        symbol="bu2612",
+        side="long",
+        volume=1,
+        entry_price=100.0,
+        initial_stop=1.0,
+        trail_stop=1.0,
+        trail_armed=True,
+    )
+    s.set_signaled_bar("bu2612", last)
+    s.set_last_entry_bar("bu2612", last)
+    s._best_price["bu2612"] = float(minutes["close"].iloc[-1])
+    decision = s.evaluate(
+        "bu2612",
+        minutes,
+        now=datetime(2026, 1, 6, 14, 55),
+        trend_bars=daily,
+    )
+    assert decision.action == StrategyAction.CLOSE
+    assert (decision.meta or {}).get("scale") == "exit"

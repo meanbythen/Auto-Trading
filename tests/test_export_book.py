@@ -473,6 +473,10 @@ def test_export_all_rebuilds_when_workbook_schema_outdated(tmp_path) -> None:
     assert list(summary.columns) == BACKTEST_SUMMARY_COLUMNS
     assert "盈利覆盖" in list(summary.columns)
     assert float(summary.iloc[0]["盈利覆盖"]) == 80
+    assert "收益期望" in list(summary.columns)
+    # 这条旧报告胜率 100%、没有平均亏损，无单位期望算不出。
+    expect_cell = summary.iloc[0]["收益期望"]
+    assert expect_cell == "" or pd.isna(expect_cell)
     assert "旧交叉" not in set(cross["品种"].astype(str))
     assert counts[SHEET_BACKTEST] == 1
 
@@ -505,6 +509,7 @@ def test_export_cross_appends_symbol_and_strategy(tmp_path) -> None:
                 "trades": 8,
                 "win_rate": 0.5,
                 "profit_factor": 2.0,
+                "payoff": 1.8,
                 "max_drawdown": 100,
                 "net_pnl": 500,
                 "score": 0.8,
@@ -530,6 +535,10 @@ def test_export_cross_appends_symbol_and_strategy(tmp_path) -> None:
     assert frame.iloc[0]["品种"] == "螺纹 rb0"
     assert frame.iloc[0]["策略"] == "日内实体"
     assert frame.iloc[0]["结果"] == "较好"
+    assert "盈亏比" in list(frame.columns)
+    assert abs(float(frame.iloc[0]["盈亏比"]) - 1.8) < 1e-6
+    assert "收益期望" in list(frame.columns)
+    assert abs(float(frame.iloc[0]["收益期望"]) - 0.4) < 1e-6
     assert int(frame.iloc[0]["持仓手数"]) == 1
     assert "止损周期" in list(frame.columns)
     assert "行情来源" in list(frame.columns)
@@ -726,3 +735,50 @@ def test_optimize_old_sheet_without_stamp_keeps_rows_and_fills_stamp(tmp_path) -
     frame = pd.read_excel(path, sheet_name=SHEET_OPTIMIZE, engine="openpyxl")
     assert added == 0 and total == 2  # 旧行补时间后与新行一致，没有重复
     assert set(frame["测试时间"].astype(str)) == {"2026-11-04 07:29:34"}
+
+
+def test_write_sheet_falls_back_when_excel_locked(tmp_path, monkeypatch) -> None:
+    """Excel 占用原文件时，改写到带时间的另一份，不报 Permission denied。"""
+    from src.export import book
+
+    path = tmp_path / "Auto-Trading导出.xlsx"
+    first = pd.DataFrame([{"品种": "sa"}])
+    book.write_sheet(path, SHEET_CROSS, first)
+    original = book._write_sheet_at
+
+    def boom(out, sheet, frame):
+        # 只拦原来那份，另存的那份还是正常写。
+        if out.resolve() == path.resolve():
+            raise PermissionError(13, "Permission denied")
+        return original(out, sheet, frame)
+
+    monkeypatch.setattr(book, "_write_sheet_at", boom)
+    written = book.write_sheet(path, SHEET_CROSS, pd.DataFrame([{"品种": "sh"}]))
+    assert written != path
+    assert written.exists()
+    assert "Auto-Trading导出_" in written.name
+    frame = pd.read_excel(written, sheet_name=SHEET_CROSS, engine="openpyxl")
+    assert list(frame["品种"].astype(str)) == ["sh"]
+    assert "关掉那张表" in book.locked_file_hint(path)
+    assert book.export_lock_note(path, written)
+    assert book.export_lock_note(path, path) == ""
+
+
+def test_write_book_falls_back_when_excel_locked(tmp_path, monkeypatch) -> None:
+    """导出全部时原文件被占用，整本写到另一份。"""
+    from src.export import book
+
+    path = tmp_path / "Auto-Trading导出.xlsx"
+    original = book._write_book_at
+
+    def boom(out, sheets):
+        if out.resolve() == path.resolve():
+            raise PermissionError(13, "Permission denied")
+        return original(out, sheets)
+
+    monkeypatch.setattr(book, "_write_book_at", boom)
+    written = book.write_book(path, {SHEET_CROSS: pd.DataFrame([{"品种": "fu"}])})
+    assert written != path
+    assert written.exists()
+    frame = pd.read_excel(written, sheet_name=SHEET_CROSS, engine="openpyxl")
+    assert list(frame["品种"].astype(str)) == ["fu"]

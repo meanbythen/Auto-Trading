@@ -21,6 +21,7 @@ from src.strategy.cta_factors import factor_fields_for_trade
 from src.data.kline import KlineProvider
 from src.data.periods import canonical_period, drop_forming_bar, last_ohlc_price, period_label, unique_ohlc_columns
 from src.risk.commission import fee_close, fee_open, is_close_today
+from src.risk.delivery import contract_gate
 from src.strategy import StrategyAction, StrategyDecision, create_strategy
 from src.strategy.generic_stop import GenericStopOverlay, generic_stop_snapshot
 from src.strategy.session_scope import session_kind
@@ -493,6 +494,13 @@ def coverage_note(
     return "".join(notes)
 
 
+def _as_mask(flag: Any):
+    """比较日期时，有的是 Series，有的已经是 numpy 数组。"""
+    if hasattr(flag, "to_numpy"):
+        return flag.to_numpy()
+    return flag
+
+
 def _trading_day_index(index: pd.Index) -> pd.DatetimeIndex:
     """
     每根K线属于哪个期货交易日，统一表示成那一天的 00:00。
@@ -511,25 +519,47 @@ def filter_bars_by_range(
     df: pd.DataFrame | None,
     start: str | datetime | None = None,
     end: str | datetime | None = None,
+    keep_before: int = 0,
 ) -> pd.DataFrame | None:
     """
     按期货交易日截取K线（含起止当天）。
 
     开始日 T 从 T-1 晚上 21:00 的夜盘算起，结束日 T 一直算到 T 20:59；
     T 晚上 21:00 之后的K线属于下一个交易日，不计入。周末的夜盘顺延到周一。
+
+    keep_before：开始日之前再留几根，只给均线预热，不当作这段要测的行情。
+    换月后新主力必须用它自己更早的K线把 EMA120 算热，否则和同花顺打开这张合约对不上。
     """
     if df is None or len(df) == 0:
         return df
     out = df
+    keep_before = max(0, int(keep_before or 0))
     days = _trading_day_index(out.index)
     if start not in (None, ""):
         start_day = pd.Timestamp(futures_trading_day(pd.Timestamp(start).to_pydatetime()))
-        out = out[days >= start_day]
-        days = days[days >= start_day]
-    if end not in (None, ""):
+        in_range = _as_mask(days >= start_day)
+        if keep_before > 0 and bool(in_range.any()):
+            first = int(in_range.nonzero()[0][0])
+            out = out.iloc[max(0, first - keep_before) :]
+        else:
+            out = out.iloc[in_range]
+        days = _trading_day_index(out.index)
+    if end not in (None, "") and len(out) > 0:
         end_day = pd.Timestamp(futures_trading_day(pd.Timestamp(end).to_pydatetime()))
-        out = out[days <= end_day]
+        out = out.iloc[_as_mask(days <= end_day)]
     return out
+
+
+def _range_start_index(df: pd.DataFrame | None, start: str | datetime | None) -> int:
+    """截完之后，真正开始交易的第一根下标。前面留下的是均线预热。"""
+    if df is None or len(df) == 0 or start in (None, ""):
+        return 0
+    days = _trading_day_index(df.index)
+    start_day = pd.Timestamp(futures_trading_day(pd.Timestamp(start).to_pydatetime()))
+    hits = _as_mask(days >= start_day)
+    if not bool(hits.any()):
+        return 0
+    return int(hits.nonzero()[0][0])
 
 
 def skip_reason_key(reason: str) -> str:
@@ -570,12 +600,17 @@ class BacktestLimits:
         from src.strategy.types import config_flag
 
         self.apply = config_flag((cfg.get("risk") or {}).get("apply_limits", True), default=True)
+        # 和回测页「真实账户口径」是同一个开关：开=手数跟着剩余权益走；关=一直按这一段的起始资金。
+        self.chain_capital = config_flag(
+            (cfg.get("backtest") or {}).get("chain_capital"), default=False
+        )
         self.day: Any = None
         self.last_open_at: datetime | None = None
         self.skipped: dict[str, int] = {}
         self.closed_pnls: list[float] = []
         self.closed_ats: list[datetime] = []
         # 账户权益最高点，给回撤减仓用。开跑时用初始资金垫上。
+        self.start_capital: float = float(self.sizer.capital)
         self.equity: float = 0.0
         self.peak_equity: float = 0.0
         self.cfg = cfg
@@ -605,9 +640,15 @@ class BacktestLimits:
         entry: float | None,
         stop: float | None,
     ) -> tuple[int, str]:
-        """按权益、每笔风险和止损距离算手数。算不出 1 手就返回 0。限制关掉时固定 1 手。"""
+        """按每笔风险和止损距离算手数。算不出 1 手就返回 0。限制关掉时固定 1 手。"""
         if not self.apply:
             return 1, "未启用开仓限制，固定1手"
+        # 真实账户口径开：这一笔按当前剩余权益算（前面赚了可能多开、亏多了可能开不了）。
+        # 关：这一段从头到尾都用起始资金，便于和当时实盘、和单合约对照。净值曲线仍跟着盈亏走。
+        if self.chain_capital and self.equity > 1e-9:
+            self.sizer.capital = float(self.equity)
+        else:
+            self.sizer.capital = float(self.start_capital)
         sized = self.sizer.calc_open(
             symbol,
             entry,
@@ -719,6 +760,8 @@ def run_backtest(
     start_date: str | None = None,
     end_date: str | None = None,
     engine: str | None = None,
+    chain_capital: bool | None = None,
+    inherit_position: dict[str, Any] | None = None,
 ) -> BacktestResult:
     """
     对单个品种跑完整回测。
@@ -731,11 +774,19 @@ def run_backtest(
         volume: 若传入，则这次回测改成固定手数，不再按风险算仓
         start_date / end_date: 可选，格式 YYYY-MM-DD；空则用全部已拉到的K线
         engine: 可选，临时指定策略引擎（不改磁盘配置）
+        chain_capital: 真实账户口径。None=读 backtest.chain_capital（默认关）。
+            开=手数跟着剩余权益走；关=每一笔都按本段起始资金。
+        inherit_position: 换月移仓。上一段结束时还拿着仓，就带
+            {"side": "long"|"short", "volume": 手数}，新主力第一根按同方向开。
     """
     cfg = _deepcopy_cfg(cfg)
     st = cfg.setdefault("strategy", {})
     trade = cfg.setdefault("trade", {})
     risk = cfg.setdefault("risk", {})
+    bt = cfg.setdefault("backtest", {})
+    # 调用方传入时盖过配置；换月分段和单合约共用这一个开关，不再另设「手数按起始资金」。
+    if chain_capital is not None:
+        bt["chain_capital"] = bool(chain_capital)
 
     if engine:
         st["engine"] = str(engine)
@@ -748,6 +799,10 @@ def run_backtest(
     if volume is not None:
         trade["volume"] = int(volume)
         risk["sizing_mode"] = "fixed"
+        # 固定手数对照时不要再走凯利，否则 1 手测试会被凯利改掉。
+        box = dict(risk.get("kelly") or {}) if isinstance(risk.get("kelly"), dict) else {}
+        box["enabled"] = False
+        risk["kelly"] = box
     capital0 = float(initial_capital if initial_capital is not None else risk.get("capital", 1_000_000))
     risk["capital"] = capital0
     # 从品种字母取乘数
@@ -824,8 +879,9 @@ def run_backtest(
     available_from = str(bars_signal.index[0]) if bars_signal is not None and len(bars_signal) else ""
     available_to = str(bars_signal.index[-1]) if bars_signal is not None and len(bars_signal) else ""
     before = 0 if bars_signal is None else len(bars_signal)
-    bars_signal = filter_bars_by_range(bars_signal, start_date, end_date)
-    bars_trail = filter_bars_by_range(bars_trail, start_date, end_date)
+    # 开始日之前留下 warmup 根，只给均线预热。换月后新主力才对得上同花顺图。
+    bars_signal = filter_bars_by_range(bars_signal, start_date, end_date, keep_before=warmup)
+    bars_trail = filter_bars_by_range(bars_trail, start_date, end_date, keep_before=warmup)
     # 大周期均线要往前看：开始日期只截信号 K 线，日线仍保留更早的收盘。
     if bars_trend is not None:
         bars_trend = filter_bars_by_range(bars_trend, None, end_date)
@@ -833,11 +889,26 @@ def run_backtest(
     if before and after < before:
         logger.info("按时间段截取K线: {} → {} 根 ({} ~ {})", before, after, start_date or "起", end_date or "止")
 
-    if bars_signal is None or len(bars_signal) < warmup + 5:
+    trade_from = _range_start_index(bars_signal, start_date)
+    loop_start = max(int(trade_from), int(warmup))
+    if bars_signal is None or len(bars_signal) <= loop_start:
         raise RuntimeError(
             f"K线不足，无法回测 symbol={symbol} bars={0 if bars_signal is None else len(bars_signal)}。"
             "可把时间段改成「全部可用」，或检查网络后重试。"
         )
+    carry = None
+    if isinstance(inherit_position, dict):
+        side = str(inherit_position.get("side") or "").strip().lower()
+        if side in {"long", "short"}:
+            try:
+                lots = max(1, int(inherit_position.get("volume") or 1))
+            except (TypeError, ValueError):
+                lots = 1
+            carry = {"side": side, "volume": lots}
+            setter = getattr(strategy, "set_rollover_carry", None)
+            if callable(setter):
+                setter(side, lots)
+                logger.info("换月移仓 {} 沿用上一段{} {}手", symbol, "多" if side == "long" else "空", lots)
 
     logger.info(
         "回测数据就绪 symbol={} engine={} 信号K={}根 止损K={}根 大周期K={}根 warmup={} max_bars={}",
@@ -851,8 +922,7 @@ def run_backtest(
     )
     # 确保空仓起点
     strategy.positions[symbol] = PositionState(symbol=symbol)
-    if hasattr(strategy, "_last_entry_bar"):
-        strategy._last_entry_bar[symbol] = ""
+    strategy.set_last_entry_bar(symbol, "")
     # 通用止损：和策略自身止损相互独立，谁先触发就按谁平。
     generic_stop = GenericStopOverlay(cfg)
 
@@ -902,14 +972,13 @@ def run_backtest(
         "src.strategy.trend_follow",
         "src.strategy.supertrend",
         "src.strategy.dual_ma",
+        "src.strategy.macd_swing",
         "src.strategy.bollinger_break",
         "src.strategy.sar_trend",
         "src.strategy.multi_factor",
-        "src.strategy.multi_factor_adapt",
-        "src.strategy.adaptive_weights",
         "src.strategy.daily_body",
-        "src.strategy.morning_edge",
         "src.strategy.swing_trend",
+        "src.strategy.swing_box",
         "src.risk.sizing",
         "src.risk.guardian",
         "src.risk.dynamic",
@@ -917,7 +986,7 @@ def run_backtest(
         logger.disable(_mod)
 
     try:
-        for i in range(warmup, n):
+        for i in range(loop_start, n):
             # 只用第 i 根（含）已收盘的数据做决策；开仓按下一根开盘成交（可配置关闭）。
             signal_df = bars_signal.iloc[: i + 1]
             now = _ts_to_dt(signal_df.index[-1])
@@ -969,6 +1038,42 @@ def run_backtest(
                         # 成交价要按止损线算，不能退回下一根开盘。
                         meta={"generic_stop": True},
                     )
+            # 交割月不再交易这一手：日盘收盘后若夜盘已算交割月，当根收盘平掉，也不再开。
+            gate = contract_gate(symbol, now)
+            if gate.flatten:
+                held_for_roll = strategy.positions.get(symbol)
+                if held_for_roll is not None and held_for_roll.side != "flat":
+                    decision = StrategyDecision(
+                        StrategyAction.CLOSE,
+                        symbol,
+                        gate.reason,
+                        meta={"delivery_flatten": True},
+                    )
+                elif decision.action in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN):
+                    _note_reject(
+                        "交割换月",
+                        gate.reason,
+                        "多" if decision.action == StrategyAction.BUY_OPEN else "空",
+                        at=now,
+                        price=px,
+                        stop=decision.stop_price,
+                        key="交割月不开仓",
+                    )
+                    decision = StrategyDecision(StrategyAction.HOLD, symbol, gate.reason)
+            elif gate.block_open and decision.action in (
+                StrategyAction.BUY_OPEN,
+                StrategyAction.SELL_OPEN,
+            ):
+                _note_reject(
+                    "交割换月",
+                    gate.reason,
+                    "多" if decision.action == StrategyAction.BUY_OPEN else "空",
+                    at=now,
+                    price=px,
+                    stop=decision.stop_price,
+                    key="交割月不开仓",
+                )
+                decision = StrategyDecision(StrategyAction.HOLD, symbol, gate.reason)
             # 下一根开盘价用来成交；断开或已到最后一根时退回当根收盘价。
             next_open = _next_open_price(bars_signal, i, tf) if fill.on_next_open else None
             limits.on_bar(now)
@@ -1106,6 +1211,18 @@ def run_backtest(
                     size_reason = f"{joined}（{allowed_reason}）" if allowed_reason else joined
                 else:
                     size_reason = allowed_reason
+                if open_vol <= 0 and (meta.get("rollover_carry") or (carry and want == carry.get("side"))):
+                    # 换月移仓：你本来就拿着仓，不是新开冒险。止损跟着新主力均线，
+                    # 距离可能宽过每笔风险%，仍按上一段手数移过去。
+                    try:
+                        want_vol = max(1, int(meta.get("volume") or (carry or {}).get("volume") or 1))
+                    except (TypeError, ValueError):
+                        want_vol = 1
+                    open_vol = want_vol
+                    size_reason = (
+                        f"换月移仓：止损宽于每笔风险%，仍按{open_vol}手把仓移到新主力"
+                        + (f"（{allowed_reason}）" if allowed_reason else "")
+                    )
                 if open_vol <= 0:
                     limits.note_skip(size_reason)
                     _note_reject(
@@ -1140,7 +1257,7 @@ def run_backtest(
                 )
                 limits.on_open(now, decision.action.value, open_vol, symbol)
                 pos_after = strategy.positions.get(symbol)
-                # 有些策略（日内实体、早盘箱体）开仓时用真实时钟记 opened_at；
+                # 有些策略（日内实体）开仓时用真实时钟记 opened_at；
                 # 回测里必须改成这根K线的模拟时间，否则通用止损会把这些历史K线
                 # 全当成「开仓之前」，整段回测都不会生效。
                 if pos_after is not None and pos_after.side != "flat" and not is_add:
@@ -1172,10 +1289,9 @@ def run_backtest(
                         "score_sar": meta.get("score_sar"),
                         "atr": meta.get("atr"),
                     }
-                if hasattr(strategy, "_last_entry_bar"):
-                    bar_id = str(meta.get("bar_id", ""))
-                    if bar_id:
-                        strategy._last_entry_bar[symbol] = bar_id
+                bar_id = str(meta.get("bar_id", ""))
+                if bar_id:
+                    strategy.set_last_entry_bar(symbol, bar_id)
 
             elif decision.action == StrategyAction.CLOSE:
                 pos = strategy.positions.get(symbol)
@@ -1188,11 +1304,13 @@ def run_backtest(
                     pos_stop = float(decision.stop_price)
                 # 触发它的那根止损周期K线（比如 15 分钟）决定跳空多少，不能用信号K线代判。
                 fill_bar = signal_df if gs_bar is None else gs_bar.to_frame().T
+                # 交割月换月必须当根收盘走，不能拖到夜盘开盘（那根已经算交割月）。
+                exit_next_open = None if meta.get("delivery_flatten") else next_open
                 exit_px = _exit_fill_price(
                     side=side,
                     stop=pos_stop,
                     bar=fill_bar,
-                    next_open=next_open,
+                    next_open=exit_next_open,
                     close_px=px,
                     fill=fill,
                     touch_stop=bool(getattr(strategy, "stop_on_touch", True)),
@@ -1272,14 +1390,13 @@ def run_backtest(
             "src.strategy.trend_follow",
             "src.strategy.supertrend",
             "src.strategy.dual_ma",
+            "src.strategy.macd_swing",
             "src.strategy.bollinger_break",
             "src.strategy.sar_trend",
             "src.strategy.multi_factor",
-            "src.strategy.multi_factor_adapt",
-            "src.strategy.adaptive_weights",
             "src.strategy.daily_body",
-            "src.strategy.morning_edge",
             "src.strategy.swing_trend",
+            "src.strategy.swing_box",
             "src.risk.sizing",
             "src.risk.guardian",
         ):
@@ -1343,15 +1460,16 @@ def run_backtest(
         "end_date": end_date or "",
         "available_from": available_from,
         "available_to": available_to,
-        "data_from": str(bars_signal.index[0]) if len(bars_signal) else "",
+        "data_from": str(bars_signal.index[trade_from]) if len(bars_signal) else "",
         "data_to": str(bars_signal.index[-1]) if len(bars_signal) else "",
+        "lookback_bars": int(trade_from),
         "coverage_note": _coverage_with_gaps(
             coverage_note(
                 start_date,
                 end_date,
                 available_from,
                 available_to,
-                str(bars_signal.index[0]) if len(bars_signal) else "",
+                str(bars_signal.index[trade_from]) if len(bars_signal) else "",
                 str(bars_signal.index[-1]) if len(bars_signal) else "",
                 tf,
             ),
@@ -1376,7 +1494,11 @@ def run_backtest(
         "price_tick": fill.price_tick,
         "fill_note": fill.describe(),
         "sizing_mode": str(risk.get("sizing_mode", "risk_pct")),
+        "kelly_in_backtest": bool(
+            isinstance(risk.get("kelly"), dict) and risk["kelly"].get("enabled")
+        ),
         "capital": capital0,
+        "chain_capital": bool(limits.chain_capital),
         "risk_per_trade_pct": float(risk.get("risk_per_trade_pct", 0.5)),
         "margin_usage_pct": float(risk.get("margin_usage_pct", 80) or 0),
         "fixed_volume": int(trade.get("volume", 1)),
@@ -1391,18 +1513,19 @@ def run_backtest(
         "skipped_opens": dict(limits.skipped),
     }
     logger.info(
-        "回测结束 {} | bars={} 成交{}笔 胜率{:.0%} 净盈亏{:.0f}",
+        "回测结束 {} | bars={} 成交{}笔 胜率{:.0%} 盈亏比{:.2f} 净盈亏{:.0f}",
         symbol,
         n,
         perf.trades,
         perf.win_rate,
+        perf.payoff,
         perf.net_pnl,
     )
     return BacktestResult(
         symbol=symbol,
         timeframe=tf,
         trail_timeframe=trail_tf,
-        bars=n,
+        bars=max(0, n - int(trade_from)),
         performance=perf,
         trades=trades,
         equity=equity,

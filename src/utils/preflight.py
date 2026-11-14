@@ -52,11 +52,6 @@ def _log(msg: str, log: LogFn | None) -> None:
     logger.info(msg)
     if log:
         log(msg)
-    else:
-        try:
-            print(msg)
-        except UnicodeEncodeError:
-            print(msg.encode("gbk", errors="replace").decode("gbk"))
 
 
 # 标定窗口留下的点，和配置页正在用的点，差在这个范围里只提醒。

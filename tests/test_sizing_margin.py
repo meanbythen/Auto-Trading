@@ -101,6 +101,128 @@ def test_ctp_available_caps_margin_without_double_count() -> None:
     assert "柜台可用" in sized.reason
 
 
+def test_backtest_lots_stay_on_start_capital() -> None:
+    """真实账户口径关：手数按起始权益，纸面盈亏变了也不加仓减仓。"""
+    from src.backtest.engine import BacktestLimits
+
+    cfg = {
+        "trade": {"volume": 1},
+        "risk": {
+            "sizing_mode": "risk_pct",
+            "capital": 1_030_018,
+            "risk_per_trade_pct": 10,
+            "min_volume": 1,
+            "margin_per_lot": 9384,
+            "margin_usage_pct": 80,
+            "apply_limits": True,
+            "contracts": {"fu": {"multiplier": 10, "margin": 9384}},
+        },
+    }
+    limits = BacktestLimits(cfg)
+    limits.note_equity(1_030_018)
+    high, _ = limits.size_open("fu2701", 5000, 4990)
+    assert high == 87
+    limits.note_equity(500_000)
+    still, reason = limits.size_open("fu2701", 5000, 4990)
+    assert still == high
+    assert "500000" not in reason.replace(",", "")
+
+
+def test_backtest_lots_follow_equity_when_chain_capital() -> None:
+    """真实账户口径开：手数跟着剩余权益走，权益腰斩后面手数也少。"""
+    from src.backtest.engine import BacktestLimits
+
+    cfg = {
+        "trade": {"volume": 1},
+        "backtest": {"chain_capital": True},
+        "risk": {
+            "sizing_mode": "risk_pct",
+            "capital": 1_030_018,
+            "risk_per_trade_pct": 10,
+            "min_volume": 1,
+            "margin_per_lot": 9384,
+            "margin_usage_pct": 80,
+            "apply_limits": True,
+            "contracts": {"fu": {"multiplier": 10, "margin": 9384}},
+        },
+    }
+    limits = BacktestLimits(cfg)
+    limits.note_equity(1_030_018)
+    high, _ = limits.size_open("fu2701", 5000, 4990)
+    limits.note_equity(500_000)
+    low, reason = limits.size_open("fu2701", 5000, 4990)
+    assert high > low
+    assert low == 42
+    assert "500000" in reason.replace(",", "") or "500,000" in reason
+
+
+def test_fu_night_trade_stays_two_lots_on_live_capital() -> None:
+    """口径关：燃油 4032 空、止损 4119、起始 2.9 万。纸面涨到 4.2 万仍是 2 手，和当时实盘一致。"""
+    from src.backtest.engine import BacktestLimits
+
+    cfg = {
+        "trade": {"volume": 1},
+        "risk": {
+            "sizing_mode": "risk_pct",
+            "capital": 29493.74,
+            "risk_per_trade_pct": 10,
+            "min_volume": 1,
+            "margin_usage_pct": 80,
+            "apply_limits": True,
+            "contracts": {
+                "fu": {"multiplier": 10, "name": "燃油", "margin_rate_pct": 22.74}
+            },
+        },
+    }
+    limits = BacktestLimits(cfg)
+    # 口径关：纸面权益涨到 4.2 万，手数仍按 29493 算，不会变成 3 手。
+    limits.note_equity(42000)
+    vol, reason = limits.size_open("fu2701", 4032.0, 4119.0)
+    assert vol == 2
+    assert "意图3" in reason.replace(" ", "") or "意图 3" in reason
+
+
+def test_fu_night_trade_adds_lot_when_chain_capital() -> None:
+    """口径开：同一口夜盘箱子，纸面权益涨到 4.2 万后按剩余权益开，会变成 3 手。"""
+    from src.backtest.engine import BacktestLimits
+
+    cfg = {
+        "trade": {"volume": 1},
+        "backtest": {"chain_capital": True},
+        "risk": {
+            "sizing_mode": "risk_pct",
+            "capital": 29493.74,
+            "risk_per_trade_pct": 10,
+            "min_volume": 1,
+            "margin_usage_pct": 80,
+            "apply_limits": True,
+            "contracts": {
+                "fu": {"multiplier": 10, "name": "燃油", "margin_rate_pct": 22.74}
+            },
+        },
+    }
+    limits = BacktestLimits(cfg)
+    limits.note_equity(42000)
+    vol, _reason = limits.size_open("fu2701", 4032.0, 4119.0)
+    assert vol == 3
+
+
+def test_margin_rate_grows_with_price() -> None:
+    """比例固定时，价格越高每手占用越多，同样的钱能开的手数变少。"""
+    cfg = _cfg(0, capital=30000, margin_usage_pct=100)
+    cfg["risk"]["contracts"] = {
+        "fu": {"multiplier": 10, "name": "燃油", "margin_rate_pct": 23}
+    }
+    cheap = PositionSizer(cfg).calc_open("fu2701", 4000, 3990)
+    dear = PositionSizer(cfg).calc_open("fu2701", 5000, 4990)
+    # 4000×10×23%=9200；5000×10×23%=11500
+    assert cheap.volume == 3
+    assert dear.volume == 2
+    assert "9200" in cheap.reason or "每手9200" in cheap.reason.replace(",", "")
+    assert cheap.margin_lots == 3
+    assert dear.margin_lots == 2
+
+
 def test_margin_blocks_when_equity_cannot_buy_one_lot() -> None:
     sized = PositionSizer(_cfg(15000, mode="fixed")).calc_open("bu2612", 4585, 4575)
     assert sized.volume == 0

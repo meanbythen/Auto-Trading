@@ -1,0 +1,21 @@
+# 逐条固定到已验证的版本，供 CI 和重现问题使用。
+# 范围与 requirements.txt 的直接依赖一一对应，改依赖时两边一起改。
+# 没有钉住间接依赖（如 certifi、urllib3），它们仍按各自的约束解析。
+numpy==2.5.4
+pandas==2.3.3
+matplotlib==3.11.2
+openpyxl==3.1.2
+akshare==1.20.6
+Pillow==11.3.0
+pyautogui==0.9.54
+pygetwindow==0.0.9
+PyYAML==6.0.3
+schedule==1.2.2
+psutil==7.0.0
+uiautomation==2.0.29
+loguru==0.7.3
+customtkinter==6.0.0
+keyboard==0.13.5
+pytest==9.1.1
+openctp-ctp==6.7.11.0
+tqsdk==3.10.4

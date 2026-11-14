@@ -6,7 +6,6 @@
 
 from __future__ import annotations
 
-import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -32,18 +31,17 @@ REQUIRED_MODULES = [
     "src.ui.test_tools",
     "src.ui.order_simulator",
     "src.strategy.daily_body",
-    "src.strategy.morning_edge",
     "src.strategy.supertrend",
     "src.strategy.dual_ma",
+    "src.strategy.macd_swing",
     "src.strategy.trend_follow",
     "src.strategy.swing_trend",
+    "src.strategy.swing_box",
     "src.strategy.market_state",
     "src.strategy.trend_base",
     "src.strategy.bollinger_break",
     "src.strategy.sar_trend",
     "src.strategy.multi_factor",
-    "src.strategy.multi_factor_adapt",
-    "src.strategy.adaptive_weights",
     "src.strategy.cta_factors",
     "src.strategy.cta_filter",
     "src.export.cta_decay",
@@ -60,6 +58,13 @@ REQUIRED_MODULES = [
     # 21:00 期货交易日、保证金表等运行必需模块
     "src.utils.trading_day",
     "src.risk.margin_table",
+    "src.risk.universe_table",
+    "src.risk.kelly",
+    "src.risk.sizing",
+    "src.data.tq_source",
+    "src.trader.ctp_td",
+    "src.trader.ctp_gateway",
+    "tools.refresh_universe",
     "src.account.signal_stats",
     "src.scheduler.runner",
     "src.trader.ctp_logic",
@@ -102,18 +107,20 @@ def main() -> int:
         "strategies/daily_body.yaml",
         "strategies/supertrend.yaml",
         "strategies/dual_ma.yaml",
-        "strategies/morning_box_a.yaml",
+        "strategies/ema_swing.yaml",
+        "strategies/macd_swing.yaml",
         "strategies/trend_follow.yaml",
         "strategies/bollinger.yaml",
         "strategies/sar_trend.yaml",
         "strategies/multi_factor.yaml",
-        "strategies/multi_vote.yaml",
-        "strategies/multi_hybrid.yaml",
-        "strategies/jesse_casper.yaml",
+        "strategies/swing_box.yaml",
+        "docs/长线箱体突破操作说明书.md",
+        "docs/均线波段.md",
         "VERSION",
         "CHANGELOG.md",
-        "docs/策略迭代进化说明.md",
         "docs/日内实体操作说明书.md",
+        "docs/配置说明书.md",
+        "docs/实盘交易简易说明书.md",
     ):
         path = DIST / rel
         if not path.exists():
@@ -132,6 +139,10 @@ def main() -> int:
         "strategies/sar_flip.yaml",
         "strategies/mean_reversion.yaml",
         "strategies/morning_gap_c.yaml",
+        "strategies/jesse_casper.yaml",
+        "strategies/multi_hybrid.yaml",
+        "strategies/multi_vote.yaml",
+        "strategies/daily_body_expand.yaml",
     ):
         if (DIST / gone).exists():
             errors.append(f"发布包里仍有已删策略说明 {gone}，请从 strategies 去掉后再打包")

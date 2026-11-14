@@ -218,6 +218,55 @@ def main_contract(
     return result
 
 
+def _finite_number(value: Any) -> float:
+    """行情里空值常是 NaN，当成 0。"""
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    if num != num:  # NaN
+        return 0.0
+    return num
+
+
+def instrument_specs(
+    symbol: str,
+    *,
+    user: str = "",
+    password: str = "",
+    api: Any | None = None,
+    timeout: float = 5.0,
+) -> dict[str, float]:
+    """
+    问天勤这一张合约的每手数量、每跳、最新价。
+
+    天勤行情没有期货公司的保证金比例，比例请在品种表手填，或从 CTP 合约页抄。
+    每手数量就是 VolumeMultiple，和盈亏乘数是同一个数。
+    """
+    code = tq_symbol(symbol)
+    with _LOCK:
+        client = api if api is not None else _get_api(user, password)
+        try:
+            quote = client.get_quote(code)
+        except Exception as exc:  # noqa: BLE001
+            raise RuntimeError(f"天勤没有 {symbol} 的合约资料：{exc}") from exc
+        deadline = time.time() + max(1.0, float(timeout))
+        volume_multiple = 0
+        while time.time() < deadline:
+            volume_multiple = int(_finite_number(getattr(quote, "volume_multiple", 0)) or 0)
+            if volume_multiple > 0:
+                break
+            try:
+                _wait_update(client, min(time.time() + 1.0, deadline))
+            except Exception:  # noqa: BLE001
+                break
+        return {
+            "volume_multiple": float(volume_multiple),
+            "price_tick": _finite_number(getattr(quote, "price_tick", 0)),
+            "last_price": _finite_number(getattr(quote, "last_price", 0)),
+        }
+
+
 def reset_api() -> None:
     """断线或换账号后丢掉旧连接，下次重新登录。"""
     global _api, _api_key

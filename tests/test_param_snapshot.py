@@ -35,7 +35,8 @@ def test_kept_engine_aliases_keep_their_name() -> None:
     for old_engine, section, key, value in (
         ("supertrend", "supertrend", "multiplier", 3.5),
         ("dual_ma", "dual_ma", "short_period", 10),
-        ("morning_box_a", "morning_box_a", "be_box_mult", 0.8),
+        ("ema_swing", "ema_swing", "slope_min_deg", 3.0),
+        ("bollinger", "bollinger", "period", 20),
     ):
         restored = apply_snapshot_to_config(
             {"strategy": {}, "trade": {}},

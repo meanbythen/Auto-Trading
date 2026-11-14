@@ -4,9 +4,10 @@
 功能：
     1. 遍历天勤覆盖的全部 ~80 个期货品种（_EXCHANGES）。
     2. 问每个品种的当前主力合约（main_contract）。
-    3. 旧表里已有合约的，沿用其保证金/乘数/手续费（主力月份变了自动更新合约代码）。
-    4. 旧表里没有的品种，先写进去（启用=否，保证金/手续费默认 0），留给你后续补。
-    5. 整表重写 Excel（启用=是 的表示你关注）。
+    3. 顺手问每手数量、每跳（天勤行情有）。保证金比例天勤没有，请手填或从 CTP 抄。
+    4. 旧表已有比例的沿用；只有旧每手保证金金额、又问到最新价时，用 金额÷(价×每手数量) 估一个比例。
+    5. 旧表里没有的品种，先写进去（启用=否），留给你后续补比例。
+    6. 整表重写 Excel（启用=是 的表示你关注）。保留原来的交易时段和清仓时刻。
 
 用法（第一次跑需要天勤账号）：
     set TQ_USER=你的天勤手机号
@@ -21,7 +22,6 @@
 from __future__ import annotations
 
 import os
-import re
 import sys
 from pathlib import Path
 from typing import Any
@@ -35,12 +35,13 @@ from loguru import logger
 
 from src.data.tq_source import (
     EXCHANGE_BY_PRODUCT,
+    instrument_specs,
     main_contract,
     reset_api,
 )
 from src.risk.universe_table import (
-    DEFAULT_REL_PATH,
     _as_float,
+    parse_margin_rate_pct,
     product_key,
     read_universe_table,
     resolve_universe_path,
@@ -51,7 +52,7 @@ from src.utils import load_config, load_secrets
 
 # —— 品种中文名、合理的默认乘数/每跳（旧表没填到时用）——
 # 数值来源：中国期货市场常用值，若和实际不符以交易所为准。
-# 保证金天勤拿不到，默认 0（未填状态），让用户后续在表里补上。
+# 保证金比例天勤拿不到，默认 0，请对照期货公司或同花顺填，例如 23 表示 23%。
 _DEFAULT_NAME_MULT_TICK: dict[str, tuple[str, float, float]] = {
     # 上期所 SHFE
     "cu": ("铜", 5, 10.0),
@@ -242,7 +243,7 @@ def refresh_universe_table(
             no_tq += 1
             current_main = None
 
-        # 2. 拿旧表里已有的保证金/乘数/手续费
+        # 2. 拿旧表里已有的比例/每手数量/手续费/时段
         old = old_by_product.get(product)
         old_symbol = str(old.get("symbol") or "") if old else ""
 
@@ -251,23 +252,58 @@ def refresh_universe_table(
 
         # 4. 拼新行
         if old:
-            # 沿用旧表数值
             margin = max(0.0, _as_float(old.get("margin"), 0.0))
+            rate = parse_margin_rate_pct(old.get("margin_rate_pct"))
             multiplier = max(0.1, _as_float(old.get("multiplier"), 10.0))
             commission = max(0.0, _as_float(old.get("commission"), 0.0))
             today = old.get("commission_close_today")
             price_tick = old.get("price_tick")
             name = str(old.get("name") or product)
             enabled = bool(old.get("enabled", True))
+            trading_sessions = str(old.get("trading_sessions") or "")
+            flatten_times = str(old.get("flatten_times") or "")
         else:
-            # 旧表没有 → 用默认值
             name, multiplier, price_tick = _DEFAULT_NAME_MULT_TICK.get(
                 product, (product, 10.0, 1.0)
             )
-            margin = 0.0  # 未知，让用户补
+            margin = 0.0
+            rate = 0.0
             commission = 0.0
             today = None
-            enabled = False  # 旧表没关注过的品种默认关
+            enabled = False
+            trading_sessions = ""
+            flatten_times = ""
+
+        # 天勤能给每手数量、每跳、最新价；给不了期货公司保证金比例。
+        if current_main and tq_user and tq_password:
+            try:
+                specs = instrument_specs(
+                    current_main, user=tq_user, password=tq_password
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("  合约资料失败 {}: {}", product, exc)
+                specs = {}
+            qty = float(specs.get("volume_multiple") or 0)
+            tick = float(specs.get("price_tick") or 0)
+            last = float(specs.get("last_price") or 0)
+            if qty > 0:
+                multiplier = qty
+            if tick > 0:
+                price_tick = tick
+            # 旧表只有固定金额时，用现价估一个比例，方便以后随价格变。
+            if rate <= 0 and margin > 0 and last > 0 and multiplier > 0:
+                guessed = margin / (last * multiplier) * 100.0
+                if 1.0 < guessed <= 80.0:
+                    rate = round(guessed, 2)
+                    logger.info(
+                        "  {} 用旧保证金{:g}元 / (价{:g}×每手{:g}) 估比例 {:g}%",
+                        product,
+                        margin,
+                        last,
+                        multiplier,
+                        rate,
+                    )
+                    margin = 0.0
 
         # 如果今天主力没变 → 保留原启用状态 + 说明
         if current_main and old and old_symbol and old_symbol.lower() == current_main.lower():
@@ -284,11 +320,14 @@ def refresh_universe_table(
             {
                 "symbol": new_symbol,
                 "name": name,
+                "margin_rate_pct": rate,
                 "margin": margin,
                 "multiplier": multiplier,
                 "commission": commission,
                 "commission_close_today": today,
                 "price_tick": price_tick,
+                "trading_sessions": trading_sessions,
+                "flatten_times": flatten_times,
                 "enabled": enabled,
                 "_source": comment,
             }

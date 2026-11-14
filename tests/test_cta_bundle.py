@@ -1,5 +1,5 @@
 """
-多因子 CTA 完整版：加权打分 / 投票 / 混合。
+多因子 CTA 完整版：加权打分。
 市场过滤关掉，日线用单独的趋势 K 线传入，避免测试去拉真实行情。
 """
 
@@ -13,8 +13,6 @@ import pandas as pd
 from src.strategy.cta_factors import FactorParams, compute_factors, position_ratio
 from src.strategy.multi_factor import (
     MultiFactorStrategy,
-    MultiHybridStrategy,
-    MultiVoteStrategy,
 )
 from src.strategy.types import PositionState, StrategyAction
 
@@ -146,31 +144,6 @@ def test_sar_off_still_opens_with_remaining_factors() -> None:
     assert decision.meta.get("score_sar", 1) == 0
 
 
-def test_vote_opens_when_majority_agrees() -> None:
-    decision = MultiVoteStrategy(_cfg("multi_vote")).evaluate(
-        "bu",
-        _up_signal(),
-        now=datetime(2026, 1, 1, 10, 0),
-        trend_bars=_daily_up(),
-    )
-    assert decision.action == StrategyAction.BUY_OPEN
-    assert "投票" in decision.reason
-    assert int(decision.meta.get("long_votes") or 0) >= 2
-
-
-def test_hybrid_puts_size_scale_in_meta() -> None:
-    decision = MultiHybridStrategy(_cfg("multi_hybrid")).evaluate(
-        "bu",
-        _up_signal(),
-        now=datetime(2026, 1, 1, 10, 0),
-        trend_bars=_daily_up(),
-    )
-    assert decision.action == StrategyAction.BUY_OPEN
-    scale = float(decision.meta.get("size_scale") or 0)
-    assert 0.5 <= scale <= 1.0
-    assert "混合" in decision.reason
-
-
 def test_position_ratio_maps_threshold_to_min() -> None:
     assert abs(position_ratio(0.6, 0.6, 0.5, 1.0) - 0.5) < 1e-9
     assert abs(position_ratio(1.0, 0.6, 0.5, 1.0) - 1.0) < 1e-9
@@ -297,18 +270,17 @@ def test_weighted_gray_needs_higher_score(monkeypatch) -> None:
         assert "弱" in decision.reason or "空仓" in decision.reason
 
 
-def test_sanitize_fills_three_cta_filters() -> None:
+def test_sanitize_fills_cta_filter() -> None:
     from src.strategy.factory import sanitize_strategy_config
 
     cfg = {"strategy": {"engine": "multi_factor", "multi_factor": {}}}
     sanitize_strategy_config(cfg)
-    for name in ("multi_factor", "multi_factor_adapt", "multi_vote", "multi_hybrid"):
-        filt = cfg["strategy"][name]["cta_filter"]
-        assert filt["enabled"] is True
-        assert filt["use_adx"] is True
-        assert filt["atr_low_pct"] == 0.2
-    assert cfg["strategy"]["multi_vote"]["cta_filter"]["weak_votes"] == 3
-    assert cfg["strategy"]["multi_factor"]["cta_filter"]["weak_score"] == 0.75
+    filt = cfg["strategy"]["multi_factor"]["cta_filter"]
+    assert filt["enabled"] is True
+    assert filt["use_adx"] is True
+    assert filt["atr_low_pct"] == 0.2
+    assert filt["weak_score"] == 0.75
+    assert "multi_vote" not in cfg["strategy"]
 
 
 def test_daily_bias_uses_ema_and_can_flip_short_after_a_crash() -> None:

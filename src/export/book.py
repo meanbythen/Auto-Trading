@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -36,10 +37,10 @@ SHEET_HELP: list[tuple[str, str]] = [
     (SHEET_FILLS, "当前账户分析里的交易记录，也就是开仓和平仓。来自现在这本账"),
     (SHEET_CHANGES, "当前账户分析里的资金变动记录：初始资金、入金、出金、每日结算差额、交易盈亏"),
     (SHEET_REVIEWS, "已经生成过的收盘复盘；有成绩单时带有效性/稳定性/可信度"),
-    (SHEET_BACKTEST, "每次历史回测的总成绩。含策略中文名、信号/止损周期、夜盘分钟、收盘清仓，以及盈利覆盖、每笔收益、日均。第一列「回测时间」是这次跑完的时刻"),
+    (SHEET_BACKTEST, "每次历史回测的总成绩。含策略中文名、信号/止损周期、夜盘分钟、收盘清仓，以及盈亏比、收益期望、盈利覆盖、每笔收益、日均。第一列「回测时间」是这次跑完的时刻"),
     (SHEET_BACKTEST_TRADES, "每次历史回测里的每一笔开平仓。带策略中文名，方向写「多/空」。第一列「回测时间」用来分清是哪一次；时间相同且内容相同的行不重复写"),
     (SHEET_BACKTEST_SIGNALS, "每次历史回测里「有开仓信号但没做」的记录：信号时间、方向、信号价、止损价、被哪一层拦下和原因。同一时段同类原因只留一条。第一列「回测时间」说明属于哪一次"),
-    (SHEET_CROSS, "交叉测试每一轮的品种×策略成绩。第一列「测试时间」是这一轮跑完的时刻；同一轮再导出不重复。含盈利覆盖、每笔收益、日均，以及止损周期和行情来源"),
+    (SHEET_CROSS, "交叉测试每一轮的品种×策略成绩。第一列「测试时间」是这一轮跑完的时刻；同一轮再导出不重复。含盈亏比、收益期望、盈利覆盖、每笔收益、日均，以及止损周期和行情来源"),
     (SHEET_OPTIMIZE, "策略优化结果：最优一行，后面是得分靠前的尝试。第一列「测试时间」是这次跑完的时刻，同一次的行时间相同，用来分清是哪一次。带检验方式、检验比例、训练/检验成绩、盈利覆盖、是否通过和结论"),
 ]
 
@@ -207,34 +208,111 @@ def _cell_text(value: object) -> str:
     return str(number)
 
 
+def is_excel_locked(exc: BaseException) -> bool:
+    """Excel 正开着文件、或别的程序占用时，Windows 会报 Permission denied。"""
+    if isinstance(exc, PermissionError):
+        return True
+    if isinstance(exc, OSError):
+        if getattr(exc, "errno", None) in {13, 5}:
+            return True
+        if getattr(exc, "winerror", None) in {5, 32}:
+            return True
+    text = str(exc).lower()
+    return "permission denied" in text or "being used by another process" in text
+
+
+def fallback_export_path(path: Path) -> Path:
+    """原文件被占用时，另存一份带时间的文件，避免这次结果丢了。"""
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    return path.with_name(f"{path.stem}_{stamp}{path.suffix}")
+
+
+def locked_file_hint(path: Path | str) -> str:
+    """给人看的占用说明，不要甩 Errno 13。"""
+    return (
+        f"写不进去：{path}\n\n"
+        "多半是 Excel 正开着「Auto-Trading导出」。请先关掉那张表，再点导出。"
+        "关掉以后再点一次，新结果会接到原来那份后面。"
+    )
+
+
+def export_lock_note(chosen: Path | str, written: Path | str) -> str:
+    """
+    成功写到另一份文件时，弹窗末尾补一句说明。
+
+    原理：原文件被 Excel 锁住时，程序会另存一份带时间的文件。
+    路径相同说明写进了你选的那份，不用提醒。
+    """
+    try:
+        if Path(chosen).resolve() == Path(written).resolve():
+            return ""
+    except OSError:
+        return ""
+    return (
+        "\n\n原来的表格正被 Excel 打开，这次写到了另一份。"
+        "请先关掉 Excel 再导出，才能接到原来那份后面。"
+    )
+
+
 def write_sheet(path: Path | str, sheet: str, frame: pd.DataFrame) -> Path:
     """
     把一张表写进工作簿。
 
     文件不存在就新建，并先放一张「说明」。
     文件已存在就只替换同名表，其他功能的表不动。
+    Excel 正开着原文件时，改写到带时间的另一份，不把这次结果丢掉。
     """
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
-    if not out.exists():
-        with pd.ExcelWriter(out, engine="openpyxl") as writer:
-            index_frame().to_excel(writer, sheet_name=SHEET_INDEX, index=False)
-            frame.to_excel(writer, sheet_name=sheet, index=False)
-        logger.info("新建导出工作簿 {}，写入表 {}", out, sheet)
+    try:
+        _write_sheet_at(out, sheet, frame)
         return out
-    with pd.ExcelWriter(out, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
-        frame.to_excel(writer, sheet_name=sheet, index=False)
-    logger.info("已更新工作簿 {} 的表 {}", out, sheet)
-    return out
+    except OSError as exc:
+        if not is_excel_locked(exc):
+            raise
+        alt = fallback_export_path(out)
+        logger.warning("原文件正被占用 {}，改写到 {}", out, alt)
+        others = _try_read_book(out)
+        others[sheet] = frame
+        _write_book_at(alt, others)
+        return alt
 
 
 def write_book(path: Path | str, sheets: dict[str, pd.DataFrame]) -> Path:
     """
     一次写成完整工作簿。
     用于「导出全部」：按固定顺序重写，避免旧表名残留。
+    Excel 正开着原文件时，改写到带时间的另一份。
     """
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        _write_book_at(out, sheets)
+        return out
+    except OSError as exc:
+        if not is_excel_locked(exc):
+            raise
+        alt = fallback_export_path(out)
+        logger.warning("原文件正被占用 {}，改写到 {}", out, alt)
+        _write_book_at(alt, sheets)
+        return alt
+
+
+def _write_sheet_at(out: Path, sheet: str, frame: pd.DataFrame) -> None:
+    """真正往指定路径写一张表。占用时由 write_sheet 改道。"""
+    if not out.exists():
+        with pd.ExcelWriter(out, engine="openpyxl") as writer:
+            index_frame().to_excel(writer, sheet_name=SHEET_INDEX, index=False)
+            frame.to_excel(writer, sheet_name=sheet, index=False)
+        logger.info("新建导出工作簿 {}，写入表 {}", out, sheet)
+        return
+    with pd.ExcelWriter(out, engine="openpyxl", mode="a", if_sheet_exists="replace") as writer:
+        frame.to_excel(writer, sheet_name=sheet, index=False)
+    logger.info("已更新工作簿 {} 的表 {}", out, sheet)
+
+
+def _write_book_at(out: Path, sheets: dict[str, pd.DataFrame]) -> None:
+    """真正写出完整工作簿。"""
     ordered = [name for name, _text in SHEET_HELP if name in sheets]
     for name in sheets:
         if name not in ordered:
@@ -247,7 +325,18 @@ def write_book(path: Path | str, sheets: dict[str, pd.DataFrame]) -> Path:
         for name in ordered:
             sheets[name].to_excel(writer, sheet_name=name, index=False)
     logger.info("已写出完整导出工作簿 {}，共 {} 张表", out, len(ordered))
-    return out
+
+
+def _try_read_book(path: Path) -> dict[str, pd.DataFrame]:
+    """原文件被占用时尽量把别的表抄出来。读失败就只写这一张新表。"""
+    if not path.exists():
+        return {}
+    try:
+        book = pd.ExcelFile(path, engine="openpyxl")
+        return {name: pd.read_excel(book, sheet_name=name) for name in book.sheet_names}
+    except OSError:
+        logger.warning("原文件占用中，抄不出其它表 {}", path)
+        return {}
 
 
 def read_sheet(path: Path | str, sheet: str, required_column: str | None = None) -> pd.DataFrame:

@@ -47,12 +47,24 @@ def ohlc_series(frame: pd.DataFrame | None, name: str) -> pd.Series:
     col = frame[name]
     if isinstance(col, pd.DataFrame):
         col = col.iloc[:, -1]
+    # 已经是数字列时不用再转：pd.to_numeric 对数字列本来也是原样返回，
+    # 但每根 K 线都调一次，省下的转换在回测里很可观。
+    if isinstance(col, pd.Series) and col.dtype.kind in "fiu":
+        return col
     return pd.to_numeric(col, errors="coerce")
 
 
 def last_ohlc_price(frame: pd.DataFrame | None, name: str) -> float | None:
     """最新一根的开/高/低/收。拿不到或一格里挤了多个数就返回 None。"""
-    series = ohlc_series(frame, name).dropna()
+    series = ohlc_series(frame, name)
+    if series.empty:
+        return None
+    # 数字列不可能一格挤多个数，直接看最后一个；是 NaN 才退回原来的 dropna 路径。
+    if series.dtype.kind in "fiu":
+        candidate = series.iloc[-1]
+        if candidate == candidate:
+            return float(candidate)
+    series = series.dropna()
     if series.empty:
         return None
     raw = np.asarray(series.iloc[-1], dtype=float).reshape(-1)
@@ -239,6 +251,8 @@ def resample_ohlc(df: pd.DataFrame | None, period: str) -> pd.DataFrame | None:
     if df is None or len(df) == 0:
         return df
     df = unique_ohlc_columns(df)
+    if df is None:
+        return None
     rule = pandas_rule(period)
     agg = {"open": "first", "high": "max", "low": "min", "close": "last"}
     if "volume" in df.columns:
@@ -263,21 +277,22 @@ def _min_minutes_for_bar(step: int) -> int:
     return max(1, step - 2)
 
 
-def _is_session_open_edge(ts: pd.Timestamp, step: int) -> bool:
+def _session_open_edge_mask(index: pd.DatetimeIndex, step: int) -> np.ndarray:
     """
-    这根右标签时间，是不是某段开盘后的第一根。
+    这些右标签时间里，哪些是某段开盘后的第一根。
 
     例如 15 分钟：09:15、13:45、21:15；5 分钟：09:05、13:35、21:05。
+    整批判断，不要逐根转 Timestamp，重建 1000 根时那一步很贵。
     """
-    stamp = pd.Timestamp(ts)
-    end_m = stamp.hour * 60 + stamp.minute
+    step = int(step)
+    end_m = np.asarray(index.hour * 60 + index.minute, dtype=np.int64)
+    mask = np.zeros(len(end_m), dtype=bool)
     for open_m in _SESSION_OPEN_MINUTES:
-        if end_m == open_m + int(step):
-            return True
+        mask |= end_m == open_m + step
         # 开盘时刻本身整除周期时（如 21:00 的 60 分钟），也算开盘边
-        if end_m == open_m and open_m % int(step) == 0:
-            return True
-    return False
+        if open_m % step == 0:
+            mask |= end_m == open_m
+    return mask
 
 
 def is_session_open_stamp(ts: Any, opens: tuple[int, ...]) -> bool:
@@ -320,16 +335,10 @@ def bars_from_minutes(minutes: pd.DataFrame | None, period: str) -> pd.DataFrame
         return out
 
     min_ok = _min_minutes_for_bar(step)
-    keep = []
-    for ts, row in out.iterrows():
-        count = int(row["minute_count"])
-        if count >= step:
-            keep.append(True)
-            continue
-        if count >= min_ok and _is_session_open_edge(ts, step):
-            keep.append(True)
-            continue
-        keep.append(False)
+    counts = out["minute_count"].to_numpy(dtype=np.int64, copy=False)
+    keep = counts >= step
+    if min_ok < step:
+        keep = keep | ((counts >= min_ok) & _session_open_edge_mask(out.index, step))
     kept = out.loc[keep].copy()
     # 正在走的最后一根：即使分钟未齐也留下给实盘扫描
     last_ts = out.index[-1]
@@ -408,11 +417,12 @@ def overlay_minute_bars(
     step = int(step)
     min_ok = _min_minutes_for_bar(step)
     # 可落库：分钟够，或开盘边且达到放宽门槛
-    persist_mask = []
-    for ts, row in built.iterrows():
-        count = int(row["minute_count"])
-        ok = count >= step or (count >= min_ok and _is_session_open_edge(ts, step))
-        persist_mask.append(ok)
+    counts = built["minute_count"].to_numpy(dtype=np.int64, copy=False)
+    persist_mask = counts >= step
+    if min_ok < step:
+        persist_mask = persist_mask | (
+            (counts >= min_ok) & _session_open_edge_mask(built.index, step)
+        )
     persist = built.loc[persist_mask].drop(columns=["minute_count"], errors="ignore")
     visible = built.drop(columns=["minute_count"], errors="ignore")
     if persist is None or len(persist) == 0:

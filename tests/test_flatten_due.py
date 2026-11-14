@@ -30,7 +30,17 @@ class _Strategy:
         self.flatten_times = list(times)
 
     def is_flatten_time(self, now: object = None) -> bool:
-        return self._due
+        # 预约下一枪时传入具体钟点：品种表上的清仓点默认都认。
+        # flatten_if_due 不带 now 时，仍用 due 表示「现在是否在窗口里」。
+        if now is None:
+            return self._due
+        stamp = getattr(now, "time", lambda: None)()
+        if stamp is None:
+            return self._due
+        for clock in self.flatten_times:
+            if stamp.hour == clock.hour and stamp.minute == clock.minute:
+                return True
+        return False
 
 
 def _bot(due: bool, positions: dict[str, _Pos]) -> tuple[TradingBot, list[tuple[str, str]]]:
@@ -90,6 +100,23 @@ def test_next_flatten_at_uses_the_nearest_clock_time() -> None:
     assert bot._next_flatten_at(datetime(2026, 11, 2, 14, 50)) == datetime(2026, 11, 2, 14, 55)
     assert bot._next_flatten_at(datetime(2026, 11, 2, 15, 0)) == datetime(2026, 11, 2, 22, 55)
     assert bot._next_flatten_at(datetime(2026, 11, 2, 23, 10)) == datetime(2026, 11, 3, 14, 55)
+
+
+def test_next_flatten_at_skips_clocks_the_strategy_rejects() -> None:
+    """夜日连续否掉 22:55 时，墙上时钟不能再预约夜盘强平。"""
+
+    class _DayOnly(_Strategy):
+        def is_flatten_time(self, now: object = None) -> bool:
+            if now is None:
+                return self._due
+            stamp = now.time()
+            return stamp.hour == 14 and stamp.minute == 55
+
+    bot = TradingBot.__new__(TradingBot)
+    bot.strategy = _DayOnly(False, {})
+
+    assert bot._next_flatten_at(datetime(2026, 11, 2, 14, 50)) == datetime(2026, 11, 2, 14, 55)
+    assert bot._next_flatten_at(datetime(2026, 11, 2, 15, 0)) == datetime(2026, 11, 3, 14, 55)
 
 
 def test_next_flatten_at_is_none_when_close_rule_is_off() -> None:

@@ -1,7 +1,6 @@
 """接口原样库与清洗库分开存；质量检查只读本地、不下单。"""
 
 from datetime import datetime
-from pathlib import Path
 
 import pandas as pd
 

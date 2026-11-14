@@ -1,11 +1,11 @@
 """
 多因子自己的行情闸门（ADX + ATR 分位 + 弱趋势加严）
 
-功能：三套多因子对照各自带一套过滤，写在自己的配置小节 `cta_filter` 里，
+功能：加权打分自己带一套过滤，写在 `strategy.multi_factor.cta_filter` 里，
      不跟趋势策略的 filter_* 混用。
 原理：资料里的顶层开关是「先看市场适不适合做趋势，再看因子」。
      ADX < 20 或波动缩在最低 20% → 直接不开；
-     ADX 20～25 算偏弱：加权版要更高总分、投票版要更多票、仓位打成数。
+     ADX 20～25 算偏弱：加权版要更高总分，并且仓位打成数。
      因子分歧仍用原来的上限，但挂在这组开关下面，关掉总开关就一起停。
 """
 
@@ -21,7 +21,7 @@ from .indicators import average_true_range
 
 
 def default_cta_filter(kind: str) -> dict[str, Any]:
-    """三套对照的出厂数字：公共门槛一样，弱趋势时加严的方式不同。"""
+    """加权打分的出厂数字。"""
     base: dict[str, Any] = {
         "enabled": True,
         "use_adx": True,
@@ -36,18 +36,15 @@ def default_cta_filter(kind: str) -> dict[str, Any]:
         "weak_size": 0.5,
         "weak_votes": 3,
     }
-    # 加权打分用总分和仓位成数；投票只用加票；混合两样都要。
-    if kind == "multi_vote":
-        base["weak_score"] = 0.0
-        base["weak_size"] = 1.0
-    elif kind in {"multi_factor", "multi_factor_adapt"}:
+    # 加权打分用总分和仓位成数，弱趋势不加票门槛。
+    if kind == "multi_factor":
         base["weak_votes"] = 0
     return base
 
 
 @dataclass(frozen=True)
 class CtaFilterParams:
-    """从 strategy.multi_factor / multi_vote / multi_hybrid 的 cta_filter 读出来。"""
+    """从 strategy.multi_factor 的 cta_filter 读出来。"""
 
     enabled: bool = True
     use_adx: bool = True

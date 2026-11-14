@@ -53,6 +53,10 @@ BACKTEST_SUMMARY_COLUMNS = [
     "K线根数",
     "成交笔数",
     "胜率",
+    "平均盈利",
+    "平均亏损",
+    "盈亏比",
+    "收益期望",
     "净盈亏",
     "盈利因子",
     "最大回撤",
@@ -97,6 +101,8 @@ CROSS_COLUMNS = [
     "策略",
     "胜率",
     "盈利因子",
+    "盈亏比",
+    "收益期望",
     "最大回撤",
     "净盈亏",
     "盈利覆盖",
@@ -189,9 +195,10 @@ def export_backtest(root: Path | str, excel_path: Path | str | None = None) -> t
     signals_all, _signals_added = _append_backtest_sheet(
         path, SHEET_BACKTEST_SIGNALS, signals, list(signals.columns)
     )
-    write_sheet(path, SHEET_BACKTEST, summary_all)
-    write_sheet(path, SHEET_BACKTEST_TRADES, trades_all)
-    write_sheet(path, SHEET_BACKTEST_SIGNALS, signals_all)
+    # 原文件被 Excel 占用时，第一次会改写到带时间的另一份；后面两张必须跟过去。
+    path = write_sheet(path, SHEET_BACKTEST, summary_all)
+    path = write_sheet(path, SHEET_BACKTEST_TRADES, trades_all)
+    path = write_sheet(path, SHEET_BACKTEST_SIGNALS, signals_all)
     try:
         from src.export.cta_decay import write_decay_from_backtest
 
@@ -233,8 +240,8 @@ def export_all(root: Path | str, excel_path: Path | str | None = None) -> tuple[
         SHEET_CROSS: cross,
         SHEET_OPTIMIZE: optimize,
     }
-    write_book(path, sheets)
-    return path, {name: int(len(frame)) for name, frame in sheets.items()}
+    written = write_book(path, sheets)
+    return written, {name: int(len(frame)) for name, frame in sheets.items()}
 
 
 def _export_schema_outdated(path: Path) -> bool:
@@ -313,9 +320,9 @@ def rebuild_workbook(root: Path | str, excel_path: Path | str | None = None) -> 
         SHEET_CROSS: cross,
         SHEET_OPTIMIZE: optimize,
     }
-    write_book(path, sheets)
-    logger.info("已按当前程序结构重建导出工作簿 {}", path)
-    return path, {name: int(len(frame)) for name, frame in sheets.items()}
+    written = write_book(path, sheets)
+    logger.info("已按当前程序结构重建导出工作簿 {}", written)
+    return written, {name: int(len(frame)) for name, frame in sheets.items()}
 
 
 def _append_backtest_sheet(
@@ -405,8 +412,8 @@ def export_cross(root: Path | str, excel_path: Path | str | None = None) -> tupl
     if fresh.empty or str(fresh.iloc[0].get("测试时间") or "").startswith("还没有"):
         raise ValueError("还没有交叉测试结果。请先点「开始交叉测试」，完成后再导出。")
     merged, added = _append_cross_sheet(path, fresh)
-    write_sheet(path, SHEET_CROSS, merged)
-    return path, added, int(len(merged))
+    written = write_sheet(path, SHEET_CROSS, merged)
+    return written, added, int(len(merged))
 
 
 def export_optimize(root: Path | str, excel_path: Path | str | None = None) -> tuple[Path, int, int]:
@@ -425,8 +432,8 @@ def export_optimize(root: Path | str, excel_path: Path | str | None = None) -> t
     if fresh.empty or str(fresh.iloc[0].get("测试时间") or "").startswith("还没有"):
         raise ValueError("还没有策略优化结果。请先点「开始策略优化」，完成后再导出。")
     merged, added = _append_optimize_sheet(path, fresh)
-    write_sheet(path, SHEET_OPTIMIZE, merged)
-    return path, added, int(len(merged))
+    written = write_sheet(path, SHEET_OPTIMIZE, merged)
+    return written, added, int(len(merged))
 
 
 def export_account_part(root: Path | str, excel_path: Path | str, part: str) -> tuple[Path, str, int]:
@@ -445,8 +452,8 @@ def export_account_part(root: Path | str, excel_path: Path | str, part: str) -> 
         sheet, frame = SHEET_CHANGES, changes
     else:
         raise ValueError("只能导出交易记录或资金变动记录")
-    write_sheet(path, sheet, frame)
-    return path, sheet, int(len(frame))
+    written = write_sheet(path, sheet, frame)
+    return written, sheet, int(len(frame))
 
 
 def _account_frames(root: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -583,6 +590,8 @@ def _cross_frame(root: Path) -> pd.DataFrame:
                 "策略": row.get("strategy") or "—",
                 "胜率": row.get("win_rate") or "",
                 "盈利因子": row.get("profit_factor") or "",
+                "盈亏比": row.get("payoff") or "",
+                "收益期望": row.get("expectancy") or "",
                 "最大回撤": row.get("max_drawdown") or "",
                 "净盈亏": row.get("net_pnl") or "",
                 "盈利覆盖": cover_cols["盈利覆盖"],
@@ -603,8 +612,8 @@ def _cross_frame(root: Path) -> pd.DataFrame:
                 "每笔风险%": spec.get("risk_per_trade_pct", ""),
                 "开仓最小间隔秒": spec.get("min_order_interval_sec", ""),
                 "每天最多开仓": spec.get("max_orders_per_day", ""),
-                "信号周期": spec.get("timeframe") or "",
-                "止损周期": spec.get("trail_timeframe") or "",
+                "信号周期": row.get("timeframe") or spec.get("timeframe") or "",
+                "止损周期": row.get("timeframe") or spec.get("trail_timeframe") or spec.get("timeframe") or "",
                 "行情来源": spec.get("data_source") or payload.get("data_source") or "",
                 "开始日期": spec.get("start_date") or "",
                 "结束日期": spec.get("end_date") or "",
@@ -768,6 +777,27 @@ def _appended_optimize_frame(root: Path, path: Path) -> pd.DataFrame:
     return merged
 
 
+def _backtest_expectancy(perf: dict[str, Any]) -> float | str:
+    """
+    回测摘要里的无单位收益期望。始终用胜率、平均盈利、平均亏损当场算，
+    避免旧报告里还是「元/笔」的数字。没有亏损笔时留空。
+    """
+    from src.backtest.metrics import unit_expectancy
+
+    try:
+        avg_loss = float(perf.get("avg_loss") or 0)
+    except (TypeError, ValueError):
+        avg_loss = 0.0
+    if avg_loss <= 1e-9:
+        return ""
+    try:
+        win_rate = float(perf.get("win_rate") or 0)
+        avg_win = float(perf.get("avg_win") or 0)
+    except (TypeError, ValueError):
+        return ""
+    return unit_expectancy(win_rate, avg_win, avg_loss)
+
+
 def _backtest_frames(root: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
     """最近一次回测：摘要一张表，成交明细另一张。两张表第一列都是这次回测跑完的时间。"""
     report_path = root / "data" / "backtest_last.json"
@@ -811,6 +841,10 @@ def _backtest_frames(root: Path) -> tuple[pd.DataFrame, pd.DataFrame]:
                 "K线根数": payload.get("bars"),
                 "成交笔数": perf.get("trades"),
                 "胜率": perf.get("win_rate"),
+                "平均盈利": perf.get("avg_win"),
+                "平均亏损": perf.get("avg_loss"),
+                "盈亏比": perf.get("payoff"),
+                "收益期望": _backtest_expectancy(perf),
                 "净盈亏": perf.get("net_pnl"),
                 "盈利因子": perf.get("profit_factor"),
                 "最大回撤": perf.get("max_drawdown"),

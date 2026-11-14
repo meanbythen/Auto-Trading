@@ -60,6 +60,14 @@ hiddenimports += collect_submodules("src")
 hiddenimports += collect_submodules("comtypes")
 # 复盘 / 测试工具等新模块显式列入，避免个别环境下 collect_submodules 漏扫。
 hiddenimports += [
+    # 配置页「刷新全市场主力」会动态 import 这个文件，collect_submodules("src") 扫不到。
+    "tools.refresh_universe",
+    "src.risk.kelly",
+    "src.risk.universe_table",
+    "src.risk.sizing",
+    "src.data.tq_source",
+    "src.trader.ctp_td",
+    "src.trader.ctp_gateway",
     "src.review.quality",
     "src.review.diagnose",
     "src.review.scorecard",
@@ -87,7 +95,6 @@ hiddenimports += [
     "src.strategy.supertrend",
     "src.strategy.trend_follow",
     "src.strategy.swing_trend",
-    "src.strategy.morning_edge",
     "src.ui.datetime_pickers",
     "src.data.bar_inspect",
 ]

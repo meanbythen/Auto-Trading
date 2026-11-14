@@ -12,10 +12,9 @@ import threading
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from loguru import logger
-
-from src.data.periods import is_session_open_stamp
 
 # 实盘和回测可能同时写入。用一把锁保证同一时间只有一方在改数据库。
 _STORE_LOCK = threading.Lock()
@@ -183,22 +182,24 @@ def aligned_bars(
         return None
     step = int(period) if str(period).isdigit() else 0
 
-    def _keep(ts: pd.Timestamp, row: pd.Series) -> bool:
-        stamp = pd.Timestamp(ts)
-        if step > 0:
-            if stamp.second or stamp.microsecond or stamp.nanosecond:
-                return False
-            minutes = stamp.hour * 60 + stamp.minute
-            if minutes % step != 0:
-                return False
-            if session_opens and is_session_open_stamp(stamp, session_opens):
-                return False
-        for column in ("open", "high", "low", "close"):
-            if _market_price(row[column]) is None:
-                return False
-        return True
-
-    mask = [_keep(ts, row) for ts, row in cleaned.iterrows()]
+    index = cleaned.index
+    mask = np.ones(len(cleaned), dtype=bool)
+    if step > 0:
+        # 右标签的K线只落在整秒、整周期的格子上；落在开盘时刻的是早期左标签旧戳。
+        mask &= (
+            (index.second == 0)
+            & (index.microsecond == 0)
+            & (index.nanosecond == 0)
+            & (((index.hour * 60 + index.minute) % step) == 0)
+        )
+        if session_opens:
+            opens = np.asarray(index.hour * 60 + index.minute)
+            mask &= ~np.isin(opens, np.asarray(session_opens))
+    prices = cleaned[["open", "high", "low", "close"]].to_numpy(dtype=float)
+    rounded = np.round(prices, 3)
+    # 三位以内的小数是真实报价；空格子和更长的一串随机小数都不留着算 SAR。
+    valid = np.isfinite(prices) & (np.abs(prices - rounded) <= 1e-6)
+    mask &= valid.all(axis=1)
     kept = cleaned.loc[mask].copy()
     if len(kept) == 0:
         return None
@@ -217,6 +218,35 @@ def _as_bars(frame: pd.DataFrame | None) -> pd.DataFrame | None:
         return None
     cleaned = cleaned[~cleaned.index.duplicated(keep="last")]
     return cleaned.sort_index()
+
+
+def rows_needing_write(
+    frame: pd.DataFrame | None,
+    stored: pd.DataFrame | None,
+    columns: tuple[str, ...] = ("open", "high", "low", "close", "volume"),
+) -> pd.DataFrame | None:
+    """
+    只留下库里还没有、或数值和库里不一样的行。
+
+    每轮扫描都会把同一段K线再拼一遍。原来整段重写，库里的内容其实一点没变，
+    只是多了一次提交和 WAL 增长。逐行转文字写库在实盘每 10 秒一次时很贵。
+    """
+    if frame is None or len(frame) == 0:
+        return frame
+    if stored is None or len(stored) == 0:
+        return frame
+    cols = [name for name in columns if name in frame.columns and name in stored.columns]
+    if not cols:
+        return frame
+    try:
+        left = frame[cols].to_numpy(dtype=float)
+        right = stored[cols].reindex(frame.index).to_numpy(dtype=float)
+    except (ValueError, TypeError):  # noqa: BLE001
+        return frame
+    present = frame.index.isin(stored.index)
+    equal = (left == right) | (np.isnan(left) & np.isnan(right))
+    unchanged = present & equal.all(axis=1)
+    return frame.loc[~unchanged]
 
 
 def _normalize_frame(frame: pd.DataFrame) -> pd.DataFrame:
@@ -381,19 +411,21 @@ class BarStore:
         clean = _normalize_frame(frame)
         if len(clean) == 0:
             return 0
-        rows = [
-            (
-                symbol,
-                period,
-                pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
-                float(row.open),
-                float(row.high),
-                float(row.low),
-                float(row.close),
-                float(row.volume) if pd.notna(row.volume) else 0.0,
+        stamps = clean.index.strftime("%Y-%m-%d %H:%M:%S").tolist()
+        values = clean[["open", "high", "low", "close", "volume"]].to_numpy(dtype=float)
+        volumes = np.where(np.isnan(values[:, 4]), 0.0, values[:, 4])
+        rows = list(
+            zip(
+                [symbol] * len(stamps),
+                [period] * len(stamps),
+                stamps,
+                values[:, 0].tolist(),
+                values[:, 1].tolist(),
+                values[:, 2].tolist(),
+                values[:, 3].tolist(),
+                volumes.tolist(),
             )
-            for ts, row in clean.iterrows()
-        ]
+        )
         with _STORE_LOCK, self._connect() as conn:
             conn.executemany(
                 """
@@ -519,20 +551,22 @@ class RawBarStore:
             return 0
         numbered = numbered[~numbered.index.duplicated(keep="last")].sort_index()
         src = str(source or "akshare")
-        rows = [
-            (
-                symbol,
-                period,
-                src,
-                pd.Timestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
-                float(row.open),
-                float(row.high),
-                float(row.low),
-                float(row.close),
-                float(row.volume) if pd.notna(row.volume) else 0.0,
+        stamps = numbered.index.strftime("%Y-%m-%d %H:%M:%S").tolist()
+        values = numbered[["open", "high", "low", "close", "volume"]].to_numpy(dtype=float)
+        volumes = np.where(np.isnan(values[:, 4]), 0.0, values[:, 4])
+        rows = list(
+            zip(
+                [symbol] * len(stamps),
+                [period] * len(stamps),
+                [src] * len(stamps),
+                stamps,
+                values[:, 0].tolist(),
+                values[:, 1].tolist(),
+                values[:, 2].tolist(),
+                values[:, 3].tolist(),
+                volumes.tolist(),
             )
-            for ts, row in numbered.iterrows()
-        ]
+        )
         with _STORE_LOCK, self._connect() as conn:
             conn.executemany(
                 """

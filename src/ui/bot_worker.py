@@ -76,8 +76,16 @@ class BotWorker:
             return {}
         return self.bot.status_snapshot()
 
-    def run_once(self, cfg: dict[str, Any]) -> None:
-        """单次扫描（后台线程）。"""
+    def run_once(self, cfg: dict[str, Any]) -> bool:
+        """
+        单次扫描（后台线程）。
+
+        常驻已经在跑时不能再起一套，否则会重复下单。拦住时返回 False。
+        """
+        if self.running:
+            logger.warning("常驻还在跑，不能再开一套试跑")
+            return False
+
         def _run() -> None:
             try:
                 bot = TradingBot(cfg)
@@ -88,3 +96,4 @@ class BotWorker:
                 logger.exception("单次扫描失败: {}", e)
 
         threading.Thread(target=_run, name="TradingBotOnce", daemon=True).start()
+        return True

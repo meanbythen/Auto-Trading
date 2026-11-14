@@ -6,8 +6,7 @@
 #
 # 1) 策略引擎 strategy.engine（主推 daily_body）
 #    - daily_body            日内实体：ETH画开盘箱体，收盘突破才开
-#    - morning_box_a        早盘箱体突破A
-#    - trend_follow / supertrend / dual_ma
+#    - trend_follow / supertrend / dual_ma / ema_swing
 #
 # 2) 执行通道 trade.executor
 #    - sim   模拟成交（默认，不下真单）
@@ -38,7 +37,8 @@ schedule:
     - "20:50"
   # 15分钟策略：扫描间隔可 30~60 秒
   scan_interval_sec: 30
-  # 全时段 / 只做日盘 / 只做夜盘：只决定这一段能不能开新仓。已经拿着的仓照旧按止损和收盘清仓走。
+  # 全时段 / 只做日盘 / 只做夜盘 / 夜日连续（跳空小）。
+  # 前三项只决定能不能开新仓。夜日连续只建议隔夜跳空小的品种：夜盘拿到日盘，跳空大时回撤会很大。
   session_scope: all
   trading_sessions:
     - ["09:00", "11:30"]
@@ -47,8 +47,8 @@ schedule:
 
 # ---------- 策略引擎（见文件顶部路线菜单） ----------
 strategy:
-  # 切换策略：daily_body | morning_box_a | trend_follow | supertrend |
-  # dual_ma | bollinger | sar_trend | multi_factor | multi_vote | multi_hybrid | swing_trend | jesse_casper
+  # 切换策略：daily_body | trend_follow | supertrend |
+  # dual_ma | ema_swing | bollinger | sar_trend | multi_factor | swing_trend | swing_box
   engine: "daily_body"
   # 信号周期：5 / 15 / 60 是分钟。日线写 D，周线写 W。自定义分钟直接写数字，如 120
   timeframe: "5"
@@ -60,17 +60,16 @@ strategy:
   # 交叉测试要跑的策略。不写就用程序里的每一套。正在用的策略仍是上面的 engine。
   cross_engines:
     - daily_body
-    - morning_box_a
+    - float_hold
     - trend_follow
     - supertrend
     - dual_ma
+    - ema_swing
     - bollinger
     - sar_trend
     - multi_factor
-    - multi_vote
-    - multi_hybrid
     - swing_trend
-    - jesse_casper
+    - swing_box
   flatten_times:
     - "14:55"
     - "22:55"
@@ -157,6 +156,20 @@ strategy:
     filter_adx_flat: 20
     filter_atr_low_pct: 0.2
 
+  # 均线波段（engine=ema_swing）。方向、信号均线根数自己填。
+  # 多空分界线 / 止损 / 倾角各一根，出厂都是 120。旧名 macd_swing。
+  ema_swing:
+    dir_ema_pair: 60/120
+    sig_ema_triple: 5/10/30
+    side_ema: 120
+    stop_ema: 120
+    slope_ema: 120
+    slope_min_deg: 3.0
+    slope_lookback: 20
+    slope_exit: false
+    no_open_before_close_min: 30
+    flatten_at_close: false
+
   # 布林带趋势突破（engine=bollinger）。只顺势：中轨上方突破上轨做多，中轨下方跌破下轨做空。
   # 不做轨道反转（那是均值回归）。跌回中轨离场，止损 1.5 倍 ATR。
   bollinger:
@@ -227,76 +240,27 @@ strategy:
       weak_size: 0.5
       weak_votes: 0
 
-  # 对照：等权投票。因子参数读 multi_factor，这里只改投票门槛和本策略过滤。
-  multi_vote:
-    min_votes: 2
-    min_vote_diff: 2
-    flatten_at_close: true
-    cta_filter:
-      enabled: true
-      use_adx: true
-      use_atr: true
-      use_disagree: true
-      adx_period: 14
-      adx_flat: 20
-      adx_trend: 25
-      atr_lookback: 60
-      atr_low_pct: 0.2
-      weak_score: 0.0
-      weak_size: 1.0
-      weak_votes: 3
-
-  # 对照：投票开门 + 打分定仓位成数。
-  multi_hybrid:
-    min_votes: 2
-    min_vote_diff: 2
-    threshold: 0.6
-    min_position_ratio: 0.5
-    max_position_ratio: 1.0
-    flatten_at_close: true
-    cta_filter:
-      enabled: true
-      use_adx: true
-      use_atr: true
-      use_disagree: true
-      adx_period: 14
-      adx_flat: 20
-      adx_trend: 25
-      atr_lookback: 60
-      atr_low_pct: 0.2
-      weak_score: 0.75
-      weak_size: 0.5
-      weak_votes: 3
-
-  # 早盘 A：开盘半小时箱体，放量突破定方向。钟点可用默认，一般不用改。
-  morning_box_a:
-    be_box_mult: 0.9
-    vol_confirm_bars: 3
-    fake_break_bars: 2
-    max_trades_per_day: 2
-    stop_buffer_ticks: 2
-    enable_night: true
-    no_new_before_close_minutes: 15
-
   # 日内实体（engine=daily_body 时生效）。
   # 方向看信号周期。ETH 走完后，收盘离开开盘区间才开仓。夜盘用夜盘自己的区间。
   # 止损固定在开盘箱体对沿再让 stop_extra_ticks 跳（默认 1）：多守箱底、空守箱顶，开仓后冻结。
   # 触发方式用全策略共用的 strategy.stop_mode：touch 触及即止损；close 等收盘价确认。
   # 没触发就顺着捅破方向拿到收盘。中间不做回撤止损。
-  # 策略优化只搜：ETH分钟数、信号周期、止损触发方式。配置页可改 ETH 分钟数、箱沿外再让几跳、跳空上限、箱体宽度上限。
+  # 策略优化只搜：第一ETH窗口、信号周期、止损触发方式。配置页可改两个 ETH 窗口、箱沿外再让几跳、跳空上限、箱体宽度上限。
   daily_body:
     eth_minutes: 20
-    # 第二段 ETH：日盘第一段止损后、截止前，用这段箱体再开一次（仅日盘，夜盘仍只开一次）。0=关闭二次开仓。
+    # 第二ETH窗口：也从开盘起算。过了这个时间丢掉第一窗口。日盘止损后还可按这口再开。0=关闭。
     eth_minutes2: 30
     stop_extra_ticks: 1
-    # 这一段开盘相对上一段收盘跳空超过多少跳就不开；0=关闭。缺口回补时箱沿止损会被一次打穿。
-    skip_gap_ticks: 50
-    # 开盘箱体最高-最低超过多少跳就不开；0=关闭。箱体越宽，箱沿止损离进场价越远。
-    max_box_ticks: 100
+    # 开盘相对上一段收盘跳空超过开盘前 ATR 的多少倍就不开；0=关闭。出厂 2.5。
+    skip_gap_atr_mult: 2.5
+    # 开盘箱体最高-最低超过开盘前 ATR 的多少倍就不开；0=关闭。出厂 5。
+    max_box_atr_mult: 5.0
+    # 信号收盘离破位超过开盘前 ATR 的多少倍就先等回抽；0=关闭。出厂 1。
+    max_chase_atr_mult: 1.0
     # 开仓截止钟点：过了这个钟点，这一段不再开新仓。日盘和夜盘分开设。
     day_cutoff: "10:30"
     night_cutoff: "22:15"
-    # 本策略自带的区间过滤。不拦波动压缩。filter_enabled 关了这一层就不看。
+    # 本策略自带的箱体突破过滤：ADX 过高（强单边）不开，不拦波动压缩。关了这一层就不看。
     filter_enabled: true
     filter_adx_period: 14
     filter_atr_period: 14
@@ -304,9 +268,45 @@ strategy:
     filter_adx_upper: 30
     filter_atr_high_pct: 0.8
 
+  # 日内浮盈飘单（engine=float_hold 时生效）。和日内实体分开。
+  # 默认等开盘观察结束，顺着 EMA60/120 开仓；止损放宽，少过滤。
+  float_hold:
+    direction: eth_trend
+    macd_timeframe: "5"
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    dir_ema_fast: 5
+    dir_ema_slow: 20
+    trend_align_enabled: false
+    trend_align_fast: 60
+    trend_align_slow: 120
+    trend_slope_lookback: 5
+    trend_slope_min_deg: 0
+    cluster_max_width: 10
+    eth_minutes: 60
+    eth_minutes2: 0
+    stop_atr_mult: 1.5
+    be_atr_mult: 2.0
+    skip_gap_atr_mult: 0
+    max_box_atr_mult: 0
+    max_chase_atr_mult: 0
+    gap_align_atr_mult: 0
+    ema_period: 0
+    ema_buffer_ticks: 2
+    day_cutoff: "14:45"
+    night_cutoff: "22:50"
+    filter_enabled: false
+    filter_adx_period: 14
+    filter_atr_period: 14
+    filter_lookback: 60
+    filter_adx_upper: 30
+    filter_atr_high_pct: 0.8
+
   # 长线趋势加减仓（engine=swing_trend）。
-  # 逻辑自相似：scale=D_60 为日线定方向+60分钟回调；scale=60_15 为60分钟定方向+15分钟回调。
-  # 浮盈后可再回调加仓，伸展过远先减仓。配置页总信号周期对它不生效。
+  # scale 只定大周期方向：D_60=日线，60_15=60分钟。
+  # 回调进出跟上面的 timeframe，止损跟 trail_timeframe。没填时退回搭配里的小周期。
+  # 浮盈后可再回调加仓，伸展过远先减仓。
   # 加仓上限 = 单元手数 ×（1+最多加仓次数）。默认不收盘清仓。
   swing_trend:
     scale: "D_60"
@@ -331,23 +331,22 @@ strategy:
     filter_adx_flat: 20
     filter_atr_low_pct: 0.2
 
-  # Jesse Casper 简化 SMC（engine=jesse_casper）。没有足迹图，用放量和价值区代替。
-  # 信号周期建议 5 分钟；15 分钟定方向。默认黄金时段才开、收盘清仓。
-  jesse_casper:
-    trend_timeframe: "15"
-    lookback_liq: 20
-    vol_ma_len: 20
-    vol_mult: 1.2
-    displacement_body_ratio: 0.5
-    min_rr: 3.0
-    price_tick: 1.0
-    va_pct: 0.70
-    use_va: true
-    use_kill_zone: true
-    use_daily_halt: true
-    setup_wait_bars: 16
-    target_lookback: 40
-    flatten_at_close: true
+  # 长线箱体突破（engine=swing_box）。收盘走出箱子才顺着做。
+  # 信号周期、止损周期跟上面的 timeframe / trail_timeframe。没填时默认日线。
+  # 默认不收盘清仓。手数仍用公共每笔风险%。
+  swing_box:
+    lookback: 40
+    peak_look: 2
+    min_gap: 5
+    atr_period: 20
+    height_atr: 1.2
+    adx_period: 14
+    adx_min: 20
+    stop_atr: 0.5
+    trail_atr: 2.0
+    trail_start_h: 1.0
+    vol_mult: 0
+    flatten_at_close: false
 
 data:
   source: "akshare"
@@ -457,6 +456,14 @@ risk:
   # fixed：意图手数 = trade.volume
   # 仓位上限：floor((权益×margin_usage_pct% − 已占用) ÷ 每手保证金)；≤0 按全部权益估
   sizing_mode: risk_pct
+  # 凯利公式（可选）：打开后意图手数改用你手填的胜率、盈亏比，不再用每笔风险%或固定手数。
+  # 自己跑完历史回测，把摘要里的胜率和「平均盈利÷平均亏损」填进来。仓位上限、日亏损、波动暂停仍有效。
+  kelly:
+    enabled: false
+    fraction: 0.5          # 0.25=四分之一 0.5=一半 1=全凯利
+    max_f_pct: 2           # 每笔最多拿本金的百分之几去冒险
+    win_rate_pct: 46       # 胜率，46 表示 46%
+    payoff: 1.2            # 盈亏比 = 平均盈利 ÷ 平均亏损（不是盈利因子）
   # 当前账户余额。配置页只显示，不在这里手改。要改去账户分析。
   # 历史回测和策略优化可以另填一个数，用来测保证金高的品种，也可以再从配置页抄回当前余额。
   capital: 1000000

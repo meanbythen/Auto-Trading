@@ -3,7 +3,7 @@
 
 用法:
     python tools/pick_coords.py
-    或双击 标定坐标.bat
+    或在图形界面配置页点「标定下单坐标」
 
 窗口本体在 src/ui/coord_picker.py。这里只负责从项目根目录启动，
 这样双击脚本时也能找到配置。
