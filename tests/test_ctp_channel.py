@@ -49,6 +49,37 @@ from src.trader.ctp_logic import (
 from src.trader.ctp_trader import CtpTrader
 
 
+def test_ctp_missing_dry_run_never_reaches_counter() -> None:
+    """配置缺 dry_run 键时必须按模拟处理，不能自行连柜台发单。"""
+    trader = CtpTrader({})
+    ok, message = trader.connect()
+    assert ok is False
+    assert "模拟" in message
+
+    ok, message = trader.reconcile({})
+    assert ok is False
+    assert "模拟" in message
+
+    result = trader.place_order(
+        OrderRequest(symbol="bu2612", side="buy_open", volume=1, price=4000)
+    )
+    assert result.ok is False
+    assert "模拟" in result.message
+
+
+def test_load_config_defaults_dry_run_true(tmp_path, monkeypatch) -> None:
+    import src.utils.config_loader as config_loader
+
+    monkeypatch.setattr(config_loader, "ensure_runtime_layout", lambda: tmp_path)
+    monkeypatch.setattr(config_loader, "load_secrets", lambda: {})
+    path = tmp_path / "config.yaml"
+    path.write_text("trade:\n  symbol: bu2612\n", encoding="utf-8")
+
+    cfg = config_loader.load_config(path, apply_universe=False)
+
+    assert cfg["dry_run"] is True
+
+
 def _settings() -> CtpSettings:
     return CtpSettings(
         td_front="tcp://127.0.0.1:1234",
@@ -778,6 +809,45 @@ def test_other_accounts_orders_are_not_our_errors() -> None:
     assert gateway.table.get("别人的单") is None
 
 
+def test_unknown_order_status_with_contract_is_still_foreign() -> None:
+    """未知报单回报即使带合约代码，也不收编，避免把别人的成交记进本程序账本。"""
+    gateway = CtpGateway(_settings(), FakeClient())
+    booked: list[dict[str, object]] = []
+    gateway.fill_handler = lambda report: booked.append(report)
+
+    gateway.on_order_status(
+        "888",
+        "1",
+        1,
+        "部分成交",
+        detail={"symbol": "bu2612", "direction": "0", "offset": "0"},
+    )
+    gateway.on_trade("888", 4569.0, 1, {"symbol": "bu2612"})
+
+    assert gateway.table.get("888") is None
+    assert gateway.foreign_reports == 2
+    assert booked == []
+
+
+def test_query_discovered_order_fill_is_not_booked() -> None:
+    """重启后查询到的、本进程没发过的报单，成交不重复入账（账本以信号账户为准）。"""
+    client = FakeClient()
+
+    def query(_settings):
+        client.listener.on_query_order("77", "3", 0, "bu2612", True)
+
+    client.query_orders = query
+    gateway = CtpGateway(_settings(), client)
+    booked: list[dict[str, object]] = []
+    gateway.fill_handler = lambda report: booked.append(report)
+    trader = CtpTrader({"dry_run": False}, gateway)
+    trader.connect()
+
+    gateway.on_trade("77", 4569.0, 1, {"symbol": "bu2612"})
+
+    assert booked == []
+
+
 def test_price_band_comes_from_the_instrument_query() -> None:
     """涨停价和跌停价用柜台合约资料，不拿同花顺的现价来猜。"""
     client = FakeClient()
@@ -855,6 +925,26 @@ def test_cancelled_partial_order_is_accounted_once_by_the_gateway() -> None:
     # 再来一条迟到的成交回报，不能重复记账。
     gateway.on_trade("1", 4501, 1)
     assert seen == [1]
+
+
+def test_fill_accounting_runs_outside_the_gateway_lock() -> None:
+    """记账要写账本、改配置、读 Excel，不能占着网关锁，否则报单回调被卡住、submit 超时撤单。"""
+    acquired: list[bool] = []
+    gateway = CtpGateway(_settings(), FakeClient())
+    order = TrackedOrder("1", "bu2612", "0", "0", 1, 4500, status="submitted")
+    gateway.table.add(order)
+
+    def _handler(report: dict[str, object]) -> bool:
+        got = gateway._lock.acquire(blocking=False)  # noqa: SLF001 - 测试锁是否已释放
+        acquired.append(got)
+        if got:
+            gateway._lock.release()  # noqa: SLF001
+        return True
+
+    gateway.fill_handler = _handler
+    gateway.on_trade("1", 4500.0, 1, {"symbol": "bu2612"})
+
+    assert acquired == [True]
 
 
 # ---------------------------------------------------------------- 超时自动撤单
@@ -959,7 +1049,7 @@ def test_order_report_and_trade_event_do_not_double_count() -> None:
 
 
 def test_runner_rolls_over_daytime_counters_when_date_changes(tmp_path) -> None:
-    """挂机跨日后，昨日盈亏、开仓次数和熔断必须清零；持仓不动。"""
+    """挂机跨日后，昨日盈亏、开仓次数和日亏熔断必须清零；持仓不动。"""
     from src.scheduler.runner import TradingBot
 
     cfg = {
@@ -994,6 +1084,7 @@ def test_runner_rolls_over_daytime_counters_when_date_changes(tmp_path) -> None:
     bot.risk.open_orders_today = 3
     bot.risk.halted = True
     bot.risk.halt_reason = "旧熔断"
+    bot.risk.halt_kind = "daily_loss"
 
     assert bot._rollover_trading_day() is True
     assert bot.risk.daily_pnl == 0.0
@@ -1121,7 +1212,7 @@ def test_ctp_fill_passes_fill_key_and_stop_price() -> None:
         "stop_price": 4500,
     }
     TradingBot._on_ctp_fill(Stub(), report)
-    assert seen["fill_key"] == "7|buy_open|1"
+    assert seen["fill_key"] == "ctp:7:1"
     assert seen["stop_price"] == 4500.0
 
 
@@ -1161,9 +1252,100 @@ def test_duplicate_ctp_fill_report_is_not_booked_twice(tmp_path, monkeypatch) ->
     bot._on_ctp_fill(report)
 
     book = load_book(tmp_path)
-    rows = [row for row in book["trades"] if str(row.get("fill_key") or "") == "9|buy_open|2"]
+    rows = [row for row in book["trades"] if str(row.get("fill_key") or "") == "ctp:9:2"]
     assert len(rows) == 1
     assert bot.strategy.positions["bu2612"].volume == 2
+
+
+def test_ctp_finish_skips_fill_already_booked_by_callback() -> None:
+    """回调已经把成交记进账本时，返回结果上的补记不能再记一遍（否则仓位翻倍）。"""
+    from types import SimpleNamespace
+
+    from src.scheduler.runner import TradingBot
+    from src.strategy.types import StrategyAction, StrategyDecision
+
+    applied: list[tuple[object, ...]] = []
+
+    class Stub:
+        def _apply_fill_accounting(self, *args, **_kwargs):
+            applied.append(args)
+
+        def _record_event(self, event, **_kwargs):
+            return None
+
+    decision = StrategyDecision(StrategyAction.BUY_OPEN, "bu2612", "多", entry_price=4569)
+    result = SimpleNamespace(
+        ok=True,
+        message="成交",
+        order_id="9",
+        raw={"filled_volume": 2, "accounted_volume": 2, "fill_price": 4569.0},
+    )
+
+    TradingBot._finish_ctp_order(Stub(), decision, 2, result, "buy_open", "固定1手")
+
+    assert applied == []
+
+
+def test_reconcile_error_fails_closed(tmp_path) -> None:
+    """对账过程抛异常时不能沿用上一轮的「一致」，必须停止开新仓。"""
+    from src.scheduler.runner import TradingBot
+
+    class _Trader:
+        def __init__(self) -> None:
+            self._books_match = True
+            self.note = ""
+
+        def reconcile(self, internal):
+            raise RuntimeError("柜台查询超时")
+
+        def mark_reconcile_unknown(self, reason: str) -> None:
+            self._books_match = False
+            self.note = reason
+
+        def blocks_new_opens(self) -> bool:
+            return not self._books_match
+
+    bot = TradingBot.__new__(TradingBot)
+    bot.cfg = {"trade": {"executor": "ctp"}, "dry_run": False}
+    bot.trader = _Trader()
+    bot._internal_nets = lambda: {}  # type: ignore[assignment]
+    bot._apply_broker_equity = lambda: None  # type: ignore[assignment]
+    bot._record_event = lambda *args, **kwargs: None  # type: ignore[assignment]
+
+    bot._reconcile_ctp()
+
+    assert bot.trader.blocks_new_opens() is True
+    assert "对账异常" in bot.trader.note
+
+
+def test_ctp_connect_failure_is_retried_after_interval(tmp_path, monkeypatch) -> None:
+    """启动连不上柜台不能当作已登录：置 False，并在间隔后重试，而不是整晚不再登录。"""
+    from src.scheduler.runner import TradingBot
+
+    calls: list[int] = []
+
+    class _Trader:
+        def connect(self):
+            calls.append(1)
+            return False, "前置连不上"
+
+    bot = TradingBot.__new__(TradingBot)
+    bot.cfg = {"trade": {"executor": "ctp"}, "dry_run": False}
+    bot.trader = _Trader()
+    bot.root = tmp_path
+    bot.logged_in = True
+    bot._ctp_retry_at = None
+    bot._record_event = lambda *args, **kwargs: None  # type: ignore[assignment]
+    monkeypatch.setattr("src.trader.go_live.strategy_order_block_reason", lambda cfg: "")
+    monkeypatch.setattr("src.account.ctp_sync.resident_book_guard", lambda root, cfg: "")
+
+    assert bot._arm_ctp() is False
+    assert bot.logged_in is False
+    assert bot._ctp_retry_at is not None
+
+    # 重试间隔内不再反复连柜台（扫描每 30 秒一轮，不能每轮都撞一次）
+    assert bot._arm_ctp() is False
+    assert calls == [1]
 
 
 def test_sim_profile_does_not_use_ths_account() -> None:

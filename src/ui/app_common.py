@@ -7,96 +7,33 @@ from typing import Any
 import customtkinter as ctk
 
 
-ENGINE_LABELS = {
-    "daily_body": "日内实体（主推）",
-    "float_hold": "日内浮盈飘单",
-    "trend_follow": "趋势跟随",
-    "supertrend": "SuperTrend趋势",
-    "st": "SuperTrend趋势",
-    "dual_ma": "双均线趋势",
-    "ma_cross": "双均线趋势",
-    "ema_swing": "均线波段",
-    "macd_swing": "均线波段",
-    "bollinger": "布林带突破",
-    "boll": "布林带突破",
-    "sar_trend": "SAR波段趋势",
-    "parabolic_sar": "SAR波段趋势",
-    "multi_factor": "多因子CTA（加权打分）",
-    "cta": "多因子CTA（加权打分）",
-    "swing_trend": "长线趋势加减仓",
-    "swing_box": "长线箱体突破",
+from src.strategy.factory import (
+    ENGINE_ALIASES,
+    ENGINE_LABELS as _CANONICAL_ENGINE_LABELS,
+    REGISTRY as _STRATEGY_REGISTRY,
+    REMOVED_ENGINES,
+)
+
+# 引擎显示名：正式名 + 别名都指向同一个中文名，统一由策略工厂提供。
+ENGINE_LABELS: dict[str, str] = {
+    **dict(_CANONICAL_ENGINE_LABELS),
+    **{
+        alias: _CANONICAL_ENGINE_LABELS[target]
+        for alias, target in ENGINE_ALIASES.items()
+        if target in _CANONICAL_ENGINE_LABELS
+    },
 }
 
-
-ENGINE_CHOICES = [
+# 配置页下拉顺序：多因子放最前，其余按注册表顺序，别名不重复列。
+_ALIAS_KEYS = set(ENGINE_ALIASES)
+ENGINE_CHOICES: list[str] = [
     "multi_factor",
-    "daily_body",
-    "float_hold",
-    "trend_follow",
-    "supertrend",
-    "dual_ma",
-    "ema_swing",
-    "bollinger",
-    "sar_trend",
-    "swing_trend",
-    "swing_box",
+    *[key for key in _STRATEGY_REGISTRY if key not in _ALIAS_KEYS and key != "multi_factor"],
 ]
 
+_ENGINE_ALIASES = dict(ENGINE_ALIASES)
 
-_ENGINE_ALIASES = {
-    "st": "supertrend",
-    "ma_cross": "dual_ma",
-    "boll": "bollinger",
-    "bollinger_break": "bollinger",
-    "sar": "sar_trend",
-    "parabolic_sar": "sar_trend",
-    "multi": "multi_factor",
-    "cta": "multi_factor",
-    "macd_swing": "ema_swing",
-}
-
-
-_REMOVED_ENGINES: set[str] = {
-    "liquidity_exhaustion",
-    "liquidity_signs",
-    "macd_divergence",
-    "macd_top_bottom",
-    "macd_ths",
-    "macd_zero",
-    "macd",
-    "reversal_pivot",
-    "fvg",
-    "intraday_breakout",
-    "intraday",
-    "pinbar_sar",
-    "ema_pin_momentum",
-    "ema_pin",
-    "price_action",
-    "pa_liquidity",
-    "custom",
-    "morning_gap_c",
-    "morning_c",
-    "sar_flip",
-    "sar",
-    "mean_reversion",
-    "single_ma",
-    "Single_ma",
-    "ma20_trend",
-    "ma20",
-    "morning_structure_b",
-    "morning_b",
-    "morning_box_a",
-    "morning_a",
-    "jesse_casper",
-    "casper",
-    "jesse",
-    "multi_factor_adapt",
-    "multi_hybrid",
-    "hybrid",
-    "multi_vote",
-    "vote",
-    "daily_body_expand",
-}
+_REMOVED_ENGINES: set[str] = set(REMOVED_ENGINES)
 
 
 def _ui_engine(name: object) -> str:

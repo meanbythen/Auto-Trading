@@ -277,13 +277,17 @@ class TrendStrategyBase(StrategyBase):
         if reason:
             return self._close_decision(symbol, pos, now, bar_id, reason)
 
+        prev_stop = float(pos.trail_stop or pos.initial_stop or 0.0)
         stop = self.trail_stop(bars, bar, pos, ind)
+        # 本根K线自己算出的移动止损只从下一根生效；判定和成交都用上一根已知的止损，
+        # 否则大阳线把止损推上去的同时，会把这根自己的影线判成已止损。
+        judge_stop = prev_stop or stop
         # 开仓那根自己的高低点是进场前就印出来的，不能拿来判已经被止损打掉。
         if not self._is_entry_bar(symbol, bar_id) and stop_triggered(
-            side=pos.side, stop=stop, close=close, high=high, low=low, mode=self.stop_mode
+            side=pos.side, stop=judge_stop, close=close, high=high, low=low, mode=self.stop_mode
         ):
             return self._close_decision(
-                symbol, pos, now, bar_id, f"{self.label}止损 {stop:.2f} 离场"
+                symbol, pos, now, bar_id, f"{self.label}止损 {judge_stop:.2f} 离场", stop_price=judge_stop
             )
 
         return StrategyDecision(
@@ -310,6 +314,8 @@ class TrendStrategyBase(StrategyBase):
         now: datetime,
         bar_id: str,
         reason: str,
+        *,
+        stop_price: float | None = None,
     ) -> StrategyDecision:
         self._pending[symbol] = {"time": now, "bar_id": bar_id}
         self._signaled_bar[symbol] = bar_id
@@ -319,7 +325,7 @@ class TrendStrategyBase(StrategyBase):
             StrategyAction.CLOSE,
             symbol,
             reason,
-            stop_price=pos.trail_stop or pos.initial_stop,
+            stop_price=stop_price if stop_price is not None else (pos.trail_stop or pos.initial_stop),
             entry_price=pos.entry_price,
         )
 

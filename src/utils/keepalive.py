@@ -9,7 +9,7 @@
 from __future__ import annotations
 
 import sys
-from typing import Optional
+from typing import Any
 
 from loguru import logger
 
@@ -33,7 +33,7 @@ class KeepAwake:
     def __init__(self, *, keep_display: bool = True) -> None:
         self.keep_display = keep_display
         self._active = False
-        self._kernel32: Optional[object] = None
+        self._kernel32: Any = None
 
     @property
     def active(self) -> bool:

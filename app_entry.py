@@ -36,6 +36,25 @@ def main() -> int:
         pick_main()
         return 0
 
+    # 真正会操作交易账户的入口才拦：同一时间只能有一个进程。
+    from src.utils.single_instance import acquire
+
+    if not acquire():
+        message = "程序已在运行：同一时间只能有一个实例操作交易账户，请先关闭另一个窗口。"
+        print(message, file=sys.stderr)
+        if _want_gui(argv):
+            try:
+                import tkinter as tk
+                from tkinter import messagebox
+
+                root = tk.Tk()
+                root.withdraw()
+                messagebox.showerror("Auto-Trading", message)
+                root.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+        return 2
+
     if _want_gui(argv):
         from src.ui import run_app
 

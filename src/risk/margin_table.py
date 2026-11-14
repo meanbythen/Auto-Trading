@@ -251,7 +251,7 @@ def _find_col(names: list[str], aliases: tuple[str, ...]) -> int | None:
     return None
 
 
-def _as_float(value: object, default: float) -> float:
+def _as_float(value: Any, default: float) -> float:
     if value is None or value == "":
         return default
     try:

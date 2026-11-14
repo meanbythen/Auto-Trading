@@ -11,6 +11,9 @@ from loguru import logger
 class SessionAuditMixin:
     """盘前审计方法；共享运行状态仍保存在 TradingBot 实例上。"""
 
+    _last_audit_at: datetime | None
+    _audit_thread: threading.Thread | None
+
     def _maybe_run_session_audit(self) -> None:
         """定时触发：盘前 08:55 / 13:25 / 20:25 各跑一次审计。"""
         from src.strategy.session_audit import (

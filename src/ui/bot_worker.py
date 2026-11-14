@@ -68,6 +68,11 @@ class BotWorker:
         if self.bot:
             self.bot.set_orders_paused(paused)
 
+    def sync_risk_limits(self, max_daily_loss: float | None = None) -> None:
+        """把配置页刚保存的日亏限额同步给正在跑的机器人。"""
+        if self.bot:
+            self.bot.sync_risk_limits(max_daily_loss)
+
     def orders_paused(self) -> bool:
         return bool(self.bot and getattr(self.bot, "_orders_paused", False))
 
@@ -86,6 +91,9 @@ class BotWorker:
             logger.warning("常驻还在跑，不能再开一套试跑")
             return False
 
+        # 和常驻共用同一个 busy 标志：试跑期间连点第二次也会被拦住。
+        self._alive = True
+
         def _run() -> None:
             try:
                 bot = TradingBot(cfg)
@@ -94,6 +102,12 @@ class BotWorker:
                 logger.info("单次扫描完成")
             except Exception as e:  # noqa: BLE001
                 logger.exception("单次扫描失败: {}", e)
+            finally:
+                self._alive = False
 
-        threading.Thread(target=_run, name="TradingBotOnce", daemon=True).start()
+        try:
+            threading.Thread(target=_run, name="TradingBotOnce", daemon=True).start()
+        except Exception:
+            self._alive = False
+            raise
         return True

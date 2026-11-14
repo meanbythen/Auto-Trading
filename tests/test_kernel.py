@@ -80,6 +80,32 @@ def test_pass_open_when_risk_allows() -> None:
     assert result.ok is True
 
 
+def test_stage_block_only_stops_new_opens() -> None:
+    """上线阶段未批准只拦新开仓；止损、反手和收盘清仓必须放行。"""
+
+    class _Risk:
+        def allow(self, side: str, volume: int, symbol: str = "") -> tuple[bool, str]:
+            return True, ""
+
+    blocked = TradeIntent(
+        symbol="bu2612",
+        side="buy_open",
+        volume=1,
+        executor="ctp",
+        stage_block="策略尚未进入实盘阶段",
+    )
+    closing = TradeIntent(
+        symbol="bu2612",
+        side="close",
+        volume=1,
+        executor="ctp",
+        stage_block="策略尚未进入实盘阶段",
+    )
+
+    assert run_pretrade_gates(blocked, _Risk()).code == "order_blocked_stage"
+    assert run_pretrade_gates(closing, _Risk()).ok is True
+
+
 def test_bar_snapshot_does_not_share_columns() -> None:
     import pandas as pd
 

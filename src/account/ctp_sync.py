@@ -154,9 +154,13 @@ def push_gateway_account(root: str | Path, gateway: Any) -> str:
     user_id = str(getattr(settings, "user_id", "") or "")
     kind = str(getattr(settings, "account_kind", "") or "sim")
     book_id = book_id_for_ctp_kind(kind)
-    old = load_named_book(root, book_id)
-    target, book = apply_ctp_equity(old, snapshot, user_id=user_id, version=read_version())
-    save_named_book(root, book_id, book)
+    # 读-改-写要和成交记账共用一把锁，否则会拿旧账本把刚追加的成交行盖掉。
+    from src.account.signal_book import book_lock
+
+    with book_lock():
+        old = load_named_book(root, book_id)
+        target, book = apply_ctp_equity(old, snapshot, user_id=user_id, version=read_version())
+        save_named_book(root, book_id, book)
     label = display_label(book_id, root)
     if load_active_id(root) == book_id:
         # 只在真正的程序目录里改配置权益，测试用的临时文件夹不会去改 config.yaml。
@@ -201,7 +205,8 @@ def resident_book_guard(root: str | Path, cfg: dict[str, Any] | None) -> str:
     book = load_named_book(root, needed)
     stored = ""
     if isinstance(book, dict):
-        snap = book.get("ctp_snapshot") if isinstance(book.get("ctp_snapshot"), dict) else {}
+        snap_raw = book.get("ctp_snapshot")
+        snap: dict[str, Any] = snap_raw if isinstance(snap_raw, dict) else {}
         stored = str(snap.get("user_id") or "").strip()
     if stored and stored != user:
         return (

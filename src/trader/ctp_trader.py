@@ -60,7 +60,7 @@ class CtpTrader(TraderBase):
 
     def connect(self) -> tuple[bool, str]:
         """连接交易前置，并完成认证、登录、结算单确认。"""
-        if self.cfg.get("dry_run", False):
+        if self.cfg.get("dry_run", True):
             return False, "模拟开关开着，不会连接柜台"
         return self.gateway.connect()
 
@@ -89,6 +89,11 @@ class CtpTrader(TraderBase):
             return True
         return not self._books_match
 
+    def mark_reconcile_unknown(self, reason: str) -> None:
+        """对账过程抛异常：按「未知=不匹配」处理，停止开新仓，等下一轮再对。"""
+        self._books_match = False
+        self._last_note = reason
+
     def reconcile(self, internal: dict[str, int]) -> tuple[bool, str]:
         """
         查询柜台真实持仓和资金。
@@ -97,7 +102,7 @@ class CtpTrader(TraderBase):
         净持仓对不上才记下失败，调用方停止开新仓。
         查询间隔没到时，用上一次的柜台结果再比一次，避免频繁查询被柜台拒绝。
         """
-        if self.cfg.get("dry_run", False):
+        if self.cfg.get("dry_run", True):
             self._books_match = False
             self._last_note = "模拟开关开着，没有柜台持仓可对"
             return False, self._last_note
@@ -256,7 +261,7 @@ class CtpTrader(TraderBase):
         开仓一笔。平仓在沥青、玉米上按今仓昨仓拆开，可能变成两笔。
         只有柜台确认全部成交才算 filled。点击成功不算成交。
         """
-        if self.cfg.get("dry_run", False):
+        if self.cfg.get("dry_run", True):
             return OrderResult(ok=False, message="模拟开关开着，不会向 CTP 发单", assumed_fill=False)
         missing = self.settings.missing()
         if missing:
@@ -325,7 +330,7 @@ class CtpTrader(TraderBase):
             )
 
         filled_volume = sum(int(order.filled) for order in orders)
-        accounted_volume = sum(int(order.filled) for order in orders if order.accounted)
+        accounted_volume = sum(int(order.accounted_volume) for order in orders)
         all_filled = filled_volume == volume and all(order.status == "filled" for order in orders)
         texts = [_status_text(order) for order in orders]
         message = "，".join(texts)
@@ -350,6 +355,18 @@ class CtpTrader(TraderBase):
                 "fill_price": avg,
                 "filled_volume": filled_volume,
                 "accounted_volume": accounted_volume,
+                # 每笔报单的成交情况。拆平今/平昨时会不止一笔，补记要按报单逐笔算增量。
+                "orders": [
+                    {
+                        "order_ref": order.order_ref,
+                        "filled": int(order.filled),
+                        "accounted_volume": int(order.accounted_volume),
+                        "avg_price": float(order.avg_price or 0),
+                        "status": order.status,
+                        "foreign": bool(order.foreign),
+                    }
+                    for order in orders
+                ],
                 "statuses": texts,
                 "working": working,
             },

@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any
 
 from loguru import logger
 
 from src.strategy import StrategyAction, StrategyDecision
+from src.utils.trading_day import is_trading_day, parse_closed_days
 
 
 def in_trading_session(
@@ -28,7 +29,7 @@ def in_trading_session(
 class FlattenManagerMixin:
     """收盘清仓方法；共享运行状态仍保存在 TradingBot 实例上。"""
 
-    def flatten_if_due(self, force: bool = False) -> None:
+    def flatten_if_due(self, force: bool = False, now: datetime | None = None) -> None:
         """
         到「收盘清仓」钟点，按系统时钟直接平仓，不等新K线。
 
@@ -36,6 +37,7 @@ class FlattenManagerMixin:
         每 10 秒再试一次，不会因为 10 分钟窗口走完就放弃。
         策略自己在拿到收盘K线时也会平，这里是按时钟的兜底。
         """
+        now = now or datetime.now()
         try:
             in_window = bool(self.strategy.is_flatten_time())
         except Exception as exc:  # noqa: BLE001
@@ -44,6 +46,9 @@ class FlattenManagerMixin:
         due = bool(force or self._flatten_pending or in_window)
         if not due:
             self._flatten_try.clear()
+            return
+        # 节假日/临时休市不点单：待办保留到下一个交易日。手动强制平仓不受限制。
+        if not force and not is_trading_day(now.date(), extra_closed=self._closed_days()):
             return
         if force:
             # 新的一轮清仓开始：重新计数、允许重新尝试（上一轮的「已发单」标记作废）。
@@ -105,7 +110,7 @@ class FlattenManagerMixin:
                         attempts=tries,
                         reason="已发单且不假定成交，停止连点",
                     )
-                elif self._flatten_retry_limit_reached(symbol):
+                elif self._flatten_retry_limit_reached(symbol, in_window=in_window):
                     self._flatten_sent.add(symbol)
                     self.last_error = "收盘清仓多次未确认，已停止自动重试"
                     logger.error(
@@ -121,35 +126,56 @@ class FlattenManagerMixin:
                     )
         self._flatten_pending = remaining
 
-    def _flatten_retry_limit_reached(self, symbol: str) -> bool:
-        """清仓重试的上限。只在「点了但内部账仍不空」时用，防止整夜反复点平仓。"""
+    def _flatten_retry_limit_reached(self, symbol: str, *, in_window: bool) -> bool:
+        """
+        清仓重试的上限。
+
+        在收盘清仓窗口内一直重试（窗口本来就只有十分钟），直到确认空仓；
+        窗口过去后最多再试 30 次，防止整夜反复点平仓。
+        """
+        if in_window:
+            return False
         return int(self._flatten_attempts.get(symbol, 0)) >= 30
 
     def _has_any_position(self) -> bool:
         """还有没有没平的仓。用于判断清仓失败后要不要继续重试。"""
         return any(not self._symbol_is_flat(symbol) for symbol in self.scan_symbols)
 
+    def _closed_days(self) -> set[date]:
+        """配置里的额外休市日（临时休市/调休）。配置读不到时按没有。"""
+        cfg = getattr(self, "cfg", None) or {}
+        raw = (cfg.get("schedule") or {}).get("closed_days") if isinstance(cfg, dict) else None
+        return parse_closed_days(raw)
+
     def _next_flatten_at(self, now: datetime | None = None) -> datetime | None:
-        """下一次收盘清仓的钟点。今天还没到就用今天，过了就顺延到明天。"""
+        """下一次收盘清仓的钟点。向后找下一个真正会清仓的交易日，周末和节假日不预约。"""
         if not getattr(self.strategy, "flatten_at_close", False):
             return None
         clocks: list[Any] = list(getattr(self.strategy, "flatten_times", []) or [])
         if not clocks:
             return None
         now = now or datetime.now()
+        closed = self._closed_days()
         soonest: datetime | None = None
-        for clock in clocks:
-            try:
-                when = datetime.combine(now.date(), clock)
-            except (TypeError, ValueError):
+        # 不能只顺延一天：周五收盘后顺延到周六，周策略会说「那天不清仓」，
+        # 定时器就再也定不上，周末的仓位没人管。国庆连休 7 天时还要跨过整段假期，
+        # 所以向后翻半个月找交易日。
+        for offset in range(0, 16):
+            day = (now + timedelta(days=offset)).date()
+            if not is_trading_day(day, extra_closed=closed):
                 continue
-            if when <= now:
-                when += timedelta(days=1)
-            # 夜日连续时策略会否掉夜盘 22:55。时钟预约必须问策略，不能按品种表硬撞。
-            if not self._strategy_would_flatten_at(when):
-                continue
-            if soonest is None or when < soonest:
-                soonest = when
+            for clock in clocks:
+                try:
+                    when = datetime.combine(day, clock)
+                except (TypeError, ValueError):
+                    continue
+                if when <= now:
+                    continue
+                # 夜日连续时策略会否掉夜盘 22:55。时钟预约必须问策略，不能按品种表硬撞。
+                if not self._strategy_would_flatten_at(when):
+                    continue
+                if soonest is None or when < soonest:
+                    soonest = when
         return soonest
 
     def _strategy_would_flatten_at(self, when: datetime) -> bool:

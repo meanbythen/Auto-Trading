@@ -1,6 +1,12 @@
 """动态减仓：账户回撤和波动放大只改手数，1 手不强平。不管连亏笔数。"""
 
-from src.risk.dynamic import DynamicExposure, atr_ratio, describe_status, drawdown_frac
+from src.risk.dynamic import (
+    DynamicExposure,
+    atr_ratio,
+    describe_status,
+    drawdown_frac,
+    live_equity_and_peak_or_error,
+)
 
 import numpy as np
 import pandas as pd
@@ -11,6 +17,24 @@ def test_drawdown_frac_from_peak() -> None:
     assert drawdown_frac(100, 100) == 0.0
     assert drawdown_frac(110, 100) == 0.0
     assert drawdown_frac(None, 100) is None
+    # 峰值为 0 属于权益数据不可信，按满回撤处理，不能放行开仓。
+    assert drawdown_frac(0, 0) == 1.0
+
+
+def test_missing_ledger_is_not_a_drawdown(tmp_path) -> None:
+    equity, peak, error = live_equity_and_peak_or_error(tmp_path)
+    assert (equity, peak, error) == (None, None, "")
+
+
+def test_ledger_read_error_is_fail_closed(monkeypatch, tmp_path) -> None:
+    def _boom(*args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr("src.risk.dynamic.load_active_book", _boom)
+    equity, peak, error = live_equity_and_peak_or_error(tmp_path)
+    assert equity is None
+    assert peak is None
+    assert "读取账本权益失败" in error
 
 
 def test_half_keeps_one_lot() -> None:

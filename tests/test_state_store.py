@@ -5,7 +5,7 @@ from datetime import timedelta
 
 from loguru import logger
 
-from src.utils.state_store import load_state
+from src.utils.state_store import SCHEMA_VERSION, load_state, save_state, update_state
 from src.utils.trading_day import futures_trading_day
 
 
@@ -14,6 +14,57 @@ def _capture_info():
     lines: list[str] = []
     sink = logger.add(lambda message: lines.append(str(message)), level="INFO")
     return lines, sink
+
+
+def test_corrupt_state_halts_and_keeps_one_backup(tmp_path) -> None:
+    """状态文件解析失败时按熔断处理，并留一份原文件备份供人工核对。"""
+    path = tmp_path / "bot_state.json"
+    path.write_text("{not json", encoding="utf-8")
+
+    state = load_state(path)
+
+    assert state["halted"] is True
+    assert state["halt_kind"] == "state_corrupt"
+    assert state["positions"] == {}
+    backups = list(tmp_path.glob("bot_state.json.corrupt-*"))
+    assert len(backups) == 1
+    assert backups[0].read_text(encoding="utf-8") == "{not json"
+
+    # 同一份坏文件反复读取，不重复生成备份。
+    load_state(path)
+    assert len(list(tmp_path.glob("bot_state.json.corrupt-*"))) == 1
+
+
+def test_save_leaves_no_tmp_file(tmp_path) -> None:
+    """原子写的临时文件用完必须清掉，不能留在状态目录里。"""
+    path = tmp_path / "bot_state.json"
+    save_state(path, {"positions": {}})
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+def test_saved_state_carries_schema_version(tmp_path) -> None:
+    """状态文件要带格式版本，读回时也补齐。"""
+    path = tmp_path / "bot_state.json"
+
+    save_state(path, {"positions": {}})
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["schema_version"] == SCHEMA_VERSION
+    assert load_state(path)["schema_version"] == SCHEMA_VERSION
+
+
+def test_update_state_is_read_modify_write_under_one_lock(tmp_path) -> None:
+    """两个入口先后改同一份状态时，后面的更新不能把前面的覆盖掉。"""
+    path = tmp_path / "bot_state.json"
+    save_state(path, {"daily_pnl": 0.0, "positions": {}})
+
+    update_state(path, lambda state: state.__setitem__("daily_pnl", 5.0))
+    final, _ = update_state(
+        path, lambda state: state["positions"].__setitem__("bu2612", {"volume": 1})
+    )
+
+    assert final["daily_pnl"] == 5.0
+    assert final["positions"]["bu2612"]["volume"] == 1
 
 
 def test_missing_trading_day_is_stamped_without_wiping_or_repeating(tmp_path) -> None:
@@ -56,6 +107,7 @@ def test_real_day_change_resets_once_and_keeps_position(tmp_path) -> None:
                 "open_orders_today": 3,
                 "halted": True,
                 "halt_reason": "旧熔断",
+                "halt_kind": "daily_loss",
                 "positions": {"bu2612": {"side": "long", "volume": 1, "entry_price": 4600}},
             }
         ),
@@ -75,6 +127,29 @@ def test_real_day_change_resets_once_and_keeps_position(tmp_path) -> None:
     assert first["positions"]["bu2612"]["entry_price"] == 4600
     assert second["trading_day"] == str(futures_trading_day())
     assert sum("新交易日" in line for line in lines) == 1
+
+
+def test_crash_halt_survives_trading_day_change(tmp_path) -> None:
+    """崩溃/遗留委托类熔断跨交易日仍保留，必须人工核对后解除。"""
+    path = tmp_path / "bot_state.json"
+    path.write_text(
+        json.dumps(
+            {
+                "trading_day": "2020-01-01",
+                "daily_pnl": 0,
+                "halted": True,
+                "halt_reason": "发现未完成的下单记录",
+                "halt_kind": "pending_intent",
+                "positions": {},
+            }
+        ),
+        encoding="utf-8",
+    )
+    state = load_state(path)
+    assert state["trading_day"] == str(futures_trading_day())
+    assert state["halted"] is True
+    assert state["halt_kind"] == "pending_intent"
+    assert state["halt_reason"] == "发现未完成的下单记录"
 
 
 def test_future_trading_day_is_not_rolled_back(tmp_path) -> None:

@@ -11,7 +11,7 @@ import threading
 import time
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pandas as pd
 import schedule
@@ -27,6 +27,7 @@ from src.scheduler.login_flow import LoginFlowMixin
 from src.scheduler.order_executor import OrderExecutorMixin
 from src.scheduler.session_audit import SessionAuditMixin
 from src.strategy import StrategyAction, StrategyDecision, create_strategy
+from src.strategy.decision_guard import apply_delivery_gate, apply_generic_stop
 from src.strategy.generic_stop import GenericStopOverlay
 from src.trader import create_trader
 from src.utils.state_store import (
@@ -194,6 +195,8 @@ class TradingBot(
         self._session_skip_log_at: datetime | None = None
         self._live_session_key = ""
         self.logged_in = False
+        # CTP 登录失败后的下次重试时刻；None 表示可以立即尝试。
+        self._ctp_retry_at: datetime | None = None
         self._running = False  # GUI / 外部可调用 stop() 结束循环
         # 暂停报单：扫描还在跑，开平仓、止损、清仓都不发出去。和交易台「暂停报单」同一标志。
         self._orders_paused = False
@@ -234,6 +237,8 @@ class TradingBot(
         self._order_dispatch_started = False
         # 信号账户写失败时置真：还能平仓，但不再开新仓，避免账本和真实仓位越差越远。
         self._ledger_failed = False
+        # 手工录入与后台扫描共用一把交易锁，避免同时改同一份策略仓位。
+        self._trade_lock = threading.RLock()
         # 盘前行情适配审计：启动时跑一次 + 每天 08:55 / 13:25 / 20:25 各跑一次。
         # 记录上次触发时间避免同一时段重复跑。
         self._last_audit_at: datetime | None = None
@@ -247,9 +252,11 @@ class TradingBot(
         self.state_path = default_state_path(root)
         # 下单意图写前日志：点击前先落盘，成功后清除。若程序在点击与记账之间崩溃，
         # 下次启动会看到这个文件，提示人工核对同花顺持仓，避免重复开仓/漏平仓。
-        from src.account.workspace import intent_file
+        from src.account.workspace import intent_dir, intent_file
 
         # 点单意图跟当前账走：模拟盘崩溃核对时，不会误用实盘那份意图文件。
+        # 新委托一笔一个文件；旧版单文件路径只用于读取升级前的遗留记录。
+        self.intent_dir = intent_dir(root)
         self.intent_path = intent_file(root)
         self._pending_intent: dict[str, Any] | None = None
         # 先记下当前交易日（夜盘 21:00 起算下一个）。读到磁盘后如果文件里已有交易日，再用文件里的。
@@ -350,14 +357,40 @@ class TradingBot(
             self._live_session_key = key
 
     def _pick_scan_symbols(self) -> list[str]:
-        """常驻扫描清单：只认当前选中的品种（trade.symbol），找不到就退回列表第一个。"""
-        if not self.symbols:
-            return []
-        wanted = str(self.default_symbol or "").strip().lower()
-        for symbol in self.symbols:
-            if symbol.lower() == wanted:
-                return [symbol]
-        return [self.symbols[0]]
+        """
+        常驻扫描清单：当前选中品种 + 程序账上所有非空持仓。
+
+        只扫当前品种会让「已移出关注列表的旧仓」裸奔，没人止损/收盘清仓。
+        当前品种放首位，交易时段仍以它的 K 线为准。
+        """
+        out: list[str] = []
+        if self.symbols:
+            wanted = str(self.default_symbol or "").strip().lower()
+            current = next(
+                (symbol for symbol in self.symbols if symbol.lower() == wanted),
+                self.symbols[0],
+            )
+            out.append(current)
+        seen = {symbol.lower() for symbol in out}
+        positions = getattr(self.strategy, "positions", None) or {}
+        for name, pos in positions.items():
+            side = str(getattr(pos, "side", "flat") or "flat")
+            volume = int(getattr(pos, "volume", 0) or 0)
+            if side not in ("long", "short") or volume <= 0:
+                continue
+            symbol = str(name)
+            if symbol.lower() in seen:
+                continue
+            out.append(symbol)
+            seen.add(symbol.lower())
+        return out
+
+    def _refresh_scan_symbols(self) -> None:
+        """重新计算扫描清单；启动恢复、每轮扫描、手工开仓后都可安全调用。"""
+        picked = self._pick_scan_symbols()
+        if picked != self.scan_symbols:
+            logger.info("扫描清单更新: {} → {}", self.scan_symbols, picked)
+            self.scan_symbols = picked
 
     def _load_persisted_state(self) -> None:
         """启动时恢复持仓/当日盈亏/开仓计数（主流程序标配）。"""
@@ -369,6 +402,7 @@ class TradingBot(
         self.risk.open_orders_today = int(st.get("open_orders_today", self.risk.orders_today) or 0)
         self.risk.halted = bool(st.get("halted", False))
         self.risk.halt_reason = str(st.get("halt_reason", "") or "")
+        self.risk.halt_kind = str(st.get("halt_kind", "") or "")
         # 从策略持仓重建风控净仓
         for sym, pos in (getattr(self.strategy, "positions", {}) or {}).items():
             side = getattr(pos, "side", "flat")
@@ -387,6 +421,8 @@ class TradingBot(
         self._restore_used_sessions(st)
         # 以信号账户为准对一次账：持仓、风控净仓、当日盈亏都和账本对齐。
         self._reconcile_books()
+        # 恢复出来的隔夜仓也要纳入扫描，否则没人管它的止损和收盘清仓。
+        self._refresh_scan_symbols()
         logger.info(
             "状态已加载 | 持仓={} | 当日盈亏={:.2f} | 熔断={}",
             snapshot_positions(self.strategy),
@@ -527,7 +563,7 @@ class TradingBot(
             if stop <= 0:
                 logger.warning("启动对账：{} 账本开仓没有止损价，重建时先不设止损", sym)
             positions[sym] = PositionState(
-                side=want_side,
+                side=cast(Any, want_side),
                 volume=want_vol,
                 entry_price=float(want.get("entry_price") or 0),
                 initial_stop=stop,
@@ -595,6 +631,7 @@ class TradingBot(
                 "open_orders_today": self.risk.open_orders_today,
                 "halted": self.risk.halted,
                 "halt_reason": self.risk.halt_reason,
+                "halt_kind": self.risk.halt_kind,
                 "positions": snapshot_positions(self.strategy),
                 "last_entry_bars": self.strategy.get_last_entry_bars(),
                 "used_sessions": dict(getattr(self.strategy, "_used_session", {}) or {}),
@@ -631,15 +668,15 @@ class TradingBot(
         self.risk.daily_pnl = 0.0
         self.risk.orders_today = 0
         self.risk.open_orders_today = 0
-        self.risk.halted = False
-        self.risk.halt_reason = ""
+        # 只解除「日亏」熔断；崩溃、遗留委托、对账不符必须人工核对。
+        self.risk.clear_halt("daily_loss")
         self.risk.last_order_ts = 0.0
         self.risk.last_open_ts = 0.0
         # 隔夜持仓不归零，只把切换时的仓位留一份记录，方便第二天对账。
         carried = snapshot_positions(self.strategy)
         held_text = format_position_text(carried)
         logger.info(
-            "交易日切换 {} → {}，已清零当日盈亏、下单次数和熔断；"
+            "交易日切换 {} → {}，已清零当日盈亏、下单次数；"
             "昨日盈亏 {:+.2f}，隔夜持仓保留: {}",
             old,
             today,
@@ -653,18 +690,25 @@ class TradingBot(
             daily_pnl_before=old_pnl,
             positions=carried,
         )
+        # 新交易日先复查上次点击后是否留下未完成委托，有就继续熔断。
+        self._check_pending_intent()
         self._persist_state()
         return True
 
 
     def _dynamic_status_text(self) -> str:
         """运行台动态减仓一行。算不出波动时只看连亏。"""
-        from src.risk.dynamic import atr_ratio, describe_status, live_equity_and_peak, DynamicExposure
+        from src.risk.dynamic import (
+            DynamicExposure,
+            atr_ratio,
+            describe_status,
+            live_equity_and_peak_or_error,
+        )
 
         dyn = DynamicExposure.from_config(self.cfg)
         bars = next(iter(self._last_signal_bars.values()), None) if self._last_signal_bars else None
         ratio = atr_ratio(bars, period=dyn.atr_period, lookback=dyn.atr_lookback) if bars is not None else None
-        equity, peak = live_equity_and_peak(self.root)
+        equity, peak, _ = live_equity_and_peak_or_error(self.root)
         return describe_status(
             self.cfg,
             ratio=ratio,
@@ -679,7 +723,11 @@ class TradingBot(
 
         返回一条平仓决策；不该减时返回 None。同一档回撤只减一次。
         """
-        from src.risk.dynamic import DynamicExposure, drawdown_frac, live_equity_and_peak
+        from src.risk.dynamic import (
+            DynamicExposure,
+            drawdown_frac,
+            live_equity_and_peak_or_error,
+        )
         from src.strategy.types import StrategyAction, StrategyDecision
 
         dyn = DynamicExposure.from_config(self.cfg)
@@ -689,7 +737,7 @@ class TradingBot(
         held = abs(int(pos.volume)) if pos and getattr(pos, "volume", 0) else 0
         if held < 2:
             return None
-        equity, peak = live_equity_and_peak(self.root)
+        equity, peak, _ = live_equity_and_peak_or_error(self.root)
         dd = drawdown_frac(equity, peak)
         target = dyn.held_target(held, dd)
         if target is None or target >= held:
@@ -720,6 +768,22 @@ class TradingBot(
             self._health_report = report.as_dict()
         except Exception as exc:  # noqa: BLE001
             logger.debug("策略健康检查跳过：{}", exc)
+
+    def sync_risk_limits(self, max_daily_loss: float | None = None) -> None:
+        """
+        把配置页刚保存的日亏限额同步给运行中的风控。
+
+        常驻机器人启动时就把限额固定下来了，之后改配置只改文件不改内存；
+        不同步的话机器人会一直按旧限额熔断、界面按新限额删告警。
+        """
+        if max_daily_loss is None:
+            risk_cfg = self.cfg.get("risk") or {}
+            try:
+                max_daily_loss = float(risk_cfg.get("max_daily_loss", self.risk.max_daily_loss))
+            except (TypeError, ValueError):
+                return
+        self.cfg.setdefault("risk", {})["max_daily_loss"] = max_daily_loss
+        self.risk.set_max_daily_loss(float(max_daily_loss))
 
     def status_snapshot(self) -> dict[str, Any]:
         """给界面看的健康快照。"""
@@ -864,49 +928,44 @@ class TradingBot(
         # 通用止损：和策略自身止损相互独立，策略没让平仓时由公共止损补一刀。
         # 策略要反手/开仓时不抢，它本身也会先平掉旧仓；谁先触发都算平仓。
         if decision.action == StrategyAction.HOLD and not self._symbol_is_flat(symbol):
-            held_for_stop = self._position_for(symbol)
-            if held_for_stop is not None:
-                gs_bars = trail_closed if trail_closed is not None else closed
-                gs_forming = (
-                    trail_forming if str(trail_tf) != str(signal_tf) else forming
+            gs_bars = trail_closed if trail_closed is not None else closed
+            gs_forming = (
+                trail_forming if str(trail_tf) != str(signal_tf) else forming
+            )
+            decision, gs_hit = apply_generic_stop(
+                self.generic_stop,
+                symbol,
+                decision,
+                self._position_for(symbol),
+                gs_bars,
+                flat=False,
+                forming=gs_forming,
+                mode=getattr(self.strategy, "stop_mode", "touch"),
+                # 平仓未成交时别每轮都重复发单，和策略自身止损的等待口径一致。
+                cooldown_sec=120.0,
+            )
+            if gs_hit is not None:
+                self._record_event(
+                    "generic_stop",
+                    symbol=symbol,
+                    kind=gs_hit.kind,
+                    stop=gs_hit.stop,
                 )
-                gs_hit = self.generic_stop.check(
-                    symbol,
-                    held_for_stop,
-                    gs_bars,
-                    forming=gs_forming,
-                    mode=getattr(self.strategy, "stop_mode", "touch"),
-                    # 平仓未成交时别每轮都重复发单，和策略自身止损的等待口径一致。
-                    cooldown_sec=120.0,
-                )
-                if gs_hit is not None:
-                    decision = StrategyDecision(
-                        StrategyAction.CLOSE,
-                        symbol,
-                        gs_hit.reason,
-                        stop_price=gs_hit.stop,
-                    )
-                    self._record_event(
-                        "generic_stop",
-                        symbol=symbol,
-                        kind=gs_hit.kind,
-                        stop=gs_hit.stop,
-                    )
 
         # 交割月不再交易这一手：日盘收完、下一交易日已进交割月时平仓，也不开新仓。
-        from src.risk.delivery import contract_gate
-
-        gate_now = _eval_now(eval_bars, closed, catch_up=catch_up_used)
-        gate = contract_gate(symbol, gate_now)
-        if gate.flatten and not self._symbol_is_flat(symbol):
-            decision = StrategyDecision(StrategyAction.CLOSE, symbol, gate.reason)
-            self._record_event("delivery_flatten", symbol=symbol, reason=gate.reason)
-        elif gate.block_open and decision.action in (
-            StrategyAction.BUY_OPEN,
-            StrategyAction.SELL_OPEN,
-        ):
-            self._reject_gate(decision, "delivery_month", gate.reason, "")
-            decision = StrategyDecision(StrategyAction.HOLD, symbol, gate.reason)
+        gate_outcome = apply_delivery_gate(
+            symbol,
+            _eval_now(eval_bars, closed, catch_up=catch_up_used),
+            decision,
+            flat=self._symbol_is_flat(symbol),
+        )
+        if gate_outcome.flattened:
+            self._record_event(
+                "delivery_flatten", symbol=symbol, reason=gate_outcome.gate.reason
+            )
+        elif gate_outcome.rejected is not None:
+            self._reject_gate(decision, "delivery_month", gate_outcome.gate.reason, "")
+        decision = gate_outcome.decision
 
         # 给人看：最新K线长什么样 + 本轮是否符合开仓（不影响下单逻辑）
         try:
@@ -1011,7 +1070,7 @@ class TradingBot(
             import inspect
 
             try:
-                params = inspect.signature(self.strategy.evaluate).parameters
+                params: Any = inspect.signature(self.strategy.evaluate).parameters
             except (TypeError, ValueError):
                 params = {}
             cached = name in params or any(
@@ -1046,6 +1105,7 @@ class TradingBot(
         参数:
             force: True 时忽略交易时段限制（给 --once 调试用）
         """
+        self._refresh_scan_symbols()
         self._rollover_trading_day()
         self._refresh_sessions()
 
@@ -1073,9 +1133,10 @@ class TradingBot(
         if not self.logged_in:
             executor = str((self.cfg.get("trade") or {}).get("executor", "sim"))
             if executor == "ctp":
-                self.logged_in = True
                 self._gui_price_ready = True
-                self._arm_ctp()
+                # 连不上就停手，按间隔在下一轮重试；不能拿「已登录」硬着头皮开仓。
+                if not self._arm_ctp():
+                    return
             else:
                 self.do_login()
                 if not self.logged_in:
@@ -1171,8 +1232,7 @@ class TradingBot(
         # 准备按钮刚刚登录过，这里再登录会把交易菜单再点开一次。
         executor = str((self.cfg.get("trade") or {}).get("executor", "sim"))
         if executor == "ctp":
-            # 柜台通道自己登录 CTP，不再点同花顺。
-            self.logged_in = True
+            # 柜台通道自己登录 CTP，不再点同花顺。连不上时 logged_in 保持 False，下一轮重试。
             self._gui_price_ready = True
             self._arm_ctp()
         elif startup_should_login(self.cfg):

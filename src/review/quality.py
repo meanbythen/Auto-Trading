@@ -38,6 +38,8 @@ class SignalTrade:
     risk_points: float = 0.0
     r_multiple: float | None = None
     capture_ratio: float | None = None
+    # 开仓时的 ADX，交给评估分趋势/震荡组
+    adx_at_entry: float | None = None
 
 
 @dataclass
@@ -102,6 +104,7 @@ def enrich_round_trips(
                 reason_entry=str(op.reason or ""),
                 reason_exit=str(match.reason or ""),
                 still_open=False,
+                adx_at_entry=getattr(op, "adx", None),
             )
         else:
             # 窗口结束还拿着：用最后可见价估算，标明未平
@@ -122,6 +125,7 @@ def enrich_round_trips(
                 reason_entry=str(op.reason or ""),
                 reason_exit="窗口结束仍持仓（复盘按最后一根估算）",
                 still_open=True,
+                adx_at_entry=getattr(op, "adx", None),
             )
         _fill_excursions(trade, bars)
         out.append(trade)

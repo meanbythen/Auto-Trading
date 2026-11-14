@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import date, datetime, timedelta
 
 import pandas as pd
@@ -9,7 +10,13 @@ import pandas as pd
 from src.review.baseline import save_review_summary, build_baseline_report
 from src.review.diagnose import diagnose
 from src.review.gap import GapReport
-from src.review.quality import SignalTrade, build_quality_report, enrich_round_trips
+from src.review.live_eval import build_live_vs_backtest, build_replay_eval
+from src.review.quality import (
+    QualityReport,
+    SignalTrade,
+    build_quality_report,
+    enrich_round_trips,
+)
 from src.review.replay import ReplayEvent, StrategyReplay
 from src.review.scorecard import Scorecard
 from src.review.service import build_review
@@ -48,7 +55,15 @@ def test_mae_mfe_for_long_round_trip() -> None:
     entry_t = datetime(2026, 10, 14, 9, 30)
     exit_t = datetime(2026, 10, 14, 11, 0)
     opens = [
-        ReplayEvent("10-14 09:30", "开多", 3002.0, "测试开多", when=entry_t, stop=2990.0)
+        ReplayEvent(
+            "10-14 09:30",
+            "开多",
+            3002.0,
+            "测试开多",
+            when=entry_t,
+            stop=2990.0,
+            adx=24.0,
+        )
     ]
     closes = [
         ReplayEvent("10-14 11:00", "平仓", 3020.0, "测试平仓", when=exit_t)
@@ -57,6 +72,7 @@ def test_mae_mfe_for_long_round_trip() -> None:
     assert len(trades) == 1
     t = trades[0]
     assert t.side == "long"
+    assert t.adx_at_entry == 24.0
     assert t.mfe > 0
     assert t.mae >= 0
     assert t.r_multiple is not None
@@ -132,7 +148,9 @@ def test_scorecard_and_full_report_sections(tmp_path) -> None:
     assert "七、信号与实盘对照" in text
     assert "八、缺陷诊断" in text
     assert "九、相对基准" in text
-    assert "十、综合" in text
+    assert "十、当日重放评估" in text
+    assert "十一、最近实盘 vs 最近回测" in text
+    assert "十二、综合" in text
     summary = tmp_path / "data" / "reviews" / "2026-10-14_bu2612.json"
     assert summary.exists()
 
@@ -140,7 +158,6 @@ def test_scorecard_and_full_report_sections(tmp_path) -> None:
 def test_baseline_reads_peer_summaries(tmp_path) -> None:
     """近几日摘要能被基准模块读到。"""
     card = Scorecard(effectiveness=80, stability=70, credibility=75, summary="好")
-    from src.review.quality import QualityReport
 
     q = QualityReport(avg_r=0.5, closed_count=2, win_count=1, trades=[])
     save_review_summary(
@@ -164,3 +181,63 @@ def test_baseline_reads_peer_summaries(tmp_path) -> None:
         quality=q,
     )
     assert any("近" in line and "平均" in line for line in report.lines)
+
+
+def test_replay_eval_uses_adx_from_replay() -> None:
+    """开仓 ADX 带进复盘评估后，震荡组检查不再永远跳过。"""
+    trades = [
+        SignalTrade(
+            side="long",
+            entry_time=datetime(2026, 10, 14, 9, 30),
+            exit_time=datetime(2026, 10, 14, 10, 30),
+            entry_price=100.0,
+            exit_price=102.0,
+            stop_price=98.0,
+            pnl_points=2.0,
+            adx_at_entry=28.0,
+        ),
+        SignalTrade(
+            side="long",
+            entry_time=datetime(2026, 10, 14, 13, 30),
+            exit_time=datetime(2026, 10, 14, 14, 30),
+            entry_price=100.0,
+            exit_price=102.0,
+            stop_price=98.0,
+            pnl_points=2.0,
+            adx_at_entry=14.0,
+        ),
+    ]
+    lines = build_replay_eval(QualityReport(trades=trades), {})
+    text = "\n".join(lines)
+    assert "震荡组" in text
+    assert "跳过" not in text.split("震荡组", 1)[1].split("\n", 1)[0]
+
+
+def test_live_vs_backtest_shows_new_metrics(tmp_path) -> None:
+    """实盘对照要带出最近回测的 R 期望、卡尔玛和最大连亏。"""
+    (tmp_path / "data").mkdir()
+    (tmp_path / "data" / "backtest_last.json").write_text(
+        json.dumps(
+            {
+                "performance": {"trades": 120, "win_rate": 0.5, "profit_factor": 1.4},
+                "evaluation": {
+                    "conclusion_text": "观察",
+                    "failed_items": [],
+                    "metrics": {
+                        "r_expectancy": 0.12,
+                        "calmar": 0.85,
+                        "consecutive_losses": 6,
+                    },
+                },
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+
+    text = "\n".join(build_live_vs_backtest(tmp_path, "bu2612", {}))
+
+    assert "最近回测评估  观察" in text
+    assert "R期望 0.120" in text
+    assert "卡尔玛 0.85" in text
+    assert "最大连亏 6笔" in text

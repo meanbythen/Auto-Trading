@@ -1,0 +1,46 @@
+# P0 修复任务清单
+
+- [x] P0-1 CTP `dry_run` 默认 True
+  - [x] 3 处 `cfg.get("dry_run", False)` 改 True
+  - [x] `load_config` 加 `cfg.setdefault("dry_run", True)`
+  - [x] 相关测试
+- [x] P0-2 进程级单实例 + run_once busy
+  - [x] 新增 `src/utils/single_instance.py`
+  - [x] `app_entry.main` 接入（跳过 `--pick-coords`）
+  - [x] `BotWorker.run_once` 置/清 `_alive`
+  - [x] `tests/test_bot_worker.py` 更新
+- [x] P0-3 熔断原因分类
+  - [x] `RiskGuardian.halt_kind` + `set_halt` + `clear_halt(kind)`
+  - [x] `state_store` 换日只清 `daily_loss`
+  - [x] `runner` 持久化/恢复/日切复查意图
+  - [x] `order_executor` 意图熔断用 `pending_intent`
+  - [x] `tests/test_state_store.py`、`tests/test_crash_recovery.py` 更新
+- [x] P0-4 账本失败 fail-closed
+  - [x] `_apply_fill_accounting` balance None 不改仓位
+  - [x] `on_filled` / `risk.on_order_filled` 独立 try
+  - [x] 平仓无价回退持仓开仓价，仍无价则拒记
+  - [x] `tests/test_runner_guard.py` 增断言
+- [x] P0-5 手工单顺序与锁
+  - [x] `TradingBot._trade_lock`
+  - [x] `_execute` 包装 + `_execute_locked`
+  - [x] `manual_open/manual_close` 先记账后改内存、校验价格
+  - [x] 相关测试
+- [x] P0-6 账本读失败 fail-closed
+  - [x] `live_equity_and_peak_or_error`
+  - [x] `drawdown_frac` peak<=0 → 1.0
+  - [x] `_size_open` 读取失败返回 0 手
+  - [x] `tests/test_dynamic_exposure.py` 增断言
+- [x] P0-7 意图写盘失败熔断
+  - [x] `OrderIntentWriteError`
+  - [x] 禁止覆盖已有意图文件
+  - [x] `_dispatch` 捕获并熔断
+  - [x] `tests/test_runner_guard.py` 增断言
+- [x] P0-8 扫描清单包含持仓
+  - [x] `_pick_scan_symbols` 合并非空持仓
+  - [x] `_refresh_scan_symbols` 接入启动/每轮/手工开仓
+  - [x] `tests/test_run_scope.py` 增断言
+- [x] 收尾验证
+  - [x] 相关测试
+  - [x] `python -m ruff check .`
+  - [x] `python -m mypy src`
+  - [x] `python -m pytest -q`

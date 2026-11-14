@@ -44,7 +44,7 @@ def fraction_from_label(label: object) -> float:
 def label_from_fraction(value: object) -> str:
     """小数换成界面中文名。"""
     try:
-        num = float(value)
+        num = float(str(value))
     except (TypeError, ValueError):
         num = DEFAULT_FRACTION
     for name, frac in FRACTION_LABELS.items():
@@ -126,7 +126,8 @@ def read_manual_factors(box: dict[str, Any] | None) -> tuple[float | None, float
     方便你对照后改成手填。
     """
     box = box if isinstance(box, dict) else {}
-    snap = box.get("snapshot") if isinstance(box.get("snapshot"), dict) else {}
+    snap_raw = box.get("snapshot")
+    snap: dict[str, Any] = snap_raw if isinstance(snap_raw, dict) else {}
     rate = parse_win_rate(box.get("win_rate_pct"))
     if rate is None:
         rate = parse_win_rate(box.get("win_rate"))

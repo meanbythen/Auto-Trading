@@ -82,7 +82,9 @@ def _volume(intent: TradeIntent, _risk: Any) -> GateResult | None:
 
 
 def _stage(intent: TradeIntent, _risk: Any) -> GateResult | None:
-    if intent.executor == "ctp" and intent.stage_block:
+    # 上线阶段只拦新开仓。已经持有的仓必须能止损、反手和收盘清仓，
+    # 否则阶段没批下来时，旧仓在夜里没人管。
+    if intent.executor == "ctp" and intent.stage_block and _is_open(intent.side):
         return GateResult(False, "order_blocked_stage", intent.stage_block)
     return None
 

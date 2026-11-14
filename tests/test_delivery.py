@@ -14,6 +14,8 @@ from src.risk.delivery import (
     live_hint,
     successor_symbol,
 )
+from src.strategy.decision_guard import apply_delivery_gate
+from src.strategy.types import StrategyAction, StrategyDecision
 
 
 def test_parse_fuel_oil_delivery_month() -> None:
@@ -93,3 +95,31 @@ def test_live_hint_warns_near_delivery() -> None:
     far, far_warn = live_hint("fu2701", datetime(2026, 11, 1, 10, 0))
     assert "交割月" in far
     assert far_warn is False
+
+
+def test_gate_decision_flattens_holding_and_blocks_new_open() -> None:
+    """实盘和回测共用的闸门：有仓改平仓，空仓的开仓改观望并交回被拒决策。"""
+    open_long = StrategyDecision(StrategyAction.BUY_OPEN, "fu2701", "突破")
+    in_month = datetime(2027, 1, 5, 9, 5)
+
+    held = apply_delivery_gate(
+        "fu2701", in_month, open_long, flat=False, flatten_meta={"delivery_flatten": True}
+    )
+    assert held.decision.action == StrategyAction.CLOSE
+    assert held.flattened is True
+    assert held.rejected is None
+    assert held.decision.meta == {"delivery_flatten": True}
+
+    flat = apply_delivery_gate("fu2701", in_month, open_long, flat=True)
+    assert flat.decision.action == StrategyAction.HOLD
+    assert flat.rejected is open_long
+    assert flat.flattened is False
+
+
+def test_gate_decision_leaves_other_contracts_alone() -> None:
+    """没进交割月的合约，决策原样返回，不记拒单。"""
+    decision = StrategyDecision(StrategyAction.BUY_OPEN, "bu2612", "突破")
+    outcome = apply_delivery_gate("bu2612", datetime(2026, 11, 14, 10, 0), decision, flat=True)
+    assert outcome.decision is decision
+    assert outcome.rejected is None
+    assert outcome.flattened is False

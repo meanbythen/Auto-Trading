@@ -211,7 +211,8 @@ class PickerTabMixin:
         # 列顺序和导出「交叉测试」表一致：盈亏比后是收益期望；净盈亏后是盈利覆盖；交易频率后是笔数、每笔。
         # 「当下行情」只在这里显示（这一轮跑的时候现算），不写进导出表。
         self._pick_col_widths = (
-            108, 132, 64, 48, 64, 56, 72, 72, 72, 72, 64, 120, 40, 72, 176, 88, 88, 40, 72, 72, 48, 96, 52, 64,
+            108, 132, 64, 48, 64, 56, 72, 64, 72, 56, 64, 72, 72, 64, 120, 40, 72,
+            176, 88, 88, 40, 72, 72, 48, 96, 180, 96, 52, 64,
         )
         self._pick_headers = [
             "品种",
@@ -221,7 +222,10 @@ class PickerTabMixin:
             "盈利因子",
             "盈亏比",
             "收益期望",
+            "R期望",
             "最大回撤",
+            "卡尔玛",
+            "最大连亏",
             "净盈亏",
             "盈利覆盖",
             "收益率",
@@ -235,6 +239,8 @@ class PickerTabMixin:
             "日均",
             "K线根数",
             "得分",
+            "评估",
+            "未通过项",
             "当下行情",
             "流动性",
             "结果",
@@ -304,6 +310,14 @@ class PickerTabMixin:
                 color = T.WARN
             elif not header and "不适配" in text:
                 color = T.WARN
+            elif not header and text in {"通过", "观察", "淘汰", "未评估", "评估失败"}:
+                # 评估列：淘汰标红，观察标黄，通过标绿。
+                if text == "淘汰":
+                    color = T.DANGER
+                elif text in {"观察", "评估失败"}:
+                    color = T.WARN
+                elif text == "通过":
+                    color = T.OK
             elif not header and index == len(texts) - 1:
                 color = picked_color if picked != "未入选" else T.TEXT_DIM
             label = ctk.CTkLabel(
@@ -352,7 +366,10 @@ class PickerTabMixin:
                     item.get("profit_factor") or "—",
                     item.get("payoff") or "—",
                     item.get("expectancy") or "—",
+                    item.get("r_expectancy") or "—",
                     item.get("max_drawdown") or "—",
+                    item.get("calmar") or "—",
+                    item.get("loss_streak") or "—",
                     item.get("net_pnl") or "—",
                     item.get("profit_cover") or "—",
                     item.get("return_rate") or "—",
@@ -366,6 +383,8 @@ class PickerTabMixin:
                     item.get("daily_avg") or "—",
                     item.get("bars") or "—",
                     item.get("score") or "—",
+                    item.get("evaluation") or "—",
+                    item.get("fail_items") or "—",
                     item.get("market") or "—",
                     item.get("liquidity") or "—",
                     item.get("picked") or "—",

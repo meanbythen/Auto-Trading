@@ -1,8 +1,13 @@
-"""运行告警：熔断要落文件，相同内容短时间不刷第二遍。"""
+"""运行告警：熔断要落文件，相同内容短时间不刷第二遍；界面读告警不能改文件。"""
 
 from __future__ import annotations
 
-from src.ops.alerts import emit_alert, last_alert
+from src.ops.alerts import (
+    alerts_path,
+    emit_alert,
+    last_alert,
+    prune_stale_halt_alerts,
+)
 from src.risk.guardian import RiskGuardian
 
 
@@ -38,18 +43,24 @@ def test_guardian_can_skip_writing_alerts(tmp_path, monkeypatch) -> None:
     assert last_alert(tmp_path) is None
 
 
-def test_stale_halt_with_old_limit_is_deleted(tmp_path, monkeypatch) -> None:
-    """配置页已经改成 3000 时，文件里「限额 100」的熔断行要删掉，红字改看后面那条。"""
+def test_stale_halt_hidden_without_touching_file(tmp_path, monkeypatch) -> None:
+    """last_alert 只过滤旧限额熔断行，不删文件；清理交给显式 prune。"""
     monkeypatch.setattr("src.ops.alerts._last_emit", {})
     monkeypatch.setattr("src.utils.paths.project_root", lambda: tmp_path)
     emit_alert("reconcile", "启动对账已校准", root=tmp_path)
     emit_alert("halt", "当日亏损 -150.00 已超过限额 100", level="error", root=tmp_path)
+    path = alerts_path(tmp_path)
+    before = path.read_text(encoding="utf-8")
+    before_mtime = path.stat().st_mtime_ns
+
     leftover = last_alert(tmp_path, max_daily_loss=3000)
     assert leftover is not None
     assert leftover["code"] == "reconcile"
-    from src.ops.alerts import alerts_path
+    assert path.read_text(encoding="utf-8") == before
+    assert path.stat().st_mtime_ns == before_mtime
 
-    text = alerts_path(tmp_path).read_text(encoding="utf-8")
+    assert prune_stale_halt_alerts(tmp_path, 3000) == 1
+    text = path.read_text(encoding="utf-8")
     assert "限额 100" not in text
     assert "启动对账" in text
 
@@ -63,3 +74,46 @@ def test_halt_matching_current_limit_is_kept(tmp_path, monkeypatch) -> None:
     assert row is not None
     assert row["code"] == "halt"
     assert "3000" in row["message"]
+
+
+def test_halt_alert_written_once_per_episode(tmp_path, monkeypatch) -> None:
+    """同一段熔断里盈亏怎么变，都只在文件里留一条告警。"""
+    monkeypatch.setattr("src.ops.alerts._last_emit", {})
+    monkeypatch.setattr("src.utils.paths.project_root", lambda: tmp_path)
+    risk = RiskGuardian(max_daily_loss=100)
+    risk.update_pnl(-120)
+    risk.set_daily_pnl(-500)
+    risk.update_pnl(-10)
+
+    assert risk.halted is True
+    text = alerts_path(tmp_path).read_text(encoding="utf-8")
+    assert text.count('"code": "halt"') == 1
+
+
+def test_set_max_daily_loss_clears_halt_when_no_longer_breached(tmp_path, monkeypatch) -> None:
+    """把限额从 100 调到 3000 后，当日亏损 -150 不再超限，熔断要解除。"""
+    monkeypatch.setattr("src.ops.alerts._last_emit", {})
+    monkeypatch.setattr("src.utils.paths.project_root", lambda: tmp_path)
+    risk = RiskGuardian(max_daily_loss=100)
+    risk.set_daily_pnl(-150)
+    assert risk.halted is True
+
+    risk.set_max_daily_loss(3000)
+    assert risk.max_daily_loss == 3000
+    assert risk.halted is False
+    assert risk.halt_reason == ""
+    assert risk.halt_alerted is False
+
+
+def test_set_max_daily_loss_keeps_halt_when_still_breached(tmp_path, monkeypatch) -> None:
+    """新限额仍不够覆盖亏损时保持熔断，但不补写第二条告警。"""
+    monkeypatch.setattr("src.ops.alerts._last_emit", {})
+    monkeypatch.setattr("src.utils.paths.project_root", lambda: tmp_path)
+    risk = RiskGuardian(max_daily_loss=100)
+    risk.set_daily_pnl(-3500)
+    risk.set_max_daily_loss(3000)
+
+    assert risk.halted is True
+    assert "3000" in risk.halt_reason
+    text = alerts_path(tmp_path).read_text(encoding="utf-8")
+    assert text.count('"code": "halt"') == 1

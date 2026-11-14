@@ -19,6 +19,7 @@ from src.review.baseline import build_baseline_report, save_review_summary
 from src.review.diagnose import diagnose
 from src.review.fundamental import collect_fundamentals
 from src.review.gap import build_gap_report
+from src.review.live_eval import build_live_vs_backtest, build_replay_eval
 from src.review.quality import build_quality_report, enrich_round_trips
 from src.review.replay import replay_strategy
 from src.review.report import render_report
@@ -136,6 +137,9 @@ def build_review(
         quality=quality,
     )
 
+    replay_eval = build_replay_eval(quality, cfg)
+    live_eval = build_live_vs_backtest(root_path, symbol, cfg)
+
     text = render_report(
         symbol=symbol,
         trade_date=trade_date,
@@ -150,6 +154,8 @@ def build_review(
         diagnosis=diagnosis,
         scorecard=scorecard,
         baseline=baseline,
+        replay_eval=replay_eval,
+        live_eval=live_eval,
         now=now,
     )
     if save:

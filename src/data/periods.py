@@ -92,6 +92,14 @@ PERIOD_MENU = list(PERIOD_LABELS.values()) + ["自定义"]
 
 # 国内商品常见开盘（用于判断「这一段刚开盘，分钟可能不满」）
 _SESSION_OPEN_MINUTES = (9 * 60, 13 * 60 + 30, 21 * 60)
+# 国内商品常见收盘（用于判断「这一段要收盘，最后一根可能不足整周期」）
+_SESSION_CLOSE_MINUTES = (
+    10 * 60 + 15,
+    11 * 60 + 30,
+    15 * 60,
+    23 * 60,
+    2 * 60 + 30,
+)
 
 
 def canonical_period(text: str, custom: str = "") -> str:
@@ -295,6 +303,24 @@ def _session_open_edge_mask(index: pd.DatetimeIndex, step: int) -> np.ndarray:
     return mask
 
 
+def _session_close_edge_mask(index: pd.DatetimeIndex, step: int) -> np.ndarray:
+    """
+    这些右标签时间里，哪些是某段收盘前的最后一根。
+
+    例如 15 分钟：10:15、11:30、15:00；30/60 分钟在这些时刻前面可能不足整周期，
+    整根丢弃会让 K 线根数少于行情商。收盘边的半桶也要保留。
+    """
+    step = int(step)
+    end_m = np.asarray(index.hour * 60 + index.minute, dtype=np.int64)
+    mask = np.zeros(len(end_m), dtype=bool)
+    for close_m in _SESSION_CLOSE_MINUTES:
+        mask |= end_m == close_m
+        # 收盘时刻本身整除周期时（如 15:00 的 60 分钟），也算收盘边
+        if close_m % step == 0:
+            mask |= end_m == close_m
+    return mask
+
+
 def is_session_open_stamp(ts: Any, opens: tuple[int, ...]) -> bool:
     """
     这个右标签时刻是不是正好落在某段开盘上。
@@ -339,6 +365,9 @@ def bars_from_minutes(minutes: pd.DataFrame | None, period: str) -> pd.DataFrame
     keep = counts >= step
     if min_ok < step:
         keep = keep | ((counts >= min_ok) & _session_open_edge_mask(out.index, step))
+    # 时段收盘边的最后一根：即使分钟不足整周期也保留（如 10:15、11:30 前的 30/60 分钟半桶），
+    # 否则 K 线根数会少于行情商。
+    keep = keep | ((counts >= 1) & _session_close_edge_mask(out.index, step))
     kept = out.loc[keep].copy()
     # 正在走的最后一根：即使分钟未齐也留下给实盘扫描
     last_ts = out.index[-1]
@@ -416,13 +445,17 @@ def overlay_minute_bars(
         return native, pd.DatetimeIndex([])
     step = int(step)
     min_ok = _min_minutes_for_bar(step)
-    # 可落库：分钟够，或开盘边且达到放宽门槛
+    # 可落库：分钟够，或开盘/收盘边且达到放宽门槛
     counts = built["minute_count"].to_numpy(dtype=np.int64, copy=False)
     persist_mask = counts >= step
     if min_ok < step:
         persist_mask = persist_mask | (
             (counts >= min_ok) & _session_open_edge_mask(built.index, step)
         )
+    # 收盘边的半桶也要落库，否则本地库存会比行情商少这一根
+    persist_mask = persist_mask | (
+        (counts >= 1) & _session_close_edge_mask(built.index, step)
+    )
     persist = built.loc[persist_mask].drop(columns=["minute_count"], errors="ignore")
     visible = built.drop(columns=["minute_count"], errors="ignore")
     if persist is None or len(persist) == 0:
@@ -442,10 +475,9 @@ def overlay_minute_bars(
         return visible, persist.index
 
     out = native.copy()
-    start = persist.index.min()
-    end = persist.index.max()
-    # 拼图覆盖的时段：丢掉旧时间戳（含新浪左标签错位的那几根），再写入右标签版本
-    drop_mask = (out.index >= start) & (out.index <= end)
+    # 按时间戳逐根替换：只丢掉拼图里确实有的原生K线。
+    # 原来按 [min,max] 整段删，区间内某天缺 1 分钟数据时该天原生 K 线会被误删且不回填。
+    drop_mask = out.index.isin(persist.index)
     out = out.loc[~drop_mask]
     try:
         out.attrs = {}

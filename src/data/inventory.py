@@ -181,6 +181,7 @@ def collect_kline_inventory(root: Path | str) -> dict[str, Any]:
         "detail": detail,
         "by_source": [by_source[name] for name in sorted(by_source)],
         "by_contract": contract_rows,
+        "ingests": clean_store.list_ingests(200),
     }
 
 
@@ -225,6 +226,33 @@ def _write_table(ws: Any, columns: list[str], rows: list[dict[str, Any]]) -> Non
         ws.column_dimensions[get_column_letter(idx)].width = longest + 2
 
 
+def _ingest_row(item: dict[str, Any]) -> dict[str, Any]:
+    """一条读图批次转成 Excel 一行。"""
+
+    def _span(start: Any, end: Any) -> str:
+        a = str(start or "").strip()
+        b = str(end or "").strip()
+        if not a and not b:
+            return "未指定"
+        return f"{a or '起'} ~ {b or '止'}"
+
+    contract, from_name = split_stored_symbol(str(item.get("symbol") or ""))
+    expected = int(item.get("expected_n") or 0)
+    return {
+        "读取时间": item.get("created_at") or "",
+        "数据源": source_label(str(item.get("source") or from_name)),
+        "合约": contract,
+        "周期": period_label(str(item.get("period") or "")),
+        "请求时段": _span(item.get("requested_from"), item.get("requested_to")),
+        "实读范围": _span(item.get("read_from"), item.get("read_to")),
+        "根数": int(item.get("read_n") or 0),
+        "新增": int(item.get("added_n") or 0),
+        "应有": expected or None,
+        "缺失": int(item.get("missing_n") or 0) if expected else None,
+        "说明": item.get("note") or "",
+    }
+
+
 def write_inventory_excel(path: Path, book: dict[str, Any]) -> None:
     """写成给人看的 Excel：先总览，再按来源/合约，最后一组一行明细。"""
     from openpyxl import Workbook
@@ -238,6 +266,7 @@ def write_inventory_excel(path: Path, book: dict[str, Any]) -> None:
             ("这是什么", "电脑里已经存下的 K 线总账。只读本地库，不拉网、不下单。"),
             ("清洗后", "开仓和回测看这一份。东方财富带 @eastmoney，天勤带 @tq，同花顺图带 @ths。"),
             ("接口原样", "刚从网上或图上读下来、还没清洗的那一份。"),
+            ("读取记录", "每次从同花顺图读一批就记一行：请求时段、实读范围、根数、新增和缺口。"),
             ("怎么看", "「总览」看一共有多少；「明细」可按数据源、合约、周期筛选。"),
             ("检查时间", book.get("checked_at") or ""),
         ],
@@ -273,6 +302,12 @@ def write_inventory_excel(path: Path, book: dict[str, Any]) -> None:
         detail_ws,
         ["哪一份", "数据源", "品种", "合约", "周期", "根数", "从", "到", "跨度天数", "距今分钟", "库存名"],
         list(book.get("detail") or []),
+    )
+    ingest_ws = wb.create_sheet("读取记录")
+    _write_table(
+        ingest_ws,
+        ["读取时间", "数据源", "合约", "周期", "请求时段", "实读范围", "根数", "新增", "应有", "缺失", "说明"],
+        [_ingest_row(item) for item in (book.get("ingests") or [])],
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     wb.save(path)

@@ -5,15 +5,22 @@
 前一段要赚钱；后一段可以把赚变成小亏，但不能亏掉一半以上。
 """
 
+import copy
 from types import SimpleNamespace
 
+import pandas as pd
 import pytest
 
+from src.backtest.engine import BacktestResult
+from src.backtest.evaluation import EvaluationReport, EvaluationThresholds
+from src.backtest.metrics import TradeRecord, calc_performance
 from src.backtest.optimizer import (
     HOLDOUT_LOSS_RATIO,
     _apply_params,
+    _evaluate_champion_full_range,
     _factory_values,
     _finest_grid_timeframe,
+    _holdout_perf_for_params,
     _sample_combos,
     _trades_on_or_after,
     clamp_holdout_pct,
@@ -95,6 +102,43 @@ def test_walk_efficiency_and_once_cut_ratio() -> None:
     assert "检验效率" in reason
 
 
+def test_holdout_replays_only_the_holdout_window(monkeypatch) -> None:
+    """检验段要独立重跑：只给检验区间（前面带 warmup），不再从头跑一遍。"""
+    from src.backtest import optimizer as optimizer_module
+
+    seen: dict[str, object] = {}
+
+    class _Perf:
+        def to_dict(self) -> dict:
+            return {}
+
+    class _Full:
+        performance = _Perf()
+        trades: list = []
+
+    def fake_run(_cfg, **kwargs):
+        seen.update(kwargs)
+        return _Full()
+
+    monkeypatch.setattr(optimizer_module, "run_backtest", fake_run)
+    bars = pd.DataFrame(
+        {"open": [1.0], "high": [1.0], "low": [1.0], "close": [1.0]},
+        index=[pd.Timestamp("2026-10-20 09:00")],
+    )
+    _holdout_perf_for_params(
+        {"strategy": {"engine": "trend_follow"}, "trade": {}, "risk": {}},
+        symbol="bu",
+        engine_name="trend_follow",
+        params={},
+        bars_signal=bars,
+        bars_trail=None,
+        holdout_start_ts=pd.Timestamp("2026-10-15"),
+        holdout_end_ts=pd.Timestamp("2026-10-20"),
+    )
+    assert str(seen["start_date"]).startswith("2026-10-15")
+    assert str(seen["end_date"]).startswith("2026-10-20")
+
+
 def test_perf_block_matches_overall_fields() -> None:
     """训练/检验成绩和整体结果一样，都写出成交、净盈亏、盈利因子、最大回撤、盈利覆盖。"""
     lines = format_perf_block(
@@ -162,11 +206,11 @@ def test_holdout_profit_can_be_saved() -> None:
     assert "也是赚的" in reason
 
 
-def test_no_holdout_trade_is_not_a_big_loss() -> None:
-    """后一段没开仓，不能当成还会赚，但也不算大亏。"""
+def test_no_holdout_trade_is_not_accepted() -> None:
+    """后一段没有成交就没有样本外证据，不能当成通过了。"""
     ok, reason = judge_holdout(1000, 0, 0)
-    assert ok is True
-    assert "没有开仓" in reason
+    assert ok is False
+    assert "没有成交" in reason
 
 
 def test_train_loss_cannot_be_saved() -> None:
@@ -730,4 +774,390 @@ def test_judge_better_requires_holdout_not_worse() -> None:
     )
     assert better["can_apply_live"] is True
     assert "全面优于" in better["reason"]
+
+
+def _champion_eval_result(trades_count: int = 40) -> BacktestResult:
+    """构造一段确定的全区间结果，避免评估口径测试依赖行情和指标计算。"""
+    trades = []
+    equity = [100_000.0]
+    equity_times = ["2026-10-01 09:00:00"]
+    for index in range(trades_count):
+        pnl = 100.0 if index % 4 else -50.0
+        day = 1 + index // 10
+        minute = index % 10
+        trade = TradeRecord(
+            symbol="fu2701",
+            side="long",
+            entry_time=f"2026-10-{day:02d} 09:{minute:02d}:00",
+            exit_time=f"2026-10-{day:02d} 10:{minute:02d}:00",
+            entry_price=100.0,
+            exit_price=101.0 if pnl > 0 else 99.0,
+            volume=1,
+            pnl=pnl,
+            adx_at_entry=25.0,
+        )
+        trades.append(trade)
+        equity.append(equity[-1] + pnl)
+        equity_times.append(trade.exit_time)
+    return BacktestResult(
+        symbol="fu2701",
+        timeframe="5",
+        trail_timeframe="5",
+        bars=500,
+        performance=calc_performance(trades, equity, min_trades=1),
+        trades=trades,
+        equity=equity,
+        equity_times=equity_times,
+        params_snapshot={
+            "capital": 100_000.0,
+            "data_from": "2026-10-01",
+            "data_to": "2026-10-31",
+        },
+    )
+
+
+def test_champion_evaluation_and_stress_share_full_range_config(monkeypatch) -> None:
+    """主评估、滑点和扰动都用冠军配置与完整区间，扰动基准也来自全区间 PF。"""
+    cfg = {
+        "strategy": {
+            "engine": "trend_follow",
+            "trend_follow": {"entry_bars": 36, "atr_mult": 2.0},
+        },
+        "backtest": {"slippage_ticks": 1.0},
+    }
+    original = copy.deepcopy(cfg)
+    eval_result = _champion_eval_result(40)
+    full_calls = []
+    slip_calls = []
+    pert_calls = []
+
+    def full_runner(run_cfg, **kwargs):
+        full_calls.append((copy.deepcopy(run_cfg), dict(kwargs)))
+        return eval_result
+
+    def fake_slippage(run_cfg, **kwargs):
+        slip_calls.append((copy.deepcopy(run_cfg), dict(kwargs)))
+        return {
+            "profit_factor": 1.6,
+            "base_ticks": 1.0,
+            "stress_ticks": 2.0,
+            "error": "",
+        }
+
+    def fake_perturbation(run_cfg, **kwargs):
+        pert_calls.append((copy.deepcopy(run_cfg), dict(kwargs)))
+        return {
+            "ok": True,
+            "cliff": False,
+            "points_count": 4,
+            "worst_pf": 1.5,
+            "error": "",
+        }
+
+    monkeypatch.setattr("src.backtest.stress.run_slippage_stress", fake_slippage)
+    monkeypatch.setattr("src.backtest.stress.run_perturbation", fake_perturbation)
+    training_snapshot = {"segment": "train", "entry_bars": 48}
+    report, slip, pert = _evaluate_champion_full_range(
+        cfg,
+        best_params={"entry_bars": 48, "atr_mult": 2.5},
+        symbol="fu2701",
+        engine_name="trend_follow",
+        param_keys=["entry_bars", "atr_mult"],
+        start_date="2026-10-01",
+        end_date="2026-10-31",
+        thresholds=EvaluationThresholds(stress_min_trades=30),
+        runner=full_runner,
+    )
+
+    assert not report.skipped
+    assert slip["profit_factor"] == 1.6
+    assert pert["points_count"] == 4
+    assert len(full_calls) == 1
+    full_cfg, full_kwargs = full_calls[0]
+    assert full_cfg["strategy"]["trend_follow"] == {"entry_bars": 48, "atr_mult": 2.5}
+    assert full_kwargs["start_date"] == "2026-10-01"
+    assert full_kwargs["end_date"] == "2026-10-31"
+    assert "bars_signal" not in full_kwargs
+    assert cfg == original
+    assert training_snapshot == {"segment": "train", "entry_bars": 48}
+
+    for stress_cfg, stress_kwargs in (slip_calls[0], pert_calls[0]):
+        assert stress_cfg == full_cfg
+        assert stress_kwargs["start_date"] == "2026-10-01"
+        assert stress_kwargs["end_date"] == "2026-10-31"
+        assert stress_kwargs["runner"] is full_runner
+    assert pert_calls[0][1]["base_pf"] == eval_result.performance.profit_factor
+    assert pert_calls[0][1]["param_keys"] == ["entry_bars", "atr_mult"]
+
+
+def test_champion_stress_threshold_uses_full_range_trade_count() -> None:
+    """全区间不足 30 笔就不跑压力，不能拿训练段笔数代替。"""
+    calls = []
+
+    def runner(_cfg, **kwargs):
+        calls.append(kwargs)
+        return _champion_eval_result(29)
+
+    _report, slip, pert = _evaluate_champion_full_range(
+        {"strategy": {"engine": "trend_follow", "trend_follow": {"entry_bars": 36}}},
+        best_params={"entry_bars": 48},
+        symbol="fu2701",
+        engine_name="trend_follow",
+        param_keys=["entry_bars"],
+        start_date=None,
+        end_date=None,
+        thresholds=EvaluationThresholds(stress_min_trades=30),
+        runner=runner,
+    )
+    assert len(calls) == 1
+    assert slip == {}
+    assert pert == {}
+
+
+def test_champion_full_range_failure_returns_skipped_report() -> None:
+    """全区间复跑失败要留下明确原因，不能退回训练段评估冒充成功。"""
+
+    def broken_runner(_cfg, **_kwargs):
+        raise RuntimeError("测试行情失败")
+
+    report, slip, pert = _evaluate_champion_full_range(
+        {"strategy": {"engine": "trend_follow", "trend_follow": {"entry_bars": 36}}},
+        best_params={"entry_bars": 48},
+        symbol="fu2701",
+        engine_name="trend_follow",
+        param_keys=["entry_bars"],
+        start_date="2026-10-01",
+        end_date="2026-10-31",
+        thresholds=EvaluationThresholds(),
+        runner=broken_runner,
+    )
+    assert "冠军参数全区间评估失败" in report.skipped
+    assert "测试行情失败" in report.skipped
+    assert slip == {}
+    assert pert == {}
+
+
+@pytest.mark.parametrize("gate_on_optimize", [True, False])
+@pytest.mark.parametrize(("skipped", "conclusion"), [("测试评估失败", "watch"), ("", "reject")])
+def test_optimization_evaluation_gate_and_training_snapshot(
+    monkeypatch,
+    gate_on_optimize: bool,
+    skipped: str,
+    conclusion: str,
+) -> None:
+    """评估失败或淘汰时门禁开启则拦截、关闭只提示；best_limits 始终来自训练段。"""
+    from src.backtest.optimizer import optimize_strategy
+
+    bars = pd.DataFrame(
+        {
+            "open": [100.0] * 100,
+            "high": [101.0] * 100,
+            "low": [99.0] * 100,
+            "close": [100.0] * 100,
+            "volume": [1] * 100,
+        },
+        index=pd.date_range("2026-01-01", periods=100, freq="min"),
+    )
+
+    class Provider:
+        def __init__(self, _cfg):
+            pass
+
+        def fetch(self, *_args, **_kwargs):
+            return bars
+
+    training_result = _champion_eval_result(5)
+    training_result.params_snapshot = {"segment": "train", "entry_bars": 48}
+    eval_calls = []
+
+    def train_runner(_cfg, **_kwargs):
+        return training_result
+
+    def fake_full_eval(_cfg, **kwargs):
+        eval_calls.append(kwargs)
+        return EvaluationReport(skipped=skipped, conclusion=conclusion), {}, {}
+
+    monkeypatch.setattr("src.backtest.optimizer.KlineProvider", Provider)
+    monkeypatch.setattr("src.backtest.optimizer.run_backtest", train_runner)
+    monkeypatch.setattr(
+        "src.backtest.optimizer._score_grid_on_slice",
+        lambda *_args, **_kwargs: [
+            {
+                "params": {"entry_bars": 48},
+                "score": 1.0,
+                "performance": {"net_pnl": 1000.0, "profit_factor": 1.8, "trades": 20},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "src.backtest.optimizer._holdout_perf_for_params",
+        lambda *_args, **_kwargs: ({"net_pnl": 100.0, "trades": 3}, []),
+    )
+    monkeypatch.setattr("src.backtest.optimizer._evaluate_champion_full_range", fake_full_eval)
+
+    result = optimize_strategy(
+        {
+            "strategy": {
+                "engine": "trend_follow",
+                "timeframe": "5",
+                "trail_timeframe": "5",
+                "symbols": ["fu2701"],
+                "trend_follow": {"entry_bars": 36},
+            },
+            "evaluation": {"enabled": True, "gate_on_optimize": gate_on_optimize},
+        },
+        symbol="fu2701",
+        grid={"entry_bars": [48]},
+        start_date="2026-01-01",
+        end_date="2026-01-02",
+    )
+
+    assert result.accepted is (not gate_on_optimize)
+    assert result.evaluation_ok is False
+    assert result.best_limits == {"segment": "train", "entry_bars": 48}
+    assert eval_calls[0]["best_params"] == {"entry_bars": 48}
+    assert eval_calls[0]["start_date"] == "2026-01-01"
+    assert eval_calls[0]["end_date"] == "2026-01-02"
+    if gate_on_optimize:
+        assert "这次不写入" in result.evaluation_reason
+    else:
+        assert "仅提示，不拦截写入" in result.evaluation_reason
+
+
+def test_optimize_walk_mode_keeps_rolling_search(monkeypatch) -> None:
+    """滚动前进仍按段搜索、按段验收，结果里记下实际段数和每段明细。"""
+    from src.backtest.optimizer import MODE_WALK, optimize_strategy
+
+    bars = pd.DataFrame(
+        {
+            "open": [100.0] * 200,
+            "high": [101.0] * 200,
+            "low": [99.0] * 200,
+            "close": [100.0] * 200,
+            "volume": [1] * 200,
+        },
+        index=pd.date_range("2026-01-01", periods=200, freq="min"),
+    )
+
+    class Provider:
+        def __init__(self, _cfg):
+            pass
+
+        def fetch(self, *_args, **_kwargs):
+            return bars
+
+    progress_phases: list[str] = []
+
+    monkeypatch.setattr("src.backtest.optimizer.KlineProvider", Provider)
+    monkeypatch.setattr(
+        "src.backtest.optimizer.run_backtest", lambda *_a, **_k: _champion_eval_result(5)
+    )
+    monkeypatch.setattr(
+        "src.backtest.optimizer._score_grid_on_slice",
+        lambda *_args, **_kwargs: [
+            {
+                "params": {"entry_bars": 48},
+                "score": 1.0,
+                "performance": {"net_pnl": 1000.0, "profit_factor": 1.8, "trades": 20},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        "src.backtest.optimizer._holdout_perf_for_params",
+        lambda *_args, **_kwargs: ({"net_pnl": 100.0, "trades": 3}, []),
+    )
+
+    result = optimize_strategy(
+        {
+            "strategy": {
+                "engine": "trend_follow",
+                "timeframe": "5",
+                "trail_timeframe": "5",
+                "symbols": ["fu2701"],
+                "trend_follow": {"entry_bars": 36},
+            },
+            "risk": {"capital": 100_000},
+        },
+        symbol="fu2701",
+        grid={"entry_bars": [48]},
+        start_date="2026-01-01",
+        end_date="2026-01-02",
+        mode=MODE_WALK,
+        walk_steps=3,
+        progress=lambda done, total, phase: progress_phases.append(phase),
+    )
+
+    assert result.mode == MODE_WALK
+    assert result.walk_steps >= 1
+    assert len(result.walk_folds) == result.walk_steps
+    assert result.trials[0]["params"] == {"entry_bars": 48}
+    assert any(phase.startswith("第1段 冠军复跑") for phase in progress_phases)
+
+
+def test_load_optimization_bars_rejects_short_history(monkeypatch) -> None:
+    """K 线不足 50 根时直接报错，避免拿一小段行情挑参数。"""
+    from src.backtest.optimizer import _load_optimization_bars
+
+    class Provider:
+        def __init__(self, _cfg):
+            pass
+
+        def fetch(self, *_args, **_kwargs):
+            return pd.DataFrame(
+                {"open": [], "high": [], "low": [], "close": [], "volume": []}
+            )
+
+    monkeypatch.setattr("src.backtest.optimizer.KlineProvider", Provider)
+
+    with pytest.raises(RuntimeError, match="优化用K线不足"):
+        _load_optimization_bars(
+            {"strategy": {"timeframe": "5", "trail_timeframe": "5"}},
+            symbol="fu2701",
+            engine_name="trend_follow",
+            grid={"entry_bars": [48]},
+            start_date=None,
+            end_date=None,
+        )
+
+
+def test_once_cut_search_without_usable_trials(monkeypatch) -> None:
+    """所有参数组都失败时不给冠军，也不写回任何参数。"""
+    from src.backtest.optimizer import _once_cut_search
+
+    bars = pd.DataFrame(
+        {
+            "open": [100.0] * 120,
+            "high": [101.0] * 120,
+            "low": [99.0] * 120,
+            "close": [100.0] * 120,
+            "volume": [1] * 120,
+        },
+        index=pd.date_range("2026-01-01", periods=120, freq="min"),
+    )
+    monkeypatch.setattr(
+        "src.backtest.optimizer._score_grid_on_slice",
+        lambda *_args, **_kwargs: [
+            {"params": {"entry_bars": 48}, "score": -999, "error": "回测失败"}
+        ],
+    )
+
+    outcome = _once_cut_search(
+        {"strategy": {"engine": "trend_follow"}, "risk": {"capital": 100_000}},
+        symbol="fu2701",
+        engine_name="trend_follow",
+        combos=[(48,)],
+        keys=["entry_bars"],
+        bars_signal=bars,
+        bars_trail=None,
+        min_trades=3,
+        train_ratio=0.7,
+        holdout_pct=30.0,
+        cross_n=0,
+        total_steps=3,
+        report=lambda *_args: None,
+    )
+
+    assert outcome.best_params == {}
+    assert outcome.best_result is None
+    assert "成交太少" in outcome.reason
 

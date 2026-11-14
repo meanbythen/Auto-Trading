@@ -34,6 +34,8 @@ def render_report(
     diagnosis: Diagnosis | None = None,
     scorecard: Scorecard | None = None,
     baseline: BaselineReport | None = None,
+    replay_eval: list[str] | None = None,
+    live_eval: list[str] | None = None,
     now: datetime | None = None,
 ) -> str:
     """拼出完整复盘正文。"""
@@ -102,7 +104,15 @@ def render_report(
     for row in baseline.lines:
         lines.append(f"  {row}" if not row.startswith("  ") else row)
 
-    lines.extend(["", "十、综合：开仓还是观望，为什么，以及今天信不信这套规则"])
+    lines.extend(["", "十、当日重放评估"])
+    for row in replay_eval or ["（未生成）"]:
+        lines.append(f"  {row}" if not row.startswith("  ") else row)
+
+    lines.extend(["", "十一、最近实盘 vs 最近回测"])
+    for row in live_eval or ["（未生成）"]:
+        lines.append(f"  {row}" if not row.startswith("  ") else row)
+
+    lines.extend(["", "十二、综合：开仓还是观望，为什么，以及今天信不信这套规则"])
     for row in _conclusion(
         technicals,
         fundamental,

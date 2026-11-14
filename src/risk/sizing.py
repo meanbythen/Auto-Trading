@@ -34,12 +34,8 @@ from typing import Any
 
 from loguru import logger
 
-# 国内常见主力：报价「元/吨」，合约乘数「吨/手」→ 价格动1点，每手盈亏≈乘数 元
-DEFAULT_CONTRACTS: dict[str, dict[str, float]] = {
-    "bu": {"multiplier": 10, "name": "沥青"},
-    "c": {"multiplier": 10, "name": "玉米"},
-    "rb": {"multiplier": 10, "name": "螺纹"},
-}
+from src.domain.contracts import DEFAULT_CONTRACTS as DEFAULT_CONTRACTS
+from src.domain.contracts import build_contracts
 
 # 仓位上限默认 80%：权益里最多拿出这么多交保证金，其余留作缓冲。
 DEFAULT_MARGIN_USAGE_PCT = 80.0
@@ -100,19 +96,7 @@ class PositionSizer:
         except (TypeError, ValueError):
             self.margin_usage_pct = DEFAULT_MARGIN_USAGE_PCT
 
-        contracts = {**DEFAULT_CONTRACTS}
-        custom = risk.get("contracts") or {}
-        for k, v in custom.items():
-            if isinstance(v, dict):
-                contracts[str(k).lower()] = {
-                    "multiplier": float(v.get("multiplier", 10)),
-                    "name": str(v.get("name", k)),
-                    "margin": float(v.get("margin", 0) or 0),
-                    "margin_rate_pct": float(v.get("margin_rate_pct", 0) or 0),
-                }
-            else:
-                contracts[str(k).lower()] = {"multiplier": float(v), "name": str(k)}
-        self.contracts = contracts
+        self.contracts = build_contracts(cfg)
 
     def _product_key(self, symbol: str) -> str:
         """
@@ -168,7 +152,7 @@ class PositionSizer:
         参数:
             symbol: 品种代码
             entry_price: 计划入场价（可空）
-            stop_price: 策略止损价（可空；空则退回固定手数）
+            stop_price: 策略止损价（可空；按风险百分比算仓时必须有效，否则拒单）
             current_abs_position: 当前已持手数绝对值（用于已占用保证金）
             positions: 各品种净持仓。用来按各自的保证金扣掉已经占用的钱。
         """
@@ -263,9 +247,14 @@ class PositionSizer:
             vol = max(0, self.fixed_volume)
             return vol, f"固定手数模式 volume={vol}", 0.0, 0.0, 0.0
 
-        if entry_price is None or stop_price is None:
-            vol = max(self.min_volume, self.fixed_volume)
-            return vol, f"缺少入场/止损价，退回固定手数 {vol}", 0.0, 0.0, 0.0
+        if (
+            entry_price is None
+            or stop_price is None
+            or float(entry_price) <= 0
+            or float(stop_price) == 0
+        ):
+            # 按风险百分比开仓必须有止损价（0 也视为没设），否则等于开一张没有保护的上限仓位。
+            return 0, "缺少有效的入场价/止损价，risk_pct 模式不开无止损仓", 0.0, 0.0, 0.0
 
         stop_dist = abs(float(entry_price) - float(stop_price))
         if stop_dist <= 0:
@@ -329,11 +318,12 @@ class PositionSizer:
         # 期货公司回报的可用资金已经扣过真实保证金。再和本地估算取较小值，
         # 不会因为两边各扣一次而少开；可用更紧时按柜台为准。
         if self.cash_available is not None:
+            avail: float | None
             try:
                 avail = float(self.cash_available)
             except (TypeError, ValueError):
                 avail = None
-            else:
+            if avail is not None:
                 remain = min(remain, avail)
                 note = note + f"，柜台可用{avail:.0f}元"
         if remain < need:

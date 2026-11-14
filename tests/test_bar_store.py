@@ -1,11 +1,13 @@
 """本地K线库：新下载追加，旧时间不丢。"""
 
+import sqlite3
 from datetime import datetime
 
 import pandas as pd
 
 from src.data.bar_store import (
     BarStore,
+    RawBarStore,
     aligned_bars,
     merge_bars,
     merge_local_and_download,
@@ -114,6 +116,45 @@ def test_live_fetch_does_not_grow_store_when_download_is_unchanged(tmp_path) -> 
     second = provider.fetch("bu2612", "5")
     assert provider.store.count("bu2612", "5") == stored_after_first
     pd.testing.assert_frame_equal(first, second)
+
+
+def test_backtest_fetch_skips_full_rewrite_when_history_is_unchanged(tmp_path) -> None:
+    """回测重复取同一段历史时不整段重写库和 CSV，只有新K线才写。"""
+    cfg = {
+        "_project_root": str(tmp_path),
+        "data": {"source": "akshare", "cache_dir": "data/klines", "min_bars": 1, "live_max_bars": 3},
+        "strategy": {"timeframe": "5"},
+    }
+    provider = KlineProvider(cfg)
+    rows = [
+        ("2026-10-16 21:55:00", 100),
+        ("2026-10-16 22:00:00", 101),
+        ("2026-10-16 22:05:00", 102),
+    ]
+    provider._fetch_akshare = lambda *_args, **_kwargs: _frame(rows)  # type: ignore[method-assign]
+    provider.fetch("bu2612", "5", keep_history=True)
+    csv_path = provider._cache_path("bu2612", "5")
+    csv_mtime = csv_path.stat().st_mtime_ns
+
+    written: list[int] = []
+    original_upsert = provider.store.upsert
+
+    def spy(symbol: str, period: str, frame: pd.DataFrame) -> int:
+        written.append(len(frame))
+        return original_upsert(symbol, period, frame)
+
+    provider.store.upsert = spy  # type: ignore[method-assign]
+    provider.fetch("bu2612", "5", keep_history=True)
+    assert written == []
+    assert csv_path.stat().st_mtime_ns == csv_mtime
+
+    # 多一根新K线时，只写这一根。
+    provider._fetch_akshare = lambda *_args, **_kwargs: _frame(  # type: ignore[method-assign]
+        [*rows, ("2026-10-16 22:10:00", 103)]
+    )
+    provider.fetch("bu2612", "5", keep_history=True)
+    assert written == [1]
+    assert provider.store.count("bu2612", "5") == 4
 
 
 def test_aligned_bars_drop_demo_rows_between_real_15m_bars() -> None:
@@ -281,3 +322,52 @@ def test_complete_past_range_skips_download(tmp_path) -> None:
     history = provider.fetch("bu2612", "5", keep_history=True, start="2020-01-02", end="2020-01-03")
     assert len(history) == 2
     assert float(history.iloc[0]["close"]) == 80
+
+
+def test_store_keeps_open_interest_and_does_not_erase_it(tmp_path) -> None:
+    """持仓量要能存下来；后续没带持仓的批次不能把它冲成空。"""
+    store = BarStore(tmp_path / "market.sqlite")
+    first = _frame([("2026-09-01 09:00:00", 100)])
+    first["oi"] = [123456.0]
+    store.upsert("bu2612", "5", first)
+    loaded = store.load("bu2612", "5")
+    assert loaded is not None
+    assert float(loaded.iloc[0]["oi"]) == 123456.0
+
+    store.upsert("bu2612", "5", _frame([("2026-09-01 09:00:00", 101)]))
+    loaded = store.load("bu2612", "5")
+    assert loaded is not None
+    assert float(loaded.iloc[0]["close"]) == 101
+    assert float(loaded.iloc[0]["oi"]) == 123456.0
+
+
+def test_raw_store_keeps_open_interest(tmp_path) -> None:
+    raw = RawBarStore(tmp_path / "raw.sqlite")
+    frame = _frame([("2026-09-01 09:00:00", 100)])
+    frame["oi"] = [90000.0]
+    raw.upsert("bu2612", "5", "ths", frame)
+    loaded = raw.load("bu2612", "5", "ths")
+    assert loaded is not None
+    assert float(loaded.iloc[0]["oi"]) == 90000.0
+
+
+def test_old_bars_table_gets_oi_column(tmp_path) -> None:
+    """老库没有持仓列时，打开后自动补列，旧数据持仓为空。"""
+    path = tmp_path / "market.sqlite"
+    conn = sqlite3.connect(path)
+    conn.execute(
+        "CREATE TABLE bars (symbol TEXT NOT NULL, period TEXT NOT NULL, ts TEXT NOT NULL, "
+        "open REAL, high REAL, low REAL, close REAL, volume REAL, "
+        "PRIMARY KEY (symbol, period, ts))"
+    )
+    conn.execute(
+        "INSERT INTO bars VALUES ('bu2612','5','2026-09-01 09:00:00',100,101,99,100,10)"
+    )
+    conn.commit()
+    conn.close()
+
+    store = BarStore(path)
+    loaded = store.load("bu2612", "5")
+    assert loaded is not None
+    assert "oi" in loaded.columns
+    assert pd.isna(loaded.iloc[0]["oi"])

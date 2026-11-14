@@ -103,7 +103,10 @@ CROSS_COLUMNS = [
     "盈利因子",
     "盈亏比",
     "收益期望",
+    "R期望",
     "最大回撤",
+    "卡尔玛",
+    "最大连亏",
     "净盈亏",
     "盈利覆盖",
     "收益率",
@@ -117,6 +120,8 @@ CROSS_COLUMNS = [
     "日均",
     "K线根数",
     "得分",
+    "评估",
+    "未通过项",
     "流动性",
     "结果",
     "持仓手数",
@@ -137,6 +142,8 @@ OPTIMIZE_COLUMNS = [
     "测试时间",
     "名次",
     "得分",
+    "评估",
+    "未通过项",
     "成交笔数",
     "胜率",
     "净盈亏",
@@ -416,6 +423,21 @@ def export_cross(root: Path | str, excel_path: Path | str | None = None) -> tupl
     return written, added, int(len(merged))
 
 
+def _eval_text(evaluation: Any) -> str:
+    """优化导出用的评估结论。老结果没有这一块时留空。"""
+    if not isinstance(evaluation, dict) or not evaluation:
+        return ""
+    return str(evaluation.get("conclusion_text") or "")
+
+
+def _eval_failed(evaluation: Any) -> str:
+    """优化导出用的未通过项。"""
+    if not isinstance(evaluation, dict):
+        return ""
+    items = evaluation.get("failed_items") or []
+    return "、".join(str(item) for item in items)
+
+
 def export_optimize(root: Path | str, excel_path: Path | str | None = None) -> tuple[Path, int, int]:
     """
     把最近一次策略优化追加进统一 Excel 的「优化结果」表，不盖掉以前的优化。
@@ -592,7 +614,10 @@ def _cross_frame(root: Path) -> pd.DataFrame:
                 "盈利因子": row.get("profit_factor") or "",
                 "盈亏比": row.get("payoff") or "",
                 "收益期望": row.get("expectancy") or "",
+                "R期望": row.get("r_expectancy") or "",
                 "最大回撤": row.get("max_drawdown") or "",
+                "卡尔玛": row.get("calmar") or "",
+                "最大连亏": row.get("loss_streak") or "",
                 "净盈亏": row.get("net_pnl") or "",
                 "盈利覆盖": cover_cols["盈利覆盖"],
                 "收益率": row.get("return_rate") or "",
@@ -606,6 +631,8 @@ def _cross_frame(root: Path) -> pd.DataFrame:
                 "日均": cover_cols["日均"],
                 "K线根数": row.get("bars") or "",
                 "得分": row.get("score") or "",
+                "评估": row.get("evaluation") or "",
+                "未通过项": row.get("fail_items") or "",
                 "流动性": row.get("liquidity") or "",
                 "结果": row.get("picked") or "",
                 "持仓手数": lots,
@@ -908,6 +935,33 @@ def _backtest_signal_frame(root: Path) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=BACKTEST_SIGNAL_COLUMNS)
 
 
+def _day_gap(start: Any, end: Any) -> int | None:
+    """两个日期字符串差几天；解析不了返回 None。"""
+    try:
+        left = datetime.fromisoformat(str(start).replace("T", " ")[:10]).date()
+        right = datetime.fromisoformat(str(end).replace("T", " ")[:10]).date()
+    except (TypeError, ValueError):
+        return None
+    return (right - left).days
+
+
+def _walk_holdout_days(payload: dict[str, Any]) -> int | None:
+    """滚动前进各段检验区间天数之和。一次切断返回 None，走首尾差。"""
+    if str(payload.get("mode") or "") != "滚动前进":
+        return None
+    total = 0
+    counted = False
+    for fold in payload.get("walk_folds") or []:
+        if not isinstance(fold, dict):
+            continue
+        gap = _day_gap(fold.get("holdout_start"), fold.get("holdout_end"))
+        if gap is None:
+            continue
+        total += max(0, gap)
+        counted = True
+    return total if counted else None
+
+
 def _optimize_ran_at(payload: dict[str, Any], report_path: Path) -> str:
     """
     取出这次优化跑完的时间，格式固定成「2026-10-19 14:59:12」。
@@ -965,6 +1019,7 @@ def _optimize_frame(root: Path) -> pd.DataFrame:
         hold_perf.get("trades"),
         hold_start,
         end,
+        span_days=_walk_holdout_days(payload),
     )
     best_cover = cover_export_cells(
         best_perf.get("net_pnl"),
@@ -998,6 +1053,8 @@ def _optimize_frame(root: Path) -> pd.DataFrame:
         {
             "名次": "最优",
             "得分": payload.get("best_score"),
+            "评估": _eval_text(payload.get("evaluation")),
+            "未通过项": _eval_failed(payload.get("evaluation")),
             "成交笔数": best_perf.get("trades"),
             "胜率": best_perf.get("win_rate"),
             "净盈亏": best_perf.get("net_pnl"),

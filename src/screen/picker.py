@@ -18,6 +18,9 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from src.backtest.evaluation import verdict_text
+from src.strategy.factory import ENGINE_ALIASES, cross_engine_choices
+
 # 主力连续：代码末尾的 0 表示「当前主力」，例如 rb0 会到新浪去拉 RB0。
 # 每一项是（代码，中文名，乘数，是否流动性偏少）。
 # 乘数是「价格动 1 个点，1 手大约盈亏多少元」。回撤要折成钱才能横向比。
@@ -355,32 +358,12 @@ def _attach_universe_contracts(risk: dict[str, Any]) -> None:
 
 
 # 比策略时按这个顺序，每套只测一次。旧的短名字不单独测，避免同一套跑两遍。
-SCREEN_STRATEGIES: list[tuple[str, str]] = [
-    ("daily_body", "日内实体"),
-    ("float_hold", "日内浮盈飘单"),
-    ("trend_follow", "趋势跟随"),
-    ("supertrend", "SuperTrend趋势"),
-    ("dual_ma", "双均线趋势"),
-    ("ema_swing", "均线波段"),
-    ("bollinger", "布林带突破"),
-    ("sar_trend", "SAR波段趋势"),
-    ("multi_factor", "多因子CTA（加权打分）"),
-    ("swing_trend", "长线趋势加减仓"),
-    ("swing_box", "长线箱体突破"),
-]
+# 交叉测试可选策略：统一从策略工厂取，不再在这里另抄一份名单。
+# 以损定开、凯利突破参数维度太高，暂不参与交叉测试（见 factory.CROSS_TEST_ENGINE_ORDER）。
+SCREEN_STRATEGIES: list[tuple[str, str]] = cross_engine_choices()
 
 # 配置里可能写着旧的短名字。交叉测试只认左边这一套，避免同一套跑两遍。
-_ENGINE_ALIAS = {
-    "st": "supertrend",
-    "ma_cross": "dual_ma",
-    "boll": "bollinger",
-    "bollinger_break": "bollinger",
-    "sar": "sar_trend",
-    "parabolic_sar": "sar_trend",
-    "multi": "multi_factor",
-    "cta": "multi_factor",
-    "macd_swing": "ema_swing",
-}
+_ENGINE_ALIAS = ENGINE_ALIASES
 
 
 # 交叉测试可勾选的周期。信号和止损用同一个，不再分开。
@@ -587,29 +570,7 @@ def screen_symbols(
                 end_date=end,
                 engine=engine,
             )
-            perf = result.performance
-            row["trades"] = int(perf.trades)
-            row["win_rate"] = float(perf.win_rate)
-            row["profit_factor"] = float(perf.profit_factor)
-            row["payoff"] = float(getattr(perf, "payoff", 0.0) or 0.0)
-            row["avg_win"] = float(getattr(perf, "avg_win", 0.0) or 0.0)
-            row["avg_loss"] = float(getattr(perf, "avg_loss", 0.0) or 0.0)
-            row["losses"] = int(getattr(perf, "losses", 0) or 0)
-            _exp = getattr(perf, "expectancy", None)
-            row["expectancy"] = 0.0 if _exp is None else float(_exp)
-            row["max_drawdown"] = float(perf.max_drawdown)
-            row["net_pnl"] = float(getattr(perf, "net_pnl", 0.0) or 0.0)
-            row["score"] = float(getattr(perf, "score", 0.0) or 0.0)
-            snap = getattr(result, "params_snapshot", None) or {}
-            # 分母是这次持仓实际要交的保证金，分子是净盈亏。没有成交就空着。
-            margin_used = float(snap.get("margin_used") or 0)
-            row["margin_used"] = margin_used
-            row["return_rate"] = (row["net_pnl"] / margin_used) if margin_used > 0 else None
-            # 实际用到的第一根和最后一根。页面上填的日期可能更宽，这里记真正测到的那段。
-            row["data_from"] = str(snap.get("data_from") or "")
-            row["data_to"] = str(snap.get("data_to") or "")
-            # 信号周期的 K 线根数。旧的测试替身没有这个数时记 0，表格里再留空。
-            row["bars"] = int(getattr(result, "bars", 0) or 0)
+            _fill_backtest_row(result, row)
         except Exception as exc:  # noqa: BLE001
             # 行情缺失或网络失败只记在这一行，不让整批优选停掉。
             row["error"] = str(exc)
@@ -658,6 +619,113 @@ def screen_symbols(
     }
 
 
+def _fill_backtest_row(result: Any, row: dict[str, Any]) -> None:
+    """
+    把一次历史回测的成绩写进表格行。
+
+    单品种优选、比策略、交叉测试都走这里，字段和口径保持一致。
+    """
+    perf = result.performance
+    row["trades"] = int(perf.trades)
+    row["win_rate"] = float(perf.win_rate)
+    row["profit_factor"] = float(perf.profit_factor)
+    row["payoff"] = float(getattr(perf, "payoff", 0.0) or 0.0)
+    row["avg_win"] = float(getattr(perf, "avg_win", 0.0) or 0.0)
+    row["avg_loss"] = float(getattr(perf, "avg_loss", 0.0) or 0.0)
+    row["losses"] = int(getattr(perf, "losses", 0) or 0)
+    _exp = getattr(perf, "expectancy", None)
+    row["expectancy"] = 0.0 if _exp is None else float(_exp)
+    row["max_drawdown"] = float(perf.max_drawdown)
+    row["net_pnl"] = float(getattr(perf, "net_pnl", 0.0) or 0.0)
+    row["score"] = float(getattr(perf, "score", 0.0) or 0.0)
+    snap = getattr(result, "params_snapshot", None) or {}
+    margin_used = float(snap.get("margin_used") or 0)
+    row["margin_used"] = margin_used
+    row["return_rate"] = (row["net_pnl"] / margin_used) if margin_used > 0 else None
+    row["data_from"] = str(snap.get("data_from") or "")
+    row["data_to"] = str(snap.get("data_to") or "")
+    row["bars"] = int(getattr(result, "bars", 0) or 0)
+    row.update(_evaluation_cells(result))
+
+
+def _evaluation_cells(result: Any) -> dict[str, Any]:
+    """
+    把回测自带的评估报告展开成表格字段。
+
+    直接用 run_backtest 按配置门槛算出的 evaluation，不在表格层另算一套。
+    评估没启用或没有成交时留「未评估」，和历史回测页一致。
+    """
+    try:
+        report = getattr(result, "evaluation", None)
+        if report is None:
+            return {
+                "evaluation": "未评估",
+                "verdict": "skip",
+                "fail_items": "",
+                "r_expectancy": None,
+                "calmar": None,
+                "consecutive_losses": None,
+                "eval_checks": [],
+                "eval_metrics": {},
+            }
+        metrics = getattr(report, "metrics", {}) or {}
+        checks = []
+        for check in getattr(report, "checks", []) or []:
+            to_dict = getattr(check, "to_dict", None)
+            checks.append(to_dict() if callable(to_dict) else dict(getattr(check, "__dict__", {})))
+        return {
+            "evaluation": verdict_text(report),
+            "verdict": getattr(report, "conclusion", "watch"),
+            "fail_items": report.failed_text() if hasattr(report, "failed_text") else "",
+            "r_expectancy": metrics.get("r_expectancy"),
+            "calmar": metrics.get("calmar"),
+            "consecutive_losses": metrics.get("consecutive_losses"),
+            "eval_checks": checks,
+            "eval_metrics": dict(metrics),
+        }
+    except Exception as exc:  # noqa: BLE001
+        return {
+            "evaluation": "评估失败",
+            "verdict": "skip",
+            "fail_items": str(exc),
+            "r_expectancy": None,
+            "calmar": None,
+            "consecutive_losses": None,
+            "eval_checks": [],
+            "eval_metrics": {},
+        }
+
+
+def _run_cross_backtest(
+    cfg: dict[str, Any],
+    settings: dict[str, Any],
+    *,
+    symbol: str,
+    engine: str,
+    runner: Callable[..., Any],
+    risk_sizing: bool = False,
+) -> tuple[Any, int | None]:
+    """
+    交叉测试里的一个组合：按这组条件调用同一次历史回测。
+
+    准备配置和手数仍走 prepare_screen_cfg，保证各组对照变量一致。
+    交叉测试始终按固定手数比；比策略时才允许按每笔风险重算手数。
+    """
+    prepared, volume = prepare_screen_cfg(cfg, settings=settings)
+    call_volume: int | None = volume
+    if risk_sizing and settings.get("apply_limits", True) and str(settings.get("sizing_mode") or "") == "risk_pct":
+        call_volume = None
+    result = runner(
+        prepared,
+        symbol=symbol,
+        volume=call_volume,
+        start_date=settings.get("start_date") or None,
+        end_date=settings.get("end_date") or None,
+        engine=engine,
+    )
+    return result, volume
+
+
 def screen_strategies(
     cfg: dict[str, Any],
     symbol: str,
@@ -697,7 +765,6 @@ def screen_strategies(
             on_progress(index, total, label)
         one = dict(spec)
         one["engine"] = engine
-        prepared, volume = prepare_screen_cfg(cfg, settings=one)
         row: dict[str, Any] = {
             "symbol": contract,
             "name": label,
@@ -713,37 +780,10 @@ def screen_strategies(
             "liquidity": liquidity_text(contract),
         }
         try:
-            call_volume = volume
-            if one.get("apply_limits", True) and str(one.get("sizing_mode") or "") == "risk_pct":
-                call_volume = None
-            result = runner(
-                prepared,
-                symbol=contract,
-                volume=call_volume,
-                start_date=one.get("start_date") or None,
-                end_date=one.get("end_date") or None,
-                engine=engine,
+            result, volume = _run_cross_backtest(
+                cfg, one, symbol=contract, engine=engine, runner=runner, risk_sizing=True
             )
-            perf = result.performance
-            row["trades"] = int(perf.trades)
-            row["win_rate"] = float(perf.win_rate)
-            row["profit_factor"] = float(perf.profit_factor)
-            row["payoff"] = float(getattr(perf, "payoff", 0.0) or 0.0)
-            row["avg_win"] = float(getattr(perf, "avg_win", 0.0) or 0.0)
-            row["avg_loss"] = float(getattr(perf, "avg_loss", 0.0) or 0.0)
-            row["losses"] = int(getattr(perf, "losses", 0) or 0)
-            _exp = getattr(perf, "expectancy", None)
-            row["expectancy"] = 0.0 if _exp is None else float(_exp)
-            row["max_drawdown"] = float(perf.max_drawdown)
-            row["net_pnl"] = float(getattr(perf, "net_pnl", 0.0) or 0.0)
-            row["score"] = float(getattr(perf, "score", 0.0) or 0.0)
-            snap = getattr(result, "params_snapshot", None) or {}
-            margin_used = float(snap.get("margin_used") or 0)
-            row["margin_used"] = margin_used
-            row["return_rate"] = (row["net_pnl"] / margin_used) if margin_used > 0 else None
-            row["data_from"] = str(snap.get("data_from") or "")
-            row["data_to"] = str(snap.get("data_to") or "")
-            row["bars"] = int(getattr(result, "bars", 0) or 0)
+            _fill_backtest_row(result, row)
         except Exception as exc:  # noqa: BLE001
             row["error"] = str(exc)
         row["frequency"] = trade_frequency(
@@ -891,7 +931,6 @@ def screen_cross(
                 # 信号和止损用同一个周期，这是这一轮的对照变量。
                 one["timeframe"] = period
                 one["trail_timeframe"] = period
-                prepared, volume = prepare_screen_cfg(cfg, settings=one)
                 row: dict[str, Any] = {
                     "symbol": code,
                     "product": product,
@@ -910,35 +949,11 @@ def screen_cross(
                     "liquidity": liquidity_text(code),
                 }
                 try:
-                    # 始终把固定手数传进去。不能改回按权益算仓，否则保证金高的品种会被账户拦住。
-                    result = runner(
-                        prepared,
-                        symbol=code,
-                        volume=volume,
-                        start_date=one.get("start_date") or None,
-                        end_date=one.get("end_date") or None,
-                        engine=engine,
+                    # 每一个组合就是一次普通历史回测：同一套配置、日期、手数和评估门槛。
+                    result, volume = _run_cross_backtest(
+                        cfg, one, symbol=code, engine=engine, runner=runner
                     )
-                    perf = result.performance
-                    row["trades"] = int(perf.trades)
-                    row["win_rate"] = float(perf.win_rate)
-                    row["profit_factor"] = float(perf.profit_factor)
-                    row["payoff"] = float(getattr(perf, "payoff", 0.0) or 0.0)
-                    row["avg_win"] = float(getattr(perf, "avg_win", 0.0) or 0.0)
-                    row["avg_loss"] = float(getattr(perf, "avg_loss", 0.0) or 0.0)
-                    row["losses"] = int(getattr(perf, "losses", 0) or 0)
-                    _exp = getattr(perf, "expectancy", None)
-                    row["expectancy"] = 0.0 if _exp is None else float(_exp)
-                    row["max_drawdown"] = float(perf.max_drawdown)
-                    row["net_pnl"] = float(getattr(perf, "net_pnl", 0.0) or 0.0)
-                    row["score"] = float(getattr(perf, "score", 0.0) or 0.0)
-                    snap = getattr(result, "params_snapshot", None) or {}
-                    margin_used = float(snap.get("margin_used") or 0)
-                    row["margin_used"] = margin_used
-                    row["return_rate"] = (row["net_pnl"] / margin_used) if margin_used > 0 else None
-                    row["data_from"] = str(snap.get("data_from") or "")
-                    row["data_to"] = str(snap.get("data_to") or "")
-                    row["bars"] = int(getattr(result, "bars", 0) or 0)
+                    _fill_backtest_row(result, row)
                 except Exception as exc:  # noqa: BLE001
                     # 某一个组合拉不到 K 线，只记这一行，后面的品种和策略继续测。
                     row["error"] = str(exc)
@@ -1187,7 +1202,10 @@ def list_rows(result: dict[str, Any]) -> list[dict[str, str]]:
                 "profit_factor": "—",
                 "payoff": "—",
                 "expectancy": "—",
+                "r_expectancy": "—",
                 "max_drawdown": "—",
+                "calmar": "—",
+                "loss_streak": "—",
                 "net_pnl": "—",
                 "profit_cover": empty["profit_cover"],
                 "return_rate": "—",
@@ -1201,6 +1219,8 @@ def list_rows(result: dict[str, Any]) -> list[dict[str, str]]:
                 "daily_avg": empty["daily_avg"],
                 "bars": "—",
                 "score": "—",
+                "evaluation": str(row.get("evaluation") or "未评估"),
+                "fail_items": _fail_text(row.get("fail_items")),
                 "market": _market_text(row),
                 "liquidity": str(row.get("liquidity") or "—"),
                 "picked": "没测成",
@@ -1342,7 +1362,10 @@ def _display_row(
         "profit_factor": _num(source.get("profit_factor")),
         "payoff": _payoff_text(source.get("payoff")),
         "expectancy": _expectancy_text(source),
+        "r_expectancy": _r_text(source.get("r_expectancy")),
         "max_drawdown": _money(source.get("max_drawdown")),
+        "calmar": _calmar_text(source.get("calmar")),
+        "loss_streak": _streak_text(source.get("consecutive_losses")),
         "net_pnl": _money(source.get("net_pnl")),
         "profit_cover": cover["profit_cover"],
         "return_rate": _return_text(source.get("return_rate")),
@@ -1356,6 +1379,8 @@ def _display_row(
         "daily_avg": cover["daily_avg"],
         "bars": _bars_text(source, period),
         "score": _score(source.get("score")),
+        "evaluation": str(source.get("evaluation") or "未评估"),
+        "fail_items": _fail_text(source.get("fail_items")),
         "market": _market_text(source),
         "liquidity": str(source.get("liquidity") or "—"),
         "picked": picked,
@@ -1368,6 +1393,8 @@ def span_cover_fields(
     trades: Any,
     data_from: str,
     data_to: str,
+    *,
+    span_days: int | None = None,
 ) -> dict[str, Any]:
     """
     交叉测试额外几列的算法。
@@ -1375,6 +1402,7 @@ def span_cover_fields(
     盈利覆盖 = 净盈亏 − 最大回撤，表示净赚盖住回撤后还剩多少。
     每笔收益、日均都用盈利覆盖去除，和你在导出表里手加的公式一致。
     天数用结束日减开始日（不多算一天），和 Excel 的 DATEDIF 一样。
+    滚动前进的检验段是多段拼起来的，用 span_days 传各段天数之和，不能拿首尾一大段算。
     """
     try:
         net = float(net_pnl or 0)
@@ -1391,7 +1419,10 @@ def span_cover_fields(
     cover = net - drawdown
     start = _as_day(data_from)
     end = _as_day(data_to)
-    days = (end - start).days if start is not None and end is not None else None
+    if span_days is not None:
+        days: int | None = int(span_days)
+    else:
+        days = (end - start).days if start is not None and end is not None else None
     per_trade = (cover / count) if count > 0 else None
     daily = (cover / days) if days is not None and days > 0 else None
     return {
@@ -1447,13 +1478,17 @@ def cover_export_cells(
     trades: Any,
     data_from: str = "",
     data_to: str = "",
+    *,
+    span_days: int | None = None,
 ) -> dict[str, Any]:
     """
     导出 Excel 用的盈利覆盖相关列。
 
     历史回测摘要、策略优化结果和交叉测试共用同一套算法，方便三张表对照。
     """
-    raw = span_cover_fields(net_pnl, max_drawdown, trades, data_from, data_to)
+    raw = span_cover_fields(
+        net_pnl, max_drawdown, trades, data_from, data_to, span_days=span_days
+    )
     days = raw["span_days"]
     per_trade = raw["pnl_per_trade"]
     daily = raw["daily_avg"]
@@ -1742,6 +1777,45 @@ def _score(value: Any) -> str:
     if number <= -100:
         return "—"
     return f"{number:.2f}"
+
+
+def _r_text(value: Any) -> str:
+    """R 期望保留三位小数。0 也是有效值，不能被当成缺失。"""
+    if value is None or value == "":
+        return "—"
+    try:
+        return f"{float(value):.3f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _calmar_text(value: Any) -> str:
+    """卡尔玛保留两位。没有回撤或没算出来时留空。"""
+    if value is None or value == "":
+        return "—"
+    try:
+        return f"{float(value):.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _streak_text(value: Any) -> str:
+    """最大连亏写成「N笔」。"""
+    if value is None or value == "":
+        return "—"
+    try:
+        return f"{int(float(value))}笔"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _fail_text(value: Any) -> str:
+    """未通过项合并成一行。没有时写横杠。"""
+    if isinstance(value, (list, tuple)):
+        text = "、".join(str(item) for item in value if str(item).strip())
+    else:
+        text = str(value or "").strip()
+    return text or "—"
 
 
 def _return_text(value: Any) -> str:

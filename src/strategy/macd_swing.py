@@ -381,6 +381,9 @@ class MacdSwingStrategy(StrategyBase):
         close_s: pd.Series,
         ema_slope: pd.Series,
     ) -> StrategyDecision:
+        # 本根算出的 EMA 止损下一根才用来判止损；判定和成交都用上一根已知的线。
+        prev_stop = float(pos.trail_stop or pos.initial_stop or 0.0)
+        judge_stop = prev_stop or float(stop_line)
         pos.trail_stop = float(stop_line)
         opposite = (pos.side == "long" and cross_down) or (pos.side == "short" and cross_up)
         if opposite:
@@ -394,11 +397,16 @@ class MacdSwingStrategy(StrategyBase):
                 f"{'多' if pos.side == 'long' else '空'}",
             )
 
-        if stop_line > 0 and stop_triggered(
-            side=pos.side, stop=stop_line, close=close, high=high, low=low, mode=self.stop_mode
+        if judge_stop > 0 and stop_triggered(
+            side=pos.side, stop=judge_stop, close=close, high=high, low=low, mode=self.stop_mode
         ):
             return self._close_decision(
-                symbol, pos, now, bar_id, f"碰到 EMA{self.stop_ema} 止损 {stop_line:.2f}，平仓"
+                symbol,
+                pos,
+                now,
+                bar_id,
+                f"碰到 EMA{self.stop_ema} 止损 {judge_stop:.2f}，平仓",
+                stop_price=judge_stop,
             )
 
         if self.slope_exit:
@@ -484,6 +492,8 @@ class MacdSwingStrategy(StrategyBase):
         now: datetime,
         bar_id: str,
         reason: str,
+        *,
+        stop_price: float | None = None,
     ) -> StrategyDecision:
         self._pending[symbol] = {"time": now, "bar_id": bar_id}
         self._close_side[symbol] = pos.side
@@ -493,7 +503,7 @@ class MacdSwingStrategy(StrategyBase):
             symbol,
             reason,
             entry_price=pos.entry_price,
-            stop_price=pos.trail_stop or pos.initial_stop,
+            stop_price=stop_price if stop_price is not None else (pos.trail_stop or pos.initial_stop),
         )
 
 

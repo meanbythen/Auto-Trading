@@ -1,6 +1,7 @@
 """
 期货交易日
-功能：按期货实盘的口径算「今天属于哪个交易日」，供换日清零和安全重启使用。
+功能：按期货实盘的口径算「今天属于哪个交易日」，供换日清零和安全重启使用；
+     并提供交易所休市日历，供收盘清仓时钟跳过节假日和临时休市。
 原理：夜盘 21:00 起算下一交易日；从 21:00 一直到次日 20:59（含次日日盘）都归这一日，
 以次日日盘日期为准。02:30 只是夜盘收盘，之后到次日 21:00 之前仍算同一交易日。
 周末没有交易，落到周末的时间一律顺延到周一。
@@ -8,6 +9,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from datetime import date, datetime, time as dtime, timedelta
 
 # 夜盘开始时间。到了这个点，就已经是下一个交易日了。
@@ -15,6 +17,57 @@ NIGHT_START = dtime(21, 0)
 # 结算单缓存单独提前一小时换日：程序 20:50 就登录夜盘，
 # 若仍按 21:00 换日，这次登录会和上午共用额度，夜盘弹出的结算单会被漏掉。
 SETTLEMENT_SESSION_START = dtime(20, 0)
+
+# 交易所休市的工作日（只列工作日，周末本来就不交易）。
+# 每年国务院公布次年放假安排后更新；临时休市/调休写 config 的 schedule.closed_days。
+EXCHANGE_HOLIDAYS: frozenset[date] = frozenset(
+    {
+        # 2026 年
+        date(2026, 1, 1),  # 元旦
+        date(2026, 2, 16),  # 春节
+        date(2026, 2, 17),
+        date(2026, 2, 18),
+        date(2026, 2, 19),
+        date(2026, 2, 20),
+        date(2026, 4, 6),  # 清明
+        date(2026, 5, 1),  # 劳动节
+        date(2026, 5, 4),
+        date(2026, 5, 5),
+        date(2026, 6, 19),  # 端午
+        date(2026, 9, 25),  # 中秋
+        date(2026, 10, 1),  # 国庆
+        date(2026, 10, 2),
+        date(2026, 10, 5),
+        date(2026, 10, 6),
+        date(2026, 10, 7),
+    }
+)
+
+
+def parse_closed_days(raw: Iterable[object] | None) -> set[date]:
+    """把配置里的额外休市日（"2026-12-31"）收成日期集合；坏数据跳过。"""
+    out: set[date] = set()
+    for item in raw or []:
+        if isinstance(item, date) and not isinstance(item, datetime):
+            out.add(item)
+            continue
+        text = str(item or "").strip()
+        if not text:
+            continue
+        try:
+            out.add(date.fromisoformat(text[:10]))
+        except ValueError:
+            continue
+    return out
+
+
+def is_trading_day(day: date, *, extra_closed: Iterable[date] | None = None) -> bool:
+    """这一天交易所开不开市：周末、内置节假日、配置里的临时休市都不开。"""
+    if day.weekday() >= 5:
+        return False
+    if day in EXCHANGE_HOLIDAYS:
+        return False
+    return day not in set(extra_closed or ())
 
 
 def _parse_moment(moment: datetime | date | str | None) -> datetime | date:

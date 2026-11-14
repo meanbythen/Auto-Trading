@@ -764,8 +764,15 @@ class OptimizeTabMixin:
                             f"最大回撤{float(row.get('max_drawdown') or 0):.0f} "
                             f"覆盖{cover:.0f}"
                         )
+                from src.backtest.evaluation import format_evaluation_lines
+
                 lines.extend(
                     [
+                        *(
+                            format_evaluation_lines(result.evaluation, title="策略评估")
+                            if result.evaluation
+                            else []
+                        ),
                         "",
                         self._last_opt_reason,
                     f"报告      {path}",

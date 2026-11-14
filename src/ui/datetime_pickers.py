@@ -284,14 +284,23 @@ class TimeField:
 
 
 class DateTimeField:
-    """删除本地 K 线用：日历选日期，再选可选的时、分。"""
+    """日历选日期，再选时、分。allow_empty=False 时日期和时间都必须选。"""
 
-    def __init__(self, parent: ctk.CTkBaseClass) -> None:
-        self.date_var = ctk.StringVar(value="")
-        self.time_var = ctk.StringVar(value="")
+    def __init__(
+        self,
+        parent: ctk.CTkBaseClass,
+        *,
+        allow_empty: bool = True,
+        date_var: ctk.StringVar | None = None,
+        time_var: ctk.StringVar | None = None,
+    ) -> None:
+        self.date_var = date_var if date_var is not None else ctk.StringVar(value="")
+        self.time_var = time_var if time_var is not None else ctk.StringVar(value="")
         self.frame = ctk.CTkFrame(parent, fg_color="transparent")
-        DateField(self.frame, self.date_var, allow_empty=True).frame.pack(anchor="w")
-        TimeField(self.frame, self.time_var, allow_empty=True).frame.pack(anchor="w", pady=(6, 0))
+        DateField(self.frame, self.date_var, allow_empty=allow_empty).frame.pack(anchor="w")
+        TimeField(self.frame, self.time_var, allow_empty=allow_empty).frame.pack(
+            anchor="w", pady=(6, 0)
+        )
 
     def get(self) -> str:
         return combine_datetime(self.date_var.get(), self.time_var.get())

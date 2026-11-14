@@ -437,6 +437,10 @@ class TrackedOrder:
     avg_price: float = 0.0
     message: str = ""
     accounted: bool = False
+    # 已经记入本程序账本的累计手数。部分成交分几次记账时，下一次只记增量。
+    accounted_volume: int = 0
+    # 不是这次登录由本程序发出的单（手工单、别人的单、重启前遗留）。只显示，不入账。
+    foreign: bool = False
     stop_price: float | None = None
     bar_id: str = ""
     # 撤单时柜台要这些编号。回报到达之前是空的。
@@ -458,6 +462,7 @@ class TrackedOrder:
             "price": self.price,
             "status": self.status,
             "filled": self.filled,
+            "accounted_volume": self.accounted_volume,
             "avg_price": self.avg_price,
             "message": self.message,
             "stop_price": self.stop_price,

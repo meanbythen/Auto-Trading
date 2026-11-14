@@ -201,6 +201,50 @@ def test_resident_order_does_not_type_a_limit_price(monkeypatch) -> None:
     assert ("press", "delete") not in events
 
 
+def test_click_succeeded_but_confirm_failed_counts_as_sent(monkeypatch) -> None:
+    """点完买卖后关确认框出错，必须按「已发出」返回，否则上层会对着同一根K线再点一次。"""
+    trader = _trader()
+    _mute_mouse(monkeypatch, trader, ["对手价", "对手价"])
+
+    def _boom() -> None:
+        raise RuntimeError("确认框关不掉")
+
+    monkeypatch.setattr(trader, "_dismiss_confirm", _boom)
+
+    result = trader.place_order(OrderRequest("bu2612", "sell_open", 1))
+
+    assert result.ok is True
+    assert result.assumed_fill is True
+    assert result.raw["unclean"] is True
+    assert "核对" in result.message
+
+
+def test_symbol_switch_is_verified_before_clicking(monkeypatch) -> None:
+    """写进合约框后回读不一致，就不点买卖按钮，避免把单点到别的品种上。"""
+    trader = _trader()
+    trader.gui["symbol_input"] = [100, 200]
+    events = _mute_mouse(monkeypatch, trader, ["对手价", "对手价"])
+    monkeypatch.setattr(trader, "_price_control_text", lambda point: (None, "ag2612"))
+
+    result = trader.place_order(OrderRequest("bu2612", "sell_open", 1))
+
+    assert result.ok is False
+    assert "合约" in result.message
+    assert not any(item[:3] == ("click", 548, 1206) for item in events)
+
+
+def test_symbol_switch_passes_when_readback_matches(monkeypatch) -> None:
+    """回读和要切的合约一致时正常下单。"""
+    trader = _trader()
+    trader.gui["symbol_input"] = [100, 200]
+    _mute_mouse(monkeypatch, trader, ["对手价", "对手价"])
+    monkeypatch.setattr(trader, "_price_control_text", lambda point: (None, "BU2612"))
+
+    result = trader.place_order(OrderRequest("bu2612", "sell_open", 1))
+
+    assert result.ok is True
+
+
 def test_place_order_skips_when_another_click_is_running(monkeypatch) -> None:
     """两个 GuiTrader 实例（常驻 / 模拟器）共用一把锁，抢不到就跳过，绝不并发点击。"""
     held = threading.Lock()

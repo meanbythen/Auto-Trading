@@ -23,6 +23,7 @@ import pandas as pd
 from loguru import logger
 
 from src.backtest.engine import BacktestResult, run_backtest
+from src.backtest.evaluation import EvaluationThresholds, evaluate_backtest
 from src.backtest.main_table import ManualRow, read_manual_rows
 from src.backtest.metrics import TradeRecord, calc_performance, peak_margin
 from src.risk.delivery import apply_delivery_cutoff, extend_last_before_delivery
@@ -413,6 +414,7 @@ def run_backtest_rollover(
     run = RolloverRun(table_path=str(table))
     trades: list[TradeRecord] = []
     equity: list[float] = []
+    equity_times: list[str] = []
     total_bars = 0
     lasts: list[BacktestResult] = []
     # 各段里「有信号但没开成」的记录也接在一起，换月回测同样能看到为什么没做。
@@ -469,12 +471,17 @@ def run_backtest_rollover(
             # 上一段的落点；真实账户口径：段内起点已是上段落点，直接接上。
             # 两种口径衔接处都不重复记一笔，总盈亏 = 各段盈亏之和。
             seg_equity = result.equity
+            seg_times = list(getattr(result, "equity_times", []) or [])
             if chain_capital:
                 equity.extend(seg_equity[1:] if equity else seg_equity)
+                if seg_times:
+                    equity_times.extend(seg_times[1:] if equity_times else seg_times)
                 capital = float(seg_equity[-1])
             else:
                 shifted = [e + equity_offset for e in seg_equity]
                 equity.extend(shifted[1:] if equity else shifted)
+                if seg_times:
+                    equity_times.extend(seg_times[1:] if equity_times else seg_times)
                 equity_offset += float(seg_equity[-1]) - float(seg_equity[0])
         perf = result.performance
         run.segments.append(
@@ -553,7 +560,7 @@ def run_backtest_rollover(
         perf.win_rate,
         perf.net_pnl,
     )
-    return BacktestResult(
+    result = BacktestResult(
         symbol=f"{product}主力连续",
         timeframe=lasts[-1].timeframe,
         trail_timeframe=lasts[-1].trail_timeframe,
@@ -561,10 +568,15 @@ def run_backtest_rollover(
         performance=perf,
         trades=trades,
         equity=equity,
+        equity_times=equity_times,
         params_snapshot=snap,
         rejected=rejected,
         ran_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     )
+    th = EvaluationThresholds.from_cfg(cfg)
+    if th.enabled:
+        result.evaluation = evaluate_backtest(result, thresholds=th)
+    return result
 
 
 def format_rollover_lines(snap: dict[str, Any] | None) -> str:

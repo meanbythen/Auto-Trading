@@ -466,20 +466,23 @@ class SwingTrendStrategy(StrategyBase):
             )
 
         # 2) 止损：用初始止损与「最好价回撤 stop_atr」里更紧的一侧。
+        # 本根算出的止损下一根才生效，判定用上一根已知的线。
+        prev_stop = float(pos.trail_stop or pos.initial_stop or 0.0)
         stop = self._current_stop(pos, best, stop_atr)
+        judge_stop = prev_stop or stop
         pos.trail_stop = stop
         pos.trail_armed = True
         if not self._is_entry_bar(symbol, bar_id):
             if stop_triggered(
                 side=pos.side,
-                stop=stop,
+                stop=judge_stop,
                 close=close,
                 high=float(bar["high"]),
                 low=float(bar["low"]),
                 mode=self.stop_mode,
             ):
                 return self._close_decision(
-                    symbol, now, bar_id, pos.volume, f"长线止损触发 {stop:.2f}", scale="exit"
+                    symbol, now, bar_id, pos.volume, f"长线止损触发 {judge_stop:.2f}", scale="exit"
                 )
 
         # 这根已经开过/加过/减过：止损和清仓已经看过，不要同一根再加一次。

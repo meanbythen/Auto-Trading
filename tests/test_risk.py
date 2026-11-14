@@ -35,6 +35,35 @@ def test_close_flat_symbol_blocked_when_another_is_open() -> None:
     assert ok_c is True
 
 
+def test_clear_halt_only_daily_loss_is_auto_clearable() -> None:
+    """崩溃/遗留委托熔断不能被日切或改限额顺手清掉。"""
+    g = RiskGuardian(min_order_interval_sec=0)
+    g.set_halt("pending_intent", "发现未完成的下单记录")
+    assert g.clear_halt("daily_loss") is False
+    assert g.halted is True
+    assert g.halt_kind == "pending_intent"
+
+    assert g.clear_halt() is True
+    assert g.halted is False
+    assert g.halt_kind == ""
+
+
+def test_daily_loss_halt_can_be_auto_cleared() -> None:
+    g = RiskGuardian(min_order_interval_sec=0)
+    g.set_halt("daily_loss", "亏太多")
+    assert g.clear_halt("daily_loss") is True
+    assert g.halted is False
+
+
+def test_crash_halt_is_not_overwritten_by_daily_loss() -> None:
+    g = RiskGuardian(min_order_interval_sec=0)
+    g.set_halt("pending_intent", "发现未完成的下单记录")
+    g.set_halt("daily_loss", "亏太多")
+    assert g.halted is True
+    assert g.halt_kind == "pending_intent"
+    assert "未完成的下单记录" in g.halt_reason
+
+
 def test_multiplier_does_not_treat_cu_as_corn() -> None:
     """cu 的字母里含有 c，手数计算必须用铜自己的乘数，不能用玉米。"""
     from src.risk.sizing import PositionSizer
@@ -58,6 +87,26 @@ def test_multiplier_does_not_treat_cu_as_corn() -> None:
     # 没单独配置的品种不要借玉米的乘数
     bare = PositionSizer({"risk": {"contracts": {"c": {"multiplier": 8}}}, "trade": {"volume": 1}})
     assert bare.multiplier_for("cu2612") == 10
+
+
+def test_risk_pct_without_stop_refuses_to_open() -> None:
+    """按风险百分比算仓时缺止损必须拒单，不能退回固定手数开出裸仓。"""
+    from src.risk.sizing import PositionSizer
+
+    sizer = PositionSizer(
+        {
+            "risk": {"sizing_mode": "risk_pct", "risk_per_trade_pct": 1, "capital": 100000},
+            "trade": {"volume": 3},
+        }
+    )
+
+    result = sizer.calc_open("bu2612", 4000.0, None)
+
+    assert result.volume == 0
+    assert "止损" in result.reason
+
+    zero_stop = sizer.calc_open("bu2612", 4000.0, 0.0)
+    assert zero_stop.volume == 0
 
 
 def test_close_symbol_match_ignores_letter_case() -> None:

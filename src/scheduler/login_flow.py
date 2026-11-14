@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
+
 from loguru import logger
 
 
 class LoginFlowMixin:
     """登录流程方法；共享运行状态仍保存在 TradingBot 实例上。"""
+
+    _ctp_retry_at: datetime | None
 
     def _warn_gui_safety(self) -> None:
         """启动时打印 GUI 路径的关键安全提醒。"""
@@ -114,7 +118,12 @@ class LoginFlowMixin:
             self.trader.reconcile(self._internal_nets())
             self._apply_broker_equity()
         except Exception as exc:  # noqa: BLE001
-            logger.exception("柜台对账失败: {}", exc)
+            # 读不到柜台就当成「对不上」，绝不能沿用上一轮的 True 继续开仓。
+            logger.exception("柜台对账失败，按不匹配处理，暂停开新仓: {}", exc)
+            mark = getattr(self.trader, "mark_reconcile_unknown", None)
+            if callable(mark):
+                mark(f"对账异常：{exc}")
+            self._record_event("reconcile_error", error=str(exc))
 
     def _uses_ctp_broker_funds(self) -> bool:
         """当前是不是已经连上 CTP、并且有期货公司资金数字可以跟。"""
@@ -142,21 +151,44 @@ class LoginFlowMixin:
         except Exception as exc:  # noqa: BLE001
             logger.warning("按柜台资金改本地账失败，开平仓规则不变: {}", exc)
 
-    def _arm_ctp(self) -> None:
-        """执行通道是 CTP 时，启动就完成认证、登录、结算单确认，并按柜台资金改本地账。"""
+    _ctp_retry_sec = 60.0
+
+    def _arm_ctp(self) -> bool:
+        """
+        执行通道是 CTP 时，启动就完成认证、登录、结算单确认，并按柜台资金改本地账。
+
+        返回是否已经连上柜台。连不上时置 logged_in=False，隔一段时间再重试，
+        不能让「启动时连不上」变成整晚都不再登录。
+        """
         executor = str((self.cfg.get("trade") or {}).get("executor", "sim"))
         if executor != "ctp":
-            return
+            return True
+        if self.cfg.get("dry_run", True):
+            logger.warning("模拟开关开着，CTP 不会连接柜台，也不会发单")
+            self.logged_in = True
+            return True
+        if not hasattr(self.trader, "connect"):
+            self.logged_in = True
+            return True
+
+        now = datetime.now()
+        retry_at = getattr(self, "_ctp_retry_at", None)
+        if retry_at is not None and now < retry_at:
+            return False
+
         from src.trader.go_live import strategy_order_block_reason
 
         blocked_stage = strategy_order_block_reason(self.cfg)
         if blocked_stage:
-            logger.warning(blocked_stage)
-            return
+            # 上线阶段只拦新开仓，平仓和定时清仓必须照常，所以这里照样连柜台。
+            logger.warning("{}（只拦新开仓，平仓与清仓照常）", blocked_stage)
+
         from src.account.ctp_sync import resident_book_guard
 
         book_block = resident_book_guard(self.root, self.cfg)
         if book_block:
+            self.logged_in = False
+            self._ctp_retry_at = now + timedelta(seconds=self._ctp_retry_sec)
             logger.error("CTP 常驻未连接：{}", book_block)
             try:
                 from src.ops.alerts import emit_alert
@@ -164,24 +196,30 @@ class LoginFlowMixin:
                 emit_alert("ctp_book_mismatch", book_block, level="error")
             except Exception:  # noqa: BLE001
                 pass
-            return
-        if self.cfg.get("dry_run", True):
-            logger.warning("模拟开关开着，CTP 不会连接柜台，也不会发单")
-            return
-        if not hasattr(self.trader, "connect"):
-            return
+            return False
+
         ok, message = self.trader.connect()
         if ok:
+            self.logged_in = True
+            self._ctp_retry_at = None
             logger.info("CTP {}", message)
             self._startup_equity_sync()
-        else:
-            logger.error("CTP 没有连上：{}。扫描会继续，但开新仓会停，直到登录和对账都通过。", message)
-            try:
-                from src.ops.alerts import emit_alert
+            return True
 
-                emit_alert("ctp_down", f"CTP 没有连上：{message}", level="error")
-            except Exception:  # noqa: BLE001
-                pass
+        self.logged_in = False
+        self._ctp_retry_at = now + timedelta(seconds=self._ctp_retry_sec)
+        logger.error(
+            "CTP 没有连上：{}。扫描会继续，但开新仓会停，{} 秒后重试登录和对账。",
+            message,
+            int(self._ctp_retry_sec),
+        )
+        try:
+            from src.ops.alerts import emit_alert
+
+            emit_alert("ctp_down", f"CTP 没有连上：{message}", level="error")
+        except Exception:  # noqa: BLE001
+            pass
+        return False
 
     def _startup_equity_sync(self) -> None:
         """连上柜台后先查权益，按期货公司数字改本地账，再进入扫描。"""
@@ -196,3 +234,6 @@ class LoginFlowMixin:
                 logger.warning("启动权益已按柜台改本地账，但持仓还对不上：{}", note)
         except Exception as exc:  # noqa: BLE001
             logger.exception("启动时向柜台核对资金失败: {}", exc)
+            mark = getattr(self.trader, "mark_reconcile_unknown", None)
+            if callable(mark):
+                mark(f"启动对账异常：{exc}")

@@ -15,6 +15,7 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 from copy import deepcopy
 from datetime import date, datetime
@@ -23,10 +24,20 @@ from typing import Any
 
 from loguru import logger
 
+from src.domain.contracts import contract_multipliers
+from src.domain.ledger import (
+    balance_of,
+    ctp_history_equity as ctp_history_equity,
+    ensure_changes,
+    equity_and_peak as equity_and_peak,
+    equity_points,
+    read_book_file,
+    shown_equity as shown_equity,
+)
 from src.utils.trading_day import futures_trading_day
 
 # 同一份账本可能被常驻线程和界面同时改，先排队再读写。
-_LOCK = threading.Lock()
+_LOCK = threading.RLock()
 
 # 余额只允许被这五种方式改动。键是账本里的记号，值是界面上的中文。
 _KIND_NAME = {
@@ -55,10 +66,7 @@ def multiplier_map(cfg: dict[str, Any] | None) -> dict[str, float]:
     """
     if not cfg:
         return {}
-    from src.risk.sizing import PositionSizer
-
-    sizer = PositionSizer(cfg)
-    return {key: float(info.get("multiplier", 10)) for key, info in sizer.contracts.items()}
+    return contract_multipliers(cfg)
 
 
 def change_kind_name(kind: Any) -> str:
@@ -94,54 +102,18 @@ def new_book(initial_capital: float, *, version: str, started_at: str | None = N
     }
 
 
-def _safe_float(value: Any, default: float = 0.0) -> float:
-    """把可能被手工改过的账本字段安全地转成 float。"""
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return float(default)
-
-
 def load_named_book(root: str | Path, account_id: Any) -> dict[str, Any] | None:
     """读指定那一本账，不看当前下拉框。"""
     from src.account.workspace import book_file
 
     path = book_file(root, account_id)
-    return _read_book_file(path)
+    return read_book_file(path)
 
 
 def load_book(root: str | Path) -> dict[str, Any] | None:
     """读账本。还没有文件、或文件坏了，就返回空，调用方不要当成已经开始记账。"""
     path = book_path(root)
-    return _read_book_file(path)
-
-
-def _read_book_file(path: Path) -> dict[str, Any] | None:
-    """读一份账本文件。路径由调用方决定是哪一本。"""
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("信号账户账本读不出来: {}", exc)
-        return None
-    if not isinstance(data, dict):
-        return None
-    data.setdefault("cashflows", [])
-    data.setdefault("trades", [])
-    # 账本文件可能被手工改过，或旧版本写进了非法字符串。这里一次性把所有数值字段清洗掉，
-    # 避免后面 float(row.get("amount")) 这类调用散落在各处时，一处坏数据把整个界面刷新链炸断。
-    data["initial_capital"] = _safe_float(data.get("initial_capital"), 0.0)
-    for section in ("changes", "cashflows"):
-        for row in data.get(section) or []:
-            if isinstance(row, dict):
-                for key in ("amount", "price", "stop_price"):
-                    if key in row and not isinstance(row[key], (int, float)):
-                        row[key] = _safe_float(row.get(key), 0.0)
-    data.setdefault("initial_capital", 0.0)
-    # 1.8.0 的账本还没有逐笔变动。读出来时补上，余额和原来的算法一致。
-    _ensure_changes(data)
-    return data
+    return read_book_file(path)
 
 
 def save_named_book(root: str | Path, account_id: Any, book: dict[str, Any]) -> Path:
@@ -207,7 +179,7 @@ def apply_ctp_equity(
         ]
     book["funding"] = "ctp"
     book["ctp_user_id"] = broker_id
-    packed = {
+    packed: dict[str, Any] = {
         "user_id": broker_id,
         "account_id": broker_id,
         "time": _now(),
@@ -241,32 +213,6 @@ def _ctp_snap_changed(old: dict[str, Any], new: dict[str, Any]) -> bool:
     return str(old.get("account_id") or old.get("user_id") or "") != str(
         new.get("account_id") or new.get("user_id") or ""
     )
-
-
-def ctp_history_equity(book: dict[str, Any] | None) -> list[tuple[str, float]]:
-    """柜台动态权益按查询时间排成一条线，给账户分析画图。"""
-    if not isinstance(book, dict):
-        return []
-    points: list[tuple[str, float]] = []
-    for row in book.get("ctp_history") or []:
-        if not isinstance(row, dict):
-            continue
-        try:
-            bal = float(row.get("balance") or 0)
-        except (TypeError, ValueError):
-            continue
-        points.append((str(row.get("time") or ""), bal))
-    snap = book.get("ctp_snapshot") if isinstance(book.get("ctp_snapshot"), dict) else None
-    if isinstance(snap, dict):
-        try:
-            bal = float(snap.get("balance") or 0)
-        except (TypeError, ValueError):
-            bal = 0.0
-        if bal > 0:
-            stamp = str(snap.get("time") or "")
-            if not points or points[-1][1] != bal or points[-1][0] != stamp:
-                points.append((stamp, bal))
-    return points
 
 
 def save_book(root: str | Path, book: dict[str, Any]) -> Path:
@@ -337,7 +283,7 @@ def set_initial_capital(book: dict[str, Any], amount: float) -> float:
     余额不会整本重写。只追加一笔「初始资金」，金额是新旧本金的差额。
     没变化时不记。返回这次差额。
     """
-    _ensure_changes(book)
+    ensure_changes(book)
     new_amount = round(float(amount), 2)
     delta = round(new_amount - _sum_kind(book, "initial"), 2)
     book["initial_capital"] = new_amount
@@ -355,7 +301,7 @@ def add_cash(book: dict[str, Any], kind: str, amount: float, *, note: str = "") 
     """
     if kind not in {"deposit", "withdraw"}:
         raise ValueError("只能记入金或出金")
-    _ensure_changes(book)
+    ensure_changes(book)
     value = round(float(amount), 2)
     if value <= 0:
         raise ValueError("金额要大于 0")
@@ -374,7 +320,7 @@ def settle_to(book: dict[str, Any], target: float, multipliers: dict[str, float]
     差额单独记一笔，不改已经记过的开平仓价格。
     返回这次差额。已经一样时返回 0，不重复记。
     """
-    _ensure_changes(book)
+    ensure_changes(book)
     current = balance_of(book, multipliers)
     delta = round(float(target) - current, 2)
     if abs(delta) < 0.005:
@@ -432,7 +378,7 @@ def append_trade(
         if key and any(_trade_key(row.get("symbol"), row.get("offset"), row.get("direction"), row.get("bar_id")) == key for row in book.get("trades") or []):
             logger.info("信号账户已有同一笔，跳过 | {} {} {}", symbol, offset, bar_id)
             return False
-    _ensure_changes(book)
+    ensure_changes(book)
     fee = round(max(0.0, float(commission or 0)), 2)
     stop = round(float(stop_price or 0), 4)
     book.setdefault("trades", []).append(
@@ -478,59 +424,9 @@ def append_trade(
     return True
 
 
-def shown_equity(book: dict[str, Any] | None, multipliers: dict[str, float] | None = None) -> float:
-    """
-    界面和仓位计算看到的当前权益。
-
-    华泰账已经跟过柜台时，用柜台动态权益；同花顺账仍把资金变动加总。
-    """
-    if not isinstance(book, dict):
-        return 0.0
-    if str(book.get("funding") or "") == "ctp":
-        snap = book.get("ctp_snapshot") if isinstance(book.get("ctp_snapshot"), dict) else {}
-        try:
-            bal = float(snap.get("balance") or 0)
-        except (TypeError, ValueError):
-            bal = 0.0
-        if bal > 0:
-            return round(bal, 2)
-        try:
-            avail = float(snap.get("available") or 0)
-        except (TypeError, ValueError):
-            avail = 0.0
-        if avail > 0:
-            return round(avail, 2)
-    return balance_of(book, multipliers)
-
-
-def balance_of(book: dict[str, Any], multipliers: dict[str, float] | None = None) -> float:
-    """当前余额。等于全部资金变动相加，未平仓的浮动盈亏不算进来。"""
-    _ensure_changes(book)
-    # multipliers 仍留给旧账补交易盈亏时使用。已经补过的账直接加变动。
-    del multipliers
-    return round(sum(float(row.get("amount") or 0) for row in book.get("changes") or []), 2)
-
-
-def equity_and_peak(book: dict[str, Any], multipliers: dict[str, float] | None = None) -> tuple[float, float]:
-    """
-    当前余额，以及这条余额曲线曾经到过的最高点。
-
-    入金会抬高峰值，出金会让余额掉下去，回撤百分比会变大。
-    和账户分析页同一条线，未平仓浮动盈亏不算。
-    """
-    points = _equity_points(book, multipliers)
-    if not points:
-        return 0.0, 0.0
-    last = float(points[-1][1])
-    peak = float(points[0][1])
-    for _moment, point in points:
-        peak = max(peak, float(point))
-    return last, peak
-
-
 def describe(book: dict[str, Any], multipliers: dict[str, float] | None = None) -> str:
     """给界面右边看的整段说明。用大白话，不写内部函数名。"""
-    _ensure_changes(book)
+    ensure_changes(book)
     _trade_pnl, opens, closed, unmatched = _pair(book, multipliers)
     cash_in = _sum_kind(book, "deposit")
     cash_out = -_sum_kind(book, "withdraw")
@@ -543,7 +439,7 @@ def describe(book: dict[str, Any], multipliers: dict[str, float] | None = None) 
     decided = wins + losses
     win_text = "还没有平仓" if decided == 0 else f"{wins / decided * 100:.1f}%"
     # 回撤从当时已经到达过的最高余额往下量。不能用最终余额当起点，否则会把后来才赚到的钱算成已经回撤。
-    points = _equity_points(book, multipliers)
+    points = equity_points(book, multipliers)
     peak = points[0][1] if points else 0.0
     max_dd = 0.0
     for _moment, point in points:
@@ -758,12 +654,33 @@ def _closed_filename(started_at: str, closed_at: str) -> str:
     return f"{_stamp(started_at)}_至_{_stamp(closed_at)}.json"
 
 
+def book_lock() -> threading.RLock:
+    """
+    账本的进程级读写锁。
+
+    需要「读账本→改→写回」的调用方（例如按柜台权益刷新余额）要自己包一层，
+    否则会和成交记账线程互相覆盖。
+    """
+    return _LOCK
+
+
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
-    """先写临时文件再换上，避免存档只写了一半。"""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temp = path.with_suffix(path.suffix + ".tmp")
-    temp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-    temp.replace(path)
+    """先写临时文件并落盘，再换上，避免存档只写了一半；同一进程内串行写。"""
+    with _LOCK:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temp = path.with_suffix(path.suffix + ".tmp")
+        try:
+            with open(temp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(temp, path)
+        finally:
+            if temp.exists():
+                try:
+                    temp.unlink()
+                except OSError:
+                    pass
 
 
 def _unique_period_path(folder: Path, filename: str) -> Path:
@@ -885,6 +802,8 @@ def open_position_rows(
         if net == 0:
             continue
         chosen = long_slot if net > 0 else short_slot
+        if chosen is None:
+            continue
         volume = abs(net)
         out.append(
             {
@@ -1007,98 +926,6 @@ def _walk_matches(
     return pnl, still, closed, unmatched, details
 
 
-def _equity_points(book: dict[str, Any], multipliers: dict[str, float] | None = None) -> list[tuple[str, float]]:
-    """按资金变动的先后，算出每一笔之后的余额。回撤用这条线。"""
-    del multipliers
-    _ensure_changes(book)
-    equity = 0.0
-    points: list[tuple[str, float]] = []
-    for row in book.get("changes") or []:
-        equity = round(equity + float(row.get("amount") or 0), 2)
-        points.append((str(row.get("time") or ""), equity))
-    return points
-
-
-def _ensure_changes(book: dict[str, Any]) -> None:
-    """旧账没有逐笔变动时，按当时的本金、出入金、结算和已平仓盈亏补一张表。"""
-    if isinstance(book.get("changes"), list):
-        return
-    book["changes"] = _legacy_changes(book)
-
-
-def _legacy_changes(book: dict[str, Any]) -> list[dict[str, Any]]:
-    """
-    把 1.8.0 的账补成五类变动。
-
-    本金记一笔初始资金。入金、出金、每日结算沿用原来的手工记录。
-    已经平掉且盈亏不是 0 的，补一笔交易盈亏。这样补完后的余额和旧算法相同。
-    """
-    changes: list[dict[str, Any]] = [
-        {
-            "time": str(book.get("started_at") or ""),
-            "kind": "initial",
-            "amount": round(float(book.get("initial_capital") or 0), 2),
-            "note": "开始记账",
-        }
-    ]
-    for row in book.get("cashflows") or []:
-        kind = str(row.get("kind") or "")
-        amount = round(float(row.get("amount") or 0), 2)
-        if kind == "deposit":
-            signed = amount
-        elif kind == "withdraw":
-            signed = -amount
-        elif kind == "settlement":
-            signed = amount
-        else:
-            continue
-        changes.append(
-            {
-                "time": str(row.get("time") or ""),
-                "kind": kind,
-                "amount": signed,
-                "note": str(row.get("note") or ""),
-            }
-        )
-    opens: list[dict[str, Any]] = []
-    for row in book.get("trades") or []:
-        if row.get("offset") == "开仓":
-            opens.append({**row, "left": int(row.get("volume") or 0)})
-            continue
-        if row.get("offset") != "平仓":
-            continue
-        need = int(row.get("volume") or 0)
-        price = float(row.get("price") or 0)
-        part_sum = 0.0
-        matched = 0
-        for held in opens:
-            if need <= 0:
-                break
-            if held.get("symbol") != row.get("symbol") or held.get("direction") != row.get("direction"):
-                continue
-            if int(held.get("left") or 0) <= 0:
-                continue
-            take = min(int(held["left"]), need)
-            diff = price - float(held.get("price") or 0)
-            if row.get("direction") == "空":
-                diff = -diff
-            mult = float(held.get("multiplier") or 10)
-            part_sum += diff * take * mult
-            held["left"] = int(held["left"]) - take
-            need -= take
-            matched += take
-        if matched > 0 and abs(part_sum) >= 0.005:
-            changes.append(
-                {
-                    "time": str(row.get("time") or ""),
-                    "kind": "pnl",
-                    "amount": round(part_sum, 2),
-                    "note": f"{row.get('symbol')} {row.get('direction')} {matched}手",
-                }
-            )
-    return changes
-
-
 def _append_change(
     book: dict[str, Any],
     kind: str,
@@ -1127,7 +954,7 @@ def _append_change(
 
 def _sum_kind(book: dict[str, Any], kind: str) -> float:
     """把同一种变动的金额加在一起。出金在账里是负数。"""
-    _ensure_changes(book)
+    ensure_changes(book)
     return round(
         sum(float(row.get("amount") or 0) for row in book.get("changes") or [] if row.get("kind") == kind),
         2,

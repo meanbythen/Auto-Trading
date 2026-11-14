@@ -84,7 +84,7 @@ def parse_margin_rate_pct(value: object) -> float:
     return 0.0
 
 
-def _as_float(value: object, default: float) -> float:
+def _as_float(value: Any, default: float) -> float:
     if value is None or value == "":
         return default
     try:

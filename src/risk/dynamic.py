@@ -18,17 +18,20 @@ from dataclasses import dataclass
 from typing import Any
 
 import pandas as pd
+from loguru import logger
 
+from src.domain.ledger import ctp_history_equity, equity_and_peak, load_active_book, shown_equity
 from src.strategy.indicators import average_true_range
 
 
 def drawdown_frac(equity: float | None, peak: float | None) -> float | None:
-    """从最高点往下掉了百分之几，用 0~1 的小数。峰值无效时不加这一层。"""
+    """从最高点往下掉了百分之几，用 0~1 的小数。峰值无效时按已触发处理。"""
     if equity is None or peak is None:
         return None
     top = float(peak)
     if top <= 1e-12:
-        return None
+        # 账本存在但峰值为 0，说明权益数据不可信；fail-closed，按满回撤暂停开仓。
+        return 1.0
     now = float(equity)
     return max(0.0, (top - now) / top)
 
@@ -227,29 +230,37 @@ def apply_dynamic_open(
     return dyn.adjust_open(int(volume), ratio, dd)
 
 
-def live_equity_and_peak(root: Any) -> tuple[float, float]:
-    """账本当前余额和曾经到过的最高点。读不到当 0。华泰账优先用柜台动态权益。"""
+def live_equity_and_peak_or_error(
+    root: Any,
+) -> tuple[float | None, float | None, str]:
+    """
+    账本当前余额和曾经到过的最高点，附带读取错误。
+
+    账本不存在时返回 (None, None, "")，视为新账；读取异常时返回错误文本，
+    调用方必须 fail-closed（暂停开仓），不能当成 0 回撤放行。
+    """
     try:
-        from pathlib import Path
-
-        from src.account.signal_book import equity_and_peak, load_book, shown_equity
-
-        book = load_book(Path(root))
+        book = load_active_book(root)
         if not book:
-            return 0.0, 0.0
+            return None, None, ""
         shown = shown_equity(book)
         if str(book.get("funding") or "") == "ctp":
-            from src.account.signal_book import ctp_history_equity
-
             series = ctp_history_equity(book)
             peak = max((point[1] for point in series), default=shown)
-            return shown, max(peak, shown)
+            return shown, max(peak, shown), ""
         last, peak = equity_and_peak(book)
         if shown > 0:
-            return shown, max(peak, shown)
-        return last, peak
-    except Exception:  # noqa: BLE001
-        return 0.0, 0.0
+            return shown, max(peak, shown), ""
+        return last, peak, ""
+    except Exception as exc:  # noqa: BLE001
+        logger.error("读取账本权益失败，按已触发回撤暂停开仓: {}", exc)
+        return None, None, f"读取账本权益失败: {exc}"
+
+
+def live_equity_and_peak(root: Any) -> tuple[float | None, float | None]:
+    """账本当前余额和最高点，仅供界面展示。读不到返回 None，不再伪装成 0。"""
+    equity, peak, _ = live_equity_and_peak_or_error(root)
+    return equity, peak
 
 
 def describe_status(

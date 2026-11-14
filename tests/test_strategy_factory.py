@@ -27,6 +27,35 @@ def _cfg(engine: str = "daily_body", executor: str = "sim") -> dict:
     }
 
 
+def test_engine_metadata_comes_from_one_registry() -> None:
+    """引擎名、中文名、审计模式、复盘下拉都从策略工厂这一份注册表来。"""
+    from src.review.replay import ENGINE_BY_LABEL, LABEL_BY_ENGINE
+    from src.strategy.factory import (
+        CROSS_TEST_ENGINE_ORDER,
+        ENGINE_AUDIT_MODES,
+        ENGINE_ALIASES,
+        ENGINE_LABELS,
+        PRIMARY_ENGINES,
+        engine_label_map,
+    )
+    from src.strategy.session_audit import ENGINE_NAMES
+
+    labels = engine_label_map()
+    for code in PRIMARY_ENGINES:
+        assert code in ENGINE_LABELS, f"{code} 缺少中文名"
+        assert code in ENGINE_AUDIT_MODES, f"{code} 缺少审计模式"
+    for alias, target in ENGINE_ALIASES.items():
+        assert alias in labels and alias in ENGINE_NAMES, f"{alias} 缺少中文名"
+        assert labels[alias] == ENGINE_LABELS[target]
+    assert ENGINE_NAMES == labels
+
+    # 复盘下拉和工厂用同一份名单，中文名可以反查回引擎。
+    for code in CROSS_TEST_ENGINE_ORDER:
+        assert ENGINE_BY_LABEL[ENGINE_LABELS[code]] == code
+        assert code in LABEL_BY_ENGINE
+    assert "只看盘面（不套策略）" in ENGINE_BY_LABEL
+
+
 def test_list_engines_contains_core() -> None:
     names = list_engines()
     assert "daily_body" in names

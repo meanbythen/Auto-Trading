@@ -318,8 +318,10 @@ def extend_last_before_delivery(
         return out, note
     if last.end < cap:
         out[-1] = replace_period(last, end=cap)
+    month = delivery_month_start(last.symbol)
+    month_text = month.isoformat()[:7] if month else "未知"
     note = (
-        f"{last.symbol} 交割月是 {delivery_month_start(last.symbol).isoformat()[:7]}，"
+        f"{last.symbol} 交割月是 {month_text}，"
         f"最晚做到 {cap.isoformat()}，交割月不再交易。"
     )
     nxt = successor_symbol(last.symbol, cycle)

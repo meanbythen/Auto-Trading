@@ -272,7 +272,8 @@ class DualMaStrategy(StrategyBase):
         cross_down: bool,
         stop_pad: float = 0.0,
     ) -> StrategyDecision:
-        # 止损跟长均线，只往有利方向收
+        # 止损跟长均线，只往有利方向收。先记下上一根已知的止损，本根新收紧的下一根才生效。
+        prev_stop = float(pos.trail_stop or pos.initial_stop or 0.0)
         if pos.side == "long":
             trail = long_now
             if pos.trail_stop and pos.trail_stop > 0:
@@ -319,18 +320,19 @@ class DualMaStrategy(StrategyBase):
                 ),
             )
 
-        # 真正触发用已经收紧的跟踪止损，和界面上看到的止损价同一条。
+        # 真正触发用上一根已知的跟踪止损；本根新收紧的下一根才参与判定。
         # 反向交叉优先，避免反手被止损抢走。
-        stop_line = float(pos.trail_stop or 0) or long_now
+        judge_stop = prev_stop or float(pos.trail_stop or 0) or long_now
         if self.stop_on_touch and stop_triggered(
-            side=pos.side, stop=stop_line, close=close, high=high, low=low, mode=self.stop_mode
+            side=pos.side, stop=judge_stop, close=close, high=high, low=low, mode=self.stop_mode
         ):
             return self._close_decision(
                 symbol,
                 pos,
                 now,
                 bar_id,
-                f"盘中触及跟踪止损 {stop_line:.2f}，先平",
+                f"盘中触及跟踪止损 {judge_stop:.2f}，先平",
+                stop_price=judge_stop,
             )
 
         # 短线已回到长线错误一侧（未等到完整交叉判定时的保险）

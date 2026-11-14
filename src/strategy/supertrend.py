@@ -229,6 +229,9 @@ class SuperTrendStrategy(StrategyBase):
         high: float = 0.0,
         low: float = 0.0,
     ) -> StrategyDecision:
+        # 本根算出的 SuperTrend 线下一根才用来判止损；判定和成交都用上一根已知的线。
+        prev_stop = float(pos.trail_stop or pos.initial_stop or 0.0)
+        judge_stop = prev_stop or st_now
         pos.trail_stop = st_now
         pos.trail_armed = True
 
@@ -252,26 +255,27 @@ class SuperTrendStrategy(StrategyBase):
                 pos,
                 now,
                 bar_id,
-                f"SuperTrend 翻向，平{'多' if pos.side == 'long' else '空'} ST={st_now:.2f}",
+                f"SuperTrend 翻向，平{'多' if pos.side == 'long' else '空'} ST={judge_stop:.2f}",
+                stop_price=judge_stop,
             )
 
         # 止损触发方式（全策略共用）：touch 时影线碰到 SuperTrend 线就平；close 等收盘确认。
         # 翻向优先，避免反手被止损抢走。
         if self.stop_on_touch and stop_triggered(
-            side=pos.side, stop=st_now, close=close, high=high, low=low, mode=self.stop_mode
+            side=pos.side, stop=judge_stop, close=close, high=high, low=low, mode=self.stop_mode
         ):
             return self._close_decision(
-                symbol, pos, now, bar_id, f"盘中触及 SuperTrend 线 {st_now:.2f}，先平"
+                symbol, pos, now, bar_id, f"盘中触及 SuperTrend 线 {judge_stop:.2f}，先平", stop_price=judge_stop
             )
 
         # 未翻向：收盘打穿当前线也平（与线同步的保险）
-        if pos.side == "long" and close < st_now:
+        if pos.side == "long" and close < judge_stop:
             return self._close_decision(
-                symbol, pos, now, bar_id, f"多单收盘跌破 SuperTrend {st_now:.2f}"
+                symbol, pos, now, bar_id, f"多单收盘跌破 SuperTrend {judge_stop:.2f}", stop_price=judge_stop
             )
-        if pos.side == "short" and close > st_now:
+        if pos.side == "short" and close > judge_stop:
             return self._close_decision(
-                symbol, pos, now, bar_id, f"空单收盘站上 SuperTrend {st_now:.2f}"
+                symbol, pos, now, bar_id, f"空单收盘站上 SuperTrend {judge_stop:.2f}", stop_price=judge_stop
             )
 
         return StrategyDecision(

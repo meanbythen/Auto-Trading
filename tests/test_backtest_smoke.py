@@ -31,6 +31,11 @@ def test_backtest_runs_on_demo_bars() -> None:
     assert result.bars >= 60
     assert result.performance.trades >= 0
     assert isinstance(result.performance.score, float)
+    # 评估需要权益时间轴；成交里统一带开仓 ADX 字段（预热期可能为 None）。
+    assert len(result.equity_times) == len(result.equity)
+    assert result.evaluation is not None
+    assert "evaluation" in result.to_dict()
+    assert all(hasattr(trade, "adx_at_entry") for trade in result.trades)
 
 
 def test_filter_bars_by_range_uses_futures_trading_day() -> None:

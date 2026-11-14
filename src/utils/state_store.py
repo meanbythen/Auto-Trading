@@ -9,13 +9,38 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from loguru import logger
 
+from src.domain.position import PositionState
 from src.utils.trading_day import futures_trading_day
+
+# 状态文件的格式版本。旧文件没有这个字段，读出来按当前版本补上。
+SCHEMA_VERSION = 2
+# 一个进程内所有状态文件读改写都走同一把锁：界面线程和扫描线程不会互相覆盖。
+_STATE_LOCK = threading.RLock()
+
+
+def _backup_corrupt(path: Path) -> None:
+    """解析失败时按修改时间留一份备份，避免后续写入把原文件覆盖后无法人工核对。"""
+    try:
+        stamp = int(path.stat().st_mtime)
+    except OSError:
+        return
+    backup = path.with_name(f"{path.name}.corrupt-{stamp}")
+    if backup.exists():
+        return
+    try:
+        backup.write_bytes(path.read_bytes())
+    except OSError as e:
+        logger.error("状态文件损坏，备份到 {} 失败: {}", backup, e)
+        return
+    logger.error("状态文件损坏，原文件已备份到 {}，请人工核对后再恢复交易", backup)
 
 
 def default_state_path(project_root: Path | str) -> Path:
@@ -26,9 +51,15 @@ def default_state_path(project_root: Path | str) -> Path:
 
 
 def load_state(path: Path | str) -> dict[str, Any]:
-    """读取状态；文件不存在或损坏则返回空骨架。"""
-    path = Path(path)
+    """读取状态；文件不存在或损坏则返回空骨架。同一进程内与写互斥。"""
+    with _STATE_LOCK:
+        return _load_locked(Path(path))
+
+
+def _load_locked(path: Path) -> dict[str, Any]:
+    """已持有状态锁：真正读文件、换日清零并写回。"""
     empty = {
+        "schema_version": SCHEMA_VERSION,
         "saved_at": "",
         "trading_day": str(futures_trading_day()),
         "daily_pnl": 0.0,
@@ -36,6 +67,7 @@ def load_state(path: Path | str) -> dict[str, Any]:
         "open_orders_today": 0,  # 与 orders_today 一并换日清零，避免误触开仓上限
         "halted": False,
         "halt_reason": "",
+        "halt_kind": "",
         "positions": {},
         "last_entry_bars": {},
         "heartbeat_at": "",
@@ -48,10 +80,22 @@ def load_state(path: Path | str) -> dict[str, Any]:
         data = json.loads(path.read_text(encoding="utf-8"))
         if not isinstance(data, dict):
             return empty
+        # 先看文件自己写的版本号，再补默认值，否则旧文件会被当成当前版本。
+        try:
+            stored_version = int(data.get("schema_version") or 0)
+        except (TypeError, ValueError):
+            stored_version = 0
+        if stored_version > SCHEMA_VERSION:
+            logger.warning(
+                "状态文件版本 {} 比程序支持的 {} 新，按兼容方式读取，不要用旧程序覆盖",
+                stored_version,
+                SCHEMA_VERSION,
+            )
         # 先看文件里原来写的交易日。补默认值之后再看，会把「没写」误当成「已经是今天」。
         stored_day = str(data.get("trading_day") or "")
         for k, v in empty.items():
             data.setdefault(k, v)
+        data["schema_version"] = SCHEMA_VERSION
         today = str(futures_trading_day())
         if stored_day == today:
             return data
@@ -63,14 +107,18 @@ def load_state(path: Path | str) -> dict[str, Any]:
                 stored_date = None
             if stored_date is not None and stored_date > date.fromisoformat(today):
                 return data
-            # 只有文件里明确写着另一个交易日，才清当天的盈亏、报单次数和熔断。仓留下。
+            # 只有文件里明确写着另一个交易日，才清当天的盈亏、报单次数和「日亏」熔断。仓留下。
             # 夜盘 21:00 就已经算新交易日了，不是等零点。
             logger.info("新交易日，清零当日盈亏与下单计数（持仓状态保留）")
             data["daily_pnl"] = 0.0
             data["orders_today"] = 0
             data["open_orders_today"] = 0  # 以前漏清的话，会误报「今日开仓已达上限」
-            data["halted"] = False
-            data["halt_reason"] = ""
+            # 崩溃、遗留委托、对账不符必须人工核对，跨交易日也不能自动解除。
+            # 旧文件没有 halt_kind 时按「未知原因」保留，交人工处理。
+            if str(data.get("halt_kind") or "") == "daily_loss":
+                data["halted"] = False
+                data["halt_kind"] = ""
+                data["halt_reason"] = ""
         data["trading_day"] = today
         # 立刻写回。界面大约每秒读一次这个文件，不写回的话每次都以为还是旧日期，日志会刷个不停。
         try:
@@ -79,26 +127,56 @@ def load_state(path: Path | str) -> dict[str, Any]:
             logger.warning("换日状态写回失败，下次读取还会再处理一次: {}", e)
         return data
     except Exception as e:  # noqa: BLE001
-        logger.warning("读取 bot_state 失败，使用空状态: {}", e)
-        return empty
+        # 解析失败不能当成「空仓、未熔断」：那会让风控按 0 持仓继续开新仓。
+        # 按 state_corrupt 熔断，只允许人工核对后再解除。
+        logger.error("读取状态文件失败，按熔断处理，禁止自动开仓: {}", e)
+        _backup_corrupt(path)
+        corrupt = dict(empty)
+        corrupt["halted"] = True
+        corrupt["halt_kind"] = "state_corrupt"
+        corrupt["halt_reason"] = f"状态文件损坏或无法读取：{e}"
+        return corrupt
 
 
 def save_state(path: Path | str, state: dict[str, Any]) -> None:
-    """原子一点地写状态文件。临时文件名带进程号，避免两个进程互相覆盖。"""
+    """原子写状态文件：进程内串行，临时文件 fsync 之后再替换，断电也不会留半截。"""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    state = dict(state)
-    state["saved_at"] = datetime.now().isoformat(timespec="seconds")
-    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
-    try:
-        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
-        tmp.replace(path)
-    finally:
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+    payload = dict(state)
+    payload["schema_version"] = SCHEMA_VERSION
+    payload["saved_at"] = datetime.now().isoformat(timespec="seconds")
+    with _STATE_LOCK:
+        # 临时名带线程 id 和随机串：同进程多线程、或多开一个进程写同一份状态时不会互相踩。
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.{uuid4().hex}.tmp")
+        try:
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False, indent=2)
+                fh.flush()
+                os.fsync(fh.fileno())
+            os.replace(tmp, path)
+        finally:
+            if tmp.exists():
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+
+
+def update_state(
+    path: Path | str, mutator: Any
+) -> tuple[dict[str, Any], Any]:
+    """
+    读-改-写同一把锁。
+
+    多个入口（界面手工补账、常驻扫描、账户刷新）改同一份状态时，
+    各自先读后写会互相覆盖；统一走这里就不会丢更新。
+    """
+    path = Path(path)
+    with _STATE_LOCK:
+        state = _load_locked(path)
+        result = mutator(state)
+        save_state(path, state)
+        return state, result
 
 
 def snapshot_positions(strategy: Any) -> dict[str, dict[str, Any]]:
@@ -106,18 +184,7 @@ def snapshot_positions(strategy: Any) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
     positions = getattr(strategy, "positions", {}) or {}
     for sym, pos in positions.items():
-        item = {
-            "side": getattr(pos, "side", "flat"),
-            "volume": int(getattr(pos, "volume", 0) or 0),
-            "entry_price": float(getattr(pos, "entry_price", 0) or 0),
-            "initial_stop": float(getattr(pos, "initial_stop", 0) or 0),
-            "trail_stop": float(getattr(pos, "trail_stop", 0) or 0),
-            "trail_armed": bool(getattr(pos, "trail_armed", False)),
-            "opened_at": str(getattr(pos, "opened_at", "") or ""),
-            "box_high": float(getattr(pos, "box_high", 0) or 0),
-            "box_low": float(getattr(pos, "box_low", 0) or 0),
-            "box_height": float(getattr(pos, "box_height", 0) or 0),
-        }
+        item = pos.to_dict()
         # 趋势跟随用持仓以来的最远价格收紧止损。重启后要带上，不然隔夜之后会忘掉已经走过的距离。
         extremes = getattr(strategy, "_extreme", None) or {}
         if sym in extremes and extremes[sym] is not None:
@@ -333,34 +400,35 @@ def manual_close_without_bot(
     返回 (被平掉的这一笔, 新余额)。账上没有这个仓时返回 (None, None)。
     """
     path = default_state_path(root)
-    state = load_state(path)
-    closed = mark_position_closed(state.setdefault("positions", {}), symbol)
-    if closed is None:
-        return None, None
-
-    direction = "多" if closed["side"] == "long" else "空"
     moment = datetime.now().strftime("%Y%m%d%H%M%S%f")
     # 放在函数内导入，避免和 state_store 启动时的导入顺序打结。
     from src.account.signal_book import load_book, record_program_trade, today_realized_pnl
 
-    balance = record_program_trade(
-        root,
-        initial_capital=float(initial_capital or 0),
-        symbol=str(closed["symbol"]),
-        offset="平仓",
-        direction=direction,
-        price=float(exit_price),
-        volume=int(closed["volume"]),
-        multiplier=float(multiplier or 10),
-        reason=reason,
-        bar_id=f"manual-{moment}",
-        fill_key=f"manual-{moment}",
-    )
-    book = load_book(root)
-    if book is not None:
-        state["daily_pnl"] = today_realized_pnl(book)
-    save_state(path, state)
-    return closed, balance
+    def _apply(state: dict[str, Any]) -> tuple[dict[str, Any] | None, float | None]:
+        closed = mark_position_closed(state.setdefault("positions", {}), symbol)
+        if closed is None:
+            return None, None
+        direction = "多" if closed["side"] == "long" else "空"
+        balance = record_program_trade(
+            root,
+            initial_capital=float(initial_capital or 0),
+            symbol=str(closed["symbol"]),
+            offset="平仓",
+            direction=direction,
+            price=float(exit_price),
+            volume=int(closed["volume"]),
+            multiplier=float(multiplier or 10),
+            reason=reason,
+            bar_id=f"manual-{moment}",
+            fill_key=f"manual-{moment}",
+        )
+        book = load_book(root)
+        if book is not None:
+            state["daily_pnl"] = today_realized_pnl(book)
+        return closed, balance
+
+    _state, result = update_state(path, _apply)
+    return result
 
 
 def manual_open_without_bot(
@@ -386,39 +454,42 @@ def manual_open_without_bot(
         return None, None
 
     path = default_state_path(root)
-    state = load_state(path)
-    opened = mark_position_open(
-        state.setdefault("positions", {}), symbol, side, volume, entry_price,
-        initial_stop=float(initial_stop or 0),
-    )
-    if opened is None:
-        return None, None
-
-    direction = "多" if side == "long" else "空"
     moment = datetime.now().strftime("%Y%m%d%H%M%S%f")
     from src.account.signal_book import record_program_trade
 
-    balance = record_program_trade(
-        root,
-        initial_capital=float(initial_capital or 0),
-        symbol=str(symbol),
-        offset="开",
-        direction=direction,
-        price=float(entry_price),
-        volume=int(volume),
-        multiplier=float(multiplier or 10),
-        reason=reason,
-        bar_id=f"manual-open-{moment}",
-        fill_key=f"manual-open-{moment}",
-    )
-    save_state(path, state)
-    return opened, balance
+    def _apply(state: dict[str, Any]) -> tuple[dict[str, Any] | None, float | None]:
+        opened = mark_position_open(
+            state.setdefault("positions", {}),
+            symbol,
+            side,
+            volume,
+            entry_price,
+            initial_stop=float(initial_stop or 0),
+        )
+        if opened is None:
+            return None, None
+        direction = "多" if side == "long" else "空"
+        balance = record_program_trade(
+            root,
+            initial_capital=float(initial_capital or 0),
+            symbol=str(symbol),
+            offset="开",
+            direction=direction,
+            price=float(entry_price),
+            volume=int(volume),
+            multiplier=float(multiplier or 10),
+            reason=reason,
+            bar_id=f"manual-open-{moment}",
+            fill_key=f"manual-open-{moment}",
+        )
+        return opened, balance
+
+    _state, result = update_state(path, _apply)
+    return result
 
 
 def restore_positions(strategy: Any, raw: dict[str, Any]) -> None:
     """把磁盘持仓灌回策略（同结构 PositionState）。"""
-    from src.strategy.types import PositionState
-
     if not raw:
         return
     positions = getattr(strategy, "positions", None)
@@ -430,19 +501,7 @@ def restore_positions(strategy: Any, raw: dict[str, Any]) -> None:
         side = d.get("side", "flat")
         if side not in ("flat", "long", "short"):
             side = "flat"
-        positions[str(sym)] = PositionState(
-            side=side,
-            volume=int(d.get("volume", 0) or 0),
-            entry_price=float(d.get("entry_price", 0) or 0),
-            initial_stop=float(d.get("initial_stop", 0) or 0),
-            trail_stop=float(d.get("trail_stop", 0) or 0),
-            trail_armed=bool(d.get("trail_armed", False)),
-            symbol=str(sym),
-            opened_at=str(d.get("opened_at", "") or ""),
-            box_high=float(d.get("box_high", 0) or 0),
-            box_low=float(d.get("box_low", 0) or 0),
-            box_height=float(d.get("box_height", 0) or 0),
-        )
+        positions[str(sym)] = PositionState.from_dict(str(sym), d)
         extremes = getattr(strategy, "_extreme", None)
         if isinstance(extremes, dict) and d.get("extreme") is not None and side != "flat":
             extremes[str(sym)] = float(d["extreme"])

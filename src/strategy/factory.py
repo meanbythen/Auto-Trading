@@ -15,7 +15,11 @@ from typing import Any, Callable, Protocol
 from loguru import logger
 
 from .cta_filter import ensure_cta_filter_box
-from .market_state import TREND_FILTER_SECTIONS, ensure_trend_filter_defaults
+from .market_state import (
+    TREND_FILTER_SECTIONS,
+    MarketFilterMode,
+    ensure_trend_filter_defaults,
+)
 from .bollinger_break import BollingerBreakStrategy
 from .daily_body import DailyBodyStrategy
 from .float_hold import (
@@ -23,9 +27,12 @@ from .float_hold import (
     normalize_direction_key,
     normalize_macd_timeframe,
 )
+from .kelly_break import KellyBreakStrategy
+from .liq_stop import LiquidityStopStrategy
 from .dual_ma import DualMaStrategy
 from .macd_swing import MacdSwingStrategy
 from .multi_factor import MultiFactorStrategy
+from .params import DEFAULT_ENGINE, ENGINE_SECTION_DEFAULTS, StrategyParams
 from .sar_trend import SarTrendStrategy
 from .supertrend import SuperTrendStrategy
 from .swing_box import SwingBoxStrategy
@@ -80,8 +87,7 @@ class StrategyLike(Protocol):
 
 StrategyFactory = Callable[[dict[str, Any]], StrategyLike]
 
-# 主策略改为日内实体；旧配置若还写着已删除的引擎名，会回退到这里。
-DEFAULT_ENGINE = "daily_body"
+# 主策略由 params 定义（DEFAULT_ENGINE），工厂继续导出同名常量，旧导入路径不变。
 
 # 已删除的引擎：加载时明确提示并回退，避免静默当成别的策略。
 _REMOVED_ENGINES = {
@@ -168,171 +174,47 @@ _OBSOLETE_STRATEGY_SECTIONS = {
     "daily_body_expand",
 }
 
-# 现有策略小节的出厂缺省。sanitize 只补缺的键，不覆盖用户已写的值。
-_DEFAULT_ENGINE_SECTIONS: dict[str, dict[str, Any]] = {
-    "daily_body": {
-        "eth_minutes": 20,
-        "eth_minutes2": 30,
-        "stop_extra_ticks": 1,
-        "skip_gap_atr_mult": 2.5,
-        "max_box_atr_mult": 5.0,
-        "max_chase_atr_mult": 1.0,
-        "ema_period": 20,
-        "ema_buffer_ticks": 2,
-        "day_cutoff": "10:30",
-        "night_cutoff": "22:15",
-        "filter_enabled": True,
-        "filter_adx_period": 14,
-        "filter_atr_period": 14,
-        "filter_lookback": 60,
-        "filter_adx_upper": 30.0,
-        "filter_atr_high_pct": 0.8,
-    },
-    "float_hold": {
-        "eth_minutes": 60,
-        "eth_minutes2": 0,
-        "stop_atr_mult": 1.5,
-        "be_atr_mult": 2.0,
-        "skip_gap_atr_mult": 0.0,
-        "max_box_atr_mult": 0.0,
-        "max_chase_atr_mult": 0.0,
-        "direction": "eth_trend",
-        "macd_timeframe": "5",
-        "macd_fast": 12,
-        "macd_slow": 26,
-        "macd_signal": 9,
-        "dir_ema_fast": 5,
-        "dir_ema_slow": 20,
-        "trend_align_enabled": False,
-        "trend_align_fast": 60,
-        "trend_align_slow": 120,
-        "trend_slope_lookback": 5,
-        "trend_slope_min_deg": 0.0,
-        "cluster_max_width": 10,
-        "gap_align_atr_mult": 0.0,
-        "ema_period": 0,
-        "ema_buffer_ticks": 2,
-        "day_cutoff": "14:45",
-        "night_cutoff": "22:50",
-        "filter_enabled": False,
-        "filter_adx_period": 14,
-        "filter_atr_period": 14,
-        "filter_lookback": 60,
-        "filter_adx_upper": 30.0,
-        "filter_atr_high_pct": 0.8,
-    },
-    "trend_follow": {
-        # 文档 5 分钟海龟：20 根高低点进场、10 根出场，止损 2ATR。
-        "entry_bars": 20,
-        "exit_bars": 10,
-        "atr_period": 14,
-        "atr_mult": 2.0,
-        "flatten_at_close": True,
-    },
-    "supertrend": {
-        "atr_period": 10,
-        "multiplier": 3.0,
-        "reverse_on_flip": True,
-        "flatten_at_close": False,
-    },
-    "dual_ma": {
-        "short_period": 20,
-        "long_period": 60,
-        "reverse_on_cross": True,
-        "atr_period": 14,
-        "atr_stop_mult": 2.0,
-    },
-    "ema_swing": {
-        "ema_fast": 60,
-        "ema_slow": 120,
-        "dir_ema_fast": 60,
-        "dir_ema_slow": 120,
-        "dir_ema_pair": "60/120",
-        "sig_ema_a": 5,
-        "sig_ema_b": 10,
-        "sig_ema_c": 30,
-        "sig_ema_triple": "5/10/30",
-        "stop_ema": 120,
-        "side_ema": 120,
-        "slope_ema": 120,
-        "slope_min_deg": 3.0,
-        "slope_lookback": 20,
-        "slope_exit": False,
-        "no_open_before_close_min": 30,
-        "flatten_at_close": False,
-    },
-    # 布林突破：中轨方向 + 上下轨突破，ATR 止损，跌回中轨离场。
-    "bollinger": {
-        "boll_window": 20,
-        "boll_dev": 2.0,
-        "atr_period": 14,
-        "atr_stop_mult": 1.5,
-        "flatten_at_close": True,
-    },
-    # SAR 波段：SAR 翻转 + MA20 方向过滤，SAR 线本身当移动止损。
-    "sar_trend": {
-        "af_start": 0.02,
-        "af_step": 0.02,
-        "af_max": 0.2,
-        "ma_filter": 20,
-        "atr_period": 14,
-        "flatten_at_close": True,
-    },
-    # 多因子 CTA 加权打分。信号周期跟公共 timeframe，不写死 5 分钟。
-    "multi_factor": {
-        "ma_short": 20,
-        "ma_long": 60,
-        "channel": 20,
-        "boll_window": 20,
-        "boll_dev": 2.0,
-        "af_start": 0.02,
-        "af_step": 0.02,
-        "af_max": 0.2,
-        "threshold": 0.6,
-        "atr_period": 14,
-        "atr_stop_mult": 2.0,
-        "use_sar": True,
-        "disagree_max": 0.7,
-        "bias_ma": 60,
-        "trend_timeframe": "D",
-        "weights": {"ma": 0.30, "turtle": 0.25, "boll": 0.25, "sar": 0.20},
-        "flatten_at_close": True,
-    },
-    "swing_trend": {
-        "scale": "D_60",
-        "signal_timeframe": "60",
-        "trend_timeframe": "D",
-        "daily_ma": 20,
-        "signal_ma": 20,
-        "atr_period": 14,
-        "pullback_lookback": 8,
-        "touch_atr": 0.6,
-        "unit_volume": 1,
-        "max_adds": 2,
-        "add_min_atr": 1.0,
-        "reduce_extend_atr": 2.5,
-        "min_core_units": 1,
-        "stop_atr": 2.0,
-        "flatten_at_close": False,
-    },
-    "swing_box": {
-        "lookback": 40,
-        "peak_look": 2,
-        "min_gap": 5,
-        "atr_period": 20,
-        "height_atr": 1.2,
-        "adx_period": 14,
-        "adx_min": 20.0,
-        "stop_atr": 0.5,
-        "trail_atr": 2.0,
-        "trail_start_h": 1.0,
-        "vol_mult": 0.0,
-        "flatten_at_close": False,
-    },
+_ENGINE_ALIASES = {
+    "st": "supertrend",
+    "ma_cross": "dual_ma",
+    "boll": "bollinger",
+    "bollinger_break": "bollinger",
+    "sar": "sar_trend",
+    "parabolic_sar": "sar_trend",
+    "multi": "multi_factor",
+    "cta": "multi_factor",
+    "macd_swing": "ema_swing",
 }
 
-# 交叉测试名单里只留正式引擎名（不含别名）。
-_CROSS_ENGINE_ORDER = [
+# 对外公开的别名表：界面、回测、复盘、审计统一从这里取，不再各写一份。
+ENGINE_ALIASES: dict[str, str] = dict(_ENGINE_ALIASES)
+
+# 已删除的引擎名：配置里读到这些要明确提示并回退，不能静默当成别的策略。
+REMOVED_ENGINES: set[str] = set(_REMOVED_ENGINES)
+
+
+# 策略中文名（配置页 / 参数表 / 导出用）。别名不单列，统一走 ENGINE_ALIASES 换算。
+ENGINE_LABELS: dict[str, str] = {
+    "daily_body": "日内实体（主推）",
+    "float_hold": "日内浮盈飘单",
+    "trend_follow": "趋势跟随",
+    "supertrend": "SuperTrend趋势",
+    "dual_ma": "双均线趋势",
+    "ema_swing": "均线波段",
+    "bollinger": "布林带突破",
+    "liq_stop": "以损定开",
+    "kelly_break": "凯利突破",
+    "sar_trend": "SAR波段趋势",
+    "multi_factor": "多因子CTA（加权打分）",
+    "swing_trend": "长线趋势加减仓",
+    "swing_box": "长线箱体突破",
+}
+
+# 选股交叉测试名单里的短名：同一策略不重复标「主推」。
+ENGINE_SHORT_LABELS: dict[str, str] = {**ENGINE_LABELS, "daily_body": "日内实体"}
+
+# 交叉测试可选的策略与顺序。以损定开、凯利突破参数维度太高，暂不参与交叉测试。
+CROSS_TEST_ENGINE_ORDER: list[str] = [
     "daily_body",
     "float_hold",
     "trend_follow",
@@ -346,16 +228,28 @@ _CROSS_ENGINE_ORDER = [
     "swing_box",
 ]
 
-_ENGINE_ALIASES = {
-    "st": "supertrend",
-    "ma_cross": "dual_ma",
-    "boll": "bollinger",
-    "bollinger_break": "bollinger",
-    "sar": "sar_trend",
-    "parabolic_sar": "sar_trend",
-    "multi": "multi_factor",
-    "cta": "multi_factor",
-    "macd_swing": "ema_swing",
+# 每个引擎盘前审计时该套哪种公共行情过滤。None = 不接公共过滤器。
+# 和引擎名、中文名放在同一处，新增策略只改这个文件。
+ENGINE_AUDIT_MODES: dict[str, MarketFilterMode | None] = {
+    "daily_body": "range",
+    "float_hold": None,  # 过滤默认关；方向交给方向选择器，默认开盘箱体 + 跳空顺向
+    "trend_follow": "trend",
+    "supertrend": "trend",
+    "st": "trend",          # 别名
+    "dual_ma": "trend",
+    "ma_cross": "trend",    # 别名
+    "ema_swing": None,  # 只用均线斜率，不用公共 ADX 过滤
+    "macd_swing": None,
+    "bollinger": "trend",
+    "boll": "trend",        # 别名
+    "liq_stop": None,  # ADX/DI 过滤写在策略自己里，不接公共趋势过滤
+    "kelly_break": None,  # 波动率阈值写在策略自己里，不接公共趋势过滤
+    "sar_trend": "trend",
+    "parabolic_sar": "trend",  # 别名
+    "multi_factor": "trend",
+    "cta": "trend",         # 别名
+    "swing_trend": "trend",
+    "swing_box": None,  # 箱子和 ADX 写在策略里
 }
 
 
@@ -377,6 +271,10 @@ REGISTRY: dict[str, StrategyFactory] = {
     # 布林带趋势突破（不做轨道反转）
     "bollinger": BollingerBreakStrategy,
     "boll": BollingerBreakStrategy,
+    # 以损定开：公共止损区被击穿并回流后再顺势进场
+    "liq_stop": LiquidityStopStrategy,
+    # 凯利突破：极简高低点突破 + ATR 止损 + 固定盈亏比止盈
+    "kelly_break": KellyBreakStrategy,
     # SAR 抛物转向波段（MA20 过滤，SAR 当移动止损）
     "sar_trend": SarTrendStrategy,
     "parabolic_sar": SarTrendStrategy,
@@ -388,6 +286,9 @@ REGISTRY: dict[str, StrategyFactory] = {
     # 震荡箱子收盘突破后顺着拿趋势（信号/止损周期跟配置页）
     "swing_box": SwingBoxStrategy,
 }
+
+# 只含正式引擎名（不含别名），顺序与注册表一致。审计/复盘按这个顺序列策略。
+PRIMARY_ENGINES: list[str] = [name for name in REGISTRY if name not in _ENGINE_ALIASES]
 
 
 def _migrate_daily_body_atr_gates(body: dict[str, Any]) -> None:
@@ -506,9 +407,8 @@ def sanitize_strategy_config(cfg: dict[str, Any]) -> dict[str, Any]:
     legacy_stop_mode = body.pop("stop_mode", None)
     if legacy_stop_mode is not None and "stop_mode" not in st:
         st["stop_mode"] = legacy_stop_mode
-    st.setdefault("stop_mode", "touch")
-    # 开仓触发方式（全策略共用）：trigger=触到即进，close=收盘确认（默认保守）。
-    st.setdefault("entry_mode", "close")
+    # 全策略共用参数（止损/开仓触发方式、通用止损）的出厂值只在 StrategyParams 里定义一次。
+    StrategyParams().apply_defaults(st)
     # 公共行情过滤已拆进各策略。旧配置里的 market_filter 只用来给趋势策略补缺省。
     mf = st.get("market_filter") if isinstance(st.get("market_filter"), dict) else {}
     for section in TREND_FILTER_SECTIONS:
@@ -517,20 +417,13 @@ def sanitize_strategy_config(cfg: dict[str, Any]) -> dict[str, Any]:
             box = {}
             st[section] = box
         ensure_trend_filter_defaults(box, mf)
-    # 通用止损（独立于策略自身止损）：默认关闭；结构固定，界面/回测/优化都读这里。
-    gs = st.get("generic_stop")
-    if not isinstance(gs, dict):
-        gs = {}
-        st["generic_stop"] = gs
-    gs.setdefault("kind", "off")
-    gs.setdefault("lookback", 20)
 
     for key in list(_OBSOLETE_STRATEGY_KEYS):
         st.pop(key, None)
     for key in list(_OBSOLETE_STRATEGY_SECTIONS):
         st.pop(key, None)
 
-    for section, defaults in _DEFAULT_ENGINE_SECTIONS.items():
+    for section, defaults in ENGINE_SECTION_DEFAULTS.items():
         box = st.get(section)
         if not isinstance(box, dict):
             box = {}
@@ -564,16 +457,46 @@ def sanitize_strategy_config(cfg: dict[str, Any]) -> dict[str, Any]:
         for item in raw_cross:
             name = str(item).strip().lower()
             name = _ENGINE_ALIASES.get(name, name)
-            if name in _REMOVED_ENGINES or name not in _CROSS_ENGINE_ORDER:
+            if name in _REMOVED_ENGINES or name not in CROSS_TEST_ENGINE_ORDER:
                 continue
             if name in seen:
                 continue
             seen.add(name)
             cleaned_cross.append(name)
     if not cleaned_cross:
-        cleaned_cross = list(_CROSS_ENGINE_ORDER)
+        cleaned_cross = list(CROSS_TEST_ENGINE_ORDER)
     st["cross_engines"] = cleaned_cross
     return cfg
+
+
+def normalize_engine(name: Any) -> str:
+    """把别名/大小写收成正式引擎名；认不出返回空串。"""
+    key = str(name or "").strip().lower()
+    key = _ENGINE_ALIASES.get(key, key)
+    return key if key in REGISTRY else ""
+
+
+def engine_label(name: Any, *, short: bool = False) -> str:
+    """引擎中文名。short=True 用交叉测试短名。认不出时原样返回，方便界面显示非法配置。"""
+    table = ENGINE_SHORT_LABELS if short else ENGINE_LABELS
+    raw = str(name or "").strip().lower()
+    key = _ENGINE_ALIASES.get(raw, raw)
+    return table.get(key, str(name or ""))
+
+
+def engine_label_map(*, short: bool = False) -> dict[str, str]:
+    """中文名表：正式名和别名都指向同一个中文名。界面、复盘、审计共用这一份。"""
+    table = ENGINE_SHORT_LABELS if short else ENGINE_LABELS
+    labels = dict(table)
+    for alias, target in _ENGINE_ALIASES.items():
+        if target in table:
+            labels[alias] = table[target]
+    return labels
+
+
+def cross_engine_choices() -> list[tuple[str, str]]:
+    """交叉测试可选策略（代号, 中文名），顺序固定。"""
+    return [(code, ENGINE_SHORT_LABELS[code]) for code in CROSS_TEST_ENGINE_ORDER]
 
 
 def list_engines() -> list[str]:

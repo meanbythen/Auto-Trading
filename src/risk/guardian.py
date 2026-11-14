@@ -34,6 +34,11 @@ class RiskGuardian:
     last_open_ts: float = 0.0
     halted: bool = False
     halt_reason: str = ""
+    # 熔断原因分类：daily_loss / pending_intent / ledger / reconcile / intent_write_failed。
+    # 日切只自动解除 daily_loss；其余必须人工核对后解除。
+    halt_kind: str = ""
+    # 同一段熔断只写一条告警：当日盈亏每变一次就重写一条旧限额告警，界面会反复删。
+    halt_alerted: bool = False
     extra: dict[str, Any] = field(default_factory=dict)
     # 实盘熔断才写运行台告警。回测/测试关掉，避免把模拟里的「限额 50」刷到界面上。
     write_alerts: bool = True
@@ -56,11 +61,7 @@ class RiskGuardian:
         """更新当日盈亏；亏损过大时自动熔断（只拦开仓，平仓仍放行）。"""
         self.daily_pnl += pnl_delta
         logger.info("当日盈亏更新: {:+.2f} → 合计 {:.2f}", pnl_delta, self.daily_pnl)
-        if self.daily_pnl <= -abs(self.max_daily_loss):
-            self.halted = True
-            self.halt_reason = f"当日亏损 {self.daily_pnl:.2f} 已超过限额 {self.max_daily_loss}"
-            logger.error("风控熔断: {}", self.halt_reason)
-            self._emit_halt()
+        self._check_daily_loss()
 
     def set_daily_pnl(self, value: float) -> None:
         """
@@ -71,16 +72,85 @@ class RiskGuardian:
         """
         self.daily_pnl = round(float(value or 0), 2)
         logger.info("当日盈亏按账本校准: {:.2f}", self.daily_pnl)
-        if self.daily_pnl <= -abs(self.max_daily_loss):
-            self.halted = True
-            self.halt_reason = f"当日亏损 {self.daily_pnl:.2f} 已超过限额 {self.max_daily_loss}"
-            logger.error("风控熔断: {}", self.halt_reason)
-            self._emit_halt()
+        self._check_daily_loss()
+
+    def _check_daily_loss(self) -> None:
+        """当日亏损是否已触发熔断。同一段熔断只写一条告警。"""
+        if self.daily_pnl > -abs(self.max_daily_loss):
+            return
+        reason = f"当日亏损 {self.daily_pnl:.2f} 已超过限额 {self.max_daily_loss}"
+        if self.halted and self.halt_kind == "daily_loss":
+            self.halt_reason = reason
+            return
+        self.set_halt("daily_loss", reason)
+
+    def set_max_daily_loss(self, value: float) -> None:
+        """
+        运行中更新日亏限额（配置页保存后调用）。
+
+        新限额下已不再超限就解除熔断；仍超限则保持熔断，但同一段熔断不会
+        再补写告警，避免界面反复清理旧限额的熔断记录。
+        """
+        try:
+            limit = float(value)
+        except (TypeError, ValueError):
+            return
+        self.max_daily_loss = limit
+        if self.daily_pnl > -abs(limit):
+            if self.halted and self.halt_kind in ("", "daily_loss"):
+                logger.info(
+                    "日亏限额改为 {:.0f}，当日盈亏 {:.2f} 未再超限，解除熔断",
+                    limit,
+                    self.daily_pnl,
+                )
+            self.clear_halt("daily_loss")
+            return
+        self._check_daily_loss()
+
+    def set_halt(self, kind: str, reason: str) -> None:
+        """按原因分类熔断。日切只自动解除 daily_loss，其余等人工处理。"""
+        if self.halted and self.halt_kind and self.halt_kind != kind:
+            # 已经在崩溃/遗留委托类熔断里，不能被后来的日亏覆盖成可自动解除的原因。
+            logger.error(
+                "已有 {} 熔断，保留原原因不覆盖: {}（本次: {}）",
+                self.halt_kind,
+                self.halt_reason,
+                reason,
+            )
+            return
+        self.halted = True
+        self.halt_kind = str(kind or "")
+        self.halt_reason = str(reason or "")
+        logger.error("风控熔断[{}]: {}", self.halt_kind, self.halt_reason)
+        self._emit_halt()
+
+    def clear_halt(self, kind: str | None = None) -> bool:
+        """
+        解除熔断。
+
+        kind=None 表示人工确认，无条件解除；否则只解除同类熔断。
+        返回是否真的解除了，避免把崩溃/意图类熔断顺手清掉。
+        """
+        if kind is not None and self.halted and self.halt_kind != kind:
+            # halt_kind 为空表示旧文件里的「未知原因」熔断，同样不能自动解除。
+            logger.warning(
+                "熔断原因是 {}，不能按 {} 自动解除: {}",
+                self.halt_kind or "未知",
+                kind,
+                self.halt_reason,
+            )
+            return False
+        self.halted = False
+        self.halt_kind = ""
+        self.halt_reason = ""
+        self.halt_alerted = False
+        return True
 
     def _emit_halt(self) -> None:
-        """熔断时记一条告警，十分钟内相同内容只写一次。回测不写。"""
-        if not self.write_alerts:
+        """熔断时记一条告警。同一段熔断只写一次；回测不写。"""
+        if not self.write_alerts or self.halt_alerted:
             return
+        self.halt_alerted = True
         try:
             from src.ops.alerts import emit_alert
 

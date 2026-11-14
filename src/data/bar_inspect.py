@@ -3,7 +3,7 @@
 
 功能：按数据源、合约、周期、日期、时间，读清洗库和原样库里这一根（或最接近的一根）。
 原理：开仓看清洗库；原样库是接口刚下来、还没对齐重拼的。CSV 是同一组的备份，Excel 能打开。
-不下单、不拉网。同花顺信息框里的今结、涨跌、持仓本地没有，只能对开高低收和量。
+不下单、不拉网。同花顺信息框里的今结、涨跌、日增仓本地没有；持仓量只有读图批次有。
 """
 
 from __future__ import annotations
@@ -94,6 +94,16 @@ def _csv_row(csv_path: Path, ts: str) -> dict[str, Any] | None:
         except (TypeError, ValueError):
             return 0.0
 
+    def _num_optional(name: str) -> float | None:
+        key = cols.get(name)
+        if key is None:
+            return None
+        try:
+            value = float(row[key])
+        except (TypeError, ValueError):
+            return None
+        return None if pd.isna(value) else value
+
     return {
         "ts": want.strftime("%Y-%m-%d %H:%M:%S"),
         "open": _num("open"),
@@ -101,6 +111,7 @@ def _csv_row(csv_path: Path, ts: str) -> dict[str, Any] | None:
         "low": _num("low"),
         "close": _num("close"),
         "volume": _num("volume"),
+        "oi": _num_optional("oi"),
     }
 
 
@@ -113,6 +124,8 @@ def _fmt_bar(bar: dict[str, Any] | None, title: str = "") -> list[str]:
         f"最低  {bar.get('low')}    收盘  {bar.get('close')}",
         f"成交量  {bar.get('volume')}",
     ]
+    if bar.get("oi") is not None:
+        body.append(f"持仓  {bar.get('oi')}")
     if title:
         return [title, *body]
     return body
@@ -177,8 +190,8 @@ def format_kline_inspect(book: dict[str, Any]) -> str:
         f"库存名  {book.get('stored')}",
         f"你要找的时刻  {book.get('when')}（右标签：这根K线的结束时刻）",
         "",
-        "对照同花顺时，只对开盘、最高、最低、收盘、成交量。"
-        "信息框里的今结、涨跌、持仓、日增仓本地库没有。",
+        "对照同花顺时，开盘、最高、最低、收盘、成交量都能对。"
+        "信息框里的今结、涨跌、日增仓本地库没有；持仓量只有同花顺读图存的那批才有。",
         "",
     ]
     if book.get("clean"):

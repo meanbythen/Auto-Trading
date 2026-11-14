@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
+from src.scheduler.order_executor import OrderIntentWriteError
 from src.scheduler.runner import TradingBot, entry_slip_blocked
 from src.strategy.base import StrategyBase
 from src.strategy.types import StrategyAction, StrategyDecision
@@ -124,6 +127,293 @@ def test_ledger_failure_blocks_new_open_but_not_close() -> None:
     ok_close = bot._execute(StrategyDecision(StrategyAction.CLOSE, "fu2701", "到点平仓"))
     assert ok_close is False
     assert bot._events[-1][0] == "close_skip_no_position"  # type: ignore[attr-defined]
+
+
+def test_ledger_rejection_keeps_strategy_position_unchanged() -> None:
+    """账本没记上时不能改策略/风控仓位，否则会出现幽灵仓。"""
+    bot = _bot()
+    bot.cfg = {"dry_run": False, "risk": {}}
+    bot.root = Path(".")
+    bot._ledger_failed = False
+    bot._position_for = lambda symbol: None  # type: ignore[assignment]
+    bot._record_signal_account = lambda *args, **kwargs: None  # type: ignore[assignment]
+    bot._contract_multiplier = lambda symbol: 10  # type: ignore[assignment]
+    calls: list[str] = []
+    bot.strategy.on_filled = lambda *args, **kwargs: calls.append("strategy")  # type: ignore[assignment]
+    bot.risk = type(  # type: ignore[assignment]
+        "_Risk",
+        (),
+        {"on_order_filled": lambda self, *args, **kwargs: calls.append("risk")},
+    )()
+
+    bot._apply_fill_accounting(
+        "fu2701",
+        StrategyDecision(StrategyAction.BUY_OPEN, "fu2701", "测试", entry_price=100),
+        1,
+        100,
+        100,
+    )
+
+    assert calls == []
+    assert bot._ledger_failed is True
+    assert bot._events[-1][0] == "ledger_block_position_update"  # type: ignore[attr-defined]
+
+
+def test_intent_write_failure_blocks_order_and_halts() -> None:
+    """意图写盘失败时本笔不能下单，并熔断等人工处理。"""
+    class _Risk:
+        def __init__(self) -> None:
+            self.kind = ""
+
+        def allow(self, side: str, volume: int, symbol: str) -> tuple[bool, str]:
+            return True, ""
+
+        def set_halt(self, kind: str, reason: str) -> None:
+            self.kind = kind
+
+    class _GuiTrader:
+        def buy_open(self, symbol: str, volume: int, price: object = None) -> object:
+            raise AssertionError("意图写失败时不应该下单")
+
+    bot = TradingBot.__new__(TradingBot)
+    bot.cfg = {"dry_run": False, "trade": {"executor": "gui", "volume": 1}}
+    bot.strategy = _Strategy()
+    bot.symbols = ["fu2701"]
+    bot.volume = 1
+    bot._sent_bar = {}
+    bot.last_error = ""
+    bot.trader = _GuiTrader()  # type: ignore[assignment]
+    bot.risk = _Risk()  # type: ignore[assignment]
+    bot._size_open = lambda decision: (1, "固定1手")  # type: ignore[assignment]
+    bot._position_for = lambda symbol: None  # type: ignore[assignment]
+    bot._record_event = lambda event, **kw: None  # type: ignore[assignment]
+
+    def _boom(decision: StrategyDecision, vol: int) -> None:
+        raise OrderIntentWriteError("磁盘满")
+
+    bot._write_order_intent = _boom  # type: ignore[assignment]
+
+    ok = bot._execute(
+        StrategyDecision(
+            StrategyAction.BUY_OPEN,
+            "fu2701",
+            "多因子做多",
+            entry_price=4000,
+            meta={"bar_id": "2026-11-05 09:05"},
+        )
+    )
+
+    assert ok is False
+    assert bot.risk.kind == "intent_write_failed"  # type: ignore[attr-defined]
+
+
+def _intent_bot(intent_path: Path) -> TradingBot:
+    """一条最小的 GUI 真下单链路：意图文件落在临时目录。"""
+    class _Risk:
+        halted = False
+        halt_kind = ""
+        halt_reason = ""
+
+        def allow(self, side: str, volume: int, symbol: str) -> tuple[bool, str]:
+            return True, ""
+
+        def set_halt(self, kind: str, reason: str) -> None:
+            type(self).halted = True
+            type(self).halt_kind = kind
+            type(self).halt_reason = reason
+
+    bot = TradingBot.__new__(TradingBot)
+    bot.cfg = {"dry_run": False, "trade": {"executor": "gui", "volume": 1}}
+    bot.strategy = _Strategy()
+    bot.symbols = ["fu2701"]
+    bot.volume = 1
+    bot._sent_bar = {}
+    bot.last_error = ""
+    bot.gui_assume_fill = True
+    bot.intent_path = intent_path
+    bot._pending_intent = None
+    bot.risk = _Risk()
+    bot._size_open = lambda decision: (1, "固定1手")  # type: ignore[assignment]
+    bot._position_for = lambda symbol: None  # type: ignore[assignment]
+    bot._record_event = lambda event, **kw: None  # type: ignore[assignment]
+    bot._apply_fill_accounting = lambda *args, **kwargs: None  # type: ignore[assignment]
+    return bot
+
+
+def test_unclean_click_counts_as_sent_and_keeps_intent(tmp_path) -> None:
+    """点击已发出但收尾异常：按已发出记账，保留意图文件并立即熔断等人工核对。"""
+    class _Result:
+        ok = True
+        order_id = "1"
+        message = "已点击，但关确认框失败"
+        assumed_fill = True
+        raw = {"assumed_fill": True, "executor": "gui", "unclean": True}
+
+    class _GuiTrader:
+        def buy_open(self, symbol: str, volume: int, price: object = None) -> _Result:
+            return _Result()
+
+    intent = tmp_path / "order_intent.json"
+    bot = _intent_bot(intent)
+    bot.trader = _GuiTrader()  # type: ignore[assignment]
+
+    ok = bot._execute(
+        StrategyDecision(
+            StrategyAction.BUY_OPEN,
+            "fu2701",
+            "多因子做多",
+            entry_price=4000,
+            meta={"bar_id": "2026-11-05 09:05"},
+        )
+    )
+
+    assert ok is True
+    # 这一根不能再重试，否则重复开仓
+    assert bot._sent_bar["fu2701"] == "2026-11-05 09:05"
+    assert intent.exists()
+    assert bot.risk.halt_kind == "pending_intent"  # type: ignore[attr-defined]
+
+
+def test_runtime_leftover_intent_blocks_next_order(tmp_path) -> None:
+    """运行期遗留的意图文件不能被下一笔覆盖：本笔拒发、熔断，原记录原样保留。"""
+    class _GuiTrader:
+        calls = 0
+
+        def buy_open(self, symbol: str, volume: int, price: object = None) -> object:
+            type(self).calls += 1
+            raise AssertionError("有未核对委托时不应该下单")
+
+    intent = tmp_path / "order_intent.json"
+    intent.write_text(
+        json.dumps(
+            {
+                "ts": "2026-11-05T09:10:00",
+                "symbol": "bu2612",
+                "side": "sell_open",
+                "volume": 2,
+                "bar_id": "2026-11-05 09:05",
+                "reason": "上一笔",
+                "executor": "gui",
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8",
+    )
+    bot = _intent_bot(intent)
+    bot.trader = _GuiTrader()  # type: ignore[assignment]
+
+    ok = bot._execute(
+        StrategyDecision(
+            StrategyAction.BUY_OPEN,
+            "fu2701",
+            "多因子做多",
+            entry_price=4000,
+            meta={"bar_id": "2026-11-05 09:35"},
+        )
+    )
+
+    assert ok is False
+    assert _GuiTrader.calls == 0
+    assert bot.risk.halt_kind == "pending_intent"  # type: ignore[attr-defined]
+    assert json.loads(intent.read_text(encoding="utf-8"))["symbol"] == "bu2612"
+
+
+def test_ctp_close_price_adds_protective_ticks() -> None:
+    """CTP 平仓不能拿已收线收盘价原样挂限价，要往对手价方向让几跳。"""
+    import pandas as pd
+
+    bot = _intent_bot(Path("unused-order-intent.json"))
+    bot.cfg = {
+        "dry_run": False,
+        "trade": {"executor": "ctp", "price_tick": 1, "ctp_close_protect_ticks": 2},
+        "risk": {},
+    }
+    bot.strategy.timeframe = "5"  # type: ignore[attr-defined]
+    bot.kline = type(  # type: ignore[assignment]
+        "_K", (), {"fetch": lambda self, symbol, period: pd.DataFrame({"close": [4569.0]})}
+    )()
+
+    bot._position_for = lambda symbol: type("_P", (), {"side": "long"})()  # type: ignore[assignment]
+    long_price = bot._ctp_limit_price(
+        StrategyDecision(StrategyAction.CLOSE, "bu2612", "止损", stop_price=4500)
+    )
+
+    bot._position_for = lambda symbol: type("_P", (), {"side": "short"})()  # type: ignore[assignment]
+    short_price = bot._ctp_limit_price(
+        StrategyDecision(StrategyAction.CLOSE, "bu2612", "止损", stop_price=4600)
+    )
+
+    assert long_price == 4567.0
+    assert short_price == 4571.0
+
+
+def test_orders_are_blocked_outside_trading_session(tmp_path, monkeypatch) -> None:
+    """非交易时段不下单：挂着的信号不能拿去点已收盘的市场。"""
+    intent = tmp_path / "order_intent.json"
+    bot = _intent_bot(intent)
+    bot.sessions = [["09:00", "15:00"]]
+    monkeypatch.setattr(
+        "src.utils.session_clock.in_trading_sessions",
+        lambda sessions, now=None, **kwargs: False,
+    )
+
+    ok = bot._execute(StrategyDecision(StrategyAction.CLOSE, "fu2701", "收盘清仓"))
+
+    assert ok is False
+    assert not intent.exists()
+
+
+def test_manual_close_rejects_nonpositive_price() -> None:
+    bot = _bot()
+    bot.cfg = {"dry_run": False, "risk": {}}
+    bot.root = Path(".")
+    bot._persist_state = lambda: None  # type: ignore[assignment]
+    called: list[int] = []
+    bot._record_signal_account = lambda *args, **kwargs: called.append(1)  # type: ignore[assignment]
+    bot._position_for = lambda symbol: type(  # type: ignore[assignment]
+        "_Pos", (), {"side": "long", "volume": 1, "entry_price": 100.0, "opened_at": ""}
+    )()
+
+    closed, balance = bot.manual_close("fu2701", 0)
+
+    assert (closed, balance) == (None, None)
+    assert called == []
+
+
+def test_manual_close_ledger_failure_keeps_position() -> None:
+    bot = _bot()
+    bot.cfg = {"dry_run": False, "risk": {}}
+    bot.root = Path(".")
+    bot._ledger_failed = False
+    bot._persist_state = lambda: None  # type: ignore[assignment]
+    pos = type("_Pos", (), {"side": "long", "volume": 1, "entry_price": 100.0, "opened_at": ""})()
+    bot.strategy.positions = {"fu2701": pos}
+    bot._position_for = lambda symbol: pos  # type: ignore[assignment]
+    bot._record_signal_account = lambda *args, **kwargs: None  # type: ignore[assignment]
+    bot._contract_multiplier = lambda symbol: 10  # type: ignore[assignment]
+
+    closed, balance = bot.manual_close("fu2701", 101)
+
+    assert (closed, balance) == (None, None)
+    assert pos.side == "long"
+    assert bot._ledger_failed is True
+
+
+def test_manual_open_ledger_failure_keeps_position_flat() -> None:
+    bot = _bot()
+    bot.cfg = {"dry_run": False, "risk": {}}
+    bot.root = Path(".")
+    bot._ledger_failed = False
+    bot._persist_state = lambda: None  # type: ignore[assignment]
+    pos = type("_Pos", (), {"side": "flat", "volume": 0})()
+    bot.strategy.positions = {"fu2701": pos}
+    bot._record_signal_account = lambda *args, **kwargs: None  # type: ignore[assignment]
+
+    opened, balance = bot.manual_open("fu2701", "long", 1, 100)
+
+    assert (opened, balance) == (None, None)
+    assert pos.side == "flat"
+    assert bot._ledger_failed is True
 
 
 class _Alive:

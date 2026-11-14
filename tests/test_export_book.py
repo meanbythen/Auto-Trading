@@ -542,6 +542,7 @@ def test_export_cross_appends_symbol_and_strategy(tmp_path) -> None:
     assert int(frame.iloc[0]["持仓手数"]) == 1
     assert "止损周期" in list(frame.columns)
     assert "行情来源" in list(frame.columns)
+    assert "评估" in list(frame.columns)
     # 盈利覆盖 = 净盈亏 − 最大回撤；每笔/日均用覆盖去除，天数用结束减开始。
     assert float(frame.iloc[0]["盈利覆盖"]) == 400
     assert int(frame.iloc[0]["笔数"]) == 8
@@ -621,6 +622,8 @@ def test_rebuild_workbook_uses_current_schema(tmp_path) -> None:
     assert SHEET_OPTIMIZE in book.sheet_names
     opt = pd.read_excel(out, sheet_name=SHEET_OPTIMIZE, engine="openpyxl")
     assert "是否通过" in list(opt.columns)
+    assert "评估" in list(opt.columns)
+    assert "未通过项" in list(opt.columns)
     assert "检验效率" in list(opt.columns)
     assert "盈利覆盖" in list(opt.columns)
     assert "训练盈利覆盖" in list(opt.columns)

@@ -123,7 +123,7 @@ class DashboardMixin:
             text_color=T.TEXT if position_text == "空仓" else T.OK,
         )
         if hasattr(self, "alert_line"):
-            # 始终按配置页现在的日最大亏损去读文件：限额已经改过的旧熔断会删掉，不在红字里留「限额 100」。
+            # 按配置页现在的日最大亏损读文件：旧限额的熔断行不显示，但这里只读不改文件。
             try:
                 now_limit = float(self.max_loss_var.get())
             except (TypeError, ValueError):
@@ -240,6 +240,9 @@ class DashboardMixin:
     ) -> None:
         """
         有字才占一行。三句都可能很长，不并成一行，免得挤成看不清的一段。
+
+        只有实际内容变化时才 pack_forget/pack——每轮都重排整窗几何很重，
+        1.25Hz 持续触发会拖慢常驻挂机时 UI 响应。
         """
         if not hasattr(self, "alert_line"):
             return
@@ -252,14 +255,19 @@ class DashboardMixin:
             (self.health_line, (health_text or "").strip(), health_tone or T.TEXT_DIM),
             (self.dyn_line, (dyn_text or "").strip(), T.TEXT_DIM),
         )
-        for label, _, _ in rows:
-            label.pack_forget()
+        # 先把新文本写进 label（不管当前显示状态），方便下面比对
         for label, text, color in rows:
-            if not text:
-                label.configure(text="")
-                continue
             label.configure(text=text, text_color=color, wraplength=width, height=18)
-            label.pack(fill="x", pady=0)
+        # 只在显示/隐藏或颜色变化时动布局
+        for label, _, _ in rows:
+            shown = bool(label.winfo_manager())
+            should_show = bool(label.cget("text"))
+            if shown == should_show:
+                continue
+            if shown:
+                label.pack_forget()
+            else:
+                label.pack(fill="x", pady=0)
 
 
     def _position_card_text(self, snap: dict[str, Any] | None) -> str:
@@ -283,7 +291,12 @@ class DashboardMixin:
 
 
     def _tick(self) -> None:
-        """每 800ms 刷状态卡和账户余额。内部任何一步异常都不能让心跳链断掉。"""
+        """每 2s 刷状态卡和账户余额。内部任何一步异常都不能让心跳链断掉。
+
+        原来 800ms 一刷，每轮都读 profile_of / last_alert / evaluate_health / live_equity_and_peak，
+        常驻挂机时 1.25Hz 磁盘读；pack_forget/pack 还触发整窗几何重算。
+        状态卡 2 秒刷一次足够跟持仓、心跳；文件读只在常驻没跑时才发生，频率已经自然很低。
+        """
         if self._closing:
             return
         try:
@@ -297,7 +310,7 @@ class DashboardMixin:
         finally:
             if not self._closing:
                 try:
-                    self._tick_after_id = self.after(800, self._tick)
+                    self._tick_after_id = self.after(2000, self._tick)
                 except Exception:  # noqa: BLE001
                     pass
 

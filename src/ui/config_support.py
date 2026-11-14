@@ -250,6 +250,10 @@ class ConfigSupportMixin:
         old_st = self.cfg.get("strategy") or {}
         old_tf = str(old_st.get("timeframe") or "")
         old_trail = str(old_st.get("trail_timeframe") or "")
+        try:
+            old_limit = float((self.cfg.get("risk") or {}).get("max_daily_loss") or 0)
+        except (TypeError, ValueError):
+            old_limit = 0.0
         cur_tf = self._period_code(self.bt_tf_var, self.bt_tf_custom_var)
         cur_trail = self._period_code(self.bt_trail_var, self.bt_trail_custom_var)
         # 保存前用最新余额填上账户权益。这个数不能在配置页手改。
@@ -274,9 +278,22 @@ class ConfigSupportMixin:
                     bot.cfg.setdefault("risk", {})["contracts"] = risk_box
             if hasattr(bot, "_refresh_sessions"):
                 bot._refresh_sessions()
+            # 日亏限额也一起推给运行中的风控，否则它仍按启动时的旧限额熔断。
+            bot.sync_risk_limits(float((cfg.get("risk") or {}).get("max_daily_loss") or 0))
             self._append_log(
                 f"扫描间隔已改为 {bot.scan_interval} 秒；当前合约时段已同步，下一轮扫描起生效。"
             )
+        try:
+            new_limit = float((cfg.get("risk") or {}).get("max_daily_loss") or 0)
+        except (TypeError, ValueError):
+            new_limit = 0.0
+        if new_limit > 0 and abs(new_limit - old_limit) > 0.5:
+            try:
+                from src.ops.alerts import prune_stale_halt_alerts
+
+                prune_stale_halt_alerts(self.root_dir, new_limit)
+            except OSError as exc:
+                logger.debug("旧限额熔断告警没清掉: {}", exc)
         if self.password_var.get():
             self._append_log("密码已写入 config/secrets.local.yaml（本地私密）")
         try:
@@ -661,7 +678,7 @@ class ConfigSupportMixin:
                         "或账号密码没填（配置页 → 账号与登录 → 天勤行情账号/密码）。",
                     )
 
-                self.after(0, _on_fail)
+                self._post_to_main(_on_fail)
 
         threading.Thread(target=_thread, name="UniverseRefresh", daemon=True).start()
         messagebox.showinfo(

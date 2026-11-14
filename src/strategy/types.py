@@ -7,7 +7,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Literal
+from typing import Any
+
+from src.domain.position import PositionState as PositionState
 
 
 def config_flag(value: Any, default: bool = True) -> bool:
@@ -164,35 +166,4 @@ class StrategyDecision:
     meta: dict[str, Any] = field(default_factory=dict)
 
 
-@dataclass
-class PositionState:
-    """策略内部记住的持仓状态。"""
 
-    side: Literal["flat", "long", "short"] = "flat"
-    volume: int = 0
-    entry_price: float = 0.0
-    initial_stop: float = 0.0
-    trail_stop: float = 0.0
-    # 是否已用大周期 SAR「确认方向」并开始移动止损（确认前只守影线端初始止损）
-    trail_armed: bool = False
-    # 长线箱体开仓时冻住的箱沿。其它策略保持 0。
-    box_high: float = 0.0
-    box_low: float = 0.0
-    box_height: float = 0.0
-    symbol: str = ""
-    opened_at: str = ""
-
-    def reduce_close(self, volume: int) -> bool:
-        """
-        按实际成交手数减仓。
-
-        返回 True 表示这一笔之后已经没有仓了。
-        平今、平昨拆成两笔时，第一笔只减掉自己的手数，止损和开仓价都留着。
-        手数大于等于现有仓位时，调用方再把仓位清成空仓。
-        """
-        lots = max(0, int(volume or 0))
-        held = int(self.volume or 0)
-        if self.side == "flat" or held <= 0 or lots >= held:
-            return True
-        self.volume = held - lots
-        return False

@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -112,6 +113,7 @@ class KlineProvider:
 
     def __init__(self, cfg: dict[str, Any]) -> None:
         root = Path(cfg.get("_project_root", "."))
+        self.root_dir = root
         data_cfg = cfg.get("data", {})
         self.cache_dir = root / data_cfg.get("cache_dir", "data/klines")
         self.cache_dir.mkdir(parents=True, exist_ok=True)
@@ -462,10 +464,15 @@ class KlineProvider:
             merged = merged.tail(limit)
         stored_len = 0 if stored is None else len(stored)
         if len(merged) > stored_len:
-            self.store.upsert(stored_name, period, merged)
-            # 实盘只读尾部，不能把这段尾部当成全部历史写回 CSV，否则会把更早的K线删掉。
-            if limit is None:
-                self._save_cache(stored_name, period, merged)
+            # 只把 CSV 里多出来、或和库里不一样的K线写进去，不整段重写。
+            pending = rows_needing_write(
+                merged, stored, columns=("open", "high", "low", "close", "volume", "oi")
+            )
+            if pending is not None and len(pending) > 0:
+                self.store.upsert(stored_name, period, pending)
+                # 实盘只读尾部，不能把这段尾部当成全部历史写回 CSV，否则会把更早的K线删掉。
+                if limit is None:
+                    self._save_cache(stored_name, period, merged)
             logger.info(
                 "本地K线文件补进数据库 {} {} {} 根，库存 {} 根",
                 symbol,
@@ -504,8 +511,14 @@ class KlineProvider:
         # 不写进去，免得下次回测把它当成收盘价。
         stored = drop_forming_bar(merged)
         if full_history:
-            self.store.upsert(stored_name, period, stored)
-            self._save_cache(stored_name, period, stored)
+            # 回测每轮拿到的都是同一段历史。和本地比对后只写新增/变化的那几根，
+            # 不整段重写；CSV 也一样，没有新K线就不重写。
+            pending = rows_needing_write(
+                stored, local, columns=("open", "high", "low", "close", "volume", "oi")
+            )
+            if pending is not None and len(pending) > 0:
+                self.store.upsert(stored_name, period, pending)
+                self._save_cache(stored_name, period, stored)
         else:
             # 实盘这段下载窗口每轮都一样。库里已经有且一样的不再重写，只补新K线和变化的那根。
             pending = rows_needing_write(drop_forming_bar(pieces), local)
@@ -717,18 +730,16 @@ class KlineProvider:
         ]
         if not cols:
             return bars_without_attrs(full)
-        start = min(stamps)
-        end = max(stamps)
         updated = bars_without_attrs(full.copy())
         before = len(updated)
-        # 覆盖窗内旧戳整段拿掉，再写入右标签拼图
-        updated = updated.loc[~((updated.index >= start) & (updated.index <= end))]
+        # 按时间戳逐根替换，不整段删除：缺 1 分钟数据的那天原生 K 线保留
+        updated = updated.loc[~updated.index.isin(stamps)]
         piece = bars_without_attrs(fresh.loc[fresh.index.isin(stamps), cols])
         updated = pd.concat([updated, piece]).sort_index()
         updated = updated[~updated.index.duplicated(keep="last")].sort_index()
         replaced = max(0, len(piece))
         # 也统计是否有新增时间戳
-        added = int(len(updated) - before + (before - len(full.loc[~((full.index >= start) & (full.index <= end))])))
+        added = int(len(updated) - before + (before - len(full.loc[~full.index.isin(stamps)])))
         if replaced <= 0 and len(updated) == len(full):
             return updated
         logger.info(
@@ -785,10 +796,98 @@ class KlineProvider:
                 f"同花顺图这次没有读到 {symbol} 的{period_label(period)}K线。"
                 "请确认期货通主图已打开、周期和合约已点好，信息框里能看到开盘和收盘。"
             )
+        return self._store_ths_batch(symbol, period, fresh, start=None, end=None)["frame"]
+
+    def import_ths_chart_batch(
+        self,
+        symbol: str,
+        period: str,
+        *,
+        start: str | None = None,
+        end: str | None = None,
+        limit: int | None = None,
+        progress: Callable[[int, int, str], None] | None = None,
+    ) -> dict[str, Any]:
+        """
+        按「时段 + 周期」读一批同花顺图并入库。
+
+        读完做三件事：算这段的覆盖/缺口，记一行读图批次，重写库存 Excel。
+        旧批次和新批次按 (库存名, 周期, 时间戳) 接续，不会重复。
+        progress 每读到一根回调一次（已读, 计划, 这根的时间），给界面刷进度。
+        """
+        from src.data.ths_chart import scrape_ths_klines_range
+
+        period = canonical_period(period or self.period)
+        ths_cfg = (self._cfg.get("data") or {}).get("ths_chart") or {}
+        cap = int(limit) if limit else int(ths_cfg.get("max_bars", 5000) or 5000)
+        fresh = scrape_ths_klines_range(
+            self._cfg, symbol, period, start, end, max_bars=cap, progress=progress
+        )
+        return self._store_ths_batch(symbol, period, fresh, start=start, end=end)
+
+    def _store_ths_batch(
+        self,
+        symbol: str,
+        period: str,
+        fresh: pd.DataFrame,
+        *,
+        start: str | None,
+        end: str | None,
+    ) -> dict[str, Any]:
+        """把一批读到的图存进原样库和清洗库，再记批次、刷新库存表。"""
+        from src.data.coverage import coverage_report, require_timestamps
+        from src.data.inventory import write_kline_inventory
+        from src.data.quote_check import storage_symbol
+
+        require_timestamps(fresh)
         fresh = fix_gap_spanning_bars(fresh)
         self._save_vendor_raw(symbol, period, fresh)
         local = self._prepare_local(symbol, period, limit=None)
-        return self._archive_bars(symbol, period, fresh, local=local, full_history=True)
+        before = 0 if local is None else len(local)
+        merged = self._archive_bars(symbol, period, fresh, local=local, full_history=True)
+        added = max(0, len(merged) - before)
+
+        stored_name = storage_symbol(symbol, "ths")
+        stored = self.store.load(stored_name, period)
+        report = None
+        if start is not None and end is not None:
+            report = coverage_report(stored, start, end, period)
+        notes: list[str] = []
+        if report is not None and report.missing_n > 0:
+            notes.append(f"时段内仍缺 {report.missing_n} 根")
+        if report is None:
+            notes.append("未指定时段，按根数读")
+        try:
+            self.store.record_ingest(
+                source="ths",
+                symbol=stored_name,
+                period=period,
+                requested_from=start or "",
+                requested_to=end or "",
+                read_from=str(fresh.index[0]) if len(fresh) else "",
+                read_to=str(fresh.index[-1]) if len(fresh) else "",
+                read_n=len(fresh),
+                added_n=added,
+                expected_n=0 if report is None else report.expected_n,
+                missing_n=0 if report is None else report.missing_n,
+                note="；".join(notes),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("读图批次没记上（不影响K线入库）: {}", exc)
+        try:
+            inventory_path = str(write_kline_inventory(self.root_dir))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("库存 Excel 没更新（不影响K线入库）: {}", exc)
+            inventory_path = ""
+        return {
+            "added": added,
+            "read_n": len(fresh),
+            "bar_from": str(fresh.index[0]) if len(fresh) else "",
+            "bar_to": str(fresh.index[-1]) if len(fresh) else "",
+            "coverage": {} if report is None else report.as_dict(),
+            "inventory_path": inventory_path,
+            "frame": merged,
+        }
 
     def _fetch_tq(self, symbol: str, period: str, *, limit: int = 200) -> pd.DataFrame:
         """向天勤要 K 线。账号密码来自配置和本地密钥，不写进代码。"""

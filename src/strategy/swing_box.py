@@ -475,6 +475,8 @@ class SwingBoxStrategy(StrategyBase):
             atr = abs(pos.entry_price - pos.initial_stop) / max(self.stop_atr, 0.1)
 
         # 浮盈够一个箱子高度才开始跟踪，避免趋势正常回撤就把止损推到成本上。
+        # 本根算出的止损下一根才生效，判定用上一根已知的线。
+        prev_stop = float(pos.trail_stop or pos.initial_stop or 0.0)
         if pos.side == "long":
             extreme = max(self._extreme.get(symbol, high), high)
             self._extreme[symbol] = extreme
@@ -496,11 +498,12 @@ class SwingBoxStrategy(StrategyBase):
                 stop = min(stop, extreme + self.trail_atr * atr)
             pos.trail_stop = stop
 
+        judge_stop = prev_stop or float(pos.trail_stop or 0.0)
         if stop_triggered(
-            side=pos.side, stop=pos.trail_stop, close=close, high=high, low=low, mode=self.stop_mode
+            side=pos.side, stop=judge_stop, close=close, high=high, low=low, mode=self.stop_mode
         ):
             kind = "跟踪止盈" if pos.trail_armed else "箱沿止损"
-            return _close(f"长线箱体{kind} {pos.trail_stop:.2f}")
+            return _close(f"长线箱体{kind} {judge_stop:.2f}")
 
         stage = "已跟踪" if pos.trail_armed else "未满1箱高度，止损不动"
         return StrategyDecision(

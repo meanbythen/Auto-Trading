@@ -8,7 +8,14 @@ import pandas as pd
 import pytest
 
 from src.data.kline import KlineProvider
-from src.data.ths_chart import bars_from_tooltips, parse_ths_tooltip, walk_tooltips
+from src.data.ths_chart import (
+    _chart_score,
+    _target_is_latest,
+    advance_to_latest,
+    bars_from_tooltips,
+    parse_ths_tooltip,
+    walk_tooltips,
+)
 
 
 _BOX_2105 = """
@@ -135,7 +142,79 @@ def test_walk_left_collects_older_bars_and_stops_on_repeat() -> None:
     assert rows[1]["datetime"] == datetime(2026, 11, 6, 21, 5, 0)
     frame = bars_from_tooltips(rows)
     assert list(frame.index) == [pd.Timestamp("2026-11-06 21:05:00"), pd.Timestamp("2026-11-06 22:40:00")]
+    assert float(frame.iloc[0]["oi"]) == 162836
     assert "left" in keys
+
+
+def test_walk_reports_progress_for_every_bar() -> None:
+    """每读到一根就回调一次，界面才能实时刷进度条和日志。"""
+    boxes = [_BOX_2240, _BOX_2105, _BOX_2105]
+    seen: list[tuple[int, str]] = []
+
+    def read_bar():
+        if not boxes:
+            return None
+        return parse_ths_tooltip(boxes.pop(0), now=datetime(2026, 11, 8))
+
+    def on_read(count: int, row: dict) -> None:
+        seen.append((count, row["datetime"].strftime("%H:%M")))
+
+    walk_tooltips(read_bar, lambda _key: None, limit=10, pause_sec=0, on_read=on_read)
+    assert seen == [(1, "22:40"), (2, "21:05")]
+
+
+def test_chart_score_prefers_kline_over_quote_list() -> None:
+    assert _chart_score("Product.FuturePro.KLinePage\n开盘 4600 收盘 4610") > 0
+    assert _chart_score("Product.FuturePro.QuotationPage\n自选股\nlu2701 5093") < 0
+    assert _chart_score("") == 0
+
+
+def test_advance_to_latest_presses_right_until_stamp_stops() -> None:
+    """点击落在中间时，一路按右键推到最新一根；时间连续两批不变才停。"""
+    stamps = [
+        "2026-11-13 21:50:00",
+        "2026-11-13 22:00:00",
+        "2026-11-13 22:30:00",
+        "2026-11-13 22:30:00",
+        "2026-11-13 22:30:00",
+    ]
+    presses: list[str] = []
+
+    def read_stamp() -> str:
+        return stamps.pop(0) if stamps else "2026-11-13 22:30:00"
+
+    pressed, last = advance_to_latest(
+        read_stamp, lambda: presses.append("right"), step=3, pause_sec=0
+    )
+    assert last == "2026-11-13 22:30:00"
+    assert pressed == 12
+    assert presses == ["right"] * 12
+
+
+def test_advance_to_latest_stops_on_cancel_and_miss() -> None:
+    """停止按钮按下后不再按键；信息框一直读不到时也不空按满上限。"""
+    pressed, _ = advance_to_latest(
+        lambda: "2026-11-13 21:50:00", lambda: None, pause_sec=0, should_stop=lambda: True
+    )
+    assert pressed == 0
+
+    misses = {"n": 0}
+
+    def empty() -> str:
+        misses["n"] += 1
+        return ""
+
+    pressed, last = advance_to_latest(empty, lambda: None, step=2, pause_sec=0)
+    assert last == ""
+    assert pressed == 6
+
+
+def test_target_is_latest_only_when_end_is_now() -> None:
+    """结束时间是现在才自己推到最新；填了历史时点就走手动定位。"""
+    assert _target_is_latest(None, "5")
+    assert _target_is_latest(datetime.now().strftime("%Y-%m-%d %H:%M:%S"), "5")
+    assert not _target_is_latest("2026-11-11 23:00:00", "5")
+    assert not _target_is_latest("2020-01-01 09:00:00", "15")
 
 
 def test_walk_stops_when_asked_and_keeps_read_bars() -> None:
@@ -223,13 +302,19 @@ def test_import_ths_chart_writes_at_ths(tmp_path) -> None:
         }
     )
     fake = pd.DataFrame(
-        [{"open": 4325, "high": 4332, "low": 4321, "close": 4322, "volume": 1036}],
+        [{"open": 4325, "high": 4332, "low": 4321, "close": 4322, "volume": 1036, "oi": 162836}],
         index=pd.to_datetime(["2026-11-06 22:55"]),
     )
     provider._fetch_ths = lambda *_a, **_k: fake  # type: ignore[method-assign]
     got = provider.import_ths_chart("fu2701", "5")
     assert float(got.iloc[-1]["close"]) == 4322
-    assert provider.store.load("fu2701@ths", "5") is not None
+    assert float(got.iloc[-1]["oi"]) == 162836
+    stored = provider.store.load("fu2701@ths", "5")
+    assert stored is not None
+    assert float(stored.iloc[-1]["oi"]) == 162836
+    raw = provider.raw_store.load("fu2701@ths", "5", "ths")
+    assert raw is not None
+    assert float(raw.iloc[-1]["oi"]) == 162836
     assert provider.store.load("fu2701", "5") is None
 
 

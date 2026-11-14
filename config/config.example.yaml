@@ -44,6 +44,9 @@ schedule:
     - ["09:00", "11:30"]
     - ["13:30", "15:00"]
     - ["21:00", "02:30"]
+  # 内置节假日之外再加的休市日（临时休市/调休），写 "2026-12-31" 这种日期。
+  # 这些天不清仓、不预约收盘清仓，待办留到下一个交易日。
+  closed_days: []
 
 # ---------- 策略引擎（见文件顶部路线菜单） ----------
 strategy:
@@ -111,6 +114,30 @@ strategy:
     max_chase_atr: 2.0
     atr_period: 14
 
+  # 以损定开（engine=liq_stop）。击穿止损聚集区后回流确认，止损放区间外侧。
+  liq_stop:
+    zone_lookback: 20
+    zone_tol: 0.005
+    pivot_span: 2
+    atr_period: 20
+    adx_period: 14
+    adx_min: 20.0
+    break_window: 3
+    entry_offset: 0.5
+    stop_atr: 1.0
+    take_profit: true
+    reward_risk: 2.0
+    vol_mult: 0.0
+
+  # 凯利突破（engine=kelly_break）。收盘突破前 N 根高低点，固定盈亏比止盈。
+  kelly_break:
+    lookback: 20
+    atr_period: 14
+    stop_atr: 1.2
+    take_profit: true
+    reward_risk: 2.5
+    min_atr_ratio: 0.0
+
   # 趋势跟随 / 海龟突破（engine=trend_follow）。收盘冲破前 N 根最高做多、跌破最低做空。
   # 文档 5 分钟口径：进场 20 根、出场 10 根、止损 2ATR，日内收盘强平。
   # 只想保持原有 36/12 的，把下面两个数改回去即可。
@@ -161,6 +188,14 @@ strategy:
   ema_swing:
     dir_ema_pair: 60/120
     sig_ema_triple: 5/10/30
+    # 上面两个「成对/三根」标签拆开后的实际根数；优化改参数时会写回这里。
+    dir_ema_fast: 60
+    dir_ema_slow: 120
+    ema_fast: 60
+    ema_slow: 120
+    sig_ema_a: 5
+    sig_ema_b: 10
+    sig_ema_c: 30
     side_ema: 120
     stop_ema: 120
     slope_ema: 120
@@ -257,6 +292,9 @@ strategy:
     max_box_atr_mult: 5.0
     # 信号收盘离破位超过开盘前 ATR 的多少倍就先等回抽；0=关闭。出厂 1。
     max_chase_atr_mult: 1.0
+    # 急破后等回抽：收盘没有效突破这条 EMA 就作废这次突破。ema_period=0 关闭。
+    ema_period: 20
+    ema_buffer_ticks: 2
     # 开仓截止钟点：过了这个钟点，这一段不再开新仓。日盘和夜盘分开设。
     day_cutoff: "10:30"
     night_cutoff: "22:15"
@@ -276,6 +314,9 @@ strategy:
     macd_fast: 12
     macd_slow: 26
     macd_signal: 9
+    # 优化按「12/26/9」「5/20」这种整串改参数时会写回这两项，和上面的分项等价。
+    macd_combo: "12/26/9"
+    dir_ema_pair: "5/20"
     dir_ema_fast: 5
     dir_ema_slow: 20
     trend_align_enabled: false
@@ -379,6 +420,44 @@ backtest:
   range_preset: "全部可用"
   start_date: ""          # 空着时，界面默认填当年1月1日
   end_date: ""
+  # 成交近似：信号下一根开盘价成交；滑点按买卖方向各让几跳。
+  fill_on_next_open: true
+  slippage_ticks: 1.0
+  # 涨跌停/流动性近似（默认关闭，打开后会改变回测结果）：
+  #   block_limit_locked: 成交这根最高=最低（一字板）时不开仓，平仓顺延到下一根。
+  #   max_volume_pct: 单根新开仓手数不超过该根成交量的比例，0=不限。
+  liquidity:
+    block_limit_locked: false
+    max_volume_pct: 0
+  # 策略优化：搜索深度、防过拟合方式（一次性留出 / 滚动验证）。
+  optimize_depth: "标准"
+  optimize_mode: "一次切断"
+  optimize_holdout_pct: 30
+  optimize_walk_steps: 3
+
+# 策略评估门槛（回测/优化共用）。缺项按程序默认值处理。
+evaluation:
+  enabled: true
+  adx_period: 14
+  adx_trend_min: 20
+  stress_on_backtest: true
+  gate_on_optimize: true
+  stress_min_trades: 30
+  profit_factor_min: 1.3
+  r_expect_min: 0.12
+  calmar_min: 1.0
+  max_drawdown_pct: 0.15
+  profit_cover_min: 0
+  trades_min: 150
+  trades_observe: 100
+  max_consecutive_losses: 8
+  range_pf_max: 1.0
+  range_trade_share_max: 0.3
+  slippage_extra_ticks: 1.0
+  slippage_pf_min: 1.2
+  perturbation_step_pct: 0.1
+  perturbation_pf_ratio: 0.8
+  perturbation_pf_min: 1.1
 
 # ---------- 执行通道（见文件顶部路线菜单） ----------
 trade:
@@ -428,6 +507,9 @@ trade:
     flow_dir: "data/ctp_flow"
     query_interval_sec: 30
     order_wait_sec: 8
+    # 报单超时自动撤单；撤单后最多等几秒确认。
+    auto_cancel_on_timeout: true
+    cancel_wait_sec: 3
     # 上期所、能源中心、大商所会自动拆平今/平昨。这里可再追加品种。
     close_split_products: ["bu", "c"]
   gui:

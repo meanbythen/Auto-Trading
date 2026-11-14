@@ -32,4 +32,45 @@ jobs:
         run: python -m mypy
 
       - name: Pytest
-        run: python -m pytest -q
+        run: python -m pytest -q --cov=src --cov-report=term-missing
+
+  build:
+    # 在 Windows 上真打一次 onedir 包，再启动 exe 看它能不能活过启动阶段。
+    # 漏打资源或 hiddenimports 时，这里会比用户先发现。
+    runs-on: windows-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.lock
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-dev.txt
+          python -m pip install "pyinstaller==6.15.0"
+
+      - name: Build exe
+        run: python -m PyInstaller --noconfirm Auto-Trading.spec
+
+      - name: Verify dist
+        run: python tools/verify_dist.py
+
+      - name: Smoke start
+        shell: pwsh
+        run: |
+          $exe = "dist/Auto-Trading/Auto-Trading.exe"
+          $p = Start-Process -FilePath $exe -PassThru
+          Start-Sleep -Seconds 12
+          if ($p.HasExited) {
+            Write-Error "exe 启动后立即退出，退出码 $($p.ExitCode)"
+            exit 1
+          }
+          Write-Host "exe 启动 12 秒后仍在运行，冒烟通过"
+          Stop-Process -Id $p.Id -Force

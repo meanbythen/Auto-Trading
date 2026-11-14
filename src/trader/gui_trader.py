@@ -843,19 +843,47 @@ class GuiTrader(TraderBase):
                 pyautogui.press("enter")
                 logger.warning("未标定 confirm_btn，改按回车确认 ({}/{})", i + 1, self.confirm_times)
 
-    def _ensure_symbol(self, symbol: str) -> None:
+    def _ensure_symbol(self, symbol: str) -> bool:
         """
-        若标定了品种输入框，则先写入合约代码（如 bu2612）。
-        主流 GUI 交易助手都会在下单前对准合约，避免点错品种。
+        若标定了品种输入框，则先写入合约代码（如 bu2612），再回读确认真的切过去了。
+
+        主流 GUI 交易助手都会在下单前对准合约，避免点错品种。输入框没标定时无法确认，
+        记一条告警后放行（沿用老行为）。回读不到内容时也放行，不拿读屏失败当切换失败。
         """
         if not self.gui.get("symbol_input"):
-            return
+            if not getattr(self, "_symbol_unconfirmed_warned", False):
+                self._symbol_unconfirmed_warned = True
+                logger.warning(
+                    "没有标定合约输入框，下单前无法确认交易面板当前合约是 {}，请人工确认", symbol
+                )
+            return True
         # 界面里常显示小写/大写均可；typewrite 用字母数字
         code = "".join(ch for ch in symbol if ch.isalnum())
         if not code:
-            return
+            return True
         self._type_into("symbol_input", code)
         time.sleep(0.15)
+        return self._verify_symbol(code)
+
+    def _verify_symbol(self, code: str) -> bool:
+        """回读合约输入框，确认切换生效。读不到字时按成功处理，避免误判卡死下单。"""
+        if self.dry_run:
+            return True
+        point = self.gui.get("symbol_input")
+        if not point:
+            return True
+        try:
+            _control, text = self._price_control_text(point)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("回读合约失败，按已切换处理: {}", exc)
+            return True
+        shown = "".join(ch for ch in str(text or "") if ch.isalnum()).lower()
+        if not shown:
+            return True
+        if code.lower() in shown or shown in code.lower():
+            return True
+        logger.error("合约切换没生效：想切 {}, 交易面板显示 {}", code, text)
+        return False
 
     def place_order(self, req: OrderRequest) -> OrderResult:
         global _ORDER_CLICKING
@@ -868,6 +896,9 @@ class GuiTrader(TraderBase):
         # 整段点击期间，界面不要把自己拉到前面。结束时无论成败都要取消钉住。
         _ORDER_CLICKING = True
         pointer: dict[str, Any] | None = None
+        # 买卖按钮一旦点下去，这一笔就按「已发出」算。之后收尾再出错也不能报失败，
+        # 否则上层会撤销「这根K线已处理」的标记，下一轮对着同一根K线再点一次。
+        clicked = False
         try:
             pointer = grab_pointer_for_order(dry_run=self.dry_run)
             # 下单期间本程序不能再跑到前面。先沉底并禁止激活，点完再恢复。
@@ -885,8 +916,11 @@ class GuiTrader(TraderBase):
             # 后面只做对手价、手数和买卖按钮。不再拉起本程序，也不再打开下单模拟器。
             self._order_armed = True
 
-            # 0) 可选：切换/确认合约
-            self._ensure_symbol(req.symbol)
+            # 0) 可选：切换/确认合约。切不过去就停手，别把单点到别的品种上。
+            if not self._ensure_symbol(req.symbol):
+                message = f"合约没有切换到 {req.symbol}，这次没有点买多、卖空或平仓。"
+                logger.error(message)
+                return OrderResult(ok=False, message=message, order_id=order_id)
 
             # 1) 常驻只填手数，价格框保持对手价。
             # 下单模拟器才会把限价打进价格框，用来挂一张不成交的委托。
@@ -961,9 +995,17 @@ class GuiTrader(TraderBase):
                 self._click("close_btn")
             else:
                 return OrderResult(ok=False, message=f"未知方向: {req.side}")
+            clicked = True
 
             # 3) 默认无确认框。只有配置了 confirm_times>0 才去关弹窗。
-            self._dismiss_confirm()
+            # 点击之后这一步失败也不能算「没发单」：委托可能已经进了柜台。
+            try:
+                self._dismiss_confirm()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("点击后关确认框失败，按已发出处理，请核对同花顺: {}", exc)
+                return self._order_sent_unclean(
+                    order_id, req, f"关确认框失败（{exc}）"
+                )
 
             if use_limit:
                 msg = f"下单模拟器已点击，不记入账户 side={req.side} 价格={typed_price}"
@@ -987,14 +1029,51 @@ class GuiTrader(TraderBase):
                 raw={"assumed_fill": not self.dry_run, "executor": "gui"},
             )
         except Exception as e:  # noqa: BLE001
+            if clicked:
+                # 点已经落下去，委托可能已进柜台。不能返回失败让上层重试。
+                logger.exception("点击后收尾异常，按已发出处理: {}", e)
+                return self._order_sent_unclean(order_id, req, f"收尾异常（{e}）")
             logger.exception("GUI 下单失败: {}", e)
             return OrderResult(ok=False, message=str(e), order_id=order_id)
         finally:
+            _ORDER_CLICKING = False
+            self._order_armed = False
+            # 收尾动作各自兜底：这里再抛异常会越过上面的返回值，让已点出的单看起来像失败。
             try:
-                _ORDER_CLICKING = False
-                self._order_armed = False
                 self._unpin_trade_window()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("取消钉住交易窗口失败: {}", exc)
+            try:
                 self._restore_own_windows()
-            finally:
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("恢复本程序窗口失败: {}", exc)
+            try:
                 release_pointer_after_order(pointer)
-                _TRADE_LOCK.release()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("恢复鼠标位置失败: {}", exc)
+            _TRADE_LOCK.release()
+
+    def _order_sent_unclean(self, order_id: str, req: OrderRequest, detail: str) -> OrderResult:
+        """
+        点击已经发出、但收尾步骤出错时的结果。
+
+        按「已发出」返回，交给调度层保留委托意图并停手人工核对，
+        绝不能让上层按失败处理再点一次。
+        """
+        message = (
+            f"已点击 {req.side} {req.symbol} {req.volume} 手，但{detail}。"
+            "按已发出处理，请在同花顺核对持仓与委托。"
+        )
+        logger.error(message)
+        return OrderResult(
+            ok=True,
+            message=message,
+            order_id=order_id,
+            assumed_fill=not self.dry_run,
+            raw={
+                "assumed_fill": not self.dry_run,
+                "executor": "gui",
+                "unclean": True,
+                "detail": detail,
+            },
+        )

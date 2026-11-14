@@ -22,6 +22,11 @@ from typing import Any, Callable, Iterable
 import pandas as pd
 
 from .cta_filter import CtaFilterParams, evaluate_cta_filter
+from .factory import (
+    CROSS_TEST_ENGINE_ORDER,
+    ENGINE_AUDIT_MODES,
+    engine_label_map,
+)
 from .market_state import (
     ENGINE_TREND_SECTION,
     MarketFilterParams,
@@ -38,52 +43,8 @@ CTA_OWN_FILTER = {
     "cta",
 }
 
-
-# 每个策略引擎的"预期过滤模式"：
-# - daily_body 日内实体 → range（写在策略自己里）
-# - 海龟 / SuperTrend / 双均线 / 布林 / SAR / 长线 → trend（各自 filter_*）
-# - 多因子 → 自己的 cta_filter
-# - swing_box → 箱子和 ADX 写在策略里
-ENGINE_AUDIT_MODES: dict[str, MarketFilterMode | None] = {
-    "daily_body": "range",
-    "float_hold": None,  # 过滤默认关；方向交给方向选择器，默认开盘箱体 + 跳空顺向
-    "trend_follow": "trend",
-    "supertrend": "trend",
-    "st": "trend",          # 别名
-    "dual_ma": "trend",
-    "ma_cross": "trend",    # 别名
-    "ema_swing": None,  # 只用均线斜率，不用公共 ADX 过滤
-    "macd_swing": None,
-    "bollinger": "trend",
-    "boll": "trend",        # 别名
-    "sar_trend": "trend",
-    "parabolic_sar": "trend",  # 别名
-    "multi_factor": "trend",
-    "cta": "trend",         # 别名
-    "swing_trend": "trend",
-    "swing_box": None,  # 箱子和 ADX 写在策略里
-}
-
-# 策略中文名（和 ENGINE_LABELS 一致，这里单独放一份避免循环 import）
-ENGINE_NAMES: dict[str, str] = {
-    "daily_body": "日内实体",
-    "float_hold": "日内浮盈飘单",
-    "trend_follow": "趋势跟随",
-    "supertrend": "SuperTrend",
-    "st": "SuperTrend",
-    "dual_ma": "双均线",
-    "ma_cross": "双均线",
-    "ema_swing": "均线波段",
-    "macd_swing": "均线波段",
-    "bollinger": "布林突破",
-    "boll": "布林突破",
-    "sar_trend": "SAR波段",
-    "parabolic_sar": "SAR波段",
-    "multi_factor": "多因子CTA（加权打分）",
-    "cta": "多因子CTA（加权打分）",
-    "swing_trend": "长线加减仓",
-    "swing_box": "长线箱体突破",
-}
+# 策略中文名（正式名 + 别名）。统一由策略工厂提供，这里不再另抄一份。
+ENGINE_NAMES: dict[str, str] = engine_label_map()
 
 
 @dataclass
@@ -162,19 +123,7 @@ def run_pre_session_audit(
     tf = str(timeframe or st.get("timeframe") or "15")
 
     # 主推引擎名（不含别名）
-    PRIMARY = {
-        "daily_body",
-        "float_hold",
-        "trend_follow",
-        "supertrend",
-        "dual_ma",
-        "ema_swing",
-        "bollinger",
-        "sar_trend",
-        "multi_factor",
-        "swing_trend",
-        "swing_box",
-    }
+    PRIMARY = CROSS_TEST_ENGINE_ORDER
     all_engines = list(engines) if engines is not None else list(
         ENGINE_AUDIT_MODES.keys() if include_aliases else PRIMARY
     )

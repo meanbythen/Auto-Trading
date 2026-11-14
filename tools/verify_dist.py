@@ -11,71 +11,30 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 DIST = ROOT / "dist" / "Auto-Trading"
 
-# 复盘升级与主流程相关的模块，必须进 PYZ
-REQUIRED_MODULES = [
-    "src.review.quality",
-    "src.review.diagnose",
-    "src.review.scorecard",
-    "src.review.baseline",
-    "src.review.gap",
-    "src.review.sources",
-    "src.review.service",
-    "src.backtest.optimizer",
-    "src.backtest.param_table",
-    "src.backtest.rollover",
-    "src.backtest.main_table",
-    "src.screen.picker",
-    "src.account.signal_book",
-    "src.export.bundle",
-    "src.ui.app",
-    "src.ui.test_tools",
-    "src.ui.order_simulator",
-    "src.strategy.daily_body",
-    "src.strategy.supertrend",
-    "src.strategy.dual_ma",
-    "src.strategy.macd_swing",
-    "src.strategy.trend_follow",
-    "src.strategy.swing_trend",
-    "src.strategy.swing_box",
-    "src.strategy.market_state",
-    "src.strategy.trend_base",
-    "src.strategy.bollinger_break",
-    "src.strategy.sar_trend",
-    "src.strategy.multi_factor",
-    "src.strategy.cta_factors",
-    "src.strategy.cta_filter",
-    "src.export.cta_decay",
-    "src.export.factor_decay_plot",
-    "src.data.quality",
-    "src.data.inventory",
-    "src.data.ths_chart",
-    "src.ops.alerts",
-    "src.risk.dynamic",
-    "src.ops.health",
-    "src.research.scan",
-    "src.research.pool",
-    "src.research.factors",
-    # 21:00 期货交易日、保证金表等运行必需模块
-    "src.utils.trading_day",
-    "src.risk.margin_table",
-    "src.risk.universe_table",
-    "src.risk.kelly",
-    "src.risk.sizing",
-    "src.data.tq_source",
-    "src.trader.ctp_td",
-    "src.trader.ctp_gateway",
-    "tools.refresh_universe",
-    "src.account.signal_stats",
-    "src.scheduler.runner",
-    "src.trader.ctp_logic",
-    "src.trader.sim_trader",
-    "src.strategy.levels",
-    "src.strategy.explain",
-    "src.ui.config_presets",
-    "src.ui.datetime_pickers",
-    "src.data.bar_inspect",
-    "src.data.bar_store",
-]
+
+def _enumerate_modules() -> list[str]:
+    """自动枚举 src/ 和 tools/ 下所有 .py 模块，避免手动维护 REQUIRED_MODULES 漏写。"""
+    modules: set[str] = set()
+    self_path = Path(__file__).resolve()
+    for root in (ROOT / "src", ROOT / "tools"):
+        if not root.exists():
+            continue
+        for py in root.rglob("*.py"):
+            # 排除 __init__.py、自身（verify_dist 不进 PYZ）
+            if py.name == "__init__.py":
+                continue
+            if py.resolve() == self_path:
+                continue
+            try:
+                rel = py.relative_to(ROOT).with_suffix("")
+            except ValueError:
+                continue
+            modules.add(str(rel).replace("\\", "/").replace("/", "."))
+    return sorted(modules)
+
+
+# 自动从源码目录枚举，加新文件后无需手动维护
+REQUIRED_MODULES = _enumerate_modules()
 
 def main() -> int:
     errors: list[str] = []

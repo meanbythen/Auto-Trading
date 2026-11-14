@@ -150,6 +150,104 @@ def save_secrets(password: str = "", extra: dict[str, Any] | None = None) -> Pat
     return path
 
 
+def _mapping_paths(data: Any, prefix: str = "") -> set[str]:
+    """把嵌套字典展开成「a.b.c」键路径集合；只看键，不看值。"""
+    if not isinstance(data, dict):
+        return set()
+    paths: set[str] = set()
+    for key, value in data.items():
+        path = f"{prefix}.{key}" if prefix else str(key)
+        paths.add(path)
+        paths |= _mapping_paths(value, path)
+    return paths
+
+
+# 键由用户或品种表动态决定的小节，天然和示例配置不同，不参与键名比对。
+_DYNAMIC_KEY_PREFIXES = ("data.symbol_map", "risk.contracts")
+
+
+def _is_ignored_path(path: str) -> bool:
+    """运行时字段（下划线开头）和动态小节跳过。"""
+    if path.split(".", 1)[0].startswith("_"):
+        return True
+    return any(path == prefix or path.startswith(f"{prefix}.") for prefix in _DYNAMIC_KEY_PREFIXES)
+
+
+def diff_config_keys(cfg: dict[str, Any], example: dict[str, Any]) -> tuple[list[str], list[str]]:
+    """
+    比对用户配置与示例配置的键名，返回 (未知键, 缺失键)。
+
+    值是用户自己的，不比较；只找多写、少写、拼错的键。
+    """
+    got = {path for path in _mapping_paths(cfg) if not _is_ignored_path(path)}
+    want = {path for path in _mapping_paths(example) if not _is_ignored_path(path)}
+    return sorted(got - want), sorted(want - got)
+
+
+def find_duplicate_keys(text: str) -> list[str]:
+    """
+    找出 YAML 同一层重复出现的键，返回「a.b」路径。
+
+    yaml.safe_load 遇到重复键不报错，后写的直接覆盖前面的；这里只负责点名，不改变解析结果。
+    文本解析失败时返回空列表，交给后续 safe_load 报真正的语法错误。
+    """
+    try:
+        root = yaml.compose(text)
+    except yaml.YAMLError:
+        return []
+    found: list[str] = []
+
+    def walk(node: yaml.Node, prefix: str) -> None:
+        if isinstance(node, yaml.MappingNode):
+            seen: set[str] = set()
+            for key_node, value_node in node.value:
+                if not isinstance(key_node, yaml.ScalarNode):
+                    continue
+                key = str(key_node.value)
+                path = f"{prefix}.{key}" if prefix else key
+                if key in seen:
+                    found.append(path)
+                seen.add(key)
+                walk(value_node, path)
+        elif isinstance(node, yaml.SequenceNode):
+            for item in node.value:
+                walk(item, prefix)
+
+    if root is not None:
+        walk(root, "")
+    return found
+
+
+def _preview_keys(paths: list[str], limit: int = 8) -> str:
+    """告警里只列前几个键，剩下的写个数，避免刷屏。"""
+    shown = "、".join(paths[:limit])
+    if len(paths) > limit:
+        return f"{shown} 等 {len(paths)} 个"
+    return shown
+
+
+def _warn_config_key_diff(cfg: dict[str, Any], example: Path) -> None:
+    """
+    和 config.example.yaml 对键名，不中断加载。
+
+    多写的键可能拼错或已废弃，记 warning；
+    少写的键一律按程序默认值处理，属于正常裁剪，只在 debug 里提示。
+    """
+    try:
+        with example.open("r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+    except OSError as exc:
+        logger.debug("读示例配置失败，跳过键名校验: {}", exc)
+        return
+    if not isinstance(data, dict):
+        return
+    unknown, missing = diff_config_keys(cfg, data)
+    if unknown:
+        logger.warning("配置里有示例没有的键（可能拼错或已废弃）: {}", _preview_keys(unknown))
+    if missing:
+        logger.debug("配置缺少示例里的键，按程序默认值处理: {}", _preview_keys(missing))
+
+
 def load_config(
     config_path: str | Path | None = None,
     *,
@@ -164,14 +262,24 @@ def load_config(
     """
     root = ensure_runtime_layout()
     path = Path(config_path) if config_path else root / "config" / "config.yaml"
+    example = root / "config" / "config.example.yaml"
 
     if not path.exists():
-        example = root / "config" / "config.example.yaml"
         logger.warning("未找到 {}，临时使用 {}", path, example)
         path = example
 
-    with path.open("r", encoding="utf-8") as f:
-        cfg: dict[str, Any] = yaml.safe_load(f) or {}
+    text = path.read_text(encoding="utf-8")
+    # 同一层写了两次的键，yaml 后写的会静默覆盖前面的；这里先点名，方便对照。
+    for dup in find_duplicate_keys(text):
+        logger.warning("配置里有重复键 {}（同一层写了两次，后写的生效）: {}", dup, path)
+    cfg: dict[str, Any] = yaml.safe_load(text) or {}
+
+    # 和示例配置对键名：多写/少写只告警，不阻断加载（旧配置仍可用）。
+    if path != example:
+        _warn_config_key_diff(cfg, example)
+
+    # 最后一道保险：配置被裁剪或缺键时按模拟处理，绝不默认走实盘。
+    cfg.setdefault("dry_run", True)
 
     secrets = load_secrets()
     pwd_env = cfg.get("account", {}).get("password_env", "FUTURES_PASSWORD")
@@ -260,6 +368,10 @@ def save_config(cfg: dict[str, Any], config_path: str | Path | None = None) -> P
     """
     root = _project_root()
     path = Path(config_path) if config_path else Path(cfg.get("_config_path") or root / "config" / "config.yaml")
+    # 缺 config.yaml 时 load_config 会临时读 config.example.yaml；保存不能把示例模板改掉，
+    # 这种情况一律写回正式的 config.yaml。
+    if path.name == "config.example.yaml":
+        path = root / "config" / "config.yaml"
 
     try:
         from src.strategy.factory import sanitize_strategy_config
@@ -294,6 +406,16 @@ def save_config(cfg: dict[str, Any], config_path: str | Path | None = None) -> P
     path.parent.mkdir(parents=True, exist_ok=True)
     if path.exists() and path.read_text(encoding="utf-8") == text:
         return path
-    path.write_text(text, encoding="utf-8")
+    # 先写临时文件再原子替换：写到一半断电/崩溃时，原配置仍是完整的一份。
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
     logger.info("配置已保存: {}", path)
     return path

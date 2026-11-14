@@ -24,6 +24,15 @@ ignore = ["E501"]
 testpaths = ["tests"]
 addopts = "-q"
 
+[tool.coverage.run]
+source = ["src"]
+
+[tool.coverage.report]
+# 2026-11-14 基线 56.87%（1090 项测试）。门槛留不到 1 个点余量，既拦住明显回退，
+# 又不因平台/依赖版本的小差异误报。补了用例再把这里往上调。
+fail_under = 56
+show_missing = true
+
 [tool.mypy]
 python_version = "3.12"
 files = ["src"]
@@ -35,12 +44,17 @@ ignore_errors = true
 
 [[tool.mypy.overrides]]
 module = [
+    "src.account.*",
     "src.backtest.metrics",
     "src.data.periods",
+    "src.domain.*",
+    "src.risk.*",
     "src.scheduler.order_executor",
+    "src.scheduler.*",
     "src.strategy.daily_body",
     "src.strategy.indicators",
     "src.strategy.market_state",
+    "src.utils.*",
     "src.utils.session_clock",
 ]
 ignore_errors = false
@@ -49,5 +63,11 @@ ignore_errors = false
 # 这几个是混入类：cfg、trader、strategy 这些共享状态定义在 TradingBot 上，
 # 单看混入类会说「没有这个属性」。查别的错误，不查这一条。
 module = ["src.scheduler.order_executor"]
+ignore_errors = false
+disable_error_code = ["attr-defined", "has-type"]
+
+[[tool.mypy.overrides]]
+# 常驻扫描的各个 Mixin 与 order_executor 同理，共享状态在 TradingBot 上。
+module = ["src.scheduler.*"]
 ignore_errors = false
 disable_error_code = ["attr-defined", "has-type"]

@@ -22,6 +22,9 @@ from typing import Any
 
 from loguru import logger
 
+from src.strategy.factory import ENGINE_ALIASES as _FACTORY_ENGINE_ALIASES
+from src.strategy.factory import ENGINE_LABELS as _FACTORY_ENGINE_LABELS
+
 DEFAULT_REL_PATH = "config/优化参数.xlsx"
 
 SHEET_GRID = "参数网格"
@@ -35,31 +38,16 @@ VALUE_HEADERS = ("参数键", "取值", "取值说明")
 
 DEPTHS = ("精简", "标准", "完整")
 
-# 写进 Excel / 从 Excel 读回时用的策略引擎键。界面里的旧名字会先换成这里的键。
+# 写进 Excel / 从 Excel 读回时用的策略引擎键。中文名统一由策略工厂提供。
+# 参数表暂不列以损定开和凯利突破：它们的网格维度和其它策略差别太大。
+_ENGINE_NAMES_EXCLUDED = {"liq_stop", "kelly_break"}
 ENGINE_NAMES: dict[str, str] = {
-    "daily_body": "日内实体（主推）",
-    "float_hold": "日内浮盈飘单",
-    "trend_follow": "趋势跟随",
-    "supertrend": "SuperTrend趋势",
-    "dual_ma": "双均线趋势",
-    "ema_swing": "均线波段",
-    "bollinger": "布林带突破",
-    "sar_trend": "SAR波段趋势",
-    "multi_factor": "多因子CTA（加权打分）",
-    "swing_trend": "长线趋势加减仓",
-    "swing_box": "长线箱体突破",
+    key: label
+    for key, label in _FACTORY_ENGINE_LABELS.items()
+    if key not in _ENGINE_NAMES_EXCLUDED
 }
 
-_ENGINE_ALIASES = {
-    "st": "supertrend",
-    "ma_cross": "dual_ma",
-    "boll": "bollinger",
-    "bollinger_break": "bollinger",
-    "sar": "sar_trend",
-    "parabolic_sar": "sar_trend",
-    "cta": "multi_factor",
-    "macd_swing": "ema_swing",
-}
+_ENGINE_ALIASES = dict(_FACTORY_ENGINE_ALIASES)
 
 _DEPTH_ALIASES = {
     "light": "精简",

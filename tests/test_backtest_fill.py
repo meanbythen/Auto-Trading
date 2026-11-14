@@ -16,6 +16,8 @@ from src.backtest.engine import (
     _trend_frame_for_signal,
     run_backtest,
 )
+from src.strategy.trend_base import TrendStrategyBase
+from src.strategy.types import PositionState, StrategyAction
 
 
 def _frame(rows: list[tuple[str, float, float, float]]) -> pd.DataFrame:
@@ -247,6 +249,32 @@ def test_slippage_and_next_open_can_be_switched_off() -> None:
     assert "未加滑点" in snap["fill_note"]
 
 
+def test_open_is_blocked_on_the_flatten_bar() -> None:
+    """下一根已经是收盘清仓时点：不开仓，避免同一根开平。"""
+    closes = [90.0 if i % 2 == 0 else 110.0 for i in range(40)] + [130.0, 131.0]
+    idx = [datetime(2026, 10, 16, 9, 0) + timedelta(minutes=5 * i) for i in range(40)]
+    idx += [datetime(2026, 10, 16, 14, 50), datetime(2026, 10, 16, 15, 0)]
+    bars = pd.DataFrame(
+        {
+            "open": closes,
+            "high": [c + 1 for c in closes],
+            "low": [c - 1 for c in closes],
+            "close": closes,
+            "volume": [100] * len(closes),
+        },
+        index=idx,
+    )
+    cfg = _cfg()
+    cfg["strategy"]["flatten_at_close"] = True
+    cfg["strategy"]["flatten_times"] = ["15:00"]
+    cfg["strategy"]["trend_follow"]["flatten_at_close"] = True
+
+    result = run_backtest(cfg, symbol="bu", bars_signal=bars, warmup=20, volume=1)
+
+    assert result.performance.trades == 0
+    assert any("收盘清仓时点" in item.reason for item in result.rejected)
+
+
 def test_backtest_symbol_follows_the_watch_list() -> None:
     """不传合约时，用关注列表的第一个；trade.symbol 不会抢先。"""
     cfg = _cfg()
@@ -334,5 +362,130 @@ def test_universe_table_round_trips_tick_column(tmp_path) -> None:
     _symbols, contracts = parse_universe_rows(rows)
     assert contracts["bu"]["price_tick"] == 0.5
     assert "price_tick" not in contracts["c"]
+
+
+def _intraday_breakout_bars() -> pd.DataFrame:
+    """09:00~12:15 在 90/110 来回，12:20 突破，之后一路小涨到 14:55，15:00 大幅低开。"""
+    idx: list[datetime] = [
+        datetime(2026, 10, 16, 9, 0) + timedelta(minutes=5 * i) for i in range(40)
+    ]
+    closes = [90.0 if i % 2 == 0 else 110.0 for i in range(40)]
+    idx.append(datetime(2026, 10, 16, 12, 20))
+    closes.append(130.0)
+    stamp = datetime(2026, 10, 16, 12, 25)
+    price = 130.0
+    while stamp <= datetime(2026, 10, 16, 14, 55):
+        price += 0.5
+        closes.append(price)
+        idx.append(stamp)
+        stamp += timedelta(minutes=5)
+    idx.append(datetime(2026, 10, 16, 15, 0))
+    closes.append(70.0)
+    return pd.DataFrame(
+        {
+            "open": closes,
+            "high": [c + 1 for c in closes],
+            "low": [c - 1 for c in closes],
+            "close": closes,
+            "volume": [100] * len(closes),
+        },
+        index=idx,
+    )
+
+
+def test_flatten_close_fills_at_the_current_close_not_next_open() -> None:
+    """收盘清仓按当根收盘成交，不能拖到下一根（这里下一根直接低开 60 点）。"""
+    bars = _intraday_breakout_bars()
+    cfg = _cfg(slippage_ticks=0)
+    cfg["strategy"]["flatten_at_close"] = True
+    cfg["strategy"]["flatten_times"] = ["14:55"]
+    cfg["strategy"]["trend_follow"]["flatten_at_close"] = True
+
+    result = run_backtest(cfg, symbol="bu", bars_signal=bars, warmup=20, volume=1)
+
+    assert result.performance.trades >= 1
+    last = result.trades[-1]
+    assert "收盘清仓" in last.reason_exit
+    expected = float(bars.loc[pd.Timestamp("2026-10-16 14:55"), "close"])
+    assert last.exit_price == expected
+
+
+def test_inherit_position_opens_at_segment_start_for_any_engine() -> None:
+    """换月接仓不再只对 macd_swing 生效：新段第一根就按上一段手数把仓补回来。"""
+    bars = _intraday_breakout_bars()
+    result = run_backtest(
+        _cfg(slippage_ticks=0),
+        symbol="bu",
+        bars_signal=bars,
+        warmup=20,
+        volume=1,
+        inherit_position={"side": "long", "volume": 3},
+    )
+
+    assert result.performance.trades >= 1
+    first = result.trades[0]
+    assert first.volume == 3
+    assert first.side == "long"
+    # warmup=20，段首就是第 21 根；成交在下一根开盘，最多晚一根。
+    assert pd.Timestamp(first.entry_time) <= pd.Timestamp(bars.index[20]) + timedelta(minutes=5)
+
+
+class _RaiseStop(TrendStrategyBase):
+    """测试用：每根都把止损推到本根最高价上方，模拟大阳线抬高止损。"""
+
+    label = "测试"
+
+    def prepare(self, bars: pd.DataFrame) -> dict[str, object]:
+        return {}
+
+    def entry_signal(self, bars: pd.DataFrame, bar: pd.Series, ind: dict[str, object]):
+        return None
+
+    def trail_stop(
+        self, bars: pd.DataFrame, bar: pd.Series, pos: PositionState, ind: dict[str, object]
+    ) -> float:
+        pos.trail_stop = float(bar["high"]) + 1
+        return pos.trail_stop
+
+
+def _stop_test_cfg() -> dict:
+    return {
+        "strategy": {
+            "engine": "supertrend",
+            "timeframe": "5",
+            "symbols": ["bu"],
+            "flatten_times": [],
+            "flatten_at_close": False,
+        },
+        "trade": {"symbol": "bu", "volume": 1},
+        "schedule": {"trading_sessions": []},
+    }
+
+
+def test_new_trail_stop_only_applies_from_the_next_bar() -> None:
+    """本根新算的止损不能拿来判本根：大阳线自己抬高止损，不该当场把自己打掉。"""
+    strat = _RaiseStop(_stop_test_cfg())
+    pos = PositionState(
+        symbol="bu", side="long", volume=1, entry_price=100, initial_stop=90, trail_stop=90
+    )
+    first = pd.DataFrame(
+        {"open": [100.0], "high": [110.0], "low": [99.0], "close": [105.0], "volume": [100]},
+        index=[pd.Timestamp("2026-10-16 09:00")],
+    )
+    decision = strat._manage(
+        "bu", first, first.iloc[0], str(first.index[0]), pos, {}, datetime(2026, 10, 16, 9, 0)
+    )
+    assert decision.action != StrategyAction.CLOSE
+    assert pos.trail_stop == 111.0
+
+    second = pd.DataFrame(
+        {"open": [105.0], "high": [115.0], "low": [89.0], "close": [95.0], "volume": [100]},
+        index=[pd.Timestamp("2026-10-16 09:05")],
+    )
+    decision = strat._manage(
+        "bu", second, second.iloc[0], str(second.index[0]), pos, {}, datetime(2026, 10, 16, 9, 5)
+    )
+    assert decision.action == StrategyAction.CLOSE
+    assert decision.stop_price == 111.0
 
 

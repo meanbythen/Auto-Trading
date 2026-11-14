@@ -52,8 +52,11 @@ from src.ui.app_common import (
 from src.ui.account_tab import AccountTabMixin
 from src.ui.app_state import AppStateMixin
 from src.ui.backtest_tab import BacktestTabMixin
+from src.ui.config_collect import ConfigCollectMixin
 from src.ui.config_support import ConfigSupportMixin
+from src.ui.config_vars import ConfigVarsMixin
 from src.ui.dashboard import DashboardMixin
+from src.ui.data_tab import DataTabMixin
 from src.ui.optimize_tab import OptimizeTabMixin
 from src.ui.picker_tab import PickerTabMixin
 from src.ui.research_tab import ResearchTabMixin
@@ -79,10 +82,13 @@ __all__ = [
 class AutoTradingApp(
     WidgetsMixin,
     AppStateMixin,
+    ConfigVarsMixin,
+    ConfigCollectMixin,
     ConfigSupportMixin,
     DashboardMixin,
     RunTabMixin,
     BacktestTabMixin,
+    DataTabMixin,
     ResearchTabMixin,
     ReviewTabMixin,
     AccountTabMixin,
@@ -112,6 +118,16 @@ class AutoTradingApp(
             log_dir=str(self.root_dir / self.cfg.get("logging", {}).get("dir", "logs")),
             level="INFO",
         )
+        # 只在这里清一次历史遗留的旧限额熔断行；之后改限额保存时再清，
+        # 不在界面每轮刷新里读写告警文件。
+        try:
+            from src.ops.alerts import prune_stale_halt_alerts
+
+            limit = float((self.cfg.get("risk") or {}).get("max_daily_loss") or 0)
+            if limit > 0:
+                prune_stale_halt_alerts(self.root_dir, limit)
+        except (OSError, TypeError, ValueError) as exc:
+            logger.debug("启动时清理旧限额熔断告警跳过: {}", exc)
         self.worker = BotWorker()
         self._status = "待命"
         self._show_password = ctk.BooleanVar(value=False)
@@ -139,7 +155,7 @@ class AutoTradingApp(
         self._tick_after_id = self.after(800, self._tick)
         self._login_tick_after_id = self.after(5000, self._tick_login_schedule)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
-        self._ths_scraping = False
+        self._dm_scraping = False
         # 读同花顺图时焦点在期货通上，窗口快捷键可能收不到；工作线程还会另外查 ESC。
         self.bind_all("<Escape>", self._on_escape_key)
 
@@ -204,6 +220,7 @@ class AutoTradingApp(
         self.tabs.add("运行")
         self.tabs.add("配置")
         self.tabs.add("历史回测")
+        self.tabs.add("数据管理")
         self.tabs.add("交叉测试")
         self.tabs.add("策略优化")
         self.tabs.add("复盘")
@@ -213,6 +230,7 @@ class AutoTradingApp(
         self._build_run_tab(self.tabs.tab("运行"))
         self._build_config_tab(self.tabs.tab("配置"))
         self._build_backtest_tab(self.tabs.tab("历史回测"))
+        self._build_data_tab(self.tabs.tab("数据管理"))
         self._build_picker_tab(self.tabs.tab("交叉测试"))
         self._build_optimize_tab(self.tabs.tab("策略优化"))
         self._build_review_tab(self.tabs.tab("复盘"))

@@ -43,6 +43,18 @@ def test_scan_falls_back_to_first_when_selected_missing(tmp_path):
     assert bot.scan_symbols == ["fu2701"]
 
 
+def test_scan_includes_nonflat_positions(tmp_path):
+    """当前品种之外的非空持仓也要扫，否则没人给它止损/收盘清仓。"""
+    bot = TradingBot(_cfg(tmp_path, symbols=["fu2701", "bu2701"], selected="bu2701"))
+    pos = bot.strategy.positions["fu2701"]
+    pos.side = "long"
+    pos.volume = 1
+
+    bot._refresh_scan_symbols()
+
+    assert bot.scan_symbols == ["bu2701", "fu2701"]
+
+
 def test_live_market_filter_follows_config(tmp_path):
     """多因子听自己的行情过滤，不跟公共那张表。"""
     on = TradingBot(_cfg(tmp_path, symbols=["fu2701"], selected="fu2701"))

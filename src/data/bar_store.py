@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import sqlite3
 import threading
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -94,8 +95,8 @@ def _bar_dict(row: Any) -> dict[str, Any] | None:
     """sqlite 一行收成给人看的字典。"""
     if not row:
         return None
-    ts, open_, high, low, close, volume = row
-    return {
+    ts, open_, high, low, close, volume = row[:6]
+    bar = {
         "ts": str(ts),
         "open": float(open_ or 0),
         "high": float(high or 0),
@@ -103,6 +104,18 @@ def _bar_dict(row: Any) -> dict[str, Any] | None:
         "close": float(close or 0),
         "volume": float(volume or 0),
     }
+    if len(row) > 6:
+        oi = row[6]
+        bar["oi"] = None if oi is None else float(oi)
+    return bar
+
+
+def _oi_values(frame: pd.DataFrame) -> list[float | None]:
+    """持仓量按行取出来；没有这一列或空值就写 NULL。"""
+    if "oi" not in frame.columns:
+        return [None] * len(frame)
+    values = pd.to_numeric(frame["oi"], errors="coerce").to_numpy(dtype=float)
+    return [None if np.isnan(value) else float(value) for value in values]
 
 
 def _next_day(day: str) -> str:
@@ -259,7 +272,10 @@ def _normalize_frame(frame: pd.DataFrame) -> pd.DataFrame:
     for column in ("open", "high", "low", "close", "volume"):
         if column not in out.columns:
             out[column] = 0.0
-    out = out[["open", "high", "low", "close", "volume"]]
+    keep = ["open", "high", "low", "close", "volume"]
+    if "oi" in out.columns:
+        keep.append("oi")
+    out = out[keep]
     out = out.loc[:, ~out.columns.duplicated(keep="last")]
     return out.apply(pd.to_numeric, errors="coerce").dropna(subset=["close"])
 
@@ -270,7 +286,7 @@ class BarStore:
     def __init__(self, path: Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        with self._connect() as conn:
+        with _STORE_LOCK, self._connect() as conn:
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS bars (
@@ -282,7 +298,32 @@ class BarStore:
                     low REAL,
                     close REAL,
                     volume REAL,
+                    oi REAL,
                     PRIMARY KEY (symbol, period, ts)
+                )
+                """
+            )
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(bars)")}
+            if "oi" not in columns:
+                conn.execute("ALTER TABLE bars ADD COLUMN oi REAL")
+            # 每读一批图记一行。补数时能看出哪段时间读过、实读多少、还缺多少。
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS ingest_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    source TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    period TEXT NOT NULL,
+                    requested_from TEXT,
+                    requested_to TEXT,
+                    read_from TEXT,
+                    read_to TEXT,
+                    read_n INTEGER,
+                    added_n INTEGER,
+                    expected_n INTEGER,
+                    missing_n INTEGER,
+                    note TEXT
                 )
                 """
             )
@@ -337,6 +378,81 @@ class BarStore:
             )
         return out
 
+    def record_ingest(
+        self,
+        *,
+        source: str,
+        symbol: str,
+        period: str,
+        requested_from: str = "",
+        requested_to: str = "",
+        read_from: str = "",
+        read_to: str = "",
+        read_n: int = 0,
+        added_n: int = 0,
+        expected_n: int = 0,
+        missing_n: int = 0,
+        note: str = "",
+    ) -> int:
+        """记一批读图：什么时候、读了哪段、实读多少、新增多少、还缺多少。返回批次号。"""
+        with _STORE_LOCK, self._connect() as conn:
+            cur = conn.execute(
+                """
+                INSERT INTO ingest_log (
+                    created_at, source, symbol, period, requested_from, requested_to,
+                    read_from, read_to, read_n, added_n, expected_n, missing_n, note
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    str(source or "ths"),
+                    str(symbol),
+                    str(period),
+                    str(requested_from or ""),
+                    str(requested_to or ""),
+                    str(read_from or ""),
+                    str(read_to or ""),
+                    int(read_n),
+                    int(added_n),
+                    int(expected_n),
+                    int(missing_n),
+                    str(note or ""),
+                ),
+            )
+            conn.commit()
+            return int(cur.lastrowid or 0)
+
+    def list_ingests(self, limit: int = 200) -> list[dict[str, Any]]:
+        """最近的读取批次，最新在前。"""
+        with _STORE_LOCK, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT id, created_at, source, symbol, period, requested_from, requested_to,
+                       read_from, read_to, read_n, added_n, expected_n, missing_n, note
+                FROM ingest_log
+                ORDER BY id DESC
+                LIMIT ?
+                """,
+                (max(1, int(limit)),),
+            ).fetchall()
+        keys = (
+            "id",
+            "created_at",
+            "source",
+            "symbol",
+            "period",
+            "requested_from",
+            "requested_to",
+            "read_from",
+            "read_to",
+            "read_n",
+            "added_n",
+            "expected_n",
+            "missing_n",
+            "note",
+        )
+        return [dict(zip(keys, row)) for row in rows]
+
     def count_where(self, where_sql: str, params: tuple[Any, ...]) -> int:
         """按条件数有多少根。where_sql 不含 WHERE。"""
         with _STORE_LOCK, self._connect() as conn:
@@ -367,7 +483,7 @@ class BarStore:
         """
         if limit is None:
             sql = """
-                SELECT ts, open, high, low, close, volume
+                SELECT ts, open, high, low, close, volume, oi
                 FROM bars
                 WHERE symbol = ? AND period = ?
                 ORDER BY ts
@@ -375,7 +491,7 @@ class BarStore:
             params: tuple[Any, ...] = (symbol, period)
         else:
             sql = """
-                SELECT ts, open, high, low, close, volume
+                SELECT ts, open, high, low, close, volume, oi
                 FROM bars
                 WHERE symbol = ? AND period = ?
                 ORDER BY ts DESC
@@ -394,13 +510,35 @@ class BarStore:
         return frame
 
     def replace(self, symbol: str, period: str, frame: pd.DataFrame) -> int:
-        """先删掉这个合约、这个周期的全部旧行，再写入整理后的K线。用来清掉混进去的假K线。"""
+        """用整理后的K线替换库存：只删库里多出来的旧行，再 upsert，整个动作在一个事务里。
+
+        原来先 DELETE 全部再单独 upsert：中间崩溃会清空该合约该周期全部历史，
+        而且整段重写在实盘读路径上很贵。现在只删那些不在新 frame 里的时间戳，
+        正确的旧行原地保留；删和写在同一把锁、同一个连接里完成。
+        """
+        clean = _normalize_frame(frame)
         with _STORE_LOCK, self._connect() as conn:
+            if len(clean) == 0:
+                conn.execute(
+                    "DELETE FROM bars WHERE symbol = ? AND period = ?",
+                    (symbol, period),
+                )
+                return 0
+            stamps = clean.index.strftime("%Y-%m-%d %H:%M:%S").tolist()
+            # 用临时表承载要保留的时间戳，避免 NOT IN (?, ?, ...) 参数数随K线根数爆炸。
+            conn.execute("CREATE TEMP TABLE IF NOT EXISTS _replace_keep (ts TEXT PRIMARY KEY)")
+            conn.execute("DELETE FROM _replace_keep")
+            conn.executemany(
+                "INSERT INTO _replace_keep (ts) VALUES (?)",
+                [(s,) for s in stamps],
+            )
             conn.execute(
-                "DELETE FROM bars WHERE symbol = ? AND period = ?",
+                "DELETE FROM bars WHERE symbol = ? AND period = ? "
+                "AND ts NOT IN (SELECT ts FROM _replace_keep)",
                 (symbol, period),
             )
-        return self.upsert(symbol, period, frame)
+            conn.execute("DROP TABLE _replace_keep")
+            return self._upsert_locked(conn, symbol, period, clean)
 
     def upsert(self, symbol: str, period: str, frame: pd.DataFrame) -> int:
         """
@@ -411,6 +549,17 @@ class BarStore:
         clean = _normalize_frame(frame)
         if len(clean) == 0:
             return 0
+        with _STORE_LOCK, self._connect() as conn:
+            return self._upsert_locked(conn, symbol, period, clean)
+
+    def _upsert_locked(
+        self,
+        conn: sqlite3.Connection,
+        symbol: str,
+        period: str,
+        clean: pd.DataFrame,
+    ) -> int:
+        """执行 INSERT ON CONFLICT。调用方必须已持有 _STORE_LOCK 并传入连接。"""
         stamps = clean.index.strftime("%Y-%m-%d %H:%M:%S").tolist()
         values = clean[["open", "high", "low", "close", "volume"]].to_numpy(dtype=float)
         volumes = np.where(np.isnan(values[:, 4]), 0.0, values[:, 4])
@@ -424,22 +573,23 @@ class BarStore:
                 values[:, 2].tolist(),
                 values[:, 3].tolist(),
                 volumes.tolist(),
+                _oi_values(clean),
             )
         )
-        with _STORE_LOCK, self._connect() as conn:
-            conn.executemany(
-                """
-                INSERT INTO bars (symbol, period, ts, open, high, low, close, volume)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(symbol, period, ts) DO UPDATE SET
-                    open = excluded.open,
-                    high = excluded.high,
-                    low = excluded.low,
-                    close = excluded.close,
-                    volume = excluded.volume
-                """,
-                rows,
-            )
+        conn.executemany(
+            """
+            INSERT INTO bars (symbol, period, ts, open, high, low, close, volume, oi)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(symbol, period, ts) DO UPDATE SET
+                open = excluded.open,
+                high = excluded.high,
+                low = excluded.low,
+                close = excluded.close,
+                volume = excluded.volume,
+                oi = COALESCE(excluded.oi, bars.oi)
+            """,
+            rows,
+        )
         return len(rows)
 
     def fetch_one(self, symbol: str, period: str, ts: str) -> dict[str, Any] | None:
@@ -447,7 +597,7 @@ class BarStore:
         with _STORE_LOCK, self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT ts, open, high, low, close, volume
+                SELECT ts, open, high, low, close, volume, oi
                 FROM bars WHERE symbol = ? AND period = ? AND ts = ?
                 """,
                 (symbol, period, ts),
@@ -458,7 +608,7 @@ class BarStore:
         with _STORE_LOCK, self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT ts, open, high, low, close, volume
+                SELECT ts, open, high, low, close, volume, oi
                 FROM bars WHERE symbol = ? AND period = ? AND ts < ?
                 ORDER BY ts DESC LIMIT 1
                 """,
@@ -470,7 +620,7 @@ class BarStore:
         with _STORE_LOCK, self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT ts, open, high, low, close, volume
+                SELECT ts, open, high, low, close, volume, oi
                 FROM bars WHERE symbol = ? AND period = ? AND ts > ?
                 ORDER BY ts ASC LIMIT 1
                 """,
@@ -488,7 +638,7 @@ class BarStore:
         with _STORE_LOCK, self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT ts, open, high, low, close, volume
+                SELECT ts, open, high, low, close, volume, oi
                 FROM bars WHERE symbol = ? AND period = ? AND ts >= ? AND ts < ?
                 ORDER BY ts
                 """,
@@ -526,10 +676,14 @@ class RawBarStore:
                     low REAL,
                     close REAL,
                     volume REAL,
+                    oi REAL,
                     PRIMARY KEY (symbol, period, source, ts)
                 )
                 """
             )
+            columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(raw_bars)")}
+            if "oi" not in columns:
+                conn.execute("ALTER TABLE raw_bars ADD COLUMN oi REAL")
 
     def _connect(self) -> sqlite3.Connection:
         key = str(self.path)
@@ -565,19 +719,21 @@ class RawBarStore:
                 values[:, 2].tolist(),
                 values[:, 3].tolist(),
                 volumes.tolist(),
+                _oi_values(numbered),
             )
         )
         with _STORE_LOCK, self._connect() as conn:
             conn.executemany(
                 """
-                INSERT INTO raw_bars (symbol, period, source, ts, open, high, low, close, volume)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                INSERT INTO raw_bars (symbol, period, source, ts, open, high, low, close, volume, oi)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(symbol, period, source, ts) DO UPDATE SET
                     open = excluded.open,
                     high = excluded.high,
                     low = excluded.low,
                     close = excluded.close,
-                    volume = excluded.volume
+                    volume = excluded.volume,
+                    oi = COALESCE(excluded.oi, raw_bars.oi)
                 """,
                 rows,
             )
@@ -594,7 +750,7 @@ class RawBarStore:
         src = str(source or "akshare")
         if limit is None:
             sql = """
-                SELECT ts, open, high, low, close, volume
+                SELECT ts, open, high, low, close, volume, oi
                 FROM raw_bars
                 WHERE symbol = ? AND period = ? AND source = ?
                 ORDER BY ts
@@ -602,7 +758,7 @@ class RawBarStore:
             params: tuple[Any, ...] = (symbol, period, src)
         else:
             sql = """
-                SELECT ts, open, high, low, close, volume
+                SELECT ts, open, high, low, close, volume, oi
                 FROM raw_bars
                 WHERE symbol = ? AND period = ? AND source = ?
                 ORDER BY ts DESC
@@ -628,7 +784,7 @@ class RawBarStore:
         with _STORE_LOCK, self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT ts, open, high, low, close, volume
+                SELECT ts, open, high, low, close, volume, oi
                 FROM raw_bars
                 WHERE symbol = ? AND period = ? AND source = ? AND ts = ?
                 """,
@@ -643,7 +799,7 @@ class RawBarStore:
         with _STORE_LOCK, self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT ts, open, high, low, close, volume
+                SELECT ts, open, high, low, close, volume, oi
                 FROM raw_bars
                 WHERE symbol = ? AND period = ? AND source = ? AND ts < ?
                 ORDER BY ts DESC LIMIT 1
@@ -659,7 +815,7 @@ class RawBarStore:
         with _STORE_LOCK, self._connect() as conn:
             row = conn.execute(
                 """
-                SELECT ts, open, high, low, close, volume
+                SELECT ts, open, high, low, close, volume, oi
                 FROM raw_bars
                 WHERE symbol = ? AND period = ? AND source = ? AND ts > ?
                 ORDER BY ts ASC LIMIT 1
@@ -680,7 +836,7 @@ class RawBarStore:
         with _STORE_LOCK, self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT ts, open, high, low, close, volume
+                SELECT ts, open, high, low, close, volume, oi
                 FROM raw_bars
                 WHERE symbol = ? AND period = ? AND source = ? AND ts >= ? AND ts < ?
                 ORDER BY ts

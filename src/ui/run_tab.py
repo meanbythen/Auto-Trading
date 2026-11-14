@@ -1295,6 +1295,11 @@ class RunTabMixin:
         if "wrong # coordinates" in text:
             logger.debug("界面绘制跳过（窗口太窄）: {}", text)
             return
+        # 切换页签或重建列表时，CustomTkinter 的延时重绘可能落在已销毁的控件上。
+        # 控件已经没了，这次重绘本来就没意义，不当成程序坏了。
+        if "invalid command name" in text:
+            logger.debug("界面控件已销毁，跳过这次重绘: {}", text)
+            return
         detail = "".join(traceback.format_exception(exc, val, tb))
         logger.error("界面回调异常:\n{}", detail)
         try:

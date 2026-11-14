@@ -135,7 +135,7 @@ def prune_stale_halt_alerts(root: Path | str | None, max_daily_loss: float | Non
     if text:
         text += "\n"
     path.write_text(text, encoding="utf-8")
-    logger.info("已删掉 {} 条限额已过期的日亏熔断告警，现限额 {:.0f}", dropped, float(max_daily_loss))
+    logger.debug("已删掉 {} 条限额已过期的日亏熔断告警，现限额 {:.0f}", dropped, float(max_daily_loss))
     return dropped
 
 
@@ -147,17 +147,12 @@ def last_alert(
     """
     读文件里最后一条给运行台显示。
 
-    传入现在的日最大亏损时，先把限额对不上的熔断行从文件里删掉，
-    再返回剩下的最后一条。这样红字跟配置页是同一套数。
+    纯读：只跳过限额对不上的熔断行，不改文件。历史旧行由启动时或
+    保存配置后的 prune_stale_halt_alerts 统一清理。
     """
     from src.utils.paths import project_root
 
     base = Path(root) if root else project_root()
-    if max_daily_loss is not None:
-        try:
-            prune_stale_halt_alerts(base, max_daily_loss)
-        except OSError as exc:
-            logger.debug("过期熔断告警没删掉: {}", exc)
     path = alerts_path(base)
     if not path.exists():
         return None

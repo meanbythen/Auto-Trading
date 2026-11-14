@@ -341,6 +341,22 @@ def test_span_cover_matches_excel_formulas() -> None:
     assert abs(raw["daily_avg"] - 357.931034482759) < 1e-9
 
 
+def test_span_cover_accepts_walk_forward_days_override() -> None:
+    """滚动前进的检验段是多段拼起来的，天数按各段之和，不按首尾差。"""
+    from src.screen.picker import span_cover_fields
+
+    raw = span_cover_fields(
+        900,
+        100,
+        9,
+        "2026-01-01",
+        "2026-12-31",
+        span_days=90,
+    )
+    assert raw["span_days"] == 90
+    assert abs(raw["daily_avg"] - 800 / 90) < 1e-9
+
+
 def test_trade_frequency_is_only_a_label() -> None:
     """几天一笔只看这段实际日期，不拿来决定入选。"""
     assert trade_frequency(0, "2026-10-01", "2026-10-22") == "没有成交"
@@ -550,6 +566,74 @@ def test_strategy_compare_keeps_one_symbol_and_ranks_each_engine() -> None:
     assert shown[0]["picked"] == "第1名"
     failed = next(row for row in shown if row["symbol"] == "双均线趋势")
     assert failed["picked"] == "没测成"
+
+
+def test_cross_row_keeps_full_evaluation_dimensions(monkeypatch) -> None:
+    """交叉测试每个组合沿用回测自带的评估，R期望、卡尔玛、连亏和未通过项都要带出来。"""
+    from src.backtest.evaluation import EvaluationReport
+
+    monkeypatch.setattr("src.screen.picker._market_snapshot", lambda *_a, **_k: {})
+
+    class Perf:
+        trades = 40
+        win_rate = 0.45
+        profit_factor = 1.1
+        max_drawdown = 3000
+        net_pnl = 800
+        score = 0.2
+        payoff = 1.2
+        avg_win = 300
+        avg_loss = -200
+        losses = 22
+
+    class Result:
+        performance = Perf()
+        params_snapshot = {
+            "data_from": "2026-01-01",
+            "data_to": "2026-02-01",
+            "margin_used": 20000,
+        }
+        bars = 100
+        evaluation = EvaluationReport(
+            metrics={
+                "r_expectancy": 0.12,
+                "calmar": 0.8,
+                "consecutive_losses": 6,
+            },
+            conclusion="reject",
+        )
+
+    result = screen_cross(
+        {
+            "strategy": {"daily_body": {"eth_minutes": 20}},
+            "trade": {},
+            "risk": {"capital": 50000, "contracts": {"rb": {"margin": 5000, "multiplier": 10}}},
+        },
+        {
+            "timeframe": "5",
+            "start_date": "2026-01-01",
+            "fixed_volume": 1,
+            "sizing_mode": "fixed",
+            "has_flatten": True,
+            "flatten_at_close": True,
+        },
+        universe=[("rb0", "螺纹", 10, False)],
+        engines=[("daily_body", "日内实体")],
+        periods=["5"],
+        runner=lambda _cfg, **_kwargs: Result(),
+    )
+
+    row = result["rows"][0]
+    assert row["r_expectancy"] == 0.12
+    assert row["calmar"] == 0.8
+    assert row["consecutive_losses"] == 6
+    assert row["evaluation"] == "淘汰"
+
+    shown = list_rows(result)[0]
+    assert shown["r_expectancy"] == "0.120"
+    assert shown["calmar"] == "0.80"
+    assert shown["loss_streak"] == "6笔"
+    assert shown["evaluation"] == "淘汰"
 
 
 def test_cross_keeps_only_the_top_quarter_of_profitable_combos() -> None:

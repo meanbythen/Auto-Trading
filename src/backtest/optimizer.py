@@ -25,6 +25,12 @@ import pandas as pd
 from loguru import logger
 
 from src.backtest.engine import BacktestResult, filter_bars_by_range, run_backtest
+from src.backtest.evaluation import (
+    EvaluationReport,
+    EvaluationThresholds,
+    evaluate_backtest,
+    verdict_text,
+)
 from src.data.kline import KlineProvider
 from src.data.periods import canonical_period
 from src.strategy.generic_stop import GenericStopConfig, normalize_generic_stop
@@ -1010,15 +1016,16 @@ def judge_holdout(train_net: float, hold_net: float, hold_trades: int) -> tuple[
     后一段只看一次，不再改参数。
 
     前一段没赚钱：不写入。
-    后一段没开仓，或还在赚钱，或只是小亏：可以写入。
+    后一段没开仓：没有样本外证据，不写入。
+    后一段还在赚钱，或只是小亏：可以写入。
     后一段把前一段的盈利亏掉一半以上：不写入。
     """
     if train_net <= 0:
         return False, "前一段没有赚到钱，这组参数不写入。"
     if hold_trades <= 0:
         return (
-            True,
-            "后一段没有开仓。没有变成大亏，但不能当成后一段还会赚。可以写入，请先看一眼。",
+            False,
+            "后一段没有成交，没有样本外证据，这组参数不写入。至少要有 1 笔成交才能评审。",
         )
     if hold_net >= 0:
         return True, "后一段也是赚的，可以写入。"
@@ -1113,6 +1120,12 @@ class OptimizationResult:
     walk_efficiency: float = 0.0
     oos_win_rate: float = 0.0
     param_stability: str = ""
+    # 按 docs/策略评估标准 打的完整评估，以及滑点/扰动两项压力测试。
+    evaluation: dict[str, Any] = field(default_factory=dict)
+    slippage: dict[str, Any] = field(default_factory=dict)
+    perturbation: dict[str, Any] = field(default_factory=dict)
+    evaluation_ok: bool = True
+    evaluation_reason: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1146,6 +1159,11 @@ class OptimizationResult:
             "walk_efficiency": self.walk_efficiency,
             "oos_win_rate": self.oos_win_rate,
             "param_stability": self.param_stability,
+            "evaluation": self.evaluation,
+            "slippage": self.slippage,
+            "perturbation": self.perturbation,
+            "evaluation_ok": self.evaluation_ok,
+            "evaluation_reason": self.evaluation_reason,
         }
 
 
@@ -1373,6 +1391,51 @@ def _apply_params(cfg: dict[str, Any], params: dict[str, Any], engine: str | Non
     return cfg
 
 
+def _evaluate_champion_full_range(
+    cfg: dict[str, Any],
+    *,
+    best_params: dict[str, Any],
+    symbol: str,
+    engine_name: str,
+    param_keys: list[str],
+    start_date: str | None,
+    end_date: str | None,
+    thresholds: EvaluationThresholds,
+    runner: Callable[..., BacktestResult] | None = None,
+) -> tuple[EvaluationReport, dict[str, Any], dict[str, Any]]:
+    """用冠军参数独立复跑完整请求区间，评估和两项压力共用这一套口径。"""
+    eval_cfg = _apply_params(cfg, best_params, engine_name)
+    fn = runner or run_backtest
+    try:
+        eval_result = fn(
+            eval_cfg,
+            symbol=symbol,
+            start_date=start_date,
+            end_date=end_date,
+            engine=engine_name,
+        )
+        report = evaluate_backtest(eval_result, thresholds=thresholds)
+        # 压力和顺序交给共用入口，和历史回测页保持一致。
+        from src.backtest.stress import evaluate_with_stress
+
+        report, slip_box, pert_box, _note = evaluate_with_stress(
+            eval_cfg,
+            eval_result,
+            report=report,
+            symbol=symbol,
+            engine=engine_name,
+            start_date=start_date,
+            end_date=end_date,
+            param_keys=list(param_keys),
+            thresholds=thresholds,
+            runner=fn,
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("冠军参数全区间评估没跑成 {}: {}", symbol, exc)
+        return EvaluationReport(skipped=f"冠军参数全区间评估失败：{exc}"), {}, {}
+    return report, slip_box, pert_box
+
+
 def _slice_trail(bars_trail: pd.DataFrame | None, end_ts: Any) -> pd.DataFrame | None:
     """止损周期 K 线截到训练段结束时刻。没有止损线就返回 None。"""
     if bars_trail is None or not len(bars_trail):
@@ -1445,24 +1508,25 @@ def _holdout_perf_for_params(
     holdout_end_ts: Any | None = None,
 ) -> tuple[dict[str, Any], list[Any]]:
     """
-    用固定参数跑整段（或到 holdout_end），只统计检验段新开的仓。
+    只用检验段独立跑一遍，训练段的仓位和资金不带进来。
 
-    返回 (绩效字典, 检验段成交列表)。滚动前进把各段成交拼起来时，不再重跑一遍。
-    不会用检验段的盈亏去换另一组参数。
+    以前是从头跑、再截取检验段成交：训练段结束时可能还持仓，资金曲线也带着训练段的
+    盈亏，检验成绩并不独立。现在从检验段开始空仓、按本金重新起跑，只让 warmup
+    之前的K线进来看指标。返回 (绩效字典, 检验段成交列表)。
     """
     from src.backtest.metrics import calc_performance
 
-    trail = bars_trail
-    signal = bars_signal
-    if holdout_end_ts is not None:
-        signal = bars_signal.loc[bars_signal.index <= holdout_end_ts]
-        trail = _slice_trail(bars_trail, holdout_end_ts)
+    start = _naive_ts(holdout_start_ts)
+    end = _naive_ts(holdout_end_ts) if holdout_end_ts is not None else None
+    trail = _slice_trail(bars_trail, holdout_end_ts)
     full = run_backtest(
         _apply_params(cfg, params, engine_name),
         symbol=symbol,
-        bars_signal=signal,
+        bars_signal=bars_signal,
         bars_trail=trail,
         engine=engine_name,
+        start_date=str(start),
+        end_date=str(end) if end is not None else None,
     )
     hold_trades = _trades_on_or_after(full.trades, holdout_start_ts)
     if holdout_end_ts is not None:
@@ -1577,6 +1641,11 @@ def validate_params_on_symbols(
             )
             perf = calc_performance(result.trades, result.equity, min_trades=1)
             row = {"symbol": code, **perf.to_dict(), "bars": len(bars_signal)}
+            report = getattr(result, "evaluation", None)
+            if report is not None:
+                row["evaluation"] = verdict_text(report)
+                row["verdict"] = report.conclusion
+                row["fail_items"] = report.failed_text()
             rows.append(row)
             logger.info(
                 "多品种验收 {} trades={} net={:.0f} pf={:.2f}",
@@ -1732,50 +1801,40 @@ def check_params_on_holdout(
     }
 
 
-def optimize_strategy(
+@dataclass
+class _SearchOutcome:
+    """一次参数搜索的结果盒。两种搜索模式都写同一组字段，主函数只管交叉验收和收尾。"""
+
+    trials: list[dict[str, Any]] = field(default_factory=list)
+    walk_folds: list[dict[str, Any]] = field(default_factory=list)
+    best_params: dict[str, Any] = field(default_factory=dict)
+    best_score: float = -999.0
+    train_perf: dict[str, Any] = field(default_factory=dict)
+    hold_perf: dict[str, Any] = field(default_factory=dict)
+    best_result: BacktestResult | None = None
+    accepted: bool = False
+    reason: str = "前一段成交太少，没有挑出能用的参数，这次不写入。"
+    used_tie: bool = False
+    train_bars: int = 0
+    holdout_bars: int = 0
+    train_end: str = ""
+    holdout_start: str = ""
+    walk_metrics: dict[str, Any] = field(default_factory=dict)
+    actual_steps: int = 0
+    total_steps: int = 0
+
+
+def _load_optimization_bars(
     cfg: dict[str, Any],
     *,
-    symbol: str | None = None,
-    grid: dict[str, list[Any]] | None = None,
-    max_trials: int = 80,
-    min_trades: int = 3,
-    start_date: str | None = None,
-    end_date: str | None = None,
-    engine: str | None = None,
-    depth: str = "标准",
-    seed: int = 42,
-    holdout_pct: float | int | str | None = None,
-    mode: str = MODE_ONCE,
-    walk_steps: int = DEFAULT_WALK_STEPS,
-    cross_symbols: list[str] | None = None,
-    progress: Callable[[int, int, str], None] | None = None,
-) -> OptimizationResult:
-    """
-    网格搜索最优参数。
-
-    一次切断：按检验比例切开，前一段打分，后一段只验收。
-    滚动前进：把检验段拆成多段，每段先在更早行情上挑参数，再验下一段；写入用最后一段挑出的参数。
-    多品种：参数在优化合约上过关后，再拿到其它关注品种上原样验收。
-
-    progress(done, total, phase)：给界面报进度用的回调，只报数，不影响挑选逻辑。
-    """
-    from src.backtest.metrics import calc_performance
-
-    cfg = copy.deepcopy(cfg)
-    st = cfg.setdefault("strategy", {})
-    if engine:
-        st["engine"] = str(engine)
-    engine_name = str(st.get("engine", "daily_body"))
-    depth = (depth or "标准").strip() or "标准"
-    mode = str(mode or MODE_ONCE).strip() or MODE_ONCE
-    if mode not in (MODE_ONCE, MODE_WALK):
-        mode = MODE_ONCE
-    holdout_pct = clamp_holdout_pct(holdout_pct)
-    train_ratio = train_ratio_from_holdout_pct(holdout_pct)
-    walk_steps = max(1, int(walk_steps or DEFAULT_WALK_STEPS))
-    grid = grid or grid_for_engine(engine_name, depth, cfg)
-    symbol = symbol or (st.get("symbols") or [cfg.get("trade", {}).get("symbol", "bu2612")])[0]
-
+    symbol: str,
+    engine_name: str,
+    grid: dict[str, list[Any]],
+    start_date: str | None,
+    end_date: str | None,
+) -> tuple[pd.DataFrame, pd.DataFrame | None]:
+    """按网格最细的信号周期拉K线，截好区间；不足 50 根直接报错。"""
+    st = cfg.get("strategy") or {}
     provider = KlineProvider(cfg)
     # 网格若含 timeframe，用最细一档拉信号 K；策略按每组参数自己的周期判断（细周期可收成粗周期）。
     tf = _finest_grid_timeframe(grid, str(st.get("timeframe", "15")))
@@ -1821,6 +1880,417 @@ def optimize_strategy(
             f"优化用K线不足 bars={0 if bars_signal is None else len(bars_signal)}，"
             "请改用「全部可用」时间段或检查网络。"
         )
+    return bars_signal, bars_trail
+
+
+def _walk_forward_search(
+    cfg: dict[str, Any],
+    *,
+    symbol: str,
+    engine_name: str,
+    combos: list[tuple[Any, ...]],
+    keys: list[str],
+    bars_signal: pd.DataFrame,
+    bars_trail: pd.DataFrame | None,
+    min_trades: int,
+    holdout_pct: float,
+    walk_steps: int,
+    cross_n: int,
+    report: Callable[[int, int, str], None],
+) -> _SearchOutcome:
+    """滚动前进：把检验段拆成多段，走一步验一步；最后一段挑出的参数才拿去写入。"""
+    from src.backtest.metrics import calc_performance
+
+    folds = walk_forward_folds(len(bars_signal), holdout_pct, walk_steps)
+    actual_steps = len(folds)
+    # 每段：试参数 len(combos) 步 + 冠军复跑 1 步；最后是验收/整理。
+    total_steps = len(combos) * actual_steps + actual_steps + cross_n
+    report(0, total_steps, "准备搜索")
+    all_oos_trades: list[Any] = []
+    logger.info(
+        "滚动前进优化 symbol={} engine={} 检验比例={}% 计划{}段实际{}段 K线={} 实跑每段{}组",
+        symbol,
+        engine_name,
+        holdout_pct,
+        walk_steps,
+        actual_steps,
+        len(bars_signal),
+        len(combos),
+    )
+    trials: list[dict[str, Any]] = []
+    walk_folds: list[dict[str, Any]] = []
+    best_params: dict[str, Any] = {}
+    best_score = -999.0
+    train_perf: dict[str, Any] = {}
+    hold_perf: dict[str, Any] = {}
+    best_result: BacktestResult | None = None
+    accepted = False
+    reason = "前一段成交太少，没有挑出能用的参数，这次不写入。"
+    used_tie = False
+    train_bars = 0
+    holdout_bars = 0
+    train_end = ""
+    holdout_start = ""
+    train_end_ts: Any = None
+    for fold_i, (train_end_i, oos_end_i) in enumerate(folds, 1):
+        train_end_ts = bars_signal.index[train_end_i - 1]
+        oos_start_ts = bars_signal.index[train_end_i]
+        oos_end_ts = bars_signal.index[oos_end_i - 1]
+        train_signal = bars_signal.iloc[:train_end_i]
+        train_trail = _slice_trail(bars_trail, train_end_ts)
+        base = (fold_i - 1) * (len(combos) + 1)
+
+        def _on_step(
+            i: int, _n: int, *, base: int = base, fold_i: int = fold_i
+        ) -> None:
+            report(base + i, total_steps, f"第{fold_i}段 试参数")
+
+        fold_trials = _score_grid_on_slice(
+            cfg,
+            symbol=symbol,
+            engine_name=engine_name,
+            combos=combos,
+            keys=keys,
+            train_signal=train_signal,
+            train_trail=train_trail,
+            min_trades=min_trades,
+            fold_tag=f"第{fold_i}段",
+            on_step=_on_step,
+        )
+        winner = pick_train_winner(fold_trials, engine_name)
+        fold_row: dict[str, Any] = {
+            "fold": fold_i,
+            "train_bars": train_end_i,
+            "holdout_bars": oos_end_i - train_end_i,
+            "train_end": _stamp(train_end_ts),
+            "holdout_start": _stamp(oos_start_ts),
+            "holdout_end": _stamp(oos_end_ts),
+        }
+        if winner is None:
+            fold_row["error"] = "训练段没有可用参数"
+            walk_folds.append(fold_row)
+            continue
+        fold_params = dict(winner["params"])
+        fold_train = dict(winner.get("performance") or {})
+        fold_hold, segment_trades = _holdout_perf_for_params(
+            cfg,
+            symbol=symbol,
+            engine_name=engine_name,
+            params=fold_params,
+            bars_signal=bars_signal,
+            bars_trail=bars_trail,
+            holdout_start_ts=oos_start_ts,
+            holdout_end_ts=oos_end_ts,
+        )
+        # 各段检验成交拼在一起，最后算总检验成绩。不再为同一段重跑一遍。
+        all_oos_trades.extend(segment_trades)
+        fold_ok, fold_reason = judge_holdout(
+            float(fold_train.get("net_pnl") or 0),
+            float(fold_hold.get("net_pnl") or 0),
+            int(fold_hold.get("trades") or 0),
+        )
+        fold_row.update(
+            {
+                "params": fold_params,
+                "train_performance": fold_train,
+                "holdout_performance": fold_hold,
+                "accepted": fold_ok,
+                "accept_reason": fold_reason,
+                "score": float(winner.get("score") or -999),
+            }
+        )
+        walk_folds.append(fold_row)
+        # 最后一段的参数才拿去写入；前面几段只负责检验稳健性。
+        trials = fold_trials
+        best_params = fold_params
+        best_score = float(winner.get("score") or -999)
+        train_perf = fold_train
+        train_bars = train_end_i
+        holdout_bars = oos_end_i - train_end_i
+        train_end = _stamp(train_end_ts)
+        holdout_start = _stamp(oos_start_ts)
+        top_score = max(float(row.get("score", -999)) for row in fold_trials)
+        used_tie = best_score + 1e-9 < top_score
+        best_result = run_backtest(
+            _apply_params(cfg, best_params, engine_name),
+            symbol=symbol,
+            bars_signal=train_signal,
+            bars_trail=train_trail,
+            engine=engine_name,
+        )
+        report(base + len(combos) + 1, total_steps, f"第{fold_i}段 冠军复跑")
+
+    capital = float((cfg.get("risk") or {}).get("capital") or 1_000_000)
+    # 总检验成绩必须用最后写入的那组参数重跑，不能把各段冠军的不同参数混在一起。
+    fold_errors = [f for f in walk_folds if f.get("error")]
+    final_oos_trades: list[Any] = []
+    if best_params and not fold_errors:
+        for solved in walk_folds:
+            _seg_perf, seg_trades = _holdout_perf_for_params(
+                cfg,
+                symbol=symbol,
+                engine_name=engine_name,
+                params=best_params,
+                bars_signal=bars_signal,
+                bars_trail=bars_trail,
+                holdout_start_ts=solved.get("holdout_start"),
+                holdout_end_ts=solved.get("holdout_end"),
+            )
+            final_oos_trades.extend(seg_trades)
+        use_trades = final_oos_trades
+    else:
+        # 有段没有可用参数时整体不通过，这里保留已有成交只为展示。
+        use_trades = all_oos_trades
+    hold = calc_performance(
+        use_trades,
+        _equity_from_trades(use_trades, capital),
+        min_trades=1,
+    )
+    hold_perf = hold.to_dict()
+    holdout_bars = sum(int(f.get("holdout_bars") or 0) for f in walk_folds)
+    # 训练成绩也用最终参数在同一段训练区间重跑，和检验成绩同一套参数、同一口径。
+    walk_train_net = float(train_perf.get("net_pnl") or 0)
+    if best_params and not fold_errors and train_end_ts is not None:
+        try:
+            train_full = run_backtest(
+                _apply_params(cfg, best_params, engine_name),
+                symbol=symbol,
+                bars_signal=bars_signal.loc[bars_signal.index <= train_end_ts],
+                bars_trail=_slice_trail(bars_trail, train_end_ts),
+                engine=engine_name,
+            )
+            walk_train_net = float(train_full.performance.net_pnl)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("滚动前进训练段用最终参数复跑失败，沿用最后一段成绩: {}", exc)
+    walk_metrics = walk_forward_metrics(
+        walk_folds,
+        train_net=walk_train_net,
+        hold_net=float(hold.net_pnl),
+    )
+    if best_params:
+        accepted, reason = judge_holdout(
+            walk_train_net,
+            float(hold.net_pnl),
+            int(hold.trades),
+        )
+        if fold_errors:
+            accepted = False
+            reason = (
+                f"第{fold_errors[0].get('fold')}段训练段没有可用参数，"
+                "滚动前进缺一段，整体不通过。"
+            )
+        walk_ok, walk_reason = judge_walk_forward(walk_metrics)
+        if accepted and not walk_ok:
+            accepted = False
+            reason = walk_reason
+        elif walk_reason and not fold_errors:
+            reason = reason + walk_reason
+        if used_tie:
+            reason = "最后一段训练分数接近，留了更靠近出厂参数的一组。" + reason
+        reason = f"滚动前进共 {actual_steps} 段。" + reason
+    else:
+        reason = "滚动前进每一段都没有挑出能用的参数，这次不写入。"
+        walk_metrics = walk_forward_metrics(walk_folds, train_net=0.0, hold_net=0.0)
+    return _SearchOutcome(
+        trials=trials,
+        walk_folds=walk_folds,
+        best_params=best_params,
+        best_score=best_score,
+        train_perf=train_perf,
+        hold_perf=hold_perf,
+        best_result=best_result,
+        accepted=accepted,
+        reason=reason,
+        used_tie=used_tie,
+        train_bars=train_bars,
+        holdout_bars=holdout_bars,
+        train_end=train_end,
+        holdout_start=holdout_start,
+        walk_metrics=walk_metrics,
+        actual_steps=actual_steps,
+        total_steps=total_steps,
+    )
+
+
+def _once_cut_search(
+    cfg: dict[str, Any],
+    *,
+    symbol: str,
+    engine_name: str,
+    combos: list[tuple[Any, ...]],
+    keys: list[str],
+    bars_signal: pd.DataFrame,
+    bars_trail: pd.DataFrame | None,
+    min_trades: int,
+    train_ratio: float,
+    holdout_pct: float,
+    cross_n: int,
+    total_steps: int,
+    report: Callable[[int, int, str], None],
+) -> _SearchOutcome:
+    """一次切断：前一段打分，后一段只验收。"""
+    walk_metrics: dict[str, Any] = {
+        "fold_count": 0,
+        "oos_profitable_folds": 0,
+        "oos_win_rate": 0.0,
+        "walk_efficiency": 0.0,
+        "param_stability": "",
+    }
+    trials: list[dict[str, Any]] = []
+    best_params: dict[str, Any] = {}
+    best_score = -999.0
+    train_perf: dict[str, Any] = {}
+    hold_perf: dict[str, Any] = {}
+    best_result: BacktestResult | None = None
+    accepted = False
+    reason = "前一段成交太少，没有挑出能用的参数，这次不写入。"
+    used_tie = False
+    train_bars = 0
+    holdout_bars = 0
+    train_end = ""
+    holdout_start = ""
+
+    cut = split_train_holdout(len(bars_signal), train_ratio)
+    train_end_ts = bars_signal.index[cut - 1]
+    holdout_start_ts = bars_signal.index[cut]
+    train_signal = bars_signal.iloc[:cut]
+    train_trail = _slice_trail(bars_trail, train_end_ts)
+    train_bars = len(train_signal)
+    holdout_bars = len(bars_signal) - cut
+    train_end = _stamp(train_end_ts)
+    holdout_start = _stamp(holdout_start_ts)
+
+    logger.info(
+        "一次切断优化 symbol={} engine={} 检验比例={}% 训练{}根 检验从{}起 实跑{}组",
+        symbol,
+        engine_name,
+        holdout_pct,
+        train_bars,
+        holdout_start,
+        len(combos),
+    )
+    report(0, total_steps, "搜索参数")
+
+    def _on_step(i: int, _n: int) -> None:
+        report(i, total_steps, "搜索参数")
+
+    trials = _score_grid_on_slice(
+        cfg,
+        symbol=symbol,
+        engine_name=engine_name,
+        combos=combos,
+        keys=keys,
+        train_signal=train_signal,
+        train_trail=train_trail,
+        min_trades=min_trades,
+        on_step=_on_step,
+    )
+    report(len(combos), total_steps, "检验冠军参数")
+    winner = pick_train_winner(trials, engine_name)
+    if winner is not None:
+        best_params = dict(winner["params"])
+        best_score = float(winner["score"])
+        train_perf = dict(winner.get("performance") or {})
+        top_score = max(float(row.get("score", -999)) for row in trials)
+        used_tie = best_score + 1e-9 < top_score
+        best_result = run_backtest(
+            _apply_params(cfg, best_params, engine_name),
+            symbol=symbol,
+            bars_signal=train_signal,
+            bars_trail=train_trail,
+            engine=engine_name,
+        )
+        hold_perf, _hold_trades = _holdout_perf_for_params(
+            cfg,
+            symbol=symbol,
+            engine_name=engine_name,
+            params=best_params,
+            bars_signal=bars_signal,
+            bars_trail=bars_trail,
+            holdout_start_ts=holdout_start_ts,
+        )
+        report(len(combos) + 2, total_steps, "多品种验收" if cross_n else "整理结果")
+        accepted, reason = judge_holdout(
+            float(train_perf.get("net_pnl") or 0),
+            float(hold_perf.get("net_pnl") or 0),
+            int(hold_perf.get("trades") or 0),
+        )
+        walk_metrics["walk_efficiency"] = once_cut_efficiency(
+            float(train_perf.get("net_pnl") or 0),
+            float(hold_perf.get("net_pnl") or 0),
+        )
+        if used_tie:
+            reason = "前一段分数接近，留了更靠近出厂参数的一组。" + reason
+    return _SearchOutcome(
+        trials=trials,
+        best_params=best_params,
+        best_score=best_score,
+        train_perf=train_perf,
+        hold_perf=hold_perf,
+        best_result=best_result,
+        accepted=accepted,
+        reason=reason,
+        used_tie=used_tie,
+        train_bars=train_bars,
+        holdout_bars=holdout_bars,
+        train_end=train_end,
+        holdout_start=holdout_start,
+        walk_metrics=walk_metrics,
+        actual_steps=0,
+        total_steps=total_steps,
+    )
+
+
+def optimize_strategy(
+    cfg: dict[str, Any],
+    *,
+    symbol: str | None = None,
+    grid: dict[str, list[Any]] | None = None,
+    max_trials: int = 80,
+    min_trades: int = 3,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    engine: str | None = None,
+    depth: str = "标准",
+    seed: int = 42,
+    holdout_pct: float | int | str | None = None,
+    mode: str = MODE_ONCE,
+    walk_steps: int = DEFAULT_WALK_STEPS,
+    cross_symbols: list[str] | None = None,
+    progress: Callable[[int, int, str], None] | None = None,
+) -> OptimizationResult:
+    """
+    网格搜索最优参数。
+
+    一次切断：按检验比例切开，前一段打分，后一段只验收。
+    滚动前进：把检验段拆成多段，每段先在更早行情上挑参数，再验下一段；写入用最后一段挑出的参数。
+    多品种：参数在优化合约上过关后，再拿到其它关注品种上原样验收。
+
+    progress(done, total, phase)：给界面报进度用的回调，只报数，不影响挑选逻辑。
+    """
+    cfg = copy.deepcopy(cfg)
+    st = cfg.setdefault("strategy", {})
+    if engine:
+        st["engine"] = str(engine)
+    engine_name = str(st.get("engine", "daily_body"))
+    depth = (depth or "标准").strip() or "标准"
+    mode = str(mode or MODE_ONCE).strip() or MODE_ONCE
+    if mode not in (MODE_ONCE, MODE_WALK):
+        mode = MODE_ONCE
+    holdout_pct = clamp_holdout_pct(holdout_pct)
+    train_ratio = train_ratio_from_holdout_pct(holdout_pct)
+    walk_steps = max(1, int(walk_steps or DEFAULT_WALK_STEPS))
+    grid = grid or grid_for_engine(engine_name, depth, cfg)
+    symbol = symbol or (st.get("symbols") or [cfg.get("trade", {}).get("symbol", "bu2612")])[0]
+
+    bars_signal, bars_trail = _load_optimization_bars(
+        cfg,
+        symbol=symbol,
+        engine_name=engine_name,
+        grid=grid,
+        start_date=start_date,
+        end_date=end_date,
+    )
 
     keys = list(grid.keys())
     values = [grid[k] for k in keys]
@@ -1851,235 +2321,55 @@ def optimize_strategy(
         except Exception as e:  # noqa: BLE001
             logger.debug("优化进度回调失败: {}", e)
 
-    trials: list[dict[str, Any]] = []
-    walk_folds: list[dict[str, Any]] = []
-    best_params: dict[str, Any] = {}
-    best_score = -999.0
-    train_perf: dict[str, Any] = {}
-    hold_perf: dict[str, Any] = {}
-    best_result: BacktestResult | None = None
-    accepted = False
-    reason = "前一段成交太少，没有挑出能用的参数，这次不写入。"
-    used_tie = False
-    train_bars = 0
-    holdout_bars = 0
-    train_end = ""
-    holdout_start = ""
-    actual_steps = 0
-
     if mode == MODE_WALK:
-        folds = walk_forward_folds(len(bars_signal), holdout_pct, walk_steps)
-        actual_steps = len(folds)
-        # 每段：试参数 len(combos) 步 + 冠军复跑 1 步；最后是验收/整理。
-        total_steps = len(combos) * actual_steps + actual_steps + cross_n
-        _report(0, total_steps, "准备搜索")
-        all_oos_trades: list[Any] = []
-        logger.info(
-            "滚动前进优化 symbol={} engine={} 检验比例={}% 计划{}段实际{}段 K线={} 实跑每段{}组",
-            symbol,
-            engine_name,
-            holdout_pct,
-            walk_steps,
-            actual_steps,
-            len(bars_signal),
-            len(combos),
-        )
-        for fold_i, (train_end_i, oos_end_i) in enumerate(folds, 1):
-            train_end_ts = bars_signal.index[train_end_i - 1]
-            oos_start_ts = bars_signal.index[train_end_i]
-            oos_end_ts = bars_signal.index[oos_end_i - 1]
-            train_signal = bars_signal.iloc[:train_end_i]
-            train_trail = _slice_trail(bars_trail, train_end_ts)
-            base = (fold_i - 1) * (len(combos) + 1)
-
-            def _on_step(i: int, _n: int, *, base: int = base, fold_i: int = fold_i) -> None:
-                _report(base + i, total_steps, f"第{fold_i}段 试参数")
-
-            fold_trials = _score_grid_on_slice(
-                cfg,
-                symbol=symbol,
-                engine_name=engine_name,
-                combos=combos,
-                keys=keys,
-                train_signal=train_signal,
-                train_trail=train_trail,
-                min_trades=min_trades,
-                fold_tag=f"第{fold_i}段",
-                on_step=_on_step,
-            )
-            winner = pick_train_winner(fold_trials, engine_name)
-            fold_row: dict[str, Any] = {
-                "fold": fold_i,
-                "train_bars": train_end_i,
-                "holdout_bars": oos_end_i - train_end_i,
-                "train_end": _stamp(train_end_ts),
-                "holdout_start": _stamp(oos_start_ts),
-                "holdout_end": _stamp(oos_end_ts),
-            }
-            if winner is None:
-                fold_row["error"] = "训练段没有可用参数"
-                walk_folds.append(fold_row)
-                continue
-            fold_params = dict(winner["params"])
-            fold_train = dict(winner.get("performance") or {})
-            fold_hold, segment_trades = _holdout_perf_for_params(
-                cfg,
-                symbol=symbol,
-                engine_name=engine_name,
-                params=fold_params,
-                bars_signal=bars_signal,
-                bars_trail=bars_trail,
-                holdout_start_ts=oos_start_ts,
-                holdout_end_ts=oos_end_ts,
-            )
-            # 各段检验成交拼在一起，最后算总检验成绩。不再为同一段重跑一遍。
-            all_oos_trades.extend(segment_trades)
-            fold_ok, fold_reason = judge_holdout(
-                float(fold_train.get("net_pnl") or 0),
-                float(fold_hold.get("net_pnl") or 0),
-                int(fold_hold.get("trades") or 0),
-            )
-            fold_row.update(
-                {
-                    "params": fold_params,
-                    "train_performance": fold_train,
-                    "holdout_performance": fold_hold,
-                    "accepted": fold_ok,
-                    "accept_reason": fold_reason,
-                    "score": float(winner.get("score") or -999),
-                }
-            )
-            walk_folds.append(fold_row)
-            # 最后一段的参数才拿去写入；前面几段只负责检验稳健性。
-            trials = fold_trials
-            best_params = fold_params
-            best_score = float(winner.get("score") or -999)
-            train_perf = fold_train
-            train_bars = train_end_i
-            holdout_bars = oos_end_i - train_end_i
-            train_end = _stamp(train_end_ts)
-            holdout_start = _stamp(oos_start_ts)
-            top_score = max(float(row.get("score", -999)) for row in fold_trials)
-            used_tie = best_score + 1e-9 < top_score
-            best_result = run_backtest(
-                _apply_params(cfg, best_params, engine_name),
-                symbol=symbol,
-                bars_signal=train_signal,
-                bars_trail=train_trail,
-                engine=engine_name,
-            )
-            _report(base + len(combos) + 1, total_steps, f"第{fold_i}段 冠军复跑")
-
-        capital = float((cfg.get("risk") or {}).get("capital") or 1_000_000)
-        hold = calc_performance(
-            all_oos_trades,
-            _equity_from_trades(all_oos_trades, capital),
-            min_trades=1,
-        )
-        hold_perf = hold.to_dict()
-        holdout_bars = sum(int(f.get("holdout_bars") or 0) for f in walk_folds)
-        walk_metrics = walk_forward_metrics(
-            walk_folds,
-            train_net=float(train_perf.get("net_pnl") or 0),
-            hold_net=float(hold.net_pnl),
-        )
-        if best_params:
-            accepted, reason = judge_holdout(
-                float(train_perf.get("net_pnl") or 0),
-                float(hold.net_pnl),
-                int(hold.trades),
-            )
-            walk_ok, walk_reason = judge_walk_forward(walk_metrics)
-            if accepted and not walk_ok:
-                accepted = False
-                reason = walk_reason
-            elif walk_reason:
-                reason = reason + walk_reason
-            if used_tie:
-                reason = "最后一段训练分数接近，留了更靠近出厂参数的一组。" + reason
-            reason = f"滚动前进共 {actual_steps} 段。" + reason
-        else:
-            reason = "滚动前进每一段都没有挑出能用的参数，这次不写入。"
-            walk_metrics = walk_forward_metrics(walk_folds, train_net=0.0, hold_net=0.0)
-    else:
-        walk_metrics = {
-            "fold_count": 0,
-            "oos_profitable_folds": 0,
-            "oos_win_rate": 0.0,
-            "walk_efficiency": 0.0,
-            "param_stability": "",
-        }
-        cut = split_train_holdout(len(bars_signal), train_ratio)
-        train_end_ts = bars_signal.index[cut - 1]
-        holdout_start_ts = bars_signal.index[cut]
-        train_signal = bars_signal.iloc[:cut]
-        train_trail = _slice_trail(bars_trail, train_end_ts)
-        train_bars = len(train_signal)
-        holdout_bars = len(bars_signal) - cut
-        train_end = _stamp(train_end_ts)
-        holdout_start = _stamp(holdout_start_ts)
-
-        logger.info(
-            "一次切断优化 symbol={} engine={} 检验比例={}% 训练{}根 检验从{}起 实跑{}组",
-            symbol,
-            engine_name,
-            holdout_pct,
-            train_bars,
-            holdout_start,
-            len(combos),
-        )
-        _report(0, total_steps, "搜索参数")
-
-        def _on_step(i: int, _n: int) -> None:
-            _report(i, total_steps, "搜索参数")
-
-        trials = _score_grid_on_slice(
+        outcome = _walk_forward_search(
             cfg,
             symbol=symbol,
             engine_name=engine_name,
             combos=combos,
             keys=keys,
-            train_signal=train_signal,
-            train_trail=train_trail,
+            bars_signal=bars_signal,
+            bars_trail=bars_trail,
             min_trades=min_trades,
-            on_step=_on_step,
+            holdout_pct=holdout_pct,
+            walk_steps=walk_steps,
+            cross_n=cross_n,
+            report=_report,
         )
-        _report(len(combos), total_steps, "检验冠军参数")
-        winner = pick_train_winner(trials, engine_name)
-        if winner is not None:
-            best_params = dict(winner["params"])
-            best_score = float(winner["score"])
-            train_perf = dict(winner.get("performance") or {})
-            top_score = max(float(row.get("score", -999)) for row in trials)
-            used_tie = best_score + 1e-9 < top_score
-            best_result = run_backtest(
-                _apply_params(cfg, best_params, engine_name),
-                symbol=symbol,
-                bars_signal=train_signal,
-                bars_trail=train_trail,
-                engine=engine_name,
-            )
-            hold_perf, _hold_trades = _holdout_perf_for_params(
-                cfg,
-                symbol=symbol,
-                engine_name=engine_name,
-                params=best_params,
-                bars_signal=bars_signal,
-                bars_trail=bars_trail,
-                holdout_start_ts=holdout_start_ts,
-            )
-            _report(len(combos) + 2, total_steps, "多品种验收" if cross_n else "整理结果")
-            accepted, reason = judge_holdout(
-                float(train_perf.get("net_pnl") or 0),
-                float(hold_perf.get("net_pnl") or 0),
-                int(hold_perf.get("trades") or 0),
-            )
-            walk_metrics["walk_efficiency"] = once_cut_efficiency(
-                float(train_perf.get("net_pnl") or 0),
-                float(hold_perf.get("net_pnl") or 0),
-            )
-            if used_tie:
-                reason = "前一段分数接近，留了更靠近出厂参数的一组。" + reason
+    else:
+        outcome = _once_cut_search(
+            cfg,
+            symbol=symbol,
+            engine_name=engine_name,
+            combos=combos,
+            keys=keys,
+            bars_signal=bars_signal,
+            bars_trail=bars_trail,
+            min_trades=min_trades,
+            train_ratio=train_ratio,
+            holdout_pct=holdout_pct,
+            cross_n=cross_n,
+            total_steps=total_steps,
+            report=_report,
+        )
+
+    trials = outcome.trials
+    walk_folds = outcome.walk_folds
+    best_params = outcome.best_params
+    best_score = outcome.best_score
+    train_perf = outcome.train_perf
+    hold_perf = outcome.hold_perf
+    best_result = outcome.best_result
+    accepted = outcome.accepted
+    reason = outcome.reason
+    used_tie = outcome.used_tie
+    train_bars = outcome.train_bars
+    holdout_bars = outcome.holdout_bars
+    train_end = outcome.train_end
+    holdout_start = outcome.holdout_start
+    walk_metrics = outcome.walk_metrics
+    actual_steps = outcome.actual_steps
+    total_steps = outcome.total_steps
 
     cross_rows: list[dict[str, Any]] = []
     _report(
@@ -2110,6 +2400,33 @@ def optimize_strategy(
             accepted = False
             reason = cross_reason
 
+    eval_th = EvaluationThresholds.from_cfg(cfg)
+    ev_report = None
+    slip_box: dict[str, Any] = {}
+    pert_box: dict[str, Any] = {}
+    eval_reason = ""
+    if best_result is not None and eval_th.enabled:
+        _report(total_steps, total_steps, "全区间冠军评估与压力测试")
+        ev_report, slip_box, pert_box = _evaluate_champion_full_range(
+            cfg,
+            best_params=best_params,
+            symbol=symbol,
+            engine_name=engine_name,
+            param_keys=list(keys),
+            start_date=start_date,
+            end_date=end_date,
+            thresholds=eval_th,
+        )
+        if ev_report.skipped:
+            eval_reason = f"评估未完成：{ev_report.skipped}"
+        elif ev_report.conclusion == "reject":
+            eval_reason = f"评估红线：{ev_report.failed_text()}"
+        if eval_reason:
+            eval_reason += "，这次不写入。" if eval_th.gate_on_optimize else "；仅提示，不拦截写入。"
+            if eval_th.gate_on_optimize:
+                accepted = False
+            reason = (reason + eval_reason).strip()
+
     opt = OptimizationResult(
         symbol=symbol,
         best_params=best_params,
@@ -2133,6 +2450,13 @@ def optimize_strategy(
         train_performance=train_perf,
         holdout_performance=hold_perf,
         used_factory_tie=used_tie,
+        evaluation=ev_report.to_dict() if ev_report is not None else {},
+        slippage=slip_box,
+        perturbation=pert_box,
+        evaluation_ok=(
+            ev_report is None or (not ev_report.skipped and ev_report.conclusion != "reject")
+        ),
+        evaluation_reason=eval_reason,
         mode=mode,
         holdout_pct=float(holdout_pct),
         walk_steps=actual_steps if mode == MODE_WALK else 0,
@@ -2167,6 +2491,8 @@ def apply_run_switches(
         "float_hold",
         "dual_ma",
         "ma_cross",
+        "kelly_break",
+        "liq_stop",
     ):
         st["flatten_at_close"] = bool(flatten_at_close)
     return out
@@ -2234,6 +2560,18 @@ def describe_run_switches(
             "收盘清仓  本策略默认关（仓可隔夜）\n"
             "震荡箱子，收盘走出箱子才顺着做；开仓后箱子冻住；假突破收回箱子就走。"
             "浮盈够一个箱子高度后用 ATR 跟踪。信号周期、止损周期跟配置页/回测页走。"
+        )
+    if name == "liq_stop":
+        return (
+            f"收盘清仓  {flat}\n"
+            "用最近 N 根高低点拐点估公共止损区；价格击穿止损区、把止损单吃掉后再收回区间外侧，"
+            "才顺着 DI 方向进场。止损放区间外侧 K 倍 ATR，止盈按固定盈亏比。ADX 太低不做。"
+        )
+    if name == "kelly_break":
+        return (
+            f"收盘清仓  {flat}\n"
+            "开仓：收盘站上前 N 根最高价做多、跌破前 N 根最低价做空，影线刺出不算。"
+            "止损在进场价外 K 倍 ATR；止盈按固定盈亏比，收盘到价才平。手数用公共凯利/每笔风险。"
         )
     return f"收盘清仓  {flat}"
 

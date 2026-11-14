@@ -51,6 +51,12 @@ def _write_intent(root, *, executor: str = "gui", side: str = "buy_open", volume
     )
 
 
+def _intent_files(root):
+    """新版按笔存放的意图文件（data/intents/<账>/ 下一笔一个）。"""
+    folder = root / "data" / "intents" / "live"
+    return sorted(folder.glob("*.json")) if folder.exists() else []
+
+
 def _events(root) -> str:
     path = root / "data" / "events.jsonl"
     return path.read_text(encoding="utf-8") if path.exists() else ""
@@ -147,8 +153,10 @@ def test_order_intent_context_clears_after_normal_exit(tmp_path):
         meta={"bar_id": "2026-11-04 09:15"},
     )
     with bot._order_intent(decision, 1):
-        assert _intent_path(tmp_path).exists()
-    assert not _intent_path(tmp_path).exists()
+        files = _intent_files(tmp_path)
+        assert len(files) == 1
+        assert files[0].stem.startswith("2026")
+    assert _intent_files(tmp_path) == []
 
 
 def test_order_intent_context_keeps_file_when_body_raises(tmp_path):
@@ -164,10 +172,62 @@ def test_order_intent_context_keeps_file_when_body_raises(tmp_path):
     with pytest.raises(RuntimeError):
         with bot._order_intent(decision, 1):
             raise RuntimeError("点击后崩溃")
-    assert _intent_path(tmp_path).exists()
-    payload = json.loads(_intent_path(tmp_path).read_text(encoding="utf-8"))
+    files = _intent_files(tmp_path)
+    assert len(files) == 1
+    payload = json.loads(files[0].read_text(encoding="utf-8"))
     assert payload["symbol"] == "bu2612"
     assert payload["volume"] == 1
+    assert payload["intent_id"] in files[0].name
+
+
+def test_each_order_intent_is_its_own_file(tmp_path):
+    """一笔一个文件：多笔崩溃遗留能同时存在、逐笔核对，不会被后一笔覆盖。"""
+    folder = tmp_path / "data" / "intents" / "live"
+    folder.mkdir(parents=True)
+    for name, side, volume, ts in (
+        ("20261104092000000000-1.json", "buy_open", 1, "2026-11-04T09:20:00"),
+        ("20261104103000000000-2.json", "sell_open", 2, "2026-11-04T10:30:00"),
+    ):
+        (folder / name).write_text(
+            json.dumps(
+                {
+                    "ts": ts,
+                    "intent_id": name[:-5],
+                    "symbol": "bu2612",
+                    "side": side,
+                    "volume": volume,
+                    "executor": "gui",
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+
+    bot = TradingBot(_cfg(tmp_path))
+    assert bot.risk.halted is True
+    assert len(bot._pending_intents) == 2
+    assert "共 2 笔" in bot.risk.halt_reason
+    # 最新那一笔用于提示；两笔都能和手工录入对上。
+    assert bot._pending_intent["side"] == "sell_open"
+    assert bot.pending_intent_matches("bu2612", "buy_open", 1)
+    assert bot.pending_intent_matches("bu2612", "sell_open", 2)
+
+    ok, _ = bot.confirm_positions_reviewed()
+    assert ok is True
+    assert bot.risk.halted is False
+    assert list(folder.glob("*.json")) == []
+
+
+def test_rollover_rechecks_pending_intent(tmp_path):
+    """新交易日不能把崩溃熔断顺手清掉：日切后要重新检查意图文件。"""
+    bot = TradingBot(_cfg(tmp_path))
+    bot.trading_day = "2020-01-01"
+    _write_intent(tmp_path)
+
+    assert bot._rollover_trading_day() is True
+    assert bot.risk.halted is True
+    assert bot.risk.halt_kind == "pending_intent"
+    assert _intent_path(tmp_path).exists()
 
 
 def test_event_log_rotates_when_file_gets_too_large(tmp_path, monkeypatch) -> None:

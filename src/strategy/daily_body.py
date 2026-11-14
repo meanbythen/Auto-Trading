@@ -49,6 +49,7 @@ from src.utils.trading_day import futures_trading_day
 
 from .base import StrategyBase
 from .indicators import average_true_range, ema_series
+from .params import section_default
 from .session_scope import (
     SCOPE_LINKED,
     SCOPE_NIGHT,
@@ -367,27 +368,40 @@ class DailyBodyStrategy(StrategyBase):
         # 调度层据此决定持仓时要不要把「未收线那根」拼进来。收盘确认方式不能看未收线。
         self.stop_on_touch = self.stop_mode == STOP_MODE_TOUCH
         # 箱沿止损再让几跳；默认 1 个最小跳动。
+        default_ticks = int(section_default(self.SECTION, "stop_extra_ticks", 1))
         try:
-            self.stop_extra_ticks = max(0, int(body.get("stop_extra_ticks", 1) or 0))
+            self.stop_extra_ticks = max(0, int(body.get("stop_extra_ticks", default_ticks) or 0))
         except (TypeError, ValueError):
-            self.stop_extra_ticks = 1
+            self.stop_extra_ticks = default_ticks
         # 三道闸都用「开盘前」信号周期 ATR 的倍数，0=关闭。换品种时跟着波动走。
-        self.skip_gap_atr_mult = _atr_mult(body.get("skip_gap_atr_mult"), 2.5)
-        self.max_box_atr_mult = _atr_mult(body.get("max_box_atr_mult"), 5.0)
-        self.max_chase_atr_mult = _atr_mult(body.get("max_chase_atr_mult"), 1.0)
+        self.skip_gap_atr_mult = _atr_mult(
+            body.get("skip_gap_atr_mult"),
+            float(section_default(self.SECTION, "skip_gap_atr_mult", 2.5)),
+        )
+        self.max_box_atr_mult = _atr_mult(
+            body.get("max_box_atr_mult"),
+            float(section_default(self.SECTION, "max_box_atr_mult", 5.0)),
+        )
+        self.max_chase_atr_mult = _atr_mult(
+            body.get("max_chase_atr_mult"),
+            float(section_default(self.SECTION, "max_chase_atr_mult", 1.0)),
+        )
+        default_atr_period = int(section_default(self.SECTION, "filter_atr_period", 14))
         try:
-            self.gate_atr_period = max(2, int(body.get("filter_atr_period", 14) or 14))
+            self.gate_atr_period = max(2, int(body.get("filter_atr_period", default_atr_period) or 14))
         except (TypeError, ValueError):
-            self.gate_atr_period = 14
+            self.gate_atr_period = default_atr_period
         # 等回抽时还要看 EMA：反抽有效打穿这条线，这次突破就作废。ema_period=0 关闭。
+        default_ema_period = int(section_default(self.SECTION, "ema_period", 20))
         try:
-            self.ema_period = max(0, int(body.get("ema_period", 20) or 0))
+            self.ema_period = max(0, int(body.get("ema_period", default_ema_period) or 0))
         except (TypeError, ValueError):
-            self.ema_period = 20
+            self.ema_period = default_ema_period
+        default_ema_buffer = int(section_default(self.SECTION, "ema_buffer_ticks", 2))
         try:
-            self.ema_buffer_ticks = max(0, int(body.get("ema_buffer_ticks", 2) or 0))
+            self.ema_buffer_ticks = max(0, int(body.get("ema_buffer_ticks", default_ema_buffer) or 0))
         except (TypeError, ValueError):
-            self.ema_buffer_ticks = 2
+            self.ema_buffer_ticks = default_ema_buffer
         # 急破后等回抽：品种 → 属于哪一段、方向、破位点。换段自动清掉，不跨段等。
         self._chase_wait: dict[str, dict[str, Any]] = {}
         # 开仓截止钟点：过了这个钟点，这一段不再开新仓。配置页可以分开设日盘和夜盘。

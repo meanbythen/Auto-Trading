@@ -583,6 +583,8 @@ class CtpGateway:
             self._ready_event.set()
 
     def on_reject(self, order_ref: str, message: str) -> None:
+        report = None
+        waiter = None
         with self._lock:
             order = self.table.get(order_ref)
             if order is None:
@@ -590,7 +592,10 @@ class CtpGateway:
                 return
             apply_order_report(order, status_code="rejected", message=message or "拒单")
             logger.error("柜台返回错误，报单 {}：{}", order_ref, order.message)
-            self._finish_locked(order)
+            report, waiter = self._finish_locked(order)
+        self._account_fill(report)
+        if waiter is not None:
+            waiter.set()
 
     def on_order_status(
         self,
@@ -604,23 +609,16 @@ class CtpGateway:
         session_id: int = 0,
         detail: dict[str, Any] | None = None,
     ) -> None:
+        report = None
+        waiter = None
         with self._lock:
             order = self.table.get(order_ref)
             extra = detail or {}
             if order is None:
-                symbol = str(extra.get("symbol") or "")
-                if not symbol:
-                    self._note_foreign_report()
-                    return
-                order = TrackedOrder(
-                    order_ref,
-                    symbol,
-                    str(extra.get("direction") or ""),
-                    str(extra.get("offset") or ""),
-                    max(int(extra.get("volume") or 0), int(filled or 0), 1),
-                    float(extra.get("price") or 0),
-                )
-                self.table.add(order)
+                # 不是这次登录由本程序发出的报单。共享账号上别人的单、手工单通常也带合约代码，
+                # 不能因为字段齐全就收编进来，否则它们的成交会写进本程序账本。
+                self._note_foreign_report()
+                return
             if extra.get("symbol") and not order.symbol:
                 order.symbol = str(extra.get("symbol") or "")
             if extra.get("direction") and not order.direction:
@@ -645,7 +643,10 @@ class CtpGateway:
                 STATUS_TEXT.get(order.status, order.status),
                 message,
             )
-            self._finish_locked(order)
+            report, waiter = self._finish_locked(order)
+        self._account_fill(report)
+        if waiter is not None:
+            waiter.set()
 
     def on_cancel_error(self, order_ref: str, message: str) -> None:
         """撤单被柜台拒绝。不是我们发出的那笔，不当成这次登录的错误。"""
@@ -669,6 +670,8 @@ class CtpGateway:
 
     def on_trade(self, order_ref: str, price: float, volume: int, detail: dict[str, Any] | None = None) -> None:
         extra = detail or {}
+        report = None
+        waiter = None
         with self._lock:
             self._remember_fill(order_ref, price, volume, extra)
             order = self.table.get(order_ref)
@@ -683,7 +686,10 @@ class CtpGateway:
                 price,
                 volume,
             )
-            self._finish_locked(order)
+            report, waiter = self._finish_locked(order)
+        self._account_fill(report)
+        if waiter is not None:
+            waiter.set()
 
     def on_query_trade(self, row: dict[str, Any] | None, is_last: bool) -> None:
         with self._lock:
@@ -770,6 +776,7 @@ class CtpGateway:
         今天已成交、已撤的也放进委托表，方便和成交页对照。
         还没完结的另外记一笔，避免程序以为仓是空的又去开仓。
         """
+        report = None
         with self._lock:
             if order_ref:
                 self._note_ref(order_ref)
@@ -782,6 +789,9 @@ class CtpGateway:
                         offset,
                         max(int(volume or 0), int(filled or 0), 1),
                         float(price or 0),
+                        # 查询到的、这次进程没发过的单：只用来显示和挡住重复开仓，
+                        # 它们的成交不入本程序账本（账本以信号账户为准）。
+                        foreign=True,
                     )
                     apply_order_report(order, status_code=status_code, filled=filled, message=message)
                     self.table.add(order)
@@ -794,7 +804,7 @@ class CtpGateway:
                         )
                 else:
                     apply_order_report(order, status_code=status_code, filled=filled, message=message)
-                    self._finish_locked(order)
+                    report, _waiter = self._finish_locked(order)
                 if exchange_id:
                     order.exchange_id = exchange_id
                 if order_sys_id and str(order_sys_id).strip():
@@ -812,6 +822,7 @@ class CtpGateway:
                 logger.info("今日委托已核对，共 {} 笔", len(self.table.orders))
                 self._ready_event.set()
                 self._order_query_event.set()
+        self._account_fill(report)
 
     def on_position_row(self, row: dict[str, Any] | None, is_last: bool) -> None:
         if row:
@@ -997,20 +1008,41 @@ class CtpGateway:
         if number >= self.table.next_ref:
             self.table.next_ref = number + 1
 
-    def _finish_locked(self, order: TrackedOrder) -> None:
-        """已经持有锁。终态时叫醒等待的报单，并只记一次成交账。"""
+    def _finish_locked(self, order: TrackedOrder) -> tuple[dict[str, Any] | None, Any]:
+        """
+        已经持有锁。终态时把「要记的成交」交给调用方，在锁外记账。
+
+        返回 (成交回报, 等待报单完成的 Event)。记账要写账本、改配置、读 Excel，
+        放在锁里会把报单/撤单回调卡住，submit 就会超时撤单。
+        """
         if not is_terminal(order.status):
-            return
+            return None, None
         waiter = self._waiters.get(order.order_ref)
         # 撤单或部分成交后剩余作废时，已经成交的手数同样要入账；
         # 否则内部持仓会一直比柜台少一截，对账永远不通过。
-        if order.filled > 0 and not order.accounted and self.fill_handler is not None:
-            try:
-                # 返回 False 表示没记上账，调用方还可以再记一次。
-                done = self.fill_handler(order.to_dict())
-                if done is not False:
-                    order.accounted = True
-            except Exception:  # noqa: BLE001
-                logger.exception("成交记账失败，报单 {}", order.order_ref)
-        if waiter is not None:
-            waiter.set()
+        # 只记「还没记过的那部分」：回调可能在部分成交时就记过一次。
+        leftover = max(0, int(order.filled) - int(order.accounted_volume))
+        report: dict[str, Any] | None = None
+        if leftover > 0 and not order.foreign and self.fill_handler is not None:
+            report = order.to_dict()
+        return report, waiter
+
+    def _account_fill(self, report: dict[str, Any] | None) -> None:
+        """在锁外记账。出错只记日志，下一轮回调或对账还会再补。"""
+        if not report or self.fill_handler is None:
+            return
+        ref = str(report.get("order_ref") or "")
+        try:
+            done = self.fill_handler(report)
+        except Exception:  # noqa: BLE001
+            logger.exception("成交记账失败，报单 {}", ref)
+            return
+        if done is False:
+            return
+        with self._lock:
+            order = self.table.get(ref)
+            if order is not None:
+                order.accounted_volume = max(
+                    int(order.accounted_volume), int(report.get("filled") or 0)
+                )
+                order.accounted = True

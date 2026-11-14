@@ -17,49 +17,48 @@ from dataclasses import dataclass, field
 import pandas as pd
 from loguru import logger
 
-from src.backtest.engine import _trend_frame_for_signal
+from src.backtest.engine import _adx_at, _adx_for_eval, _trend_frame_for_signal
+from src.backtest.evaluation import EvaluationThresholds
 from src.review.session import SessionWindow
 from src.review.technical import as_naive_datetime
 from src.strategy import StrategyAction, create_strategy
+from src.strategy.factory import (
+    CROSS_TEST_ENGINE_ORDER,
+    ENGINE_ALIASES,
+    ENGINE_LABELS,
+)
 from src.strategy.types import PositionState
 
-# 界面中文名 → 配置里的 engine。None 表示不套策略。
-ENGINE_BY_LABEL = {
-    "只看盘面（不套策略）": None,
+NO_STRATEGY_LABEL = "只看盘面（不套策略）"
+
+# 旧界面名仍认，避免老配置/老报告打不开。
+_LEGACY_LABELS: dict[str, str] = {
     "日内实体": "daily_body",
-    "日内实体（主推）": "daily_body",
-    "日内浮盈飘单": "float_hold",
-    "趋势跟随": "trend_follow",
-    "SuperTrend趋势": "supertrend",
     "SuperTrend": "supertrend",
-    "双均线趋势": "dual_ma",
     "MACD波段": "ema_swing",
-    "均线波段": "ema_swing",
-    "布林带突破": "bollinger",
-    "SAR波段趋势": "sar_trend",
     "多因子CTA": "multi_factor",
-    "多因子CTA（加权打分）": "multi_factor",
-    "长线趋势加减仓": "swing_trend",
-    "长线箱体突破": "swing_box",
 }
-LABEL_BY_ENGINE = {v: k for k, v in ENGINE_BY_LABEL.items() if v}
-# 旧配置里的短名字，显示成同一套策略。
-LABEL_BY_ENGINE.update({
-    "daily_body": "日内实体",
-    "float_hold": "日内浮盈飘单",
-    "ema_swing": "均线波段",
-    "macd_swing": "均线波段",
-    "swing_box": "长线箱体突破",
-    "st": "SuperTrend趋势",
-    "ma_cross": "双均线趋势",
-    "boll": "布林带突破",
-    "bollinger_break": "布林带突破",
-    "sar": "SAR波段趋势",
-    "parabolic_sar": "SAR波段趋势",
-    "multi": "多因子CTA（加权打分）",
-    "cta": "多因子CTA（加权打分）",
-    "multi_factor": "多因子CTA（加权打分）",
-})
+
+# 界面中文名 → 配置里的 engine。None 表示不套策略。
+# 名单和中文名统一从策略工厂取，新增策略只改 factory.py。
+ENGINE_BY_LABEL: dict[str, str | None] = {NO_STRATEGY_LABEL: None}
+for _code in CROSS_TEST_ENGINE_ORDER:
+    ENGINE_BY_LABEL.setdefault(ENGINE_LABELS[_code], _code)
+for _legacy_label, _legacy_code in _LEGACY_LABELS.items():
+    ENGINE_BY_LABEL.setdefault(_legacy_label, _legacy_code)
+
+# 引擎 → 界面名。daily_body 用短名，和旧报告一致。
+LABEL_BY_ENGINE: dict[str, str] = {
+    code: ENGINE_LABELS[code] for code in CROSS_TEST_ENGINE_ORDER
+}
+LABEL_BY_ENGINE.update(
+    {
+        alias: ENGINE_LABELS[target]
+        for alias, target in ENGINE_ALIASES.items()
+        if target in ENGINE_LABELS
+    }
+)
+LABEL_BY_ENGINE["daily_body"] = "日内实体"
 
 
 @dataclass
@@ -74,6 +73,8 @@ class ReplayEvent:
     when: object | None = None
     # 开仓时的止损价；平仓事件没有
     stop: float | None = None
+    # 开仓时评估用的 ADX，复盘评估据此分趋势/震荡组
+    adx: float | None = None
 
 
 @dataclass
@@ -140,6 +141,9 @@ def replay_strategy(
         bars_signal: 含复盘日之前的历史，指标才算得出来
         pin_count: 技术面数到的针形线数量，用来解释「盘面有形态但策略没做」
         bars_trend: 对照策略用的日线。别的策略不用，可以不传
+
+    价格口径：开仓按策略给出的信号价/当根收盘，平仓若碰到止损按止损价，否则按收盘价；
+    都不含滑点和挂单排队。这里回答的是「会不会做、为什么做」，不是真实成交价。
     """
     label = label_for_engine(engine)
     result = StrategyReplay(label=label, engine=engine)
@@ -176,7 +180,8 @@ def replay_strategy(
     result.lines.append(
         f"按「{label}」重放。假设这段开始时是空仓，用的是配置页里的时段、ETH 和形态参数，"
         "周期用复盘页上选的。这里只看策略会不会发出信号，不算手数、保证金和日亏损。"
-        "这不是交易所真实成交。"
+        "价格按信号价或当根收盘估算（止损触发按止损价），不含滑点、盘口和挂单排队，"
+        "是信号演示，不是实际执行价。"
     )
     result.lines.append(f"窗口内一共看了 {covered} 根已收盘K线。")
 
@@ -260,6 +265,8 @@ def _walk(
     strategy.positions[symbol] = PositionState(symbol=symbol)
     trend_tf = str(getattr(strategy, "trend_timeframe", "") or "")
     strategy.set_last_entry_bar(symbol, "")
+    # 和回测同一套 ADX 口径，复盘评估才能分趋势/震荡组。
+    adx_values = _adx_for_eval(bars_signal, EvaluationThresholds.from_cfg(cfg).adx_period)
 
     opens: list[ReplayEvent] = []
     closes: list[ReplayEvent] = []
@@ -300,6 +307,13 @@ def _walk(
             else:
                 decision = strategy.evaluate(symbol, signal_df, now=now, trail_bars=trail_df)
             price = float(signal_df["close"].iloc[-1])
+            pos_before = strategy.positions.get(symbol)
+            stop_before = 0.0
+            if pos_before is not None and pos_before.side != "flat":
+                try:
+                    stop_before = float(pos_before.trail_stop or pos_before.initial_stop or 0)
+                except (TypeError, ValueError):
+                    stop_before = 0.0
             # time 给人看；stamp 给质量分析配对用（字段名 when，避免和字符串抢名字）
             time_label = now.strftime("%m-%d %H:%M")
             if decision.action in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN):
@@ -331,15 +345,30 @@ def _walk(
                         decision.reason,
                         when=now,
                         stop=stop_val,
+                        adx=_adx_at(adx_values, i),
                     )
                 )
             elif decision.action == StrategyAction.CLOSE:
                 pos = strategy.positions.get(symbol)
                 if not pos or pos.side == "flat":
                     continue
-                strategy.on_filled(symbol, StrategyAction.CLOSE, price, int(pos.volume or 1))
+                # 止损被打掉时按止损价估算；这是这根之前已知的止损线，
+                # 本根新收紧的线下一根才生效。没碰到止损就按收盘价估算。
+                fill_price = price
+                bar = signal_df.iloc[-1]
+                if stop_before > 0:
+                    hit = (
+                        pos.side == "long" and float(bar["low"]) <= stop_before
+                    ) or (
+                        pos.side == "short" and float(bar["high"]) >= stop_before
+                    )
+                    if hit:
+                        fill_price = stop_before
+                strategy.on_filled(
+                    symbol, StrategyAction.CLOSE, fill_price, int(pos.volume or 1)
+                )
                 closes.append(
-                    ReplayEvent(time_label, "平仓", price, decision.reason, when=now)
+                    ReplayEvent(time_label, "平仓", fill_price, decision.reason, when=now)
                 )
             else:
                 reason = coarse_reason(decision.reason)

@@ -57,6 +57,10 @@ _LOCK = threading.RLock()
 _api: Any | None = None
 _api_key: tuple[str, str] | None = None
 
+# 天勤免费账号单档 K 线上限；超过会被服务端静默截断且 while filled<size 恒成立等满 15 秒。
+# 夹取到上限就好，要更多请自己日线合成。
+_TQ_MAX_SIZE = 10_000
+
 
 def period_seconds(period: str) -> int:
     """
@@ -346,11 +350,12 @@ def frame_from_klines(raw: Any, seconds: int) -> pd.DataFrame:
         }
     )
     # tqsdk 的时间戳是 UTC；程序里统一用不带时区的北京时间。
+    # 显式指定 unit="s"，避免 numpy 把「整数 + Timedelta」当成 generic unit（未来会变错误）。
     beijing = pd.DatetimeIndex(times).floor("s") + pd.Timedelta(hours=8)
     if int(seconds) >= _DAY_SECONDS:
         frame.index = beijing.normalize()
     else:
-        frame.index = beijing + pd.Timedelta(seconds=int(seconds))
+        frame.index = beijing + pd.Timedelta(seconds=int(seconds), unit="s")
     frame.index.name = "datetime"
     frame = frame[~frame.index.duplicated(keep="last")].sort_index()
     frame = frame.dropna(subset=["open", "high", "low", "close"])
@@ -405,11 +410,12 @@ def fetch_frame(
         return week
     seconds = period_seconds(period)
     code = tq_symbol(symbol)
-    # 天勤服务端自己有上限（免费账号实测约 10000 根，要多了不报错、按上限截），
-    # 所以这里不再设帽子：调用方要多少就传多少，给多少算多少。
-    size = max(10, int(limit))
+    # 天勤服务端自己有上限（免费账号实测约 10000 根），超过会被静默截断；
+    # 夹取到上限，否则 while filled < size 会恒成立、等满 15 秒超时。
+    size = max(10, min(int(limit), _TQ_MAX_SIZE))
+    # 登录不持 _LOCK：_get_api 要联网握手，回测首次登录时不能把实盘扫描挡在锁外。
+    client = api if api is not None else _get_api(user, password)
     with _LOCK:
-        client = api if api is not None else _get_api(user, password)
         try:
             klines = client.get_kline_serial(code, seconds, data_length=size)
             # 等服务端把历史填满再转换：服务端分批下发，只等一次可能拿到半截数据。

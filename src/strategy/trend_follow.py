@@ -321,14 +321,14 @@ class TrendFollowStrategy(StrategyBase):
         low = float(bar["low"])
         close = float(bar["close"])
 
-        def _close(reason: str) -> StrategyDecision:
+        def _close(reason: str, *, stop_price: float | None = None) -> StrategyDecision:
             self._pending[symbol] = {"time": now, "bar_id": bar_id}
             self._signaled_bar[symbol] = bar_id
             return StrategyDecision(
                 StrategyAction.CLOSE,
                 symbol,
                 reason,
-                stop_price=pos.trail_stop or pos.initial_stop,
+                stop_price=stop_price if stop_price is not None else (pos.trail_stop or pos.initial_stop),
                 entry_price=None,
             )
 
@@ -357,12 +357,15 @@ class TrendFollowStrategy(StrategyBase):
         if pos.side == "short" and close > exit_high:
             return _close(f"趋势跟随平空 收盘升破前{self.exit_bars}根高点{exit_high:.2f}")
 
+        prev_stop = float(pos.trail_stop or pos.initial_stop or 0.0)
         stop = self._ratchet(symbol, pos, bar, atr)
+        # 本根新收紧的止损下一根才用；止损判定和成交都用上一根已知的线。
+        judge_stop = prev_stop or stop
         if stop_triggered(
-            side=pos.side, stop=stop, close=close, high=high, low=low, mode=self.stop_mode
+            side=pos.side, stop=judge_stop, close=close, high=high, low=low, mode=self.stop_mode
         ):
             text = "跌破波动止损" if pos.side == "long" else "升破波动止损"
-            return _close(f"趋势跟随止损 {text} {stop:.2f}")
+            return _close(f"趋势跟随止损 {text} {judge_stop:.2f}", stop_price=judge_stop)
 
         return StrategyDecision(
             StrategyAction.HOLD,

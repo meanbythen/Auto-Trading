@@ -7,18 +7,21 @@ from types import SimpleNamespace
 
 import pandas as pd
 
+from src.strategy.decision_guard import apply_generic_stop
 from src.strategy.generic_stop import (
     GENERIC_STOP_BREAKEVEN,
     GENERIC_STOP_CHANDELIER,
     GENERIC_STOP_OFF,
     GENERIC_STOP_PRIOR_EXTREME,
     GENERIC_STOP_SAR,
+    GenericStopHit,
     GenericStopOverlay,
     generic_stop_from_cfg,
     generic_stop_from_label,
     generic_stop_label,
     normalize_generic_stop,
 )
+from src.strategy.types import StrategyAction, StrategyDecision
 
 
 def _frame(
@@ -404,3 +407,40 @@ def test_backtest_applies_generic_stop_before_strategy_exit() -> None:
     assert result.trades, "至少要开一次仓"
     assert any("通用止损" in str(t.reason_exit) for t in result.trades)
     assert result.params_snapshot["generic_stop"]["kind"] == "prior_extreme"
+
+
+class _StubOverlay:
+    """只用来验公共守卫的分支，不真的算止损。"""
+
+    def __init__(self, hit: GenericStopHit | None) -> None:
+        self.hit = hit
+        self.calls = 0
+
+    def check(self, *_args, **_kwargs):
+        self.calls += 1
+        return self.hit
+
+
+def test_apply_generic_stop_only_touches_hold_with_position() -> None:
+    """策略要开仓或本来就空仓时，不调通用止损；HOLD 且有仓才补一刀。"""
+    hit = GenericStopHit(kind=GENERIC_STOP_PRIOR_EXTREME, stop=100.0, reason="跌破前低", bar=object())
+    overlay = _StubOverlay(hit)
+    bars = _frame([105.0] * 5)
+
+    opening = StrategyDecision(StrategyAction.BUY_OPEN, "bu", "突破")
+    same, none_hit = apply_generic_stop(overlay, "bu", opening, _pos("long", 105.0, bars.index[0].isoformat()), bars)
+    assert same is opening and none_hit is None and overlay.calls == 0
+
+    holding = StrategyDecision(StrategyAction.HOLD, "bu", "等")
+    flat_pos = _pos("long", 105.0, bars.index[0].isoformat())
+    flat_pos.volume = 0
+    same, none_hit = apply_generic_stop(overlay, "bu", holding, flat_pos, bars, flat=True)
+    assert same is holding and none_hit is None and overlay.calls == 0
+
+    closed, got = apply_generic_stop(
+        overlay, "bu", holding, _pos("long", 105.0, bars.index[0].isoformat()), bars, meta={"generic_stop": True}
+    )
+    assert closed.action == StrategyAction.CLOSE
+    assert closed.stop_price == 100.0
+    assert closed.meta == {"generic_stop": True}
+    assert got is hit and overlay.calls == 1
