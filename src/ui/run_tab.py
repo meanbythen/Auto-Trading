@@ -6,7 +6,7 @@ from loguru import logger
 from pathlib import Path
 from typing import Callable
 from src.ui import theme as T
-from src.ui.app_common import QueueLogHandler
+from src.ui.app_common import QueueLogHandler, bind_wrap_to_parent
 from src.utils import save_config
 from tkinter import messagebox
 import customtkinter as ctk
@@ -109,14 +109,16 @@ class RunTabMixin:
         self.btn_confirm.pack(side="left", padx=(10, 0))
 
 
-        ctk.CTkLabel(
+        pause_hint = ctk.CTkLabel(
             left,
             text="「暂停报单」后扫描还在跑，开平仓、止损、清仓都不会发出去。要结束常驻请点「停止常驻」。交易台只给人测开平撤；③④再启动常驻由策略接管。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=420,
             justify="left",
-        ).pack(anchor="w", padx=8, pady=(0, 8))
+        )
+        pause_hint.pack(anchor="w", padx=8, pady=(0, 8))
+        bind_wrap_to_parent(pause_hint)
 
         ctk.CTkLabel(
             left,
@@ -134,14 +136,16 @@ class RunTabMixin:
             height=32,
         )
         self.go_live_menu.pack(fill="x", padx=8, pady=(4, 0))
-        ctk.CTkLabel(
+        stage_hint_label = ctk.CTkLabel(
             left,
             textvariable=self.go_live_hint_var,
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=420,
             justify="left",
-        ).pack(anchor="w", padx=8, pady=(4, 4))
+        )
+        stage_hint_label.pack(anchor="w", padx=8, pady=(4, 4))
+        bind_wrap_to_parent(stage_hint_label)
         stage_btns = ctk.CTkFrame(left, fg_color="transparent")
         stage_btns.pack(fill="x", padx=8, pady=(0, 8))
         ctk.CTkButton(
@@ -181,14 +185,16 @@ class RunTabMixin:
             command=self._on_test_tools,
         )
         self.btn_test_tools.pack(fill="x", padx=8, pady=(0, 4))
-        ctk.CTkLabel(
+        tools_hint = ctk.CTkLabel(
             left,
             text="日常先「试跑一轮」；要验坐标用「点击下单」；怀疑程序坏了再「完整自检」。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=420,
             justify="left",
-        ).pack(anchor="w", padx=8, pady=(0, 8))
+        )
+        tools_hint.pack(anchor="w", padx=8, pady=(0, 8))
+        bind_wrap_to_parent(tools_hint)
 
         ctk.CTkButton(
             left,
@@ -201,14 +207,16 @@ class RunTabMixin:
             text_color=T.ACCENT,
             command=self._on_manual_trade,
         ).pack(fill="x", padx=8, pady=(0, 4))
-        ctk.CTkLabel(
+        manual_hint = ctk.CTkLabel(
             left,
             text="手动在同花顺上开仓/平仓后，在这里录入。品种、价格、手数 + 买多/卖空/平仓。只改程序的账，不会去点同花顺。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=420,
             justify="left",
-        ).pack(anchor="w", padx=8, pady=(0, 8))
+        )
+        manual_hint.pack(anchor="w", padx=8, pady=(0, 8))
+        bind_wrap_to_parent(manual_hint)
 
         ctk.CTkButton(
             left,

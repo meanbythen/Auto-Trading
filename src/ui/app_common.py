@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import customtkinter as ctk
+
 
 ENGINE_LABELS = {
     "daily_body": "日内实体（主推）",
@@ -165,6 +167,29 @@ def _duration_text(seconds: float) -> str:
         return f"{minutes}分{sec:02d}秒"
     hours, minutes = divmod(minutes, 60)
     return f"{hours}小时{minutes:02d}分"
+
+
+def bind_wrap_to_parent(label: Any, parent: Any = None, pad: int = 32, minimum: int = 160) -> None:
+    """
+    让长提示文字按面板的实际宽度折行，而不是写死一个 wraplength。
+
+    写死时窗口拉宽它也不跟着变：明明一行放得下，却把句末的「。」单独挤到下一行。
+    这里跟着面板走：够宽就排成一行，窗口变窄再折，折行宽度始终不超过面板。
+    """
+    box = parent if parent is not None else label.master
+
+    def _apply(_event: object = None) -> None:
+        available = box.winfo_width() - pad
+        if available < minimum:
+            return
+        # CTk 把 wraplength 按窗口缩放换成屏幕像素，这里先按同一比例折回逻辑宽度。
+        scale = float(ctk.ScalingTracker.get_window_scaling(box.winfo_toplevel()) or 1.0)
+        width = int(available / max(scale, 0.5))
+        if width >= minimum and width != label.cget("wraplength"):
+            label.configure(wraplength=width)
+
+    box.bind("<Configure>", _apply, add="+")
+    label.after_idle(_apply)
 
 
 class QueueLogHandler:
