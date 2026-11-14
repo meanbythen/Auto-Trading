@@ -788,7 +788,7 @@ class RunTabMixin:
 
 
     def _on_test_tools(self) -> None:
-        """打开测试工具：试跑一轮 / 点击下单 / 完整自检，三项分选。"""
+        """打开测试工具：试跑一轮 / 点击下单 / 挂机前自检 / 完整自检，分选执行。"""
         from src.ui.test_tools import open_test_tools
 
         open_test_tools(
@@ -796,6 +796,7 @@ class RunTabMixin:
             on_once=self._on_once,
             on_order=self._on_order_simulator,
             on_full=self._on_sim_test,
+            on_preflight=self._on_preflight,
         )
 
 
@@ -814,6 +815,43 @@ class RunTabMixin:
             )
             return
         self._append_log("已触发试跑一轮信号（单次扫描）。")
+
+
+    def _on_preflight(self) -> None:
+        """
+        挂机前自检：查配置、行情、同花顺窗口和坐标，鼠标会移到各个下单框上预览。
+
+        只预览不点击，不动账户；会切窗口、动鼠标，所以常驻运行时先拦住。
+        自检过程本身用 logger 输出，运行页的日志已经接了这个通道。
+        """
+        from src.utils.preflight import run_preflight
+
+        if self.worker.running:
+            messagebox.showwarning(
+                "常驻还在跑",
+                "请先点「停止常驻」，再跑挂机前自检。自检会移动鼠标、切换窗口。",
+            )
+            return
+        self._append_log("开始挂机前自检（只预览坐标，不点委托）…")
+
+        def _run() -> None:
+            try:
+                cfg = self._clone_cfg()
+                cfg["_project_root"] = str(self.root_dir)
+                report = run_preflight(cfg, do_click_test=False, do_preview=True)
+            except Exception as exc:  # noqa: BLE001
+                # except 块结束就取不到 exc 了，先转成字符串给主线程用。
+                err_text = f"{exc}"
+                self._post_to_main(lambda: self._append_log(f"挂机前自检出错：{err_text}"))
+                return
+            summary = (
+                "挂机前自检通过，可以挂机。"
+                if report.ok
+                else "挂机前自检没通过，先处理上面「没通过」的项。"
+            )
+            self._post_to_main(lambda: self._append_log(summary))
+
+        threading.Thread(target=_run, daemon=True).start()
 
 
     def _on_sim_test(self) -> None:
