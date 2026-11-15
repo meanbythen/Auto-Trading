@@ -10,6 +10,7 @@ from src.ui.app_common import QueueLogHandler, bind_wrap_to_parent
 from src.utils import save_config
 from tkinter import messagebox
 import customtkinter as ctk
+import json
 import os
 import queue
 import subprocess
@@ -681,6 +682,26 @@ class RunTabMixin:
             self._login_tick_after_id = self.after(20000, self._tick_login_schedule)
 
 
+    def _warn_unprotected_resume(self) -> None:
+        """上次退出时还有持仓/挂单：启动先说清楚，现在不会自动再开新仓。"""
+        if getattr(self, "_unprotected_warned", False):
+            return
+        path = self.root_dir / "data" / "unprotected_positions.json"
+        if not path.exists():
+            return
+        try:
+            json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            pass
+        self._unprotected_warned = True
+        self._append_log("上次退出时仍有持仓/挂单，启动后会先对账并评估止损，恢复前不报单。")
+        messagebox.showwarning(
+            "退出保护",
+            "上次退出时仍有持仓或挂单。\n\n"
+            "程序会先与柜台对账并评估止损，完成前暂停报单。请确认账户实际持仓。",
+        )
+
+
     def _maybe_start_at_login_time(self) -> None:
         """当前这一分钟如果写在 login_times 里，而且今天还没触发过，就去准备并启动。"""
         from datetime import datetime
@@ -742,6 +763,38 @@ class RunTabMixin:
             messagebox.showinfo("对账确认", msg)
         else:
             messagebox.showwarning("对账确认", msg)
+
+
+    def _on_reconcile_actions(self) -> None:
+        """对账处理：逐个品种选择认领 / 平掉 / 暂不处理。"""
+        bot = getattr(self.worker, "bot", None)
+        if bot is None:
+            messagebox.showinfo("对账处理", "常驻没有在跑。启动常驻后再处理未认领持仓。")
+            return
+        rec = (bot.status_snapshot() or {}).get("reconcile") or {}
+        pending = list(dict.fromkeys([*(rec.get("unclaimed") or []), *(rec.get("phantom") or [])]))
+        if not pending:
+            messagebox.showinfo("对账处理", "当前没有需要处理的对账差异")
+            return
+        for symbol in pending:
+            choice = messagebox.askyesnocancel(
+                f"对账处理 {symbol}",
+                f"{symbol} 存在柜台与账本差异。\n\n"
+                "是：认领（按柜台持仓补进信号账户）\n"
+                "否：平掉（按最新价补记平仓）\n"
+                "取消：暂不处理（保持冻结)",
+            )
+            if choice is None:
+                bot.ignore_reconcile_symbol(symbol)
+                continue
+            if choice:
+                ok, msg = bot.adopt_broker_position(symbol)
+            else:
+                ok, msg = bot.close_broker_position(symbol)
+            self._append_log(msg)
+            if not ok:
+                messagebox.showwarning("对账处理", msg)
+        self._refresh_status_cards()
 
 
     def _maybe_release_intent_halt(
@@ -1277,8 +1330,60 @@ class RunTabMixin:
                     pass
                 setattr(self, name, None)
         if self.worker.running:
-            self.worker.stop()
+            bot = getattr(self.worker, "bot", None)
+            snap = self.worker.status_snapshot() or {}
+            from src.utils.state_store import format_position_text
+
+            held = format_position_text(snap.get("positions"))
+            work = False
+            trader = getattr(bot, "trader", None)
+            if trader is not None and hasattr(trader, "has_working_order"):
+                try:
+                    work = bool(trader.has_working_order())
+                except Exception:  # noqa: BLE001
+                    work = True
+            if held != "空仓" or work:
+                extra = "还有未完成委托。" if work else ""
+                if not messagebox.askyesno(
+                    "确认关闭",
+                    f"当前仍有持仓：{held}\n{extra}"
+                    "关闭后本程序不再执行止损，持仓只能由柜台或人工处理。\n\n确定要关闭吗？",
+                ):
+                    self._resume_ui_timers()
+                    return
+            ok = self.worker.stop(wait=True, timeout=15.0)
+            if not ok:
+                if not messagebox.askyesno(
+                    "后台没有按时退出",
+                    "后台线程 15 秒内没有退出，强制关闭可能导致成交未记账或状态未落盘。\n"
+                    "仍要强制关闭吗？",
+                    default="no",
+                ):
+                    self._resume_ui_timers()
+                    return
+                try:
+                    from src.ops.alerts import emit_alert
+
+                    emit_alert("force_close", "关窗时后台线程未退出，用户选择强制关闭", level="error")
+                except Exception:  # noqa: BLE001
+                    pass
+                if bot is not None and hasattr(bot, "_record_event"):
+                    try:
+                        bot._record_event("force_close")
+                    except Exception:  # noqa: BLE001
+                        pass
         self.destroy()
+
+
+    def _resume_ui_timers(self) -> None:
+        """用户取消关闭：恢复刚才为关窗停掉的界面定时器。"""
+        self._closing = False
+        if getattr(self, "_tick_after_id", None) is None:
+            self._tick_after_id = self.after(500, self._tick)
+        if getattr(self, "_log_after_id", None) is None:
+            self._log_after_id = self.after(100, self._drain_logs)
+        if getattr(self, "_login_tick_after_id", None) is None:
+            self._login_tick_after_id = self.after(20000, self._tick_login_schedule)
 
 
     def report_callback_exception(self, exc, val, tb) -> None:

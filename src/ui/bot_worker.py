@@ -58,10 +58,21 @@ class BotWorker:
         self._thread = threading.Thread(target=_run, name="TradingBotWorker", daemon=True)
         self._thread.start()
 
-    def stop(self) -> None:
-        """结束常驻主循环（扫描、清仓钟点、防休眠一并停）。"""
-        if self.bot:
-            self.bot.stop()
+    def stop(self, *, wait: bool = False, timeout: float = 15.0) -> bool:
+        """请求停止；wait=True 时等待线程退出，返回是否已退出。"""
+        if self.bot is None:
+            return True
+        self.bot.stop()
+        if not wait:
+            return not self.running
+        thread = self._thread
+        if thread is None or thread is threading.current_thread():
+            return True
+        thread.join(timeout)
+        stopped = not thread.is_alive()
+        if not stopped:
+            logger.error("后台线程 {} 秒内未退出", timeout)
+        return stopped
 
     def set_orders_paused(self, paused: bool) -> None:
         """只停发单，不停扫描。"""
