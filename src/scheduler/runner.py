@@ -7,11 +7,13 @@
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any, cast
+from uuid import uuid4
 
 import pandas as pd
 import schedule
@@ -39,7 +41,7 @@ from src.utils.state_store import (
     save_state,
     snapshot_positions,
 )
-from src.utils.trading_day import futures_trading_day
+from src.utils.trading_day import calendar_coverage_ok, futures_trading_day
 
 # events.jsonl 超过这个大小就轮转成 .1，避免长期挂机把单文件撑到几百 MB。
 EVENT_LOG_MAX_BYTES = 20 * 1024 * 1024
@@ -171,6 +173,13 @@ class TradingBot(
 
     def __init__(self, cfg: dict[str, Any]) -> None:
         self.cfg = cfg
+        # 本次运行标识：事件、告警、状态文件都带它，多次运行的数据不会混在一起。
+        # 同进程同秒内建两个实例（测试、脚本）也不会撞号，末尾加 4 位随机。
+        self.run_id = f"{datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}-{uuid4().hex[:4]}"
+        self.started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        from src.ops.alerts import set_run_id
+
+        set_run_id(self.run_id)
         self.login_mgr = AppLoginManager(cfg)
         self.risk = RiskGuardian.from_config(cfg)
         self.sizer = PositionSizer(cfg)
@@ -252,6 +261,10 @@ class TradingBot(
         self.root = root
         self.event_log = root / "data" / "events.jsonl"
         self.event_log.parent.mkdir(parents=True, exist_ok=True)
+        # 休市日历外置：读不到就用内置 2026 表（老行为）。实盘启动再检查覆盖范围。
+        from src.utils.holidays import calendar_from_config
+
+        self.holiday_calendar = calendar_from_config(cfg, root)
         # 退出保护标记：上次退出还有持仓/挂单时留下，下次启动先对账。
         # 路径要在读盘之前定好：_load_persisted_state 里会顺带落一次状态。
         self._unprotected_path = root / "data" / "unprotected_positions.json"
@@ -401,6 +414,85 @@ class TradingBot(
         """心跳停滞阈值：三个扫描周期，最少 180 秒。"""
         return max(3.0 * float(self.scan_interval), 180.0)
 
+    def _check_guardian_actions(self) -> None:
+        """
+        上次运行如果被冷备守护平过仓，启动时提醒一句。
+
+        启动对账本来就在报单前跑三方核对，这里只负责让人知道「仓不是自己平的」。
+        """
+        actions = self.root / "data" / "guardian_actions.jsonl"
+        if not actions.exists():
+            return
+        try:
+            if actions.stat().st_mtime <= Path(self.state_path).stat().st_mtime:
+                return
+            last_row: dict[str, Any] = {}
+            for line in actions.read_text(encoding="utf-8").splitlines():
+                if line.strip():
+                    last_row = json.loads(line)
+            stamp = str(last_row.get("ts") or "")
+            run_id = str(last_row.get("run_id") or "")
+            message = f"冷备守护在 {stamp or '上次运行'} 平过仓（主进程 {run_id[-6:]}），已按对账流程先核对柜台"
+        except (OSError, json.JSONDecodeError):
+            logger.exception("读取冷备守护动作记录失败")
+            return
+        self._record_event("guardian_flatten_seen", run_id=run_id, ts_guardian=stamp)
+        try:
+            from src.ops.alerts import emit_alert
+
+            emit_alert("guardian_flatten", message, level="error")
+        except Exception:  # noqa: BLE001
+            logger.exception("写冷备守护告警失败")
+
+    def _holiday_min_cover_days(self) -> int:
+        """节假日表至少要覆盖未来多少天；配置写坏时按 60 天。"""
+        try:
+            return max(int((self.cfg.get("schedule") or {}).get("holiday_min_cover_days", 60)), 0)
+        except (TypeError, ValueError):
+            return 60
+
+    def _check_holiday_calendar(self) -> bool:
+        """
+        实盘启动检查休市日历覆盖范围，缺年份时只禁止开仓。
+
+        用 risk.halt 而不是暂停报单：熔断不拦平仓，止损和收盘清仓还能正常执行，
+        只是不再开新仓。补上日历年重启后会自动解除这条限制。
+        """
+        if str((self.cfg.get("trade") or {}).get("executor", "sim")) != "ctp":
+            return True
+        if bool(self.cfg.get("dry_run", True)):
+            return True
+        calendar = getattr(self, "holiday_calendar", None)
+        if calendar is None:
+            # 没配外置日历：沿用内置表，保持旧行为。
+            return True
+        min_days = self._holiday_min_cover_days()
+        if calendar_coverage_ok(calendar, min_days=min_days):
+            if self.risk.halted and self.risk.halt_kind == "holiday_calendar_missing":
+                self.risk.clear_halt("holiday_calendar_missing")
+                logger.info("节假日表已覆盖到 {}，解除开仓限制", calendar.covered_until())
+            return True
+        horizon = (datetime.now() + timedelta(days=min_days)).date()
+        covered = calendar.covered_until()
+        message = f"节假日表只配到 {covered}，未覆盖 {horizon}，已禁止开仓；请补 config/holidays.yaml"
+        if self.risk.halted and self.risk.halt_kind == "holiday_calendar_missing":
+            # 已经在同一条限制里：只刷新原因，不重复写事件和告警。
+            self.risk.halt_reason = message
+            return False
+        self.risk.set_halt("holiday_calendar_missing", message)
+        self._record_event(
+            "holiday_calendar_missing",
+            covered_until=str(covered),
+            required=str(horizon),
+        )
+        try:
+            from src.ops.alerts import emit_alert
+
+            emit_alert("holiday_calendar_missing", message, level="error")
+        except Exception:  # noqa: BLE001
+            logger.exception("写节假日表缺失告警失败")
+        return False
+
     def _watchdog_snapshot(self) -> dict[str, Any]:
         """看门狗要看的运行快照。"""
         from src.utils.session_clock import in_trading_sessions
@@ -494,7 +586,12 @@ class TradingBot(
 
     def _record_event(self, event: str, **kwargs: Any) -> None:
         """把关键事件追加写入 data/events.jsonl；文件过大时先轮转。"""
-        row = {"ts": datetime.now().isoformat(timespec="seconds"), "event": event, **kwargs}
+        row = {
+            "ts": datetime.now().isoformat(timespec="seconds"),
+            "run_id": self.run_id,
+            "event": event,
+            **kwargs,
+        }
         try:
             if self.event_log.exists() and self.event_log.stat().st_size >= EVENT_LOG_MAX_BYTES:
                 backup = self.event_log.with_name(self.event_log.name + ".1")
@@ -1080,6 +1177,9 @@ class TradingBot(
         save_state(
             self.state_path,
             {
+                "run_id": self.run_id,
+                "started_at": self.started_at,
+                "pid": os.getpid(),
                 "trading_day": self.trading_day,
                 "daily_pnl": self.risk.daily_pnl,
                 "orders_today": self.risk.orders_today,
@@ -1248,6 +1348,8 @@ class TradingBot(
         """给界面看的健康快照。"""
         return {
             "running": self._running,
+            "run_id": self.run_id,
+            "started_at": self.started_at,
             "orders_paused": bool(self._orders_paused),
             "ctp_flow": self._ctp_flow_text(),
             "heartbeat_at": self.heartbeat_at,
@@ -1712,6 +1814,13 @@ class TradingBot(
                 "请在配置里只留一个合约，或标定 symbol_input 并设 trade.gui.allow_multi_symbol=true。"
             )
 
+        # 告警外发（默认关）。配置写错只降级成本地告警，不影响扫描。
+        from src.ops.notify import configure as configure_notify
+
+        configure_notify(self.cfg)
+        self._check_guardian_actions()
+        # 实盘先看休市日历够不够用：缺年份就禁止开仓，但不影响止损与清仓。
+        self._check_holiday_calendar()
         self.setup_schedule()
         self._stopped.clear()
         self._running = True

@@ -88,6 +88,10 @@ class DashboardMixin:
             mode_txt = f"运行中 · 心跳{str(snap['heartbeat_at'])[-8:]}"
             if snap.get("halted"):
                 mode_txt = "已熔断"
+            # 第二行放本次运行的短号，方便和 events.jsonl / alerts.jsonl 对上。
+            short = str(snap.get("run_id") or "")[-6:]
+            if short:
+                mode_txt = f"{mode_txt}\n#{short}"
             self.card_mode.configure(text=mode_txt, text_color=T.DANGER if snap.get("halted") else T.OK)
         else:
             self.card_mode.configure(

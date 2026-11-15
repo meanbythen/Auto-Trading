@@ -44,7 +44,11 @@ schedule:
     - ["09:00", "11:30"]
     - ["13:30", "15:00"]
     - ["21:00", "02:30"]
-  # 内置节假日之外再加的休市日（临时休市/调休），写 "2026-12-31" 这种日期。
+  # 交易所休市日历：工作日节假日写这里，跨年只需改文件不用升级程序。
+  # 实盘启动会检查日历是否覆盖未来 holiday_min_cover_days 天，缺年份只禁止开仓。
+  holidays_file: "config/holidays.yaml"
+  holiday_min_cover_days: 60
+  # 外置日历之外再加的休市日（临时休市/调休），写 "2026-12-31" 这种日期。
   # 这些天不清仓、不预约收盘清仓，待办留到下一个交易日。
   closed_days: []
 
@@ -602,6 +606,22 @@ runtime:
   auto_shutdown_after_close: false
   shutdown_grace_minutes: 5   # 过了最后收盘时刻后再等几分钟
   shutdown_delay_sec: 180     # 预约倒计时秒数；期间可执行 shutdown /a 取消
+  # 告警外发（默认关）：熔断、断线、对账差异推到飞书群。
+  alerts:
+    external: "off"           # off | webhook
+    min_level: "error"        # warning | error
+    rate_limit_per_hour: 10   # 同一个 code 每小时最多外发几条
+    webhook:
+      kind: "feishu"
+      url: ""                 # 飞书群机器人 webhook，只存本地，日志里不会打印
+      timeout_sec: 5
+  # 冷备守护（默认关）：主进程被结束后，另一个进程在交易时段内平掉持仓。
+  # 需要单独启动 tools/guardian.py；整机断电/断网时守护进程同样不在，救不了。
+  guardian:
+    enabled: false
+    poll_sec: 10
+    stale_after_sec: 180
+    max_close_attempts: 3
 logging:
   level: "INFO"
   dir: "logs"
