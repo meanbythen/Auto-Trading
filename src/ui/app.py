@@ -158,6 +158,7 @@ class AutoTradingApp(
         self._refresh_status_cards()
         self._tick_after_id = self.after(800, self._tick)
         self._login_tick_after_id = self.after(5000, self._tick_login_schedule)
+        self.after(2000, self._warn_unprotected_resume)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._dm_scraping = False
         # 读同花顺图时焦点在期货通上，窗口快捷键可能收不到；工作线程还会另外查 ESC。

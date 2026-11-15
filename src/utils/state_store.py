@@ -73,6 +73,8 @@ def _load_locked(path: Path) -> dict[str, Any]:
         "heartbeat_at": "",
         "last_scan_at": "",
         "last_error": "",
+        "reconcile": {},
+        "frozen_symbols": [],
     }
     if not path.exists():
         return empty

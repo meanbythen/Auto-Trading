@@ -115,7 +115,8 @@ class LoginFlowMixin:
         if executor != "ctp" or not hasattr(self.trader, "reconcile"):
             return
         try:
-            self.trader.reconcile(self._internal_nets())
+            report = self._call_reconcile()
+            self._apply_reconcile(report, phase="runtime")
             self._apply_broker_equity()
         except Exception as exc:  # noqa: BLE001
             # 读不到柜台就当成「对不上」，绝不能沿用上一轮的 True 继续开仓。
@@ -226,12 +227,18 @@ class LoginFlowMixin:
         if not hasattr(self.trader, "reconcile"):
             return
         try:
-            ok, note = self.trader.reconcile(self._internal_nets())
+            report = self._call_reconcile()
+            self._apply_reconcile(report, phase="startup")
             self._apply_broker_equity()
+            ok = bool(getattr(report, "ok", False))
+            diffs = "；".join(getattr(report, "diffs", None) or [])
             if ok:
-                logger.info("启动权益核对完成：{}", note)
+                logger.info("启动权益核对完成：{}", diffs or "持仓一致")
             else:
-                logger.warning("启动权益已按柜台改本地账，但持仓还对不上：{}", note)
+                logger.warning(
+                    "启动权益已按柜台改本地账，但持仓还对不上：{}", diffs or "柜台查询未完成"
+                )
+            self._startup_reconcile_pending = False
         except Exception as exc:  # noqa: BLE001
             logger.exception("启动时向柜台核对资金失败: {}", exc)
             mark = getattr(self.trader, "mark_reconcile_unknown", None)

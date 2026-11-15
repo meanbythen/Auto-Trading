@@ -27,6 +27,8 @@ class PositionState:
     box_height: float = 0.0
     symbol: str = ""
     opened_at: str = ""
+    # 仓位来源：""=程序自己开的，"broker"=对账从柜台补的，"ledger"=按信号账户重建的。
+    origin: str = ""
 
     def reduce_close(self, volume: int) -> bool:
         """
@@ -53,6 +55,7 @@ class PositionState:
             "trail_stop": float(self.trail_stop or 0),
             "trail_armed": bool(self.trail_armed),
             "opened_at": str(self.opened_at or ""),
+            "origin": str(self.origin or ""),
             "box_high": float(self.box_high or 0),
             "box_low": float(self.box_low or 0),
             "box_height": float(self.box_height or 0),
@@ -73,6 +76,7 @@ class PositionState:
             trail_armed=bool(raw.get("trail_armed", False)),
             symbol=str(symbol),
             opened_at=str(raw.get("opened_at", "") or ""),
+            origin=str(raw.get("origin", "") or ""),
             box_high=float(raw.get("box_high", 0) or 0),
             box_low=float(raw.get("box_low", 0) or 0),
             box_height=float(raw.get("box_height", 0) or 0),

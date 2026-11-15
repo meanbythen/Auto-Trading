@@ -30,6 +30,7 @@ from src.strategy import StrategyAction, StrategyDecision, create_strategy
 from src.strategy.decision_guard import apply_delivery_gate, apply_generic_stop
 from src.strategy.generic_stop import GenericStopOverlay
 from src.trader import create_trader
+from src.trader.ctp_logic import position_avg_price
 from src.utils.state_store import (
     default_state_path,
     format_position_text,
@@ -198,6 +199,8 @@ class TradingBot(
         # CTP 登录失败后的下次重试时刻；None 表示可以立即尝试。
         self._ctp_retry_at: datetime | None = None
         self._running = False  # GUI / 外部可调用 stop() 结束循环
+        self._stopped = threading.Event()
+        self._stop_requested_at: float | None = None
         # 暂停报单：扫描还在跑，开平仓、止损、清仓都不发出去。和交易台「暂停报单」同一标志。
         self._orders_paused = False
         # 同花顺真下单前，必须先把价格改成对手价。没改成就不允许点买卖。
@@ -249,6 +252,9 @@ class TradingBot(
         self.root = root
         self.event_log = root / "data" / "events.jsonl"
         self.event_log.parent.mkdir(parents=True, exist_ok=True)
+        # 退出保护标记：上次退出还有持仓/挂单时留下，下次启动先对账。
+        # 路径要在读盘之前定好：_load_persisted_state 里会顺带落一次状态。
+        self._unprotected_path = root / "data" / "unprotected_positions.json"
         self.state_path = default_state_path(root)
         # 下单意图写前日志：点击前先落盘，成功后清除。若程序在点击与记账之间崩溃，
         # 下次启动会看到这个文件，提示人工核对同花顺持仓，避免重复开仓/漏平仓。
@@ -261,7 +267,30 @@ class TradingBot(
         self._pending_intent: dict[str, Any] | None = None
         # 先记下当前交易日（夜盘 21:00 起算下一个）。读到磁盘后如果文件里已有交易日，再用文件里的。
         self.trading_day = str(futures_trading_day())
+        # 三方对账：最近一次结果、冻结自动交易的品种、幽灵仓连续确认轮数。
+        self._frozen_symbols: set[str] = set()
+        self._frozen_noted: set[str] = set()
+        self._reconcile_state: dict[str, Any] = {}
+        self._phantom_rounds: dict[str, int] = {}
+        self._startup_reconcile_pending = False
         self._load_persisted_state()
+        # 退出保护：上次退出时还有持仓/挂单，重启后先对账、评估止损，再恢复报单。
+        self._unprotected_resume = False
+        self._watchdog: Any = None
+        self._protective_state = "none"
+        marker = self._load_unprotected_flag()
+        if marker is not None:
+            self._unprotected_resume = True
+            self.set_orders_paused(True)
+            self._record_event(
+                "unprotected_resume",
+                reason=marker.get("reason"),
+                positions=marker.get("positions"),
+            )
+            logger.error(
+                "上次退出时仍有持仓/挂单（{}），本轮先对账并评估止损，恢复前不报单",
+                marker.get("reason"),
+            )
         self._check_pending_intent()
         self._warn_gui_safety()
         # 成交回报可能比 place_order 返回更早。先挂上记账函数，避免全部成交后没人改持仓。
@@ -288,6 +317,157 @@ class TradingBot(
         volume = int(getattr(pos, "volume", 0) or 0)
         return side == "flat" or volume <= 0
 
+    def _unprotected_flag_path(self) -> Path:
+        """退出保护标记文件路径。"""
+        return self._unprotected_path
+
+    def _load_unprotected_flag(self) -> dict[str, Any] | None:
+        """读上次退出留下的持仓标记。文件坏了按「有仓未确认」处理，宁可多拦一轮。"""
+        path = self._unprotected_flag_path()
+        if not path.exists():
+            return None
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            logger.warning("退出保护标记读不出来，按未对账处理: {}", exc)
+            return {"reason": "unreadable", "positions": {}}
+        if not isinstance(raw, dict):
+            logger.warning("退出保护标记格式不对，按未对账处理: {}", path)
+            return {"reason": "unreadable", "positions": {}}
+        return raw
+
+    def _clear_unprotected_flag(self) -> None:
+        """清掉退出保护标记。"""
+        try:
+            self._unprotected_flag_path().unlink(missing_ok=True)
+        except OSError as exc:  # noqa: BLE001
+            logger.warning("清除退出保护标记失败: {}", exc)
+
+    def _has_open_position(self) -> bool:
+        """程序账上还有没有非空仓。"""
+        for pos in (getattr(self.strategy, "positions", {}) or {}).values():
+            side = str(getattr(pos, "side", "flat") or "flat")
+            volume = int(getattr(pos, "volume", 0) or 0)
+            if side != "flat" and volume > 0:
+                return True
+        return False
+
+    def _has_open_risk(self) -> bool:
+        """有持仓或柜台还有没走完的委托，重启后都要先对账。"""
+        if self._has_open_position():
+            return True
+        check = getattr(self.trader, "has_working_order", None)
+        if not callable(check):
+            return False
+        try:
+            return bool(check())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("查询未完成委托失败，按有挂单处理: {}", exc)
+            return True
+
+    def _write_unprotected_flag(self, reason: str) -> None:
+        """退出前还有持仓/挂单就落个标记，下次启动先对账再恢复报单。"""
+        if not self._has_open_risk():
+            self._clear_unprotected_flag()
+            return
+        check = getattr(self.trader, "has_working_order", None)
+        working = bool(check()) if callable(check) else False
+        positions = snapshot_positions(self.strategy)
+        payload = {
+            "at": datetime.now().isoformat(timespec="seconds"),
+            "reason": str(reason or ""),
+            "positions": positions,
+            "working_orders": working,
+        }
+        try:
+            path = self._unprotected_flag_path()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        except OSError as exc:  # noqa: BLE001
+            logger.warning("写退出保护标记失败: {}", exc)
+        self._record_event("exit_with_positions", reason=reason, positions=positions)
+        try:
+            from src.ops.alerts import emit_alert
+
+            emit_alert(
+                "exit_with_positions",
+                "退出时仍有持仓或挂单，重启后先对账再交易",
+                level="error",
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("写退出持仓告警失败")
+
+    def _watchdog_threshold(self) -> float:
+        """心跳停滞阈值：三个扫描周期，最少 180 秒。"""
+        return max(3.0 * float(self.scan_interval), 180.0)
+
+    def _watchdog_snapshot(self) -> dict[str, Any]:
+        """看门狗要看的运行快照。"""
+        from src.utils.session_clock import in_trading_sessions
+
+        return {
+            "last_scan_at": self.last_scan_at,
+            "has_position": self._has_open_position(),
+            "in_session": in_trading_sessions(self.sessions, now=datetime.now()),
+            "positions": snapshot_positions(self.strategy),
+        }
+
+    def _on_watchdog_stale(self, snap: dict[str, Any]) -> None:
+        """主循环停摆：停报单、熔断、留标记并告警。"""
+        self.set_orders_paused(True)
+        self.risk.set_halt("stale_heartbeat", "主循环超过阈值没有心跳，已暂停报单")
+        self._write_unprotected_flag("watchdog_stale")
+        age = float(snap.get("age_sec") or 0)
+        self._record_event("watchdog_stale", age_sec=snap.get("age_sec"))
+        try:
+            from src.ops.alerts import emit_alert
+
+            emit_alert("heartbeat_stale", f"主循环 {int(age)} 秒没有心跳，已暂停报单", level="error")
+        except Exception:  # noqa: BLE001
+            logger.exception("写心跳停滞告警失败")
+
+    def _start_watchdog(self) -> None:
+        """启动主循环心跳看门狗。界面关掉也照跑。"""
+        if not bool((self.cfg.get("runtime") or {}).get("watchdog_enabled", True)):
+            return
+        if getattr(self, "_watchdog", None) is not None:
+            return
+        from src.ops.watchdog import TradingWatchdog
+
+        threshold = self._watchdog_threshold()
+        self._watchdog = TradingWatchdog(
+            get_snapshot=self._watchdog_snapshot,
+            stale_after_sec=threshold,
+            on_stale=self._on_watchdog_stale,
+        )
+        self._watchdog.start()
+        self._record_event("watchdog_started", stale_after_sec=threshold)
+
+    def _stop_watchdog(self) -> None:
+        """停止看门狗。退出路径里调用，异常不往外抛。"""
+        watchdog = getattr(self, "_watchdog", None)
+        if watchdog is None:
+            return
+        try:
+            watchdog.stop()
+        except Exception:  # noqa: BLE001
+            logger.exception("停止看门狗失败")
+        finally:
+            self._watchdog = None
+
+    def _protective_status(self) -> str:
+        """当前有没有柜台原生保护单。CTP 条件单还没接，固定是 none。"""
+        try:
+            from src.trader.protective import create_protective_adapter
+
+            adapter = getattr(self, "_protective_adapter", None)
+            if adapter is None:
+                adapter = create_protective_adapter(self.trader)
+                self._protective_adapter = adapter
+            return "native" if adapter.supported() else "none"
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("检查柜台保护单失败: {}", exc)
+            return "unknown"
 
     def _already_took_recent_entry(self, symbol: str, closed: Any, lookback: int) -> bool:
         """
@@ -421,6 +601,8 @@ class TradingBot(
         self._restore_used_sessions(st)
         # 以信号账户为准对一次账：持仓、风控净仓、当日盈亏都和账本对齐。
         self._reconcile_books()
+        # 再和柜台对一次：柜台有、账本没有的仓要冻结，等人工认领。
+        self._reconcile_broker_at_startup()
         # 恢复出来的隔夜仓也要纳入扫描，否则没人管它的止损和收盘清仓。
         self._refresh_scan_symbols()
         logger.info(
@@ -620,6 +802,279 @@ class TradingBot(
             self._persist_state()
 
 
+    def _ledger_rows(self) -> dict[str, dict[str, Any]]:
+        """信号账户里还没平的仓，按小写品种做键。"""
+        from src.account.signal_book import load_book, open_position_rows
+
+        book = load_book(self.root)
+        if book is None:
+            return {}
+        return {
+            str(row.get("symbol") or "").strip().lower(): row
+            for row in open_position_rows(book)
+        }
+
+    def _ledger_nets(self) -> dict[str, int]:
+        """信号账户净持仓：多仓为正，空仓为负。"""
+        nets: dict[str, int] = {}
+        for key, row in self._ledger_rows().items():
+            volume = int(row.get("volume") or 0)
+            if volume <= 0:
+                continue
+            nets[key] = volume if str(row.get("side") or "") == "long" else -volume
+        return nets
+
+    def _reconcile_repair_enabled(self) -> bool:
+        """配置里允许按对账结果自动修复持仓。默认允许。"""
+        trade = self.cfg.get("trade") or {}
+        ctp = (trade.get("ctp") or {}) if isinstance(trade, dict) else {}
+        return bool((ctp or {}).get("reconcile_repair", True))
+
+    def _call_reconcile(self) -> Any:
+        """向柜台对一次账并取回最近报告。旧通道不支持 ledger 参数时退回单参调用。"""
+        try:
+            self.trader.reconcile(self._internal_nets(), ledger=self._ledger_nets())
+        except TypeError:
+            self.trader.reconcile(self._internal_nets())
+        return getattr(self.trader, "last_report", None)
+
+    def _position_key(self, symbol: str) -> str:
+        """策略持仓字典里和这个品种对应的键（大小写不敏感）。"""
+        positions = getattr(self.strategy, "positions", {}) or {}
+        return next(
+            (name for name in positions if str(name).lower() == str(symbol).lower()),
+            str(symbol),
+        )
+
+    def _install_position(
+        self,
+        symbol: str,
+        net: int,
+        entry_price: float,
+        origin: str,
+        *,
+        stop_price: float = 0.0,
+    ) -> None:
+        """按净仓重建一个持仓。同方向旧仓的止损保留，方向变了就丢掉旧止损。"""
+        from src.strategy.types import PositionState
+
+        positions = getattr(self.strategy, "positions", None)
+        if positions is None:
+            return
+        key = self._position_key(symbol)
+        current = positions.get(key)
+        lots = abs(int(net))
+        if lots <= 0:
+            positions[key] = PositionState(symbol=key)
+            return
+        side = "long" if int(net) > 0 else "short"
+        initial = 0.0
+        trail = 0.0
+        opened_at = ""
+        booked_symbol = key
+        if current is not None:
+            opened_at = str(getattr(current, "opened_at", "") or "")
+            booked_symbol = str(getattr(current, "symbol", "") or key)
+            if str(getattr(current, "side", "flat") or "flat") == side:
+                initial = float(getattr(current, "initial_stop", 0) or 0)
+                trail = float(getattr(current, "trail_stop", 0) or 0)
+        if float(stop_price or 0) > 0:
+            initial = float(stop_price)
+            trail = float(stop_price)
+        if trail <= 0:
+            trail = initial
+        if initial <= 0:
+            initial = trail
+        positions[key] = PositionState(
+            side=cast(Any, side),
+            volume=lots,
+            entry_price=float(entry_price or 0),
+            initial_stop=initial,
+            trail_stop=trail,
+            trail_armed=bool(trail > 0),
+            symbol=booked_symbol,
+            opened_at=opened_at,
+            origin=origin,
+        )
+        logger.warning(
+            "对账校准 {} 为 {} {} 手 @{}（来源 {}）", key, side, lots, entry_price, origin
+        )
+
+    def _reconcile_price(self, symbol: str, net: int) -> float:
+        """重建仓位的均价：柜台开仓成本 → 旧仓开仓价 → 最新价。"""
+        price = 0.0
+        gateway = getattr(self.trader, "gateway", None)
+        views = getattr(gateway, "positions", None) if gateway is not None else None
+        view = None
+        if isinstance(views, dict):
+            view = views.get(symbol)
+            if view is None:
+                view = next(
+                    (item for name, item in views.items() if str(name).lower() == symbol),
+                    None,
+                )
+        if view is not None:
+            multiplier = float(self.sizer.multiplier_for(symbol))
+            if int(net) > 0:
+                price = (
+                    position_avg_price(view.long_open_cost, view.long_lots, multiplier) or 0.0
+                )
+            else:
+                price = (
+                    position_avg_price(view.short_open_cost, view.short_lots, multiplier) or 0.0
+                )
+        if price <= 0:
+            pos = self._position_for(symbol)
+            if pos is not None:
+                price = float(getattr(pos, "entry_price", 0) or 0)
+        if price <= 0:
+            try:
+                price = float(self.kline.latest_price(symbol) or 0)
+            except Exception:  # noqa: BLE001
+                price = 0.0
+        return price
+
+    def _rebuild_risk_positions(self) -> None:
+        """风控净仓按策略持仓重建，避免两处各记一套。"""
+        positions = getattr(self.strategy, "positions", {}) or {}
+        self.risk.positions = {}
+        self.risk.current_position = 0
+        for sym, pos in positions.items():
+            side = getattr(pos, "side", "flat")
+            vol = int(getattr(pos, "volume", 0) or 0)
+            if side == "long":
+                self.risk.positions[str(sym)] = vol
+                self.risk.current_position += vol
+            elif side == "short":
+                self.risk.positions[str(sym)] = -vol
+                self.risk.current_position -= vol
+
+    def _safe_event(self, event: str, **kwargs: Any) -> None:
+        """写事件日志失败也不能拖垮对账流程。"""
+        try:
+            self._record_event(event, **kwargs)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("事件 {} 写入失败: {}", event, exc)
+
+    def _reconcile_alert(self, kind: str, message: str, level: str = "warning") -> None:
+        """对账告警；告警通道异常时只写日志。"""
+        try:
+            from src.ops.alerts import emit_alert
+
+            emit_alert(kind, message, level=level)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("对账告警 {} 发送失败: {}", kind, exc)
+
+    def _apply_reconcile(self, report: Any, phase: str) -> None:
+        """
+        按一次三方对账结果修复程序内存。
+
+        phase: startup（启动/刚连上柜台）或 runtime（每轮扫描）。
+        柜台没查成就只告警、不动内存；幽灵仓在 runtime 要连续两轮确认才补记平仓。
+        """
+        if report is None:
+            return
+        state = report.to_dict()
+        state["phase"] = phase
+        self._reconcile_state = state
+        if not report.queried:
+            self._reconcile_alert("reconcile_unavailable", "柜台对账未完成，本轮不修复持仓")
+            self._safe_event("reconcile_unavailable", phase=phase, diffs=list(report.diffs))
+            return
+        if report.unclaimed:
+            self._reconcile_alert(
+                "position_unclaimed", "柜台有未认领持仓：" + "、".join(report.unclaimed)
+            )
+        if report.phantom:
+            self._reconcile_alert(
+                "position_phantom", "账本有、柜台无的持仓：" + "、".join(report.phantom)
+            )
+        if report.diffs:
+            self._reconcile_alert("reconcile_mismatch", "；".join(report.diffs))
+
+        # 幽灵仓：runtime 连续两轮确认才补记，避免刚成交、柜台还没更新时误平。
+        phantom_now = {str(name).strip().lower() for name in report.phantom}
+        for name in list(self._phantom_rounds):
+            if name not in phantom_now:
+                self._phantom_rounds.pop(name, None)
+        confirmed: set[str] = set()
+        for name in phantom_now:
+            if phase == "runtime":
+                self._phantom_rounds[name] = int(self._phantom_rounds.get(name, 0)) + 1
+                if self._phantom_rounds[name] >= 2:
+                    confirmed.add(name)
+            else:
+                confirmed.add(name)
+
+        if not self._reconcile_repair_enabled():
+            self._persist_state()
+            return
+
+        broker = {str(k).lower(): int(v or 0) for k, v in (report.broker or {}).items()}
+        ledger = {str(k).lower(): int(v or 0) for k, v in (report.ledger or {}).items()}
+        memory = {str(k).lower(): int(v or 0) for k, v in (report.memory or {}).items()}
+        rows = self._ledger_rows()
+        from src.strategy.types import PositionState
+
+        positions = getattr(self.strategy, "positions", None)
+        for key in sorted(set(broker) | set(ledger) | set(memory)):
+            at_broker = int(broker.get(key, 0))
+            at_ledger = int(ledger.get(key, 0))
+            at_memory = int(memory.get(key, 0))
+            if at_broker != 0 and at_ledger == 0:
+                # 柜台有、账本没有：补进内存并冻结，等人工认领。
+                self._install_position(key, at_broker, self._reconcile_price(key, at_broker), "broker")
+                self._frozen_symbols.add(key)
+            elif at_broker == 0 and at_ledger != 0 and key in confirmed:
+                # 账本有、柜台没有：两轮确认后补记平仓。
+                price = self._reconcile_price(key, at_ledger)
+                if price > 0:
+                    self.manual_close(key, price, reason="对账确认柜台无持仓，补记平仓")
+                    if positions is not None:
+                        booked = self._position_key(key)
+                        positions[booked] = PositionState(symbol=booked)
+                    self._frozen_symbols.discard(key)
+                    self._phantom_rounds.pop(key, None)
+                else:
+                    self._safe_event("reconcile_phantom_no_price", symbol=key, ledger=at_ledger)
+            elif at_broker != 0 and at_ledger != 0 and at_broker != at_ledger:
+                # 柜台和账本各说各话：内存对齐柜台，不冻结（等人工核对账本）。
+                self._install_position(key, at_broker, self._reconcile_price(key, at_broker), "broker")
+            elif at_broker == 0 and at_ledger == 0:
+                if at_memory != 0 and positions is not None:
+                    booked = self._position_key(key)
+                    positions[booked] = PositionState(symbol=booked)
+                self._frozen_symbols.discard(key)
+            elif at_broker == at_ledger and at_broker != 0 and at_memory != at_ledger:
+                # 柜台和账本一致，只是内存不同：按账本行重建。
+                row = rows.get(key) or {}
+                side = str(row.get("side") or ("long" if at_ledger > 0 else "short"))
+                volume = int(row.get("volume") or abs(at_ledger))
+                net = volume if side == "long" else -volume
+                price = float(row.get("entry_price") or 0) or self._reconcile_price(key, net)
+                self._install_position(
+                    key, net, price, "ledger", stop_price=float(row.get("stop_price") or 0)
+                )
+
+        self._rebuild_risk_positions()
+        self._persist_state()
+        self._safe_event("reconcile_applied", phase=phase, ok=bool(report.ok))
+
+    def _reconcile_broker_at_startup(self) -> None:
+        """启动时先和柜台对一次账；柜台还没登录就推迟到登录完成后再做。"""
+        executor = str((self.cfg.get("trade") or {}).get("executor", "sim"))
+        if executor != "ctp" or self.cfg.get("dry_run", True):
+            return
+        if not hasattr(self.trader, "reconcile"):
+            return
+        session = getattr(getattr(self.trader, "gateway", None), "session", None)
+        if session is not None and not getattr(session, "ready", False):
+            self._startup_reconcile_pending = True
+            logger.info("柜台还没登录，启动对账推迟到登录完成后再做")
+            return
+        self._apply_reconcile(self._call_reconcile(), phase="startup")
+        self._startup_reconcile_pending = False
+
     def _persist_state(self) -> None:
         """把关键运行态写盘。"""
         save_state(
@@ -642,6 +1097,10 @@ class TradingBot(
                 "symbols": self.symbols,
                 "dry_run": bool(self.cfg.get("dry_run", True)),
                 "executor": str((self.cfg.get("trade") or {}).get("executor", "")),
+                "reconcile": dict(self._reconcile_state or {}),
+                "frozen_symbols": sorted(self._frozen_symbols),
+                "protective": str(getattr(self, "_protective_state", "none")),
+                "unprotected": self._unprotected_flag_path().exists(),
             },
         )
 
@@ -802,11 +1261,23 @@ class TradingBot(
             "last_alert": _safe_last_alert(self.risk.max_daily_loss),
             "health": getattr(self, "_health_report", None),
             "dynamic": self._dynamic_status_text(),
+            "reconcile": dict(self._reconcile_state or {}),
+            "frozen_symbols": sorted(self._frozen_symbols),
+            "protective": str(getattr(self, "_protective_state", "none")),
+            "unprotected_resume": bool(getattr(self, "_unprotected_resume", False)),
         }
 
 
     def scan_symbol(self, symbol: str) -> None:
         """对单个品种：拉信号周期 + 止损周期K线 → 策略评估 → 执行。"""
+        key = symbol.strip().lower()
+        if key in getattr(self, "_frozen_symbols", set()):
+            if key not in self._frozen_noted:
+                self._frozen_noted.add(key)
+                logger.warning("{} 有未认领柜台持仓，已冻结自动交易，等待人工处理", symbol)
+                self._record_event("symbol_frozen", symbol=symbol)
+            return
+
         signal_tf = getattr(self.strategy, "timeframe", "15")
         trail_tf = getattr(self.strategy, "trail_timeframe", signal_tf)
 
@@ -924,6 +1395,27 @@ class TradingBot(
             trend_bars=eval_trend,
             now=_eval_now(eval_bars, closed, catch_up=catch_up_used),
         )
+
+        # 柜台对账补进来的仓：不让策略加仓、反手，只保留通用止损。
+        pos_now = self._position_for(symbol)
+        if (
+            str(getattr(pos_now, "origin", "") or "") == "broker"
+            and decision.action != StrategyAction.HOLD
+        ):
+            self._record_event(
+                "broker_origin_block_strategy",
+                symbol=symbol,
+                action=decision.action.value,
+                reason=decision.reason,
+            )
+            logger.warning(
+                "{} 持仓来自柜台对账，暂停策略动作（{}），只保留通用止损",
+                symbol,
+                decision.action.value,
+            )
+            decision = StrategyDecision(
+                StrategyAction.HOLD, symbol, "柜台对账持仓，仅允许通用止损"
+            )
 
         # 通用止损：和策略自身止损相互独立，策略没让平仓时由公共止损补一刀。
         # 策略要反手/开仓时不抢，它本身也会先平掉旧仓；谁先触发都算平仓。
@@ -1166,6 +1658,19 @@ class TradingBot(
                 self.last_error = str(e)
                 logger.exception("扫描 {} 失败: {}", symbol, e)
                 self._record_event("scan_error", symbol=symbol, error=str(e))
+            if not self._running:
+                return
+        if getattr(self, "_unprotected_resume", False):
+            queried = (self._reconcile_state or {}).get("queried", True)
+            if queried is False:
+                logger.warning("退出保护恢复未完成：柜台对账未成功，继续保持暂停报单")
+            else:
+                self._unprotected_resume = False
+                self.set_orders_paused(False)
+                self._clear_unprotected_flag()
+                self._record_event("unprotected_recovered")
+                logger.warning("启动保护恢复：已完成对账与止损评估，恢复报单")
+        self._protective_state = self._protective_status()
         self._maybe_check_health()
         self._persist_state()
 
@@ -1182,8 +1687,14 @@ class TradingBot(
 
     def stop(self) -> None:
         """请求停止主循环（供图形界面使用）。"""
+        if self._stop_requested_at is None:
+            self._stop_requested_at = time.monotonic()
         self._running = False
         logger.info("已请求停止机器人主循环")
+
+    def wait_stopped(self, timeout: float = 15.0) -> bool:
+        """等待主循环真正结束并完成落盘。"""
+        return self._stopped.wait(timeout)
 
     @property
     def is_running(self) -> bool:
@@ -1202,9 +1713,10 @@ class TradingBot(
             )
 
         self.setup_schedule()
+        self._stopped.clear()
         self._running = True
-        # 第一轮扫描才允许回溯补开仓；scan_symbol 里用掉后会关掉。
-        self._catch_up_pending = True
+        # 第一轮扫描才允许回溯补开仓；上次退出留下持仓时先不补，等对账恢复后再按需开。
+        self._catch_up_pending = not bool(getattr(self, "_unprotected_resume", False))
         logger.info(
             "机器人启动 | dry_run={} | 扫描={} | 关注={} | 周期={} | 扫描间隔={}s | 模式={}",
             self.cfg.get("dry_run"),
@@ -1226,6 +1738,9 @@ class TradingBot(
         keep_display = bool((self.cfg.get("runtime") or {}).get("keep_display_awake", True))
         keepalive = KeepAwake(keep_display=keep_display)
         keepalive.start()
+
+        # 心跳看门狗：界面关掉、扫描卡住时也能自己留证据并暂停报单。
+        self._start_watchdog()
 
         from src.login.prepare import startup_should_login
 
@@ -1289,12 +1804,30 @@ class TradingBot(
             logger.info("收到键盘退出信号")
         finally:
             self._running = False
-            keepalive.stop()
-            if hasattr(self.trader, "shutdown"):
-                self.trader.shutdown()
-            self._persist_state()
-            logger.info("机器人已停止")
-            self._record_event("shutdown")
+            try:
+                keepalive.stop()
+            except Exception:
+                logger.exception("停止防休眠失败")
+            # 先停看门狗、再写退出标记，最后才关交易通道。
+            try:
+                self._stop_watchdog()
+            except Exception:  # noqa: BLE001
+                logger.exception("停止看门狗失败")
+            try:
+                self._write_unprotected_flag("clean_exit")
+            except Exception:  # noqa: BLE001
+                logger.exception("写退出保护标记失败")
+            try:
+                if hasattr(self.trader, "shutdown"):
+                    self.trader.shutdown()
+            except Exception:
+                logger.exception("关闭交易通道失败")
+            try:
+                self._persist_state()
+            finally:
+                self._stopped.set()
+                logger.info("机器人已停止")
+                self._record_event("shutdown")
 
 
     def _maybe_shutdown_after_close(self) -> None:

@@ -722,6 +722,62 @@ def book_differences(internal: dict[str, int], remote: dict[str, PositionView]) 
     return notes
 
 
+@dataclass(frozen=True)
+class ReconcileReport:
+    """一次三方对账的结果：柜台、信号账户账本、程序内存。"""
+
+    at: str
+    queried: bool          # 柜台查询是否成功；False 时禁止据此修复内存
+    broker: dict[str, int]
+    ledger: dict[str, int]
+    memory: dict[str, int]
+    funds: float | None
+    ok: bool
+    diffs: list[str] = field(default_factory=list)
+    unclaimed: list[str] = field(default_factory=list)   # 柜台有、账本无
+    phantom: list[str] = field(default_factory=list)     # 账本有、柜台无
+    extra: list[str] = field(default_factory=list)       # 内存有、柜台与账本都无
+
+    def to_dict(self) -> dict[str, Any]:
+        return {"at": self.at, "queried": self.queried, "broker": dict(self.broker),
+                "ledger": dict(self.ledger), "memory": dict(self.memory), "funds": self.funds,
+                "ok": self.ok, "diffs": list(self.diffs), "unclaimed": list(self.unclaimed),
+                "phantom": list(self.phantom), "extra": list(self.extra)}
+
+
+def three_way_diff(
+    broker: dict[str, int] | None = None,
+    ledger: dict[str, int] | None = None,
+    memory: dict[str, int] | None = None,
+) -> tuple[bool, list[str], list[str], list[str], list[str]]:
+    """统一小写键后比较；返回 (ok, diffs, unclaimed, phantom, extra)。"""
+    left = {symbol_key(k): int(v or 0) for k, v in (broker or {}).items()}
+    book = {symbol_key(k): int(v or 0) for k, v in (ledger or {}).items()}
+    hold = {symbol_key(k): int(v or 0) for k, v in (memory or {}).items()}
+    names = sorted(set(left) | set(book) | set(hold))
+    diffs: list[str] = []
+    unclaimed: list[str] = []
+    phantom: list[str] = []
+    extra: list[str] = []
+    ok = True
+    for name in names:
+        at_broker = int(left.get(name, 0))
+        at_ledger = int(book.get(name, 0))
+        at_memory = int(hold.get(name, 0))
+        if at_broker != at_ledger:
+            diffs.append(f"{name} 柜台 {at_broker} 手，账本 {at_ledger} 手")
+            ok = False
+            if at_broker != 0 and at_ledger == 0:
+                unclaimed.append(name)
+            elif at_broker == 0 and at_ledger != 0:
+                phantom.append(name)
+        if at_broker != at_memory or at_ledger != at_memory:
+            ok = False
+        if at_memory != 0 and at_broker == 0 and at_ledger == 0:
+            extra.append(name)
+    return ok, diffs, unclaimed, phantom, extra
+
+
 @dataclass
 class SessionTracker:
     """

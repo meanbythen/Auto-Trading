@@ -141,6 +141,38 @@ class DashboardMixin:
                 alert_text = ""
         else:
             alert_text = ""
+        # 对账结果：跑着看内存快照，没跑看上次落盘的状态文件。
+        rec: dict[str, Any] = {}
+        unprotected = False
+        if running:
+            rec = snap.get("reconcile") or {}
+        else:
+            try:
+                from src.utils.state_store import default_state_path, load_state
+
+                state = load_state(default_state_path(self.root_dir))
+                unprotected = bool(state.get("unprotected"))
+                rec = state.get("reconcile") or {}
+            except Exception:  # noqa: BLE001
+                rec = {}
+        if not isinstance(rec, dict):
+            rec = {}
+        unclaimed = [str(item) for item in (rec.get("unclaimed") or []) if str(item).strip()]
+        phantom = [str(item) for item in (rec.get("phantom") or []) if str(item).strip()]
+        note = ""
+        if unclaimed:
+            note = "对账：柜台有未认领持仓 " + "、".join(unclaimed)
+        elif phantom:
+            note = "对账：账本有、柜台无 " + "、".join(phantom)
+        elif rec.get("ok") is False and rec.get("queried") is not False:
+            note = "对账：柜台与账本不一致，已暂停相关品种自动交易"
+        elif rec.get("queried") is False:
+            note = "对账：本轮未查到柜台，暂不修复持仓"
+        if note:
+            alert_text = (alert_text + "  " if alert_text else "") + note
+        if not running and unprotected:
+            hint = "退出保护：上次退出时仍有持仓，启动后将先对账"
+            alert_text = (alert_text + "  " if alert_text else "") + hint
         health_text = ""
         health_tone = T.TEXT_DIM
         if hasattr(self, "health_line"):
@@ -268,6 +300,28 @@ class DashboardMixin:
                 label.pack_forget()
             else:
                 label.pack(fill="x", pady=0)
+        # 有对账差异时给一个入口。按钮和上面几行一样，只在状态变化时动布局。
+        show_btn = any(token in (alert_text or "") for token in ("未认领", "不一致", "账本有、柜台无"))
+        btn = getattr(self, "reconcile_btn", None)
+        if show_btn and btn is None and box is not None:
+            self.reconcile_btn = ctk.CTkButton(
+                box,
+                text="处理对账",
+                width=88,
+                height=22,
+                fg_color=T.DANGER,
+                hover_color=T.DANGER_HOVER,
+                text_color=T.DANGER_TEXT,
+                command=self._on_reconcile_actions,
+            )
+            btn = self.reconcile_btn
+        if btn is not None:
+            shown = bool(btn.winfo_manager())
+            if shown != show_btn:
+                if shown:
+                    btn.pack_forget()
+                else:
+                    btn.pack(side="left", padx=(0, 8), pady=0)
 
 
     def _position_card_text(self, snap: dict[str, Any] | None) -> str:

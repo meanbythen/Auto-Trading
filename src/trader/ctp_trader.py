@@ -11,6 +11,7 @@ CTP 执行通道。
 from __future__ import annotations
 
 import time
+from datetime import datetime
 from typing import Any, Callable
 
 from loguru import logger
@@ -21,6 +22,7 @@ from src.trader.ctp_logic import (
     OFFSET_OPEN,
     CloseSlice,
     PositionView,
+    ReconcileReport,
     book_differences,
     check_order_instruction,
     describe_positions,
@@ -32,6 +34,7 @@ from src.trader.ctp_logic import (
     plan_close,
     product_code,
     symbol_key,
+    three_way_diff,
 )
 
 
@@ -47,6 +50,8 @@ class CtpTrader(TraderBase):
         self._last_query = 0.0
         self._last_note = "还没有和柜台对过账"
         self.last_broker_equity: float | None = None
+        # 最近一次三方对账的完整结果，给运行台和启动修复用。
+        self.last_report: ReconcileReport | None = None
         # 最近一次柜台资金查询的完整数字，给常驻同步账号、可用、保证金、当日盈亏。
         self.last_broker_snapshot: dict[str, Any] | None = None
         logger.info(
@@ -94,48 +99,91 @@ class CtpTrader(TraderBase):
         self._books_match = False
         self._last_note = reason
 
-    def reconcile(self, internal: dict[str, int]) -> tuple[bool, str]:
+    def reconcile(self, internal: dict[str, int], ledger: dict[str, int] | None = None) -> tuple[bool, str]:
         """
         查询柜台真实持仓和资金。
 
         资金按期货公司数字改本地账，差额不拦开仓。
         净持仓对不上才记下失败，调用方停止开新仓。
         查询间隔没到时，用上一次的柜台结果再比一次，避免频繁查询被柜台拒绝。
+
+        ledger 传入时按「柜台 / 信号账户 / 程序内存」三方比较；
+        不传时保持旧行为，只比程序和柜台。
         """
+        memory = {symbol_key(k): int(v or 0) for k, v in (internal or {}).items()}
+        ledger_nets = {symbol_key(k): int(v or 0) for k, v in (ledger or {}).items()}
+        at = datetime.now().isoformat(timespec="seconds")
+
+        def _unavailable(note: str) -> tuple[bool, str]:
+            """柜台查询没做成：禁止据此修复内存，只留下原因。"""
+            self._books_match = False
+            self._last_note = note
+            self.last_report = ReconcileReport(
+                at=at,
+                queried=False,
+                broker={},
+                ledger=dict(ledger_nets) if ledger is not None else {},
+                memory=dict(memory),
+                funds=None,
+                ok=False,
+                diffs=[note],
+            )
+            return False, note
+
         if self.cfg.get("dry_run", True):
-            self._books_match = False
-            self._last_note = "模拟开关开着，没有柜台持仓可对"
-            return False, self._last_note
+            return _unavailable("模拟开关开着，没有柜台持仓可对")
         if not self.gateway.session.ready:
-            self._books_match = False
-            self._last_note = "还没登录成功，先停止开新仓"
-            return False, self._last_note
+            return _unavailable("还没登录成功，先停止开新仓")
         now = time.time()
         if now - self._last_query >= self.settings.query_interval_sec:
             ok = self.gateway.refresh()
             self._last_query = now
             if not ok:
-                self._books_match = False
-                self._last_note = "查询柜台持仓或资金失败，先停止开新仓"
-                return False, self._last_note
+                return _unavailable("查询柜台持仓或资金失败，先停止开新仓")
         self._capture_broker_equity()
-        extra = self._sync_signal_book()
-        notes = book_differences(internal, self.gateway.positions)
+        extra_text = self._sync_signal_book()
         available = self.gateway.available
         money = f"{available:.2f}" if available is not None else "未知"
-        if notes:
-            self._books_match = False
-            self._last_note = "；".join(notes) + f"。可用资金 {money}。持仓对不上，停止开新仓"
-            if extra:
-                self._last_note = self._last_note + "。" + extra
+        broker = {symbol_key(k): int(v.net) for k, v in self.gateway.positions.items()}
+
+        if ledger is None:
+            notes = book_differences(internal, self.gateway.positions)
+            self._books_match = not notes
+            report_ok = not notes
+            diffs = list(notes)
+            unclaimed: list[str] = []
+            phantom: list[str] = []
+            extra: list[str] = []
+        else:
+            report_ok, diffs, unclaimed, phantom, extra = three_way_diff(
+                broker, ledger_nets, memory
+            )
+            self._books_match = not diffs
+
+        if diffs:
+            self._last_note = "；".join(diffs) + f"。可用资金 {money}。持仓对不上，停止开新仓"
+            if extra_text:
+                self._last_note = self._last_note + "。" + extra_text
             logger.warning("柜台持仓不一致: {}", self._last_note)
-            return False, self._last_note
-        self._books_match = True
-        self._last_note = f"持仓一致。可用资金 {money}"
-        if extra:
-            self._last_note = self._last_note + "。" + extra
-        logger.info("柜台对账通过: {}", self._last_note)
-        return True, self._last_note
+        else:
+            self._last_note = f"持仓一致。可用资金 {money}"
+            if extra_text:
+                self._last_note = self._last_note + "。" + extra_text
+            logger.info("柜台对账通过: {}", self._last_note)
+        self.last_report = ReconcileReport(
+            at=at,
+            queried=True,
+            broker=broker,
+            ledger={} if ledger is None else dict(ledger_nets),
+            memory=dict(memory),
+            funds=available,
+            ok=report_ok,
+            diffs=diffs,
+            unclaimed=unclaimed,
+            phantom=phantom,
+            extra=extra,
+        )
+        return report_ok, self._last_note
 
     def _capture_broker_equity(self) -> None:
         """记下柜台刚查到的资金，给常驻同步账号、权益、可用和当日盈亏。"""
