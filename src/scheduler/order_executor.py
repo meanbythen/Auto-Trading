@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import json
+import time
+from collections import OrderedDict
 from collections.abc import Iterator
 from contextlib import contextmanager, nullcontext
 from datetime import datetime
@@ -51,6 +53,11 @@ class OrderExecutorMixin:
     _pending_intent_files: list[Path] | None = None
     # 点击已发出但收尾出错：本笔按已发出算，意图文件留到人工核对。
     _order_unclean = False
+    # 成交回调等交易锁的上限。超时就交回补记/对账，不把 CTP 回调线程卡死。
+    FILL_LOCK_TIMEOUT = 10.0
+    _RECENT_FILL_LIMIT = 5000
+    # 锁内二级去重：本次运行已经入账的成交键。惰性初始化，避免可变类属性共享。
+    _recent_fill_keys: OrderedDict[str, float] | None = None
 
     def _intent_files(self) -> list[Path]:
         """盘上所有还没清理的委托意图：按笔目录里的每一笔，加上升级前的单文件。"""
@@ -489,6 +496,124 @@ class OrderExecutorMixin:
             balance,
         )
 
+    def adopt_broker_position(self, symbol: str) -> tuple[bool, str]:
+        """把柜台有、账本没有的持仓认领进信号账户（只补账本，不重复加内存仓位）。"""
+        lock = getattr(self, "_trade_lock", None)
+        with (lock if lock is not None else nullcontext()):
+            pos = self._position_for(symbol)
+            side = str(getattr(pos, "side", "flat") or "flat") if pos is not None else "flat"
+            volume = int(getattr(pos, "volume", 0) or 0) if pos is not None else 0
+            if pos is None or side not in ("long", "short") or volume <= 0:
+                return False, "没有可认领的持仓"
+            price = float(self.kline.latest_price(symbol) or 0)
+            if price <= 0:
+                price = float(getattr(pos, "entry_price", 0) or 0)
+            if price <= 0:
+                return False, "拿不到价格，无法认领"
+            positions = getattr(self.strategy, "positions", {}) or {}
+            booked = next(
+                (name for name in positions if str(name).lower() == str(symbol).lower()),
+                str(symbol),
+            )
+            decision = StrategyDecision(
+                StrategyAction.BUY_OPEN if side == "long" else StrategyAction.SELL_OPEN,
+                booked,
+                "对账认领柜台持仓",
+            )
+            balance = self._record_signal_account(booked, decision, volume, price, "flat")
+            if balance is None and not self.cfg.get("dry_run", True):
+                self._ledger_failed = True
+                logger.error(
+                    "对账认领账本拒记，仍保持冻结 | {} {} 手 @{}", booked, side, price
+                )
+                self._record_event(
+                    "ledger_block_position_update",
+                    symbol=booked,
+                    side=side,
+                    volume=volume,
+                    price=price,
+                    source="adopt_broker_position",
+                )
+                return False, "账本没记上，没有认领"
+            pos.origin = ""
+            self._release_frozen_symbol(symbol)
+            self._persist_state()
+            self._record_event(
+                "position_adopted",
+                symbol=booked,
+                side=side,
+                volume=volume,
+                price=price,
+                balance=balance,
+            )
+            return True, f"已认领 {booked} {side} {volume} 手 @{price:g}"
+
+    def close_broker_position(self, symbol: str) -> tuple[bool, str]:
+        """柜台已无持仓、账本还有的幽灵仓：按最新价补记平仓。"""
+        lock = getattr(self, "_trade_lock", None)
+        with (lock if lock is not None else nullcontext()):
+            pos = self._position_for(symbol)
+            side = str(getattr(pos, "side", "flat") or "flat") if pos is not None else "flat"
+            volume = int(getattr(pos, "volume", 0) or 0) if pos is not None else 0
+            if pos is None or side not in ("long", "short") or volume <= 0:
+                return False, "程序账上没有这个持仓"
+            price = float(self.kline.latest_price(symbol) or 0)
+            if price <= 0:
+                price = float(getattr(pos, "entry_price", 0) or 0)
+            if price <= 0:
+                return False, "拿不到价格，无法平账"
+            row, balance = self.manual_close(
+                symbol, price, reason="对账确认柜台无持仓，人工平掉"
+            )
+            if row is None:
+                return False, "平账没成功，请核对账本"
+            pos.origin = ""
+            self._release_frozen_symbol(symbol)
+            self._persist_state()
+            self._record_event(
+                "position_broker_closed",
+                symbol=str(row.get("symbol") or symbol),
+                side=side,
+                volume=volume,
+                price=price,
+                balance=balance,
+            )
+            return True, f"已按 {price:g} 补记平仓 {volume} 手"
+
+    def ignore_reconcile_symbol(self, symbol: str) -> tuple[bool, str]:
+        """人工决定先不处理这个品种：只清掉待办提示，品种仍保持冻结不自动交易。"""
+        lock = getattr(self, "_trade_lock", None)
+        with (lock if lock is not None else nullcontext()):
+            self._drop_reconcile_pending(symbol)
+            self._persist_state()
+            self._record_event("reconcile_ignored", symbol=symbol)
+            return True, "已忽略提示，品种仍保持冻结"
+
+    def _drop_reconcile_pending(self, symbol: str) -> None:
+        """把品种从对账待处理列表里移走，但不解除冻结。只改内存。"""
+        key = str(symbol or "").strip().lower()
+        if not key:
+            return
+        state = getattr(self, "_reconcile_state", None)
+        if isinstance(state, dict):
+            for name in ("unclaimed", "phantom", "extra"):
+                rows = state.get(name)
+                if isinstance(rows, list):
+                    state[name] = [item for item in rows if str(item).strip().lower() != key]
+        rounds = getattr(self, "_phantom_rounds", None)
+        if isinstance(rounds, dict):
+            rounds.pop(key, None)
+
+    def _release_frozen_symbol(self, symbol: str) -> None:
+        """把品种从对账冻结和待处理列表里移走。只改内存，写盘由调用方负责。"""
+        key = str(symbol or "").strip().lower()
+        if not key:
+            return
+        frozen = getattr(self, "_frozen_symbols", None)
+        if isinstance(frozen, set):
+            frozen.discard(key)
+        self._drop_reconcile_pending(key)
+
     def _contract_multiplier(self, symbol: str) -> float:
         return float(self.sizer.multiplier_for(symbol))
 
@@ -502,8 +627,8 @@ class OrderExecutorMixin:
         *,
         fill_key: str = "",
         stop_price: float | None = None,
-    ) -> None:
-        """更新策略仓位、风控、信号账户，并且只落盘一次。"""
+    ) -> bool:
+        """更新策略仓位、风控、信号账户，并且只落盘一次。返回这一笔是否已经入账。"""
         # 同一份回报再来一次时，账本会跳过。这里也直接返回，避免把仓位再改一遍。
         if fill_key and not self.cfg.get("dry_run", True):
             from src.account.signal_book import load_book
@@ -521,7 +646,7 @@ class OrderExecutorMixin:
                     volume=vol,
                     fill_key=fill_key,
                 )
-                return
+                return True
 
         pos_before = self._position_for(symbol)
         side_before = getattr(pos_before, "side", "flat") if pos_before else "flat"
@@ -576,9 +701,10 @@ class OrderExecutorMixin:
                 volume=vol,
                 price=fill_price,
             )
-            return
+            return False
 
         # 2) 再同步策略持仓和风控净仓。
+        ok = True
         try:
             self.strategy.on_filled(
                 symbol,
@@ -589,6 +715,7 @@ class OrderExecutorMixin:
             )
         except Exception as exc:  # noqa: BLE001
             # 账本已写、策略没写：置暂停开仓，避免账实继续分叉。
+            ok = False
             self._ledger_failed = True
             logger.exception("策略持仓同步失败，已暂停新开仓: {}", exc)
             self._record_event(
@@ -705,8 +832,9 @@ class OrderExecutorMixin:
 
         # 模拟测试也会走到这里，用来看内存里的仓对不对。不能把假成交写进正在用的账，也不能盖掉真实持仓文件。
         if self.cfg.get("dry_run", True):
-            return
+            return True
         self._persist_state()
+        return ok
 
     def _record_signal_account(
         self,
@@ -1380,6 +1508,20 @@ class OrderExecutorMixin:
         return price if price > 0 else None
 
     def _on_ctp_fill(self, report: dict[str, Any]) -> bool:
+        """CTP 回调线程入口：拿交易锁后入账，超时返回 False 交回补记路径。"""
+        lock = getattr(self, "_trade_lock", None)
+        if lock is None:
+            return OrderExecutorMixin._on_ctp_fill_locked(self, report)
+        if not lock.acquire(timeout=self.FILL_LOCK_TIMEOUT):
+            logger.error("成交入账等待交易锁超时，交回补记/对账 | {}", report.get("order_ref"))
+            self._record_event("fill_lock_timeout", order_ref=str(report.get("order_ref") or ""))
+            return False
+        try:
+            return self._on_ctp_fill_locked(report)
+        finally:
+            lock.release()
+
+    def _on_ctp_fill_locked(self, report: dict[str, Any]) -> bool:
         """
         柜台确认成交后改内部持仓。
 
@@ -1412,16 +1554,30 @@ class OrderExecutorMixin:
             meta={"bar_id": str(report.get("bar_id") or "")},
         )
         ref = str(report.get("order_ref") or "").strip()
+        fill_key = ctp_fill_key(ref, filled_total)
+        recent = getattr(self, "_recent_fill_keys", None)
+        if fill_key and recent is not None and fill_key in recent:
+            logger.info("同一笔成交回报已在本次运行入账，跳过 | {} {}", decision.symbol, fill_key)
+            return True
         stop = report.get("stop_price")
-        self._apply_fill_accounting(
+        ok = self._apply_fill_accounting(
             decision.symbol,
             decision,
             volume,
             price,
             price,
-            fill_key=ctp_fill_key(ref, filled_total),
+            fill_key=fill_key,
             stop_price=float(stop) if stop else None,
         )
+        if not ok:
+            return False
+        if fill_key:
+            if recent is None:
+                recent = OrderedDict()
+                self._recent_fill_keys = recent
+            recent[fill_key] = time.monotonic()
+            while len(recent) > int(self._RECENT_FILL_LIMIT):
+                recent.popitem(last=False)
         self._record_event(
             "order",
             symbol=decision.symbol,

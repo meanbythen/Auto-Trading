@@ -593,9 +593,10 @@ class CtpGateway:
             apply_order_report(order, status_code="rejected", message=message or "拒单")
             logger.error("柜台返回错误，报单 {}：{}", order_ref, order.message)
             report, waiter = self._finish_locked(order)
-        self._account_fill(report)
+        # 先唤醒等报单结果的线程，再去记账：记账要抢交易锁，主线程可能正持锁等这里。
         if waiter is not None:
             waiter.set()
+        self._account_fill(report)
 
     def on_order_status(
         self,
@@ -644,9 +645,10 @@ class CtpGateway:
                 message,
             )
             report, waiter = self._finish_locked(order)
-        self._account_fill(report)
+        # 先唤醒等报单结果的线程，再去记账：记账要抢交易锁，主线程可能正持锁等这里。
         if waiter is not None:
             waiter.set()
+        self._account_fill(report)
 
     def on_cancel_error(self, order_ref: str, message: str) -> None:
         """撤单被柜台拒绝。不是我们发出的那笔，不当成这次登录的错误。"""
@@ -687,9 +689,10 @@ class CtpGateway:
                 volume,
             )
             report, waiter = self._finish_locked(order)
-        self._account_fill(report)
+        # 先唤醒等报单结果的线程，再去记账：记账要抢交易锁，主线程可能正持锁等这里。
         if waiter is not None:
             waiter.set()
+        self._account_fill(report)
 
     def on_query_trade(self, row: dict[str, Any] | None, is_last: bool) -> None:
         with self._lock:
