@@ -137,7 +137,7 @@ def test_resident_guard_requires_matching_live_book(tmp_path) -> None:
     cfg = _ctp_cfg("live", "20318052")
     set_active_id(tmp_path, PAPER)
     text = resident_book_guard(tmp_path, cfg)
-    assert "华泰真实" in text
+    assert "CTP真实" in text
     assert "同花顺模拟" in text or "模拟" in text
 
     set_active_id(tmp_path, CTP_LIVE)
@@ -162,7 +162,7 @@ def test_resident_guard_requires_sim_book_for_sim_ctp(tmp_path) -> None:
     cfg = _ctp_cfg("sim", "28077")
     set_active_id(tmp_path, CTP_LIVE)
     text = resident_book_guard(tmp_path, cfg)
-    assert "华泰仿真" in text
+    assert "CTP仿真" in text
     set_active_id(tmp_path, CTP_SIM)
     assert resident_book_guard(tmp_path, cfg) == ""
 

@@ -15,6 +15,54 @@ from typing import Any, Literal
 Side = Literal["buy_open", "sell_open", "close"]
 
 
+@dataclass(frozen=True)
+class Capabilities:
+    """通道能力。风控、调度和界面只看这里，不看具体是哪一家。"""
+
+    can_query_positions: bool = False
+    can_query_orders: bool = False
+    confirms_fill: bool = False
+    supports_symbol_switch: bool = False
+    supports_price_mode: bool = False
+    supports_cancel: bool = False
+    # 靠桌面窗口点击下单：需要打开软件、登录、标定坐标、改价格方式。
+    window_driven: bool = False
+
+    @property
+    def orders_via_broker(self) -> bool:
+        """委托直接进柜台报单表，并且能查柜台委托（CTP 这一类）。"""
+        return self.confirms_fill and self.can_query_orders
+
+
+# 各通道的默认能力。未知通道按「只能下单、不能查询」处理。
+DEFAULT_CAPABILITIES: dict[str, Capabilities] = {
+    "sim": Capabilities(
+        confirms_fill=True,
+        supports_symbol_switch=True,
+        supports_price_mode=True,
+    ),
+    "gui": Capabilities(
+        supports_symbol_switch=True,
+        supports_price_mode=True,
+        window_driven=True,
+    ),
+    "ctp": Capabilities(
+        can_query_positions=True,
+        can_query_orders=True,
+        confirms_fill=True,
+        supports_symbol_switch=True,
+        supports_price_mode=True,
+        supports_cancel=True,
+    ),
+}
+
+
+def capabilities_for(executor: Any) -> Capabilities:
+    """按通道名取默认能力。认不出来的通道按「只能下单、不能查询」处理。"""
+    name = str(executor or "").strip().lower()
+    return DEFAULT_CAPABILITIES.get(name, Capabilities())
+
+
 @dataclass
 class OrderRequest:
     """一笔下单请求。"""
@@ -48,6 +96,11 @@ class OrderResult:
 
 class TraderBase(ABC):
     """所有交易执行器的基类。"""
+
+    @property
+    def capabilities(self) -> Capabilities:
+        """通道能力。默认只能下单：不查柜台、不确认成交、不依赖窗口。"""
+        return Capabilities()
 
     @abstractmethod
     def place_order(self, req: OrderRequest) -> OrderResult:

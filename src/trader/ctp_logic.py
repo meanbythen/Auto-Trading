@@ -271,59 +271,27 @@ def overlay_ctp_profile(
     """
     把仿真或实盘账号叠到共用参数上。
 
-    窗口和策略走同一套字段。
-    仿真：只用 sim 小节（默认 28077 + 仿真前置），不会去用资金账号。
-    真实：资金账号就是配置页「资金账号」（同花顺登录的那一个，例如 20318052）；
-    交易/行情前置只用 live 小节，不会把仿真前置抄过去。
+    真正的档案合并放在 ctp_profile.resolve_ctp_profile：
+    有 ctp_profiles 时按档案取，没有时按旧键生成 default，行为与升级前一致。
     """
-    raw = dict(ctp or {})
-    acc = account if isinstance(account, dict) else {}
-    # 资金账号只在配置页填一次；CTP 真实通道跟这一号走。
-    fund_id = str(account_user_id or acc.get("user_id") or "").strip()
-    fund_pw = str(account_password or acc.get("resolved_password") or "").strip()
-    chosen = normalize_ctp_kind(kind if kind is not None else raw.get("account_kind"))
-    nested = raw.get(chosen)
-    nested = dict(nested) if isinstance(nested, dict) else {}
-    merged = dict(raw)
-    keys = ("td_front", "md_front", "user_id", "broker_id")
-    if chosen == CTP_KIND_LIVE:
-        # 前置必须是华泰给你的实盘地址，缺了就空着，让登录提示去填。
-        merged["td_front"] = str(nested.get("td_front") or "").strip()
-        merged["md_front"] = str(nested.get("md_front") or "").strip()
-        merged["broker_id"] = str(
-            nested.get("broker_id") or raw.get("broker_id") or ""
-        ).strip()
-        # 真实资金账号 = 上面的资金账号。live.user_id 只是保存时的副本，不再单独填。
-        merged["user_id"] = fund_id or str(nested.get("user_id") or "").strip()
-        # 实盘密码优先用单独写的 ctp_live_password；没写就用同一份交易密码。
-        merged["resolved_password"] = str(
-            raw.get("resolved_live_password")
-            or nested.get("resolved_password")
-            or fund_pw
-            or ""
-        ).strip()
-    else:
-        for key in keys:
-            overlay = str(nested.get(key) or "").strip()
-            if overlay:
-                merged[key] = overlay
-        merged["resolved_password"] = str(
-            raw.get("resolved_sim_password")
-            or raw.get("resolved_password")
-            or nested.get("resolved_password")
-            or ""
-        ).strip()
-    merged["account_kind"] = chosen
-    return merged
+    from src.trader.ctp_profile import resolve_ctp_profile
+
+    acc = dict(account or {})
+    if account_user_id:
+        acc["user_id"] = account_user_id
+    if account_password:
+        acc["resolved_password"] = account_password
+    return resolve_ctp_profile(ctp, acc, kind=kind)
 
 
-def test_front_blocks_live_account(td_front: str, user_id: str, live_user_id: str) -> str:
-    """华泰仿真前置不能拿实盘资金账号去登录。"""
-    front = str(td_front or "")
+def test_front_blocks_live_account(kind: Any, user_id: str, live_user_id: str) -> str:
+    """仿真档案不能用实盘资金账号登录。按档案种类判断，不再看前置 IP。"""
+    if normalize_ctp_kind(kind) != CTP_KIND_SIM:
+        return ""
     account = str(user_id or "").strip()
     live = str(live_user_id or "").strip()
-    if "59.36.3.115" in front and account and live and account == live:
-        return "这是华泰仿真前置，不能用实盘资金账号登录。请把 trade.ctp.user_id 改成测试指引里的仿真账号"
+    if account and live and account == live:
+        return "当前是仿真档案，不能用实盘资金账号登录。请把券商档案的 user_id 改成仿真账号"
     return ""
 
 

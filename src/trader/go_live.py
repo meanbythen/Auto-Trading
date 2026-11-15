@@ -14,6 +14,7 @@ from typing import Any
 
 from loguru import logger
 
+from src.trader.base import capabilities_for
 from src.trader.ctp_logic import CTP_KIND_LIVE, CTP_KIND_SIM, normalize_ctp_kind
 
 STAGE_DESK_SIM = "desk_sim"
@@ -158,10 +159,10 @@ def current_stage_from_cfg(cfg: dict[str, Any] | None) -> str:
     if root:
         return normalize_stage(load_state(root).get("stage"))
     kind = normalize_ctp_kind(((trade.get("ctp") or {}).get("account_kind")))
-    executor = str(trade.get("executor") or "sim").lower()
-    if executor == "ctp" and kind == CTP_KIND_LIVE:
+    broker = capabilities_for(trade.get("executor") or "sim").orders_via_broker
+    if broker and kind == CTP_KIND_LIVE:
         return STAGE_AUTO_LIVE
-    if executor == "ctp":
+    if broker:
         return STAGE_AUTO_SIM
     if kind == CTP_KIND_LIVE:
         return STAGE_DESK_LIVE

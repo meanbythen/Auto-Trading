@@ -210,7 +210,7 @@ class RunTabMixin:
         ).pack(fill="x", padx=8, pady=(0, 4))
         manual_hint = ctk.CTkLabel(
             left,
-            text="手动在同花顺上开仓/平仓后，在这里录入。品种、价格、手数 + 买多/卖空/平仓。只改程序的账，不会去点同花顺。",
+            text="手动在交易软件上开仓/平仓后，在这里录入。品种、价格、手数 + 买多/卖空/平仓。只改程序的账，不会去点交易软件。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=420,
@@ -260,7 +260,7 @@ class RunTabMixin:
             right, font=T.FONT_MONO, fg_color=T.BG, text_color=T.TEXT, corner_radius=10, wrap="word",
         )
         self.log_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
-        self._append_log("控制台就绪。点「启动常驻」或到了登录时间，都会先准备同花顺，完成后再开始扫描。")
+        self._append_log("控制台就绪。点「启动常驻」或到了登录时间，都会先准备交易软件，完成后再开始扫描。")
 
 
     def _hook_logger(self) -> None:
@@ -323,7 +323,7 @@ class RunTabMixin:
         """
         把一行日志写进运行页。
 
-        正在点击同花顺时先攒着，不插入文本框。文本框一滚动，窗口就会抢到最前，
+        正在点击交易软件时先攒着，不插入文本框。文本框一滚动，窗口就会抢到最前，
         后面的价格和买卖按钮就点到本程序上。点击结束后再一次性补上。
         """
         from src.trader.gui_trader import order_click_in_progress
@@ -338,7 +338,7 @@ class RunTabMixin:
 
 
     def _on_ctp_probe(self) -> None:
-        """打开 CTP 交易窗口。不改当前执行通道，也不碰同花顺。"""
+        """打开 CTP 交易窗口。不改当前执行通道，也不碰交易软件。"""
         from src.ui.ctp_probe import open_ctp_probe
 
         open_ctp_probe(self)
@@ -432,7 +432,7 @@ class RunTabMixin:
         from tkinter import messagebox
 
         if self._prep_busy:
-            messagebox.showwarning("正在准备", "同花顺还在登录或改价格。这几步做完之前不会启动常驻。")
+            messagebox.showwarning("正在准备", "交易软件还在登录或改价格。这几步做完之前不会启动常驻。")
             return
         if self.worker.running:
             self._on_halt_resident()
@@ -451,7 +451,10 @@ class RunTabMixin:
         apply_stage_to_cfg(self.cfg, stage_now)
         if allows_strategy_orders(stage_now):
             self.exec_var.set("ctp")
-        if self.exec_var.get() == "ctp" and not allows_strategy_orders(stage_now):
+        from src.trader.base import capabilities_for
+
+        caps = capabilities_for(self.exec_var.get())
+        if caps.orders_via_broker and not allows_strategy_orders(stage_now):
             messagebox.showinfo(
                 "这一步请用交易台",
                 f"当前是{stage_label(stage_now)}。请点「打开交易台」手工下单。\n"
@@ -463,7 +466,7 @@ class RunTabMixin:
             if blocked:
                 messagebox.showerror("还不能让策略自动下单", blocked)
                 return
-        if self.exec_var.get() == "ctp":
+        if caps.orders_via_broker:
             from src.account.ctp_sync import resident_book_guard
 
             book_block = resident_book_guard(self.root_dir, self.cfg)
@@ -479,7 +482,7 @@ class RunTabMixin:
                     "策略将用和交易台同一套接口，向真实资金账户报单。\n确认前置、资金账号都填对了吗？",
                 ):
                     return
-        if self.exec_var.get() == "ctp":
+        if caps.orders_via_broker:
             from src.trader.ctp_logic import ctp_kind_label
 
             kind_txt = ctp_kind_label(self.ctp_kind_var.get())
@@ -504,12 +507,12 @@ class RunTabMixin:
                 else:
                     self._append_log("保持模拟模式：只监测，不向柜台发单。")
 
-        # 启动时若仍开着模拟，而通道是 gui：明确问要不要真下单
+        # 启动时若仍开着模拟，而通道是窗口点击：明确问要不要真下单
         # 原理：点启动会把界面开关写回 config；开关忘关就会又变成 dry_run=True
-        if self.exec_var.get() == "gui" and self.dry_var.get():
+        if caps.window_driven and self.dry_var.get():
             choice = messagebox.askyesnocancel(
                 "模拟模式还开着",
-                "当前「模拟模式」是开的：会先打开同花顺、登录并改成对手价，但不会点买开、卖开、平仓。\n\n"
+                "当前「模拟模式」是开的：会先打开交易软件、登录并改成对手价，但不会点买开、卖开、平仓。\n\n"
                 "是 = 关掉模拟，允许自动点单（模拟账户也可）\n"
                 "否 = 继续只监测、不点买卖\n"
                 "取消 = 不启动",
@@ -520,14 +523,14 @@ class RunTabMixin:
                 return
             if choice:
                 self.dry_var.set(False)
-                self._append_log("已关闭模拟模式，将真实点击同花顺下单。")
+                self._append_log("已关闭模拟模式，将真实点击交易软件下单。")
             else:
                 self._append_log("保持模拟模式：只监测，不点击。")
-        elif self.exec_var.get() == "gui" and not self.dry_var.get():
-            self._append_log("警告：gui + 关闭模拟 会真实点击同花顺。")
+        elif caps.window_driven and not self.dry_var.get():
+            self._append_log("警告：窗口点击通道 + 关闭模拟 会真实点击交易软件。")
 
-        # 同花顺通道先做完打开、登录、确认结算单和对手价。失败就不启动，避免没准备好就去扫描。
-        if self.exec_var.get() == "gui":
+        # 窗口点击通道先做完打开、登录、确认结算单和对手价。失败就不启动，避免没准备好就去扫描。
+        if caps.window_driven:
             self._begin_prepare(automatic=True)
             return
         self._launch_resident()
@@ -558,11 +561,13 @@ class RunTabMixin:
             # 准备阶段已经登录过。这个标记只留在内存副本里，不写进配置文件。
             cfg["_startup_login_done"] = True
             self._skip_next_bot_login = False
-        # 单品种挂机更安全：多品种 GUI 不会自动改同花顺合约框
+        # 单品种挂机更安全：多品种窗口点击通道不会自动改合约框
         syms = (cfg.get("strategy") or {}).get("symbols") or []
-        if cfg.get("trade", {}).get("executor") == "gui" and len(syms) > 1:
+        from src.trader.base import capabilities_for
+
+        if capabilities_for((cfg.get("trade") or {}).get("executor")).window_driven and len(syms) > 1:
             self._append_log(
-                f"警告：GUI 模式关注了多个品种 {syms}，程序不会自动切换合约，"
+                f"警告：窗口点击模式关注了多个品种 {syms}，程序不会自动切换合约，"
                 "请只保留一个（如 bu2612）或确保盘面合约正确。"
             )
         # 磁盘上保存的是配置页本身。交给机器人的是副本，后面回测改副本不会牵动正在跑的程序。
@@ -585,8 +590,8 @@ class RunTabMixin:
         else:
             self._append_log("常驻会先登录并核对对手价，这两步不点买卖。价格没改成功时，后面也不会点买卖。")
         self.tabs.set("运行")
-        # 不再把自己拉到最前。一拉到前面，后面要点同花顺的那一下会点到本程序的按钮上，
-        # 比如下单模拟器。常驻只该操作同花顺，下单模拟器留给你自己点。
+        # 不再把自己拉到最前。一拉到前面，后面要点交易软件的那一下会点到本程序的按钮上，
+        # 比如下单模拟器。常驻只该操作交易软件，下单模拟器留给你自己点。
         try:
             self.log_box.focus_set()
         except Exception:  # noqa: BLE001
@@ -595,7 +600,7 @@ class RunTabMixin:
 
     def _on_prepare_then_start(self, *, automatic: bool = False) -> None:
         """
-        先打开同花顺、登录、改对手价，全部成功后再启动常驻。
+        先打开交易软件、登录、改对手价，全部成功后再启动常驻。
 
         准备过程不点买开、卖开、平仓。失败就停在准备，不启动扫描。
         """
@@ -616,7 +621,7 @@ class RunTabMixin:
         ):
             if not messagebox.askyesno(
                 "准备后会启动常驻",
-                "接下来只做三件事：打开同花顺、登录、把价格改成对手价。\n"
+                "接下来只做三件事：打开交易软件、登录、把价格改成对手价。\n"
                 "这三步不点买开、卖开、平仓。\n\n"
                 "都成功以后才会启动常驻。当前模拟是关的，"
                 "启动后如果策略给出信号，就会真实点击下单。\n\n"
@@ -629,7 +634,7 @@ class RunTabMixin:
     def _begin_prepare(self, *, automatic: bool) -> None:
         """在后台做准备。界面保持可点，但常驻要等准备结果回来才启动。"""
         self._prep_busy = True
-        self._append_log("开始准备同花顺：打开、登录、改对手价。这几步不下单。")
+        self._append_log("开始准备交易软件：打开、登录、改对手价。这几步不下单。")
         cfg = self._clone_cfg()
 
         def _work() -> None:
@@ -638,7 +643,7 @@ class RunTabMixin:
             try:
                 ok, lines = prepare_trading_desk(cfg)
             except Exception as exc:  # noqa: BLE001
-                logger.exception("准备同花顺失败")
+                logger.exception("准备交易软件失败")
                 ok, lines = False, [f"准备失败：{exc}"]
 
             def _done() -> None:
@@ -718,12 +723,12 @@ class RunTabMixin:
         if self.worker.running or self._prep_busy:
             self._append_log(f"到了登录时间 {current}，常驻已在运行，不重复启动。")
             return
-        self._append_log(f"到了登录时间 {current}。先准备同花顺，完成后再开始扫描。")
+        self._append_log(f"到了登录时间 {current}。先准备交易软件，完成后再开始扫描。")
         self._begin_prepare(automatic=True)
 
 
     def _bring_self_front(self) -> None:
-        """把本程序窗口拉回最前（启动后避免被同花顺/命令行盖住）。下单点击还没结束时不拉。"""
+        """把本程序窗口拉回最前（启动后避免被交易软件/命令行盖住）。下单点击还没结束时不拉。"""
         from src.trader.gui_trader import order_click_in_progress
 
         if order_click_in_progress():
@@ -744,7 +749,7 @@ class RunTabMixin:
 
 
     def _on_confirm_positions(self) -> None:
-        """人工核对同花顺持仓后，清掉遗留委托意图并解除对应熔断。"""
+        """人工核对交易软件持仓后，清掉遗留委托意图并解除对应熔断。"""
         from tkinter import messagebox
 
         bot = getattr(self.worker, "bot", None)
@@ -753,7 +758,7 @@ class RunTabMixin:
             return
         if not messagebox.askyesno(
             "对账确认",
-            "请先在同花顺里核对实际持仓与委托。\n"
+            "请先在交易软件里核对实际持仓与委托。\n"
             "如果这笔其实已成交，先用「手工单录入」把仓位补进程序账，再回来点这里。\n\n"
             "确认无误后解除熔断并继续扫描？",
         ):
@@ -892,8 +897,8 @@ class RunTabMixin:
         """
         统一的手工单录入：弹窗里填品种、价格、手数，按「买多」「卖空」或「平仓」。
 
-        完全仿照真实下单，只是把动作记进程序的账，不会去点同花顺。
-        用于你手动在同花顺上开仓/平仓后，把这笔回填进程序的持仓和信号账户。
+        完全仿照真实下单，只是把动作记进程序的账，不会去点交易软件。
+        用于你手动在交易软件上开仓/平仓后，把这笔回填进程序的持仓和信号账户。
         """
         from tkinter import messagebox
 
@@ -947,7 +952,7 @@ class RunTabMixin:
 
         ctk.CTkLabel(
             dialog,
-            text="手动在同花顺上开/平仓后，在这里录入。只改程序的账，不会去点同花顺。",
+            text="手动在交易软件上开/平仓后，在这里录入。只改程序的账，不会去点交易软件。",
             justify="left",
             text_color=T.TEXT_DIM,
         ).pack(padx=16, pady=(16, 4))
@@ -1153,7 +1158,7 @@ class RunTabMixin:
             stop_hint = f"，策略止损 {stop_price:g}" if stop_price > 0 else "（不填止损，只靠反向信号和收盘清仓）"
             if not messagebox.askyesno(
                 "确认手工开仓",
-                f"手工录入：{symbol} {side_word}{volume}手，开仓价 {price:g}{stop_hint}。\n不会去点同花顺。\n\n确定？",
+                f"手工录入：{symbol} {side_word}{volume}手，开仓价 {price:g}{stop_hint}。\n不会去点交易软件。\n\n确定？",
             ):
                 return
 
@@ -1194,7 +1199,7 @@ class RunTabMixin:
             )
             messagebox.showinfo(
                 "已录入",
-                f"已把 {symbol} {side_word} {volume} 手记成开仓，开仓价 {price:g}{stop_note}。\n没有去点同花顺。",
+                f"已把 {symbol} {side_word} {volume} 手记成开仓，开仓价 {price:g}{stop_note}。\n没有去点交易软件。",
             )
             self._maybe_release_intent_halt(
                 bot, symbol, "buy_open" if side == "long" else "sell_open", volume
@@ -1204,7 +1209,7 @@ class RunTabMixin:
             if not messagebox.askyesno(
                 "确认手工平仓",
                 f"手工录入平仓：{symbol}，平仓价 {price:g}。\n"
-                f"会按程序账上 {symbol} 的持仓手数平仓，盈亏按开仓价算。\n不会去点同花顺。\n\n确定？",
+                f"会按程序账上 {symbol} 的持仓手数平仓，盈亏按开仓价算。\n不会去点交易软件。\n\n确定？",
             ):
                 return
 
@@ -1242,7 +1247,7 @@ class RunTabMixin:
             messagebox.showinfo(
                 "已录入",
                 f"已按 {price:g} 把 {symbol} {direction} {closed['volume']} 手记成平仓。\n"
-                f"这笔盈亏 {pnl:+.0f} 元。没有去点同花顺。",
+                f"这笔盈亏 {pnl:+.0f} 元。没有去点交易软件。",
             )
             self._maybe_release_intent_halt(bot, symbol, "close", int(closed["volume"]))
 

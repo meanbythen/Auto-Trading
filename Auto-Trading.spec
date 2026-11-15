@@ -43,11 +43,12 @@ if (ROOT / "strategies").exists():
 binaries = []
 hiddenimports = []
 
-# 华泰指定的 CTP 动态库。放到 ctp/api 后，下次打包会打进程序。
-api_dir = ROOT / "ctp" / "api"
-if api_dir.is_dir():
-    for dll in api_dir.glob("*.dll"):
-        binaries.append((str(dll), "ctp/api"))
+# 柜台指定的 CTP 动态库。优先 ctp/vendor_libs；旧目录 ctp/api 也一起打包。
+for _lib_dir in (ROOT / "ctp" / "vendor_libs", ROOT / "ctp" / "api"):
+    if not _lib_dir.is_dir():
+        continue
+    for dll in _lib_dir.glob("*.dll"):
+        binaries.append((str(dll), f"ctp/{_lib_dir.name}"))
 
 # 只对「带资源文件或动态库」的包做 collect_all；pandas/numpy 走官方 hook，避免打进 tests。
 # uiautomation / comtypes 负责交易登录框；curl_cffi 是行情库自带的网络库；tqsdk 带行情的配置与数据文件。

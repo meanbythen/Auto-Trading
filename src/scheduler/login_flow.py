@@ -13,9 +13,8 @@ class LoginFlowMixin:
     _ctp_retry_at: datetime | None
 
     def _warn_gui_safety(self) -> None:
-        """启动时打印 GUI 路径的关键安全提醒。"""
-        executor = str((self.cfg.get("trade") or {}).get("executor", "sim"))
-        if executor != "gui":
+        """启动时打印窗口点击路径的关键安全提醒。"""
+        if not self.trader_capabilities.window_driven:
             return
         if len(self.scan_symbols) > 1:
             logger.error(
@@ -27,12 +26,12 @@ class LoginFlowMixin:
         if not gui.get("symbol_input"):
             logger.warning(
                 "未标定 trade.gui.symbol_input：程序不会改合约框，"
-                "请确认同花顺盘面合约与策略品种一致。"
+                "请确认交易软件盘面合约与策略品种一致。"
             )
         if self.gui_assume_fill and not self.cfg.get("dry_run", True):
             logger.warning(
                 "gui.assume_fill=true：点击成功后会立刻改内部持仓"
-                "（点击≠交易所成交）。建议定期核对同花顺真实持仓；"
+                "（点击≠交易所成交）。建议定期核对交易软件真实持仓；"
                 "也可改为 assume_fill=false，只记发单不自动改仓。"
             )
 
@@ -47,18 +46,17 @@ class LoginFlowMixin:
 
     def _arm_order_price(self) -> None:
         """
-        启动常驻后把同花顺价格设成对手价。
+        启动常驻后把交易软件价格设成对手价。
 
         模拟模式只看信号、不点鼠标，所以这里也不去点价格框。
         设失败只写警告，扫描照常开始。后面的开仓和平仓都不会再改价格。
         """
-        executor = str((self.cfg.get("trade") or {}).get("executor", "sim"))
-        if executor != "gui":
+        if not self.trader_capabilities.window_driven:
             self._gui_price_ready = True
             return
         if self.cfg.get("dry_run", True):
             self._gui_price_ready = True
-            logger.info("模拟模式不点击同花顺。真下单前请确认价格框是「对手价」。")
+            logger.info("模拟模式不点击交易软件。真下单前请确认价格框是「对手价」。")
             return
         try:
             from src.trader.price_mode import ensure_opponent_price
@@ -75,22 +73,21 @@ class LoginFlowMixin:
 
     def _ensure_runtime_ready(self) -> bool:
         """
-        运行期健康检查：期货通窗口是否还在。
+        运行期健康检查：交易软件窗口是否还在。
         原理：登录成功后若窗口被关掉，不能继续当「已登录」去点鼠标。
         """
-        executor = str((self.cfg.get("trade") or {}).get("executor", "sim"))
-        if executor != "gui" or self.cfg.get("dry_run", True):
+        if not self.trader_capabilities.window_driven or self.cfg.get("dry_run", True):
             return True
         if self.login_mgr.window_exists():
             return True
-        logger.error("未找到同花顺窗口，本轮跳过扫描。请重新打开并登录后再挂机。")
+        logger.error("未找到交易软件窗口，本轮跳过扫描。请重新打开并登录后再挂机。")
         self.logged_in = False
-        self.last_error = "期货通窗口丢失"
+        self.last_error = "交易软件窗口丢失"
         self._record_event("window_lost")
         try:
             from src.ops.alerts import emit_alert
 
-            emit_alert("window_lost", "期货通窗口丢失，本轮跳过扫描", level="error")
+            emit_alert("window_lost", "交易软件窗口丢失，本轮跳过扫描", level="error")
         except Exception:  # noqa: BLE001
             pass
         return False
@@ -111,8 +108,7 @@ class LoginFlowMixin:
 
     def _reconcile_ctp(self) -> None:
         """扫描前向柜台对一次账。持仓对不上才拦开仓；资金按期货公司数字改本地。"""
-        executor = str((self.cfg.get("trade") or {}).get("executor", "sim"))
-        if executor != "ctp" or not hasattr(self.trader, "reconcile"):
+        if not self.trader_capabilities.can_query_positions or not hasattr(self.trader, "reconcile"):
             return
         try:
             report = self._call_reconcile()
@@ -128,8 +124,7 @@ class LoginFlowMixin:
 
     def _uses_ctp_broker_funds(self) -> bool:
         """当前是不是已经连上 CTP、并且有期货公司资金数字可以跟。"""
-        trade = self.cfg.get("trade") or {}
-        if str(trade.get("executor") or "").strip().lower() != "ctp":
+        if not self.trader_capabilities.can_query_positions:
             return False
         if getattr(self.trader, "last_broker_snapshot", None):
             return True
@@ -156,13 +151,12 @@ class LoginFlowMixin:
 
     def _arm_ctp(self) -> bool:
         """
-        执行通道是 CTP 时，启动就完成认证、登录、结算单确认，并按柜台资金改本地账。
+        执行通道是柜台 API 时，启动就完成认证、登录、结算单确认，并按柜台资金改本地账。
 
         返回是否已经连上柜台。连不上时置 logged_in=False，隔一段时间再重试，
         不能让「启动时连不上」变成整晚都不再登录。
         """
-        executor = str((self.cfg.get("trade") or {}).get("executor", "sim"))
-        if executor != "ctp":
+        if not self.trader_capabilities.orders_via_broker:
             return True
         if self.cfg.get("dry_run", True):
             logger.warning("模拟开关开着，CTP 不会连接柜台，也不会发单")

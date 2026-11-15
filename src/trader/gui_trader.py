@@ -63,7 +63,7 @@ def release_pointer_after_order(token: dict[str, Any] | None) -> None:
             logger.warning("解除鼠标锁定失败，可按 Ctrl+Alt+Delete 恢复: {}", exc)
     pyautogui.FAILSAFE = False
 
-from .base import OrderRequest, OrderResult, TraderBase
+from .base import DEFAULT_CAPABILITIES, Capabilities, OrderRequest, OrderResult, TraderBase
 
 # 真下单的鼠标键盘还没结束时为真。界面这时不要把自己拉到同花顺前面。
 _ORDER_CLICKING = False
@@ -107,6 +107,10 @@ class GuiTrader(TraderBase):
         # 下单时暂时禁止激活的本程序窗口，结束时恢复。
         self._parked_hwnds: list[int] = []
         pyautogui.PAUSE = 0.2
+
+    @property
+    def capabilities(self) -> Capabilities:
+        return DEFAULT_CAPABILITIES["gui"]
 
     def _focus_ths_before_click(self) -> bool:
         """

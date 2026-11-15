@@ -16,6 +16,7 @@ from tkinter import ttk
 
 from loguru import logger
 
+from src.trader.base import capabilities_for
 from src.trader.ctp_orders import ctp_order, flatten_order_steps, prepare_live_ctp_cfg, reverse_order_steps
 from src.trader.ctp_display import (
     account_headline,
@@ -327,7 +328,7 @@ class CtpProbeWindow(tk.Toplevel):
             "这里只给人点：买开、卖开、买平、卖平、平仓（锁仓会平两边）、反手（先平再反向开）、撤单。"
             "和常驻策略用同一套报单。策略自动出信号要到③④再点「启动常驻」。"
             "点蓝色数字可把价格填进框。卖开用买一，买开用卖一。测涨跌停可点涨停/跌停。"
-            "改价请先撤未成交委托。华泰外接测试请打开「华泰必测」页勾选。"
+            "改价请先撤未成交委托。柜台外接测试请打开「柜台必测」页勾选。"
         )
 
     def _make_tree(
@@ -577,7 +578,7 @@ class CtpProbeWindow(tk.Toplevel):
         worker = getattr(self.master, "worker", None)
         if bool(getattr(worker, "running", False)):
             executor = str(((load_config().get("trade") or {}).get("executor") or "")).lower()
-            if executor == "ctp":
+            if capabilities_for(executor).orders_via_broker:
                 self._say(
                     "常驻已经在用 CTP 连这个账号。请先到运行页点「停止常驻」，再在交易台登录，"
                     "否则柜台可能把一边踢下线。"
@@ -602,7 +603,7 @@ class CtpProbeWindow(tk.Toplevel):
                     f"本机单笔最多 {lots} 手（超过会拦住，不是柜台上限）。"
                     f"报单/撤单到 {warn} 笔只提醒、不拦单。"
                     f"最小变动价位 {trader.settings.price_tick}。"
-                    f"挂单留给你手撤（华泰测撤单用）；常驻挂机仍会超时自动撤。"
+                    f"挂单留给你手撤（测撤单用）；常驻挂机仍会超时自动撤。"
                 )
             )
             self._say(
@@ -1025,9 +1026,9 @@ class CtpProbeWindow(tk.Toplevel):
         return rows
 
     def _build_huatai_tab(self, book: ttk.Notebook) -> None:
-        """华泰程序化外接必测勾选。勾完后才能把①标成完成。"""
+        """柜台程序化外接必测勾选。勾完后才能把①标成完成。"""
         frame = ttk.Frame(book)
-        book.add(frame, text="华泰必测")
+        book.add(frame, text="柜台必测")
         ttk.Label(
             frame,
             text="除「重复报单」「批量撤单」外都必须勾上。截图要带时间戳或电脑右下角时间。",
@@ -1049,7 +1050,7 @@ class CtpProbeWindow(tk.Toplevel):
             latest["huatai"][key] = bool(var.get())
         save_state(self._root, latest)
         self._go_live = latest
-        self._say("华泰必测勾选已保存。全部勾完后，请到运行页点「本阶段完成」。")
+        self._say("柜台必测勾选已保存。全部勾完后，请到运行页点「本阶段完成」。")
 
     def _block_symbol(self) -> None:
         self.symbol.set("XXXX")

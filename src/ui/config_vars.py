@@ -46,6 +46,24 @@ class ConfigVarsMixin:
         self.ctp_kind_choices = list(CTP_KIND_LABELS.values())
         self.ctp_live_td_var = ctk.StringVar(value=str(live_box.get("td_front") or ""))
         self.ctp_live_md_var = ctk.StringVar(value=str(live_box.get("md_front") or ""))
+        # 券商档案：下拉选 ctp_profile，下面的输入框改的是当前档案。
+        from src.trader.ctp_profile import list_profiles, selected_profile_name
+
+        self.ctp_profile_var = ctk.StringVar(value=selected_profile_name(ctp_box))
+        self.ctp_profile_choices = list_profiles(ctp_box)
+        self.ctp_profile_td_var = ctk.StringVar(value="")
+        self.ctp_profile_md_var = ctk.StringVar(value="")
+        self.ctp_profile_broker_var = ctk.StringVar(value="")
+        self.ctp_profile_user_var = ctk.StringVar(value="")
+        self.ctp_profile_pwd_env_var = ctk.StringVar(value="")
+        self.ctp_profile_auth_env_var = ctk.StringVar(value="")
+        self.ctp_profile_note_var = ctk.StringVar(value="")
+        self._ctp_profile_syncing = False
+        self._fill_ctp_profile_vars()
+        try:
+            self.ctp_profile_var.trace_add("write", self._on_ctp_profile_changed)
+        except Exception:  # noqa: BLE001
+            pass
         from src.trader.go_live import STAGE_LABELS, current_stage_from_cfg, load_state as load_go_live
         from src.trader.go_live import stage_hint, stage_label
 
@@ -736,6 +754,45 @@ class ConfigVarsMixin:
     def _parse_list(self, raw: str) -> list[str]:
         return [x.strip() for x in raw.replace("，", ",").split(",") if x.strip()]
 
+    def _fill_ctp_profile_vars(self) -> None:
+        """把当前券商档案的字段填进配置页。没有新档案时按旧键取，界面不会空着。"""
+        from src.trader.ctp_profile import (
+            list_profiles,
+            profile_validation_notes,
+            resolve_ctp_profile,
+            selected_profile_name,
+        )
+
+        trade = self.cfg.get("trade") or {}
+        ctp_box = trade.get("ctp") or {}
+        account = self.cfg.get("account") or {}
+        names = list_profiles(ctp_box)
+        self.ctp_profile_choices = names
+        name = str(self.ctp_profile_var.get() or "").strip()
+        if name not in names:
+            name = selected_profile_name(ctp_box)
+            self._ctp_profile_syncing = True
+            self.ctp_profile_var.set(name)
+            self._ctp_profile_syncing = False
+        resolved = resolve_ctp_profile(
+            ctp_box,
+            account,
+            name=name if ctp_box.get("ctp_profiles") else None,
+        )
+        self.ctp_profile_td_var.set(str(resolved.get("td_front") or ""))
+        self.ctp_profile_md_var.set(str(resolved.get("md_front") or ""))
+        self.ctp_profile_broker_var.set(str(resolved.get("broker_id") or ""))
+        self.ctp_profile_user_var.set(str(resolved.get("user_id") or ""))
+        self.ctp_profile_pwd_env_var.set(str(resolved.get("password_env") or "CTP_PASSWORD"))
+        self.ctp_profile_auth_env_var.set(str(resolved.get("auth_code_env") or ""))
+        self.ctp_profile_note_var.set("；".join(profile_validation_notes(ctp_box, account)))
+
+    def _on_ctp_profile_changed(self, *_args: object) -> None:
+        """下拉换档案时，把下面几个输入框换成那一份档案的值。"""
+        if getattr(self, "_ctp_profile_syncing", False):
+            return
+        self._fill_ctp_profile_vars()
+
     def _reload_values_only(self) -> None:
         self.cfg = load_config()
         st = self.cfg.get("strategy", {})
@@ -752,9 +809,15 @@ class ConfigVarsMixin:
 
         ctp_box = trade.get("ctp") or {}
         live_box = ctp_box.get("live") if isinstance(ctp_box.get("live"), dict) else {}
+        from src.trader.ctp_profile import selected_profile_name
+
         self.ctp_kind_var.set(ctp_kind_label(ctp_box.get("account_kind")))
         self.ctp_live_td_var.set(str(live_box.get("td_front") or ""))
         self.ctp_live_md_var.set(str(live_box.get("md_front") or ""))
+        self._ctp_profile_syncing = True
+        self.ctp_profile_var.set(selected_profile_name(ctp_box))
+        self._ctp_profile_syncing = False
+        self._fill_ctp_profile_vars()
         from src.trader.go_live import load_state as load_go_live, stage_hint, stage_label
 
         go_state = load_go_live(self.root_dir)

@@ -1,10 +1,10 @@
 """
 仿真行情。
 
-功能：连接华泰测试环境的行情前置，订阅窗口里的那一个合约，
+功能：连接券商档案里配置的行情前置，订阅窗口里的那一个合约，
 把最新价、买一、卖一、涨停价、跌停价交给测试窗口。
-原理：行情端口和交易端口是一套柜台。同花顺上的价格是另一路，不能拿来在仿真里下单。
-这里不计算开仓信号，也不发报单。
+原理：行情前置必须来自配置（md_front）；交易端口和行情端口不是同一个，
+程序不再按交易端口去猜行情端口。这里不计算开仓信号，也不发报单。
 """
 
 from __future__ import annotations
@@ -21,20 +21,9 @@ from src.trader.ctp_logic import ctp_depth_row, ctp_field_symbol, ctp_instrument
 from src.trader.ctp_td import prepare_ctp_dll_search
 
 
-def market_front(td_front: str, md_front: str = "") -> str:
-    """
-    仿真行情地址。
-
-    配置里写了行情前置就用配置。没写、而交易前置是华泰这份测试地址时，
-    用同一台机器上的行情端口 27236。
-    """
-    text = str(md_front or "").strip()
-    if text:
-        return text
-    trade = str(td_front or "").strip()
-    if trade.endswith(":27226"):
-        return trade[: -len("27226")] + "27236"
-    return ""
+def market_front(md_front: str = "") -> str:
+    """行情前置只认配置。没写就留空，由界面提示去券商档案里补。"""
+    return str(md_front or "").strip()
 
 
 def quote_text(value: Any) -> str:
@@ -119,10 +108,7 @@ class CtpMdClient:
 
     def __init__(self, settings: Any) -> None:
         self.settings = settings
-        self.front = market_front(
-            getattr(settings, "td_front", ""),
-            getattr(settings, "md_front", ""),
-        )
+        self.front = market_front(getattr(settings, "md_front", ""))
         self.wanted = ""
         self.latest: dict[str, Any] | None = None
         self.last_tick_at = 0.0
@@ -138,7 +124,11 @@ class CtpMdClient:
         if self.ready and self._api is not None:
             return True, f"仿真行情已登录 {self.front}"
         if not self.front:
-            return False, "还没有仿真行情地址"
+            return (
+                False,
+                "还没有行情前置。请在券商档案里填写 md_front（行情前置），"
+                "程序不会按交易端口自动推断行情端口",
+            )
         if not str(getattr(self.settings, "broker_id", "") or "").strip():
             return False, "还没有 BrokerID，不能登录仿真行情"
         if not str(getattr(self.settings, "user_id", "") or "").strip():
@@ -268,7 +258,7 @@ def _md_flow_dir(trade_flow: str) -> str:
 
 
 def _load_mdapi(project_root: str) -> Any:
-    """先换上 ctp/api 里的生产版动态库，再导入行情封装。"""
+    """先换上 ctp/vendor_libs（或旧目录 ctp/api）里的生产版动态库，再导入行情封装。"""
     prepare_ctp_dll_search(project_root or None)
     from openctp_ctp import mdapi  # type: ignore
 

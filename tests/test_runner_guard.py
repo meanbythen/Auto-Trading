@@ -12,6 +12,7 @@ from src.scheduler.order_executor import OrderIntentWriteError
 from src.scheduler.runner import TradingBot, entry_slip_blocked
 from src.strategy.base import StrategyBase
 from src.strategy.types import StrategyAction, StrategyDecision
+from src.trader.base import DEFAULT_CAPABILITIES
 
 
 def test_entry_slip_gate_blocks_chasing_and_leaves_the_other_side_alone() -> None:
@@ -172,6 +173,8 @@ def test_intent_write_failure_blocks_order_and_halts() -> None:
             self.kind = kind
 
     class _GuiTrader:
+        capabilities = DEFAULT_CAPABILITIES["gui"]
+
         def buy_open(self, symbol: str, volume: int, price: object = None) -> object:
             raise AssertionError("意图写失败时不应该下单")
 
@@ -250,6 +253,8 @@ def test_unclean_click_counts_as_sent_and_keeps_intent(tmp_path) -> None:
         raw = {"assumed_fill": True, "executor": "gui", "unclean": True}
 
     class _GuiTrader:
+        capabilities = DEFAULT_CAPABILITIES["gui"]
+
         def buy_open(self, symbol: str, volume: int, price: object = None) -> _Result:
             return _Result()
 
@@ -277,6 +282,7 @@ def test_unclean_click_counts_as_sent_and_keeps_intent(tmp_path) -> None:
 def test_runtime_leftover_intent_blocks_next_order(tmp_path) -> None:
     """运行期遗留的意图文件不能被下一笔覆盖：本笔拒发、熔断，原记录原样保留。"""
     class _GuiTrader:
+        capabilities = DEFAULT_CAPABILITIES["gui"]
         calls = 0
 
         def buy_open(self, symbol: str, volume: int, price: object = None) -> object:
@@ -432,6 +438,8 @@ def test_gui_real_order_writes_intent_without_dry_run_attribute() -> None:
         assumed_fill = True
 
     class _GuiTrader:
+        capabilities = DEFAULT_CAPABILITIES["gui"]
+
         def buy_open(self, symbol: str, volume: int, price: object = None) -> _Result:
             return _Result()
 
@@ -481,6 +489,8 @@ def test_failed_order_releases_strategy_signal_mark() -> None:
         assumed_fill = False
 
     class _GuiTrader:
+        capabilities = DEFAULT_CAPABILITIES["gui"]
+
         def buy_open(self, symbol: str, volume: int, price: object = None) -> _Result:
             return _Result()
 
@@ -536,6 +546,8 @@ def test_successful_order_keeps_signal_mark() -> None:
         assumed_fill = True
 
     class _GuiTrader:
+        capabilities = DEFAULT_CAPABILITIES["gui"]
+
         def buy_open(self, symbol: str, volume: int, price: object = None) -> _Result:
             return _Result()
 

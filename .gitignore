@@ -21,7 +21,8 @@ data/
 @AutomationLog.txt
 *.log
 
-# 第三方二进制（华泰提供的 CTP dll 自行放到 ctp/api，不入库）
+# 第三方二进制（柜台提供的 CTP dll 自行放到 ctp/vendor_libs，旧目录 ctp/api 也认，不入库）
+ctp/vendor_libs/*.dll
 ctp/api/*.dll
 
 # 系统文件

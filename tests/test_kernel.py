@@ -91,14 +91,18 @@ def test_stage_block_only_stops_new_opens() -> None:
         symbol="bu2612",
         side="buy_open",
         volume=1,
-        executor="ctp",
+        can_query_positions=True,
+        can_query_orders=True,
+        confirms_fill=True,
         stage_block="策略尚未进入实盘阶段",
     )
     closing = TradeIntent(
         symbol="bu2612",
         side="close",
         volume=1,
-        executor="ctp",
+        can_query_positions=True,
+        can_query_orders=True,
+        confirms_fill=True,
         stage_block="策略尚未进入实盘阶段",
     )
 

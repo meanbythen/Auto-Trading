@@ -37,7 +37,6 @@ from src.trader.ctp_logic import (
     ctp_instrument_id,
     is_terminal,
     keep_order_sys_id,
-    overlay_ctp_profile,
     symbol_key,
     test_front_blocks_live_account,
 )
@@ -113,19 +112,28 @@ class CtpSettings:
     auto_cancel_on_timeout: bool = True
     cancel_wait_sec: float = 3.0
     account_user_id: str = ""
-    # 仿真报价走行情端口。空着时，华泰测试交易端口 27226 会配对到 27236。
+    # 行情前置只认配置（券商档案或 trade.ctp.md_front），不按交易端口推断。
     md_front: str = ""
     # sim=仿真账号，live=真实账号。窗口和策略共用这一项。
     account_kind: str = CTP_KIND_SIM
     # 交易台会话：报单代码与常驻相同，但不因「已有挂单」拒单，也不超时自动撤。
     desk_session: bool = False
+    # 认证码环境变量名。为空表示该柜台不需要认证码。
+    auth_code_env: str = "CTP_AUTH_CODE"
+    # 当前券商档案名与显示名，日志和界面对照用。
+    profile: str = ""
+    profile_label: str = ""
 
     @classmethod
     def from_cfg(cls, cfg: dict[str, Any]) -> "CtpSettings":
+        from src.trader.ctp_profile import profile_validation_notes, resolve_ctp_profile
+
         trade = cfg.get("trade") or {}
         account = cfg.get("account") or {}
-        # 仿真用 28077；真实用配置页资金账号，前置只用 live 小节。
-        ctp = overlay_ctp_profile(trade.get("ctp") or {}, account=account)
+        # 公共默认 + 券商档案覆盖；旧配置没有 ctp_profiles 时生成 default，行为不变。
+        ctp = resolve_ctp_profile(trade.get("ctp") or {}, account=account)
+        for note in profile_validation_notes(trade.get("ctp") or {}, account=account):
+            logger.debug("CTP 档案提示：{}", note)
         root = str(cfg.get("_project_root") or "")
         flow = str(ctp.get("flow_dir") or "data/ctp_flow")
         flow_path = Path(flow)
@@ -155,6 +163,13 @@ class CtpSettings:
             md_front=str(ctp.get("md_front") or "").strip(),
             account_kind=str(ctp.get("account_kind") or CTP_KIND_SIM),
             desk_session=_flag(ctp.get("desk_session"), False),
+            auth_code_env=(
+                str(ctp.get("auth_code_env")).strip()
+                if ctp.get("auth_code_env") is not None
+                else "CTP_AUTH_CODE"
+            ),
+            profile=str(ctp.get("profile") or ""),
+            profile_label=str(ctp.get("profile_label") or ""),
         )
 
     def submit_wait_sec(self) -> float:
@@ -183,7 +198,7 @@ class CtpSettings:
             names.append("交易密码")
         if not self.app_id:
             names.append("AppID")
-        if not self.auth_code:
+        if self.auth_code_env and not self.auth_code:
             names.append("认证码")
         return names
 
@@ -243,7 +258,7 @@ class CtpGateway:
         已经就绪就直接返回。缺参数或动态库时返回失败原因，不抛给界面。
         """
         blocked = test_front_blocks_live_account(
-            self.settings.td_front,
+            self.settings.account_kind,
             self.settings.user_id,
             self.settings.account_user_id,
         )

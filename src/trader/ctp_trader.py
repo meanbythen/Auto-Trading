@@ -16,7 +16,7 @@ from typing import Any, Callable
 
 from loguru import logger
 
-from src.trader.base import OrderRequest, OrderResult, TraderBase
+from src.trader.base import DEFAULT_CAPABILITIES, Capabilities, OrderRequest, OrderResult, TraderBase
 from src.trader.ctp_gateway import STATUS_TEXT, CtpGateway, CtpSettings
 from src.trader.ctp_logic import (
     OFFSET_OPEN,
@@ -62,6 +62,10 @@ class CtpTrader(TraderBase):
             self.settings.app_id,
             ",".join(self.settings.close_split),
         )
+
+    @property
+    def capabilities(self) -> Capabilities:
+        return DEFAULT_CAPABILITIES["ctp"]
 
     def connect(self) -> tuple[bool, str]:
         """连接交易前置，并完成认证、登录、结算单确认。"""

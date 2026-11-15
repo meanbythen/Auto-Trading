@@ -24,7 +24,10 @@ class TradeIntent:
     orders_paused: bool = False
     ledger_failed: bool = False
     already_sent_this_bar: bool = False
-    executor: str = "sim"
+    # 通道能力：柜台能查持仓/委托，才需要上线阶段、未完成委托和对账这几道闸门。
+    can_query_positions: bool = False
+    can_query_orders: bool = False
+    confirms_fill: bool = False
     stage_block: str = ""
     has_working_order: bool = False
     blocks_new_opens: bool = False
@@ -84,19 +87,19 @@ def _volume(intent: TradeIntent, _risk: Any) -> GateResult | None:
 def _stage(intent: TradeIntent, _risk: Any) -> GateResult | None:
     # 上线阶段只拦新开仓。已经持有的仓必须能止损、反手和收盘清仓，
     # 否则阶段没批下来时，旧仓在夜里没人管。
-    if intent.executor == "ctp" and intent.stage_block and _is_open(intent.side):
+    if intent.can_query_orders and intent.stage_block and _is_open(intent.side):
         return GateResult(False, "order_blocked_stage", intent.stage_block)
     return None
 
 
 def _working(intent: TradeIntent, _risk: Any) -> GateResult | None:
-    if intent.executor == "ctp" and intent.has_working_order:
+    if intent.can_query_orders and intent.has_working_order:
         return GateResult(False, "order_working", "上一笔还没有最终回报，先不报新单")
     return None
 
 
 def _books(intent: TradeIntent, _risk: Any) -> GateResult | None:
-    if intent.executor == "ctp" and _is_open(intent.side) and intent.blocks_new_opens:
+    if intent.can_query_positions and _is_open(intent.side) and intent.blocks_new_opens:
         return GateResult(
             False,
             "risk_block",

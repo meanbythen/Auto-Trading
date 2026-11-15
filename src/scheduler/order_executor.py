@@ -15,6 +15,7 @@ from loguru import logger
 
 from src.kernel.risk_chain import TradeIntent, run_early_gates, run_send_gates
 from src.strategy import StrategyAction, StrategyDecision
+from src.trader.base import Capabilities
 from src.trader.ctp_orders import ctp_order
 
 
@@ -58,6 +59,11 @@ class OrderExecutorMixin:
     _RECENT_FILL_LIMIT = 5000
     # 锁内二级去重：本次运行已经入账的成交键。惰性初始化，避免可变类属性共享。
     _recent_fill_keys: OrderedDict[str, float] | None = None
+
+    @property
+    def trader_capabilities(self) -> Capabilities:
+        """当前通道能力。调度只看能力，不看具体是哪一家。"""
+        return getattr(self.trader, "capabilities", None) or Capabilities()
 
     def _intent_files(self) -> list[Path]:
         """盘上所有还没清理的委托意图：按笔目录里的每一笔，加上升级前的单文件。"""
@@ -133,7 +139,7 @@ class OrderExecutorMixin:
 
         正常走完（下单成功，或明确失败）就清掉。中途抛异常时不清：
         异常可能发生在点击之后，留着文件让运行期和下次启动都按「未完成委托」熔断，
-        先去同花顺核对持仓，宁可多核对一次，也不重复下单。
+        先去交易软件核对持仓，宁可多核对一次，也不重复下单。
 
         yield 出去的字典是给调用方的回执：置 ``unclean=True`` 表示点击已发出但收尾
         出错，这时同样不删文件，等人工核对。
@@ -166,7 +172,7 @@ class OrderExecutorMixin:
             f"{intent.get('side') or '未知方向'} "
             f"{'?' if volume is None else volume} 手 "
             f"（{intent.get('ts') or '时间未知'}）。程序可能在点击后崩溃。"
-            "请先在同花顺核对持仓与委托，再到界面点「对账确认」解除熔断。"
+            "请先在交易软件核对持仓与委托，再到界面点「对账确认」解除熔断。"
         )
         if len(intents) > 1:
             message += f"（盘上共 {len(intents)} 笔未核对委托）"
@@ -242,7 +248,7 @@ class OrderExecutorMixin:
         return None
 
     def confirm_positions_reviewed(self) -> tuple[bool, str]:
-        """人工核对同花顺持仓后，清掉遗留委托意图并解除对应熔断。"""
+        """人工核对交易软件持仓后，清掉遗留委托意图并解除对应熔断。"""
         if self._pending_intent is None:
             return False, "没有待核对的委托记录。"
         intent = dict(self._pending_intent)
@@ -402,9 +408,9 @@ class OrderExecutorMixin:
         reason: str = "手工录入开仓",
     ) -> tuple[dict[str, Any] | None, float | None]:
         """
-        人工在同花顺上开了仓后，把这笔仓回填进程序的策略内存、风控、bot_state 和信号账户。
+        人工在交易软件上开了仓后，把这笔仓回填进程序的策略内存、风控、bot_state 和信号账户。
 
-        side: "long" / "short"。只改程序的账，不会去点同花顺。
+        side: "long" / "short"。只改程序的账，不会去点交易软件。
         initial_stop: 可选的策略级止损价（填了之后策略会按规则自动止损；0 只靠反向信号和收盘清仓）。
         返回 (写进去的这一笔, 新余额)。参数无效或品种不在关注列表里时返回 (None, None)。
         """
@@ -1014,16 +1020,16 @@ class OrderExecutorMixin:
     ) -> TradeIntent:
         """把当前准备发的这一笔收成只读意图，交给风控链，不把整个机器人传出去。"""
         cfg = getattr(self, "cfg", None) or {}
-        executor = str((cfg.get("trade") or {}).get("executor", "sim"))
+        caps = self.trader_capabilities
         bar_key = str((decision.meta or {}).get("bar_id", "") or "")
         stage = ""
-        if executor == "ctp":
+        if caps.can_query_orders:
             from src.trader.go_live import strategy_order_block_reason
 
             stage = str(strategy_order_block_reason(cfg) or "")
         working = False
         trader = getattr(self, "trader", None)
-        if executor == "ctp" and trader is not None:
+        if caps.can_query_orders and trader is not None:
             working = bool(getattr(trader, "has_working_order", lambda _symbol: False)(decision.symbol))
         sent = getattr(self, "_sent_bar", None) or {}
         return TradeIntent(
@@ -1034,7 +1040,9 @@ class OrderExecutorMixin:
             orders_paused=bool(getattr(self, "_orders_paused", False)),
             ledger_failed=bool(getattr(self, "_ledger_failed", False)),
             already_sent_this_bar=bool(bar_key and sent.get(decision.symbol) == bar_key),
-            executor=executor,
+            can_query_positions=caps.can_query_positions,
+            can_query_orders=caps.can_query_orders,
+            confirms_fill=caps.confirms_fill,
             stage_block=stage,
             has_working_order=working,
             blocks_new_opens=bool(getattr(trader, "blocks_new_opens", lambda: False)()) if trader is not None else False,
@@ -1204,15 +1212,15 @@ class OrderExecutorMixin:
         bar_key: str,
     ) -> bool:
         """定好价格和成交方向，再交给 _send_and_book 点单。"""
-        executor = str((self.cfg.get("trade") or {}).get("executor", "sim"))
+        caps = self.trader_capabilities
 
-        # 对手价只在真正下单时看一次。下单会先把同花顺拉到最前，没有交易窗口才登录。
+        # 对手价只在真正下单时看一次。下单会先把交易软件拉到最前，没有交易窗口才登录。
         # 不在这里提前读价格，免得日志刷新把本程序叫到前面，也免得价格菜单被点开两次。
 
-        # 同花顺点击时永远不把策略里的价格写进价格框。启动时已经选好对手价。
-        # CTP 必须带限价。平仓策略通常不给价格，就用这根 K 线的收盘价。
+        # 窗口点击时永远不把策略里的价格写进价格框。启动时已经选好对手价。
+        # 柜台报单必须带限价。平仓策略通常不给价格，就用这根 K 线的收盘价。
         position_side = None
-        if executor == "ctp":
+        if caps.orders_via_broker:
             price = self._ctp_limit_price(decision)
             if price is None or price <= 0:
                 logger.error("CTP 没有可用价格，这次不报单 | {}", decision.symbol)
@@ -1222,18 +1230,18 @@ class OrderExecutorMixin:
             if decision.action == StrategyAction.CLOSE:
                 held = self._position_for(decision.symbol)
                 position_side = getattr(held, "side", None)
-        elif executor == "gui" or decision.action == StrategyAction.CLOSE:
-            price = None
-        else:
+        elif caps.confirms_fill and decision.action != StrategyAction.CLOSE:
             price = decision.entry_price
+        else:
+            price = None
 
         def place() -> bool:
             return self._send_and_book(
-                decision, vol, executor, price, position_side, side, size_note, bar_key
+                decision, vol, price, position_side, side, size_note, bar_key
             )
 
-        # GUI 真下单先落一笔「意图」，避免点击成功后程序崩溃、重启又开一次。
-        if executor == "gui" and not bool(self.cfg.get("dry_run", True)):
+        # 窗口点击真下单先落一笔「意图」，避免点击成功后程序崩溃、重启又开一次。
+        if caps.window_driven and not bool(self.cfg.get("dry_run", True)):
             try:
                 with self._order_intent(decision, vol) as state:
                     sent = place()
@@ -1268,7 +1276,6 @@ class OrderExecutorMixin:
         self,
         decision: StrategyDecision,
         vol: int,
-        executor: str,
         price: float | None,
         position_side: str | None,
         side: str,
@@ -1277,9 +1284,10 @@ class OrderExecutorMixin:
     ) -> bool:
         """真正点单并记账。调用前风控链已经放行，价格也已经定好。"""
         # 从这里开始真正点单。下面的异常再撤销信号标记就可能重复下单，所以先置位。
+        caps = self.trader_capabilities
         self._order_dispatch_started = True
         self._order_unclean = False
-        if executor == "ctp":
+        if caps.orders_via_broker:
             # 和交易台同一份 OrderRequest、同一个 place_order。价格来自策略/最新收盘，人点时来自盘口。
             result = self.trader.place_order(
                 ctp_order(
@@ -1320,7 +1328,7 @@ class OrderExecutorMixin:
                 message=result.message,
             )
 
-        if executor == "ctp":
+        if caps.orders_via_broker:
             self._finish_ctp_order(decision, vol, result, side, size_note)
             # CTP 是异步发单：result.ok 表示已报入柜台。只有成功报入才标记 sent，
             # 没发出去（缺配置、前置没连上、暂停报单）的话下一轮应该再试。
@@ -1339,14 +1347,14 @@ class OrderExecutorMixin:
             self._release_signal_mark(decision)
 
         if result.ok:
-            # GUI 且关闭 assume_fill：只记「已发单」，不改内部持仓（点击≠成交）
+            # 不确认成交的通道且关闭 assume_fill：只记「已发单」，不改内部持仓（点击≠成交）
             if (
-                executor == "gui"
+                not caps.confirms_fill
                 and getattr(result, "assumed_fill", False)
                 and not self.gui_assume_fill
             ):
                 logger.warning(
-                    "GUI 已发单但 assume_fill=false，不更新内部持仓 | {} {} vol={} | {}",
+                    "已发单但 assume_fill=false，不更新内部持仓 | {} {} vol={} | {}",
                     decision.action.value,
                     decision.symbol,
                     vol,
@@ -1395,7 +1403,7 @@ class OrderExecutorMixin:
 
             if getattr(result, "assumed_fill", False):
                 logger.warning(
-                    "GUI 假定成交记账（请尽快核对同花顺真实持仓）| {} {} vol={}",
+                    "假定成交记账（请尽快核对交易软件真实持仓）| {} {} vol={}",
                     decision.action.value,
                     decision.symbol,
                     vol,

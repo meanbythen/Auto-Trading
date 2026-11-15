@@ -934,24 +934,98 @@ def build_strategy_section(
     )
     ctk.CTkLabel(
         left,
-        text="仿真=28077+仿真前置。真实=上面的资金账号+下面两个实盘前置。账号不用填两遍。",
+        text="仿真=仿真账号+仿真前置。真实=上面的资金账号+实盘前置。账号不用填两遍。",
         font=T.FONT_SMALL,
         text_color=T.TEXT_DIM,
         wraplength=420,
         justify="left",
     ).pack(anchor="w", pady=(0, 4))
+    app._option_row(
+        left,
+        "券商档案",
+        app.ctp_profile_var,
+        getattr(app, "ctp_profile_choices", ["default"]),
+        width=220,
+    )
+    ctk.CTkLabel(
+        left,
+        text="换期货公司只改档案，不改代码。没有 ctp_profiles 时这里显示 default，按下面的旧字段运行。",
+        font=T.FONT_SMALL,
+        text_color=T.TEXT_DIM,
+        wraplength=420,
+        justify="left",
+    ).pack(anchor="w", pady=(0, 4))
+    ctk.CTkLabel(
+        left,
+        textvariable=app.ctp_profile_note_var,
+        font=T.FONT_SMALL,
+        text_color=T.WARN,
+        wraplength=420,
+        justify="left",
+    ).pack(anchor="w", pady=(0, 4))
+    app._entry_row(
+        left,
+        "档案交易前置",
+        app.ctp_profile_td_var,
+        hint="当前档案的交易地址，例如 tcp://主机:端口",
+        width=160,
+    )
+    app._entry_row(
+        left,
+        "档案行情前置",
+        app.ctp_profile_md_var,
+        hint="行情地址必须单独填，程序不再按交易端口推断行情端口",
+        width=160,
+    )
+    app._entry_row(
+        left,
+        "档案BrokerID",
+        app.ctp_profile_broker_var,
+        hint="柜台给的 BrokerID，例如 8080 / 9999",
+        width=160,
+    )
+    app._entry_row(
+        left,
+        "档案资金账号",
+        app.ctp_profile_user_var,
+        hint="仿真档案填仿真账号；真实档案留空时沿用上面的资金账号",
+        width=160,
+    )
+    app._entry_row(
+        left,
+        "档案密码变量",
+        app.ctp_profile_pwd_env_var,
+        hint="环境变量名，默认 CTP_PASSWORD；真实档案默认 CTP_LIVE_PASSWORD",
+        width=160,
+    )
+    app._entry_row(
+        left,
+        "档案认证码变量",
+        app.ctp_profile_auth_env_var,
+        hint="环境变量名，默认 CTP_AUTH_CODE；该柜台不需要认证码时留空",
+        width=160,
+    )
+    ctk.CTkButton(
+        left,
+        text="测试交易前置连通",
+        width=160,
+        command=app._test_ctp_front,
+        fg_color=T.ACCENT,
+        hover_color=T.ACCENT_HOVER,
+        text_color=T.TEXT,
+    ).pack(anchor="w", pady=(2, 8))
     app._entry_row(
         left,
         "实盘交易前置",
         app.ctp_live_td_var,
-        hint="只给 CTP 真实资金用。华泰给你的实盘交易地址，例如 tcp://主机:端口。仿真前置不要填这里",
+        hint="旧写法，保留兼容；新配置请优先填上面的「档案交易前置」",
         width=160,
     )
     app._entry_row(
         left,
         "实盘行情前置",
         app.ctp_live_md_var,
-        hint="只给 CTP 真实资金用。实盘行情地址。留空时测试窗口看不到真实盘口",
+        hint="旧写法，保留兼容；新配置请优先填上面的「档案行情前置」",
         width=160,
     )
     app._entry_row(

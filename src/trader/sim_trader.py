@@ -13,7 +13,7 @@ from typing import Any
 
 from loguru import logger
 
-from .base import OrderRequest, OrderResult, TraderBase
+from .base import DEFAULT_CAPABILITIES, Capabilities, OrderRequest, OrderResult, TraderBase
 
 
 class SimTrader(TraderBase):
@@ -24,6 +24,10 @@ class SimTrader(TraderBase):
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.record_file = self.data_dir / "sim_orders.jsonl"
         self.orders: list[dict[str, Any]] = []
+
+    @property
+    def capabilities(self) -> Capabilities:
+        return DEFAULT_CAPABILITIES["sim"]
 
     def place_order(self, req: OrderRequest) -> OrderResult:
         order_id = f"SIM-{uuid.uuid4().hex[:8]}"

@@ -4,10 +4,15 @@ from src.trader.ctp_logic import ctp_depth_row, ctp_field_symbol
 from src.trader.ctp_md import CtpMdClient, describe_quote, market_front, merge_quote, quote_line, quote_text
 
 
-def test_market_front_pairs_huatai_ports() -> None:
-    """没单独写行情地址时，华泰交易端口配到行情端口。"""
-    assert market_front("tcp://59.36.3.115:27226") == "tcp://59.36.3.115:27236"
-    assert market_front("tcp://59.36.3.115:27226", "tcp://1.2.3.4:27236") == "tcp://1.2.3.4:27236"
+def test_market_front_comes_from_config_only() -> None:
+    """行情前置只认 md_front，不再按交易端口推断。"""
+    assert market_front("") == ""
+    assert market_front("tcp://1.2.3.4:27236") == "tcp://1.2.3.4:27236"
+    client = CtpMdClient(_settings())
+    assert client.front == ""
+    ok, text = client.start()
+    assert ok is False
+    assert "md_front" in text
 
 
 def test_quote_line_ignores_missing_text_fields() -> None:

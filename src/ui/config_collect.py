@@ -650,6 +650,25 @@ class ConfigCollectMixin:
             top = str(ctp_box.get(key) or "").strip()
             if top and not str(sim_box.get(key) or "").strip():
                 sim_box[key] = top
+        # 券商档案：页面上改的是当前选中的那一份。保存时才落新格式，旧键继续保留。
+        profile_name = str(self.ctp_profile_var.get() or "").strip()
+        if profile_name:
+            profiles = ctp_box.get("ctp_profiles")
+            if not isinstance(profiles, dict):
+                profiles = {}
+            ctp_box["ctp_profiles"] = profiles
+            current = profiles.get(profile_name)
+            item = dict(current) if isinstance(current, dict) else {}
+            item.setdefault("kind", ctp_box["account_kind"])
+            item.setdefault("label", profile_name)
+            item["td_front"] = str(self.ctp_profile_td_var.get() or "").strip()
+            item["md_front"] = str(self.ctp_profile_md_var.get() or "").strip()
+            item["broker_id"] = str(self.ctp_profile_broker_var.get() or "").strip()
+            item["user_id"] = str(self.ctp_profile_user_var.get() or "").strip()
+            item["password_env"] = str(self.ctp_profile_pwd_env_var.get() or "").strip()
+            item["auth_code_env"] = str(self.ctp_profile_auth_env_var.get() or "").strip()
+            profiles[profile_name] = item
+            ctp_box["ctp_profile"] = profile_name
         try:
             trade["volume"] = int(self.volume_var.get())
         except ValueError:

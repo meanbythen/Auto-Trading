@@ -69,7 +69,7 @@ class AccountTabMixin:
         )
         ctk.CTkLabel(
             self.ac_ths_panel,
-            text="同花顺点单账可以手改。初始化会先把旧账存档，再从现在另记一本。入金、出金填正数。红字是赚，绿字是亏。",
+            text="GUI 点单账可以手改。初始化会先把旧账存档，再从现在另记一本。入金、出金填正数。红字是赚，绿字是亏。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=390,
@@ -119,7 +119,7 @@ class AccountTabMixin:
         ).pack(fill="x", pady=(8, 0))
         ctk.CTkLabel(
             self.ac_ctp_panel,
-            text="数字原样来自期货公司，本地只保存、不改。同花顺点单请换到上面的同花顺账。",
+            text="数字原样来自期货公司，本地只保存、不改。GUI 点单请换到上面的 GUI 账。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=390,
@@ -156,7 +156,7 @@ class AccountTabMixin:
         self.ac_ths_manual.pack(fill="x", padx=4, pady=(0, 4))
         self.ac_ths_manual_note = ctk.CTkLabel(
             left,
-            text="手动在同花顺上开仓/平仓后，在这里录入。品种、价格、手数 + 买多/卖空/平仓。只改程序的账，不会去点同花顺。",
+            text="手动在交易软件上开仓/平仓后，在这里录入。品种、价格、手数 + 买多/卖空/平仓。只改程序的账，不会去点交易软件。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=390,
@@ -258,7 +258,7 @@ class AccountTabMixin:
 
 
     def _sync_account_mode(self) -> None:
-        """同花顺账显示手改工具；CTP 账显示柜台资金表。两套界面不同时出现。"""
+        """GUI 账显示手改工具；CTP 账显示柜台资金表。两套界面不同时出现。"""
         from src.account.workspace import is_ctp_book, load_active_id
 
         ctp = is_ctp_book(load_active_id(self.root_dir))
@@ -314,7 +314,7 @@ class AccountTabMixin:
 
 
     def _paint_account_hint(self) -> None:
-        """账户分析左边说明现在记的是哪一本，以及期货通该开哪边。"""
+        """账户分析左边说明现在记的是哪一本，以及交易软件该开哪边。"""
         from src.account.signal_book import load_book
         from src.account.workspace import display_label, profile_of
 
@@ -407,24 +407,24 @@ class AccountTabMixin:
         self._append_log(f"账户分析已换成 {shown}")
         if wanted == "paper":
             messagebox.showinfo(
-                "同花顺模拟账",
+                "GUI模拟账",
                 "程序这边已经换成模拟账。\n"
-                "请到期货通左上角打开「模拟交易」，再点启动常驻。\n"
+                "请到交易软件左上角打开「模拟交易」，再点启动常驻。\n"
                 "这样点单走模拟盘，不会动真实资金，也不会改实盘账。\n"
                 "这本账的余额仍要手工记入金、出金或每日结算。",
             )
         elif is_ctp_book(wanted):
             messagebox.showinfo(
                 shown,
-                "这本账的权益以华泰柜台查询为准。\n"
+                "这本账的权益以 CTP 柜台查询为准。\n"
                 "请打开交易台，用对应账号登录后点「刷新持仓」，\n"
                 "或在本页点「从柜台刷新资金」。\n"
-                "同花顺登录号不要填进 CTP 资金账号。",
+                "GUI 登录号不要填进 CTP 资金账号。",
             )
 
 
     def _on_ctp_refresh_funds(self) -> None:
-        """向已经登录的柜台再查一次资金，写入当前这本华泰账。"""
+        """向已经登录的柜台再查一次资金，写入当前这本 CTP 账。"""
         from tkinter import messagebox
 
         from src.account.ctp_sync import can_pull_from_trader
@@ -434,9 +434,9 @@ class AccountTabMixin:
         if not is_ctp_book(aid):
             messagebox.showinfo(
                 "这本账不接柜台",
-                "同花顺模拟账仍要手工改余额。\n"
-                "同花顺实盘账仍是程序开平仓加手工结算。\n"
-                "请换到「华泰仿真」或「华泰真实账户」再刷新。",
+                "GUI模拟账仍要手工改余额。\n"
+                "GUI实盘账仍是程序开平仓加手工结算。\n"
+                "请换到「CTP仿真」或「CTP真实」再刷新。",
             )
             return
         trader = None
@@ -539,7 +539,7 @@ class AccountTabMixin:
         记下初始资金，并把它当作新账期的起点。
 
         原来的账先整份存进 data/signal_periods，再另建一本新账。
-        存档没成功就不会清掉当前账。同花顺里的持仓不动。
+        存档没成功就不会清掉当前账。交易软件里的持仓不动。
         """
         from tkinter import messagebox
 
@@ -558,7 +558,7 @@ class AccountTabMixin:
                 "存档在 data/signal_periods，里面仍有原来的交易、入金、出金、结算和盈亏。\n"
                 "新账期用新的存档，从现在按时间重新统计。\n"
                 f"余额会改成 {amount:g} 元，配置页的账户权益一起改。\n\n"
-                "同花顺里的真实持仓不会被平掉。\n\n确定开始？",
+                "交易软件里的真实持仓不会被平掉。\n\n确定开始？",
             ):
                 return
         try:
@@ -592,7 +592,7 @@ class AccountTabMixin:
         from src.account.workspace import is_ctp_book, load_active_id
 
         if is_ctp_book(load_active_id(self.root_dir)):
-            messagebox.showinfo("这本账用柜台资金", "华泰仿真和华泰真实的余额请点「从柜台刷新资金」，不要手工记入金出金。")
+            messagebox.showinfo("这本账用柜台资金", "CTP仿真和CTP真实的余额请点「从柜台刷新资金」，不要手工记入金出金。")
             return
 
         try:
@@ -617,7 +617,7 @@ class AccountTabMixin:
         from src.account.workspace import is_ctp_book, load_active_id
 
         if is_ctp_book(load_active_id(self.root_dir)):
-            messagebox.showinfo("这本账用柜台资金", "华泰仿真和华泰真实请点「从柜台刷新资金」，不要用每日结算手改。")
+            messagebox.showinfo("这本账用柜台资金", "CTP仿真和CTP真实请点「从柜台刷新资金」，不要用每日结算手改。")
             return
 
         try:
@@ -976,7 +976,7 @@ class AccountTabMixin:
                     f"「{info['label']}」还没有期货公司资金回报。\n"
                     "请先打开交易台，用这一本账对应的账号登录，点「刷新持仓」或左边「从柜台刷新资金」。\n"
                     "查到的账号、权益、可用资金会原样存到本地，不能手改。\n"
-                    "同花顺点单请换到同花顺实盘账或同花顺模拟账。"
+                    "GUI 点单请换到 GUI实盘账 或 GUI模拟账。"
                 )
             else:
                 empty = (

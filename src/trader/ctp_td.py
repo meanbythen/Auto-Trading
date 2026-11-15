@@ -1,8 +1,9 @@
 """
 CTP 动态库加载。
 
-功能：优先使用项目里 ctp/api 目录中华泰指定的动态库，再调用 Python 封装去连接交易前置。
-原理：Windows 按 PATH 顺序找 dll。把华泰给的 thosttraderapi_se.dll 放在最前面，
+功能：优先使用项目里 ctp/vendor_libs 目录中柜台指定的动态库（旧目录 ctp/api 仍可读），
+再调用 Python 封装去连接交易前置。
+原理：Windows 按 PATH 顺序找 dll。把柜台给的 thosttraderapi_se.dll 放在最前面，
 程序就会用这一份，而不是别的机器上碰巧装过的旧库。没有库时只返回说明，不让整个程序崩溃。
 """
 
@@ -19,13 +20,18 @@ from loguru import logger
 from src.trader.ctp_logic import ctp_depth_row, ctp_exchange_id, ctp_field_symbol, ctp_instrument_id, keep_order_sys_id
 
 
-def ctp_api_dir(project_root: str | Path | None) -> Path | None:
-    """华泰动态库应该放在这个目录。没有目录就返回 None。"""
+# 新目录优先；旧目录 ctp/api 继续可读，升级时不用先搬文件。
+_VENDOR_LIB_DIRS = ("ctp/vendor_libs", "ctp/api")
+
+
+def vendor_libs_dir(project_root: str | Path | None) -> Path | None:
+    """柜台动态库应该放在这个目录。没有目录就返回 None。"""
     if not project_root:
         return None
-    folder = Path(project_root) / "ctp" / "api"
-    if folder.is_dir():
-        return folder
+    for rel in _VENDOR_LIB_DIRS:
+        folder = Path(project_root) / rel
+        if folder.is_dir():
+            return folder
     return None
 
 
@@ -43,14 +49,14 @@ def _ctp_libs_dirs() -> list[Path]:
     return found
 
 
-def apply_huatai_dlls(project_root: str | Path | None) -> None:
+def apply_vendor_libs(project_root: str | Path | None) -> None:
     """
-    用 ctp/api 里的动态库覆盖程序即将加载的那一份。
+    用 ctp/vendor_libs（或旧目录 ctp/api）里的动态库覆盖程序即将加载的那一份。
 
-    华泰如果发来指定版本，文件名仍是 thosttraderapi_se.dll。
+    柜台如果发来指定版本，文件名仍是 thosttraderapi_se.dll。
     覆盖之后再导入接口，连上的就是这一份，而不是安装包里自带的旧库。
     """
-    folder = ctp_api_dir(project_root)
+    folder = vendor_libs_dir(project_root)
     if folder is None:
         return
     names = ("thosttraderapi_se.dll", "thostmduserapi_se.dll")
@@ -66,19 +72,19 @@ def apply_huatai_dlls(project_root: str | Path | None) -> None:
                     if target.is_file() and target.read_bytes() == payload:
                         continue
                     shutil.copyfile(source, target)
-                    logger.info("已用 ctp/api 里的 {} 替换接口要加载的动态库", name)
+                    logger.info("已用 {} 里的 {} 替换接口要加载的动态库", folder, name)
                 except OSError as exc:
                     logger.warning("没能替换 {}：{}", target.name, exc)
 
 
 def prepare_ctp_dll_search(project_root: str | Path | None) -> Path | None:
     """
-    让系统先到 ctp/api 里找动态库。
+    让系统先到柜台的动态库目录里找。
 
     返回实际加入搜索路径的目录；目录不存在则什么都不改。
     """
-    apply_huatai_dlls(project_root)
-    folder = ctp_api_dir(project_root)
+    apply_vendor_libs(project_root)
+    folder = vendor_libs_dir(project_root)
     if folder is None:
         return None
     folder_text = str(folder)
@@ -93,8 +99,8 @@ def load_tdapi(project_root: str | Path | None) -> Any:
     """
     导入交易接口模块。
 
-    先把华泰动态库目录加进搜索路径，再导入 openctp 的 Python 封装。
-    封装和 dll 要是同一套版本。华泰明天如果指定了别的版本，替换 ctp/api 里的 dll，
+    先把柜台动态库目录加进搜索路径，再导入 openctp 的 Python 封装。
+    封装和 dll 要是同一套版本。柜台换了指定版本时，替换 ctp/vendor_libs 里的 dll，
     并安装对应的 Python 封装即可，业务代码不用改。
     """
     prepare_ctp_dll_search(project_root)
@@ -103,7 +109,7 @@ def load_tdapi(project_root: str | Path | None) -> Any:
     except ImportError as exc:
         raise ImportError(
             "没有找到 CTP 的 Python 封装。请先安装 openctp-ctp，"
-            "并把华泰指定的 thosttraderapi_se.dll 放到 ctp/api。"
+            "并把柜台指定的 thosttraderapi_se.dll 放到 ctp/vendor_libs。"
         ) from exc
     return tdapi
 

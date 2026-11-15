@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import time
 
-from src.trader.base import OrderRequest
+from src.trader.base import DEFAULT_CAPABILITIES, OrderRequest
 from src.trader.ctp_gateway import CtpGateway, CtpSettings
 from src.trader.ctp_display import (
     account_headline,
@@ -750,13 +750,14 @@ def test_order_and_cancel_counts_warn_at_the_threshold() -> None:
     assert activity.cancels == 2
 
 
-def test_sim_front_refuses_the_live_account() -> None:
-    """仿真前置不能拿实盘资金账号登录。"""
+def test_sim_profile_refuses_the_live_account() -> None:
+    """仿真档案不能拿实盘资金账号登录；按档案种类判断，不再看前置 IP。"""
     from src.trader.ctp_logic import test_front_blocks_live_account
 
-    text = test_front_blocks_live_account("tcp://59.36.3.115:27226", "20318052", "20318052")
+    text = test_front_blocks_live_account("sim", "20318052", "20318052")
     assert "仿真" in text
-    assert test_front_blocks_live_account("tcp://59.36.3.115:27226", "10001437", "20318052") == ""
+    assert test_front_blocks_live_account("sim", "10001437", "20318052") == ""
+    assert test_front_blocks_live_account("live", "20318052", "20318052") == ""
 
 
 def test_cancel_uses_the_counter_id() -> None:
@@ -1291,6 +1292,8 @@ def test_reconcile_error_fails_closed(tmp_path) -> None:
     from src.scheduler.runner import TradingBot
 
     class _Trader:
+        capabilities = DEFAULT_CAPABILITIES["ctp"]
+
         def __init__(self) -> None:
             self._books_match = True
             self.note = ""
@@ -1325,6 +1328,8 @@ def test_ctp_connect_failure_is_retried_after_interval(tmp_path, monkeypatch) ->
     calls: list[int] = []
 
     class _Trader:
+        capabilities = DEFAULT_CAPABILITIES["ctp"]
+
         def connect(self):
             calls.append(1)
             return False, "前置连不上"
@@ -1456,3 +1461,196 @@ def test_desk_flatten_covers_locked_and_reverse_matches_strategy() -> None:
     assert close_sides_for_view(None) == []
     assert reverse_open_side("long") == "sell_open"
     assert reverse_open_side("short") == "buy_open"
+
+
+# ---------------------------------------------------------------- P1 券商档案
+
+
+def test_legacy_config_produces_the_same_settings_as_before() -> None:
+    """旧配置不改也能跑：没有 ctp_profiles 时生成 default 档案，字段逐项等价。"""
+    settings = CtpSettings.from_cfg(
+        {
+            "account": {"user_id": "20318052", "resolved_password": "ths-pw"},
+            "trade": {
+                "ctp": {
+                    "account_kind": "sim",
+                    "td_front": "tcp://old:1",
+                    "md_front": "tcp://old:2",
+                    "broker_id": "8080",
+                    "user_id": "top",
+                    "app_id": "app-x",
+                    "flow_dir": "data/ctp_flow",
+                    "price_tick": 2,
+                    "max_order_volume": 3,
+                    "order_wait_sec": 6,
+                    "query_interval_sec": 20,
+                    "login_timeout_sec": 15,
+                    "order_count_warn": 5,
+                    "cancel_count_warn": 6,
+                    "auto_cancel_on_timeout": False,
+                    "cancel_wait_sec": 2,
+                    "close_split_products": ["bu", "c", "fu"],
+                    "sim": {
+                        "td_front": "tcp://sim:1",
+                        "md_front": "tcp://sim:2",
+                        "user_id": "28077",
+                        "broker_id": "9999",
+                    },
+                    "live": {"td_front": "tcp://live:1", "md_front": "tcp://live:2"},
+                    "resolved_sim_password": "sim-pw",
+                    "resolved_live_password": "live-pw",
+                }
+            },
+        }
+    )
+    assert settings.profile == "default"
+    assert settings.account_kind == "sim"
+    assert settings.td_front == "tcp://sim:1"
+    assert settings.md_front == "tcp://sim:2"
+    assert settings.broker_id == "9999"
+    assert settings.user_id == "28077"
+    assert settings.password == "sim-pw"
+    assert settings.app_id == "app-x"
+    assert settings.price_tick == 2
+    assert settings.max_order_volume == 3
+    assert settings.order_wait_sec == 6
+    assert settings.query_interval_sec == 20
+    assert settings.login_timeout_sec == 15
+    assert settings.order_count_warn == 5
+    assert settings.cancel_count_warn == 6
+    assert settings.auto_cancel_on_timeout is False
+    assert settings.cancel_wait_sec == 2
+    assert settings.close_split == ("bu", "c", "fu")
+
+
+def test_named_profile_overrides_public_defaults() -> None:
+    """有 ctp_profiles 时按 ctp_profile 选档案，档案覆盖 trade.ctp 公共默认值。"""
+    settings = CtpSettings.from_cfg(
+        {
+            "account": {"user_id": "20318052"},
+            "trade": {
+                "ctp": {
+                    "app_id": "public-app",
+                    "max_order_volume": 5,
+                    "ctp_profile": "simnow",
+                    "ctp_profiles": {
+                        "huatai_sim": {
+                            "kind": "sim",
+                            "td_front": "tcp://huatai:1",
+                            "md_front": "tcp://huatai:2",
+                            "user_id": "28077",
+                        },
+                        "simnow": {
+                            "label": "SimNow 仿真",
+                            "kind": "sim",
+                            "td_front": "tcp://simnow:10130",
+                            "md_front": "tcp://simnow:10131",
+                            "broker_id": "9999",
+                            "user_id": "123456",
+                            "auth_code_env": "",
+                            "resolved_auth_code": "",
+                            "resolved_password": "simnow-pw",
+                        },
+                    },
+                }
+            },
+        }
+    )
+    assert settings.profile == "simnow"
+    assert settings.profile_label == "SimNow 仿真"
+    assert settings.td_front == "tcp://simnow:10130"
+    assert settings.md_front == "tcp://simnow:10131"
+    assert settings.broker_id == "9999"
+    assert settings.user_id == "123456"
+    assert settings.app_id == "public-app"
+    assert settings.max_order_volume == 5
+    assert settings.password == "simnow-pw"
+    # 该柜台不需要认证码：auth_code_env 为空时不再把「认证码」算成缺失项。
+    assert settings.auth_code_env == ""
+    assert "认证码" not in settings.missing()
+
+
+def test_live_profile_without_user_id_uses_the_fund_account() -> None:
+    """真实档案 user_id 留空时沿用配置页资金账号；前置仍来自档案。"""
+    settings = CtpSettings.from_cfg(
+        {
+            "account": {"user_id": "20318052", "resolved_password": "ths-pw"},
+            "trade": {
+                "ctp": {
+                    "ctp_profile": "huatai_live",
+                    "ctp_profiles": {
+                        "huatai_live": {
+                            "kind": "live",
+                            "td_front": "tcp://live:1",
+                            "md_front": "tcp://live:2",
+                            "broker_id": "8080",
+                        }
+                    },
+                }
+            },
+        }
+    )
+    assert settings.account_kind == "live"
+    assert settings.user_id == "20318052"
+    assert settings.td_front == "tcp://live:1"
+    assert settings.md_front == "tcp://live:2"
+    assert settings.password == "ths-pw"
+
+
+def test_unknown_profile_name_falls_back_to_legacy_config() -> None:
+    """档案名写错时不猜别的券商，回到旧配置路径，避免连错柜台。"""
+    settings = CtpSettings.from_cfg(
+        {
+            "trade": {
+                "ctp": {
+                    "ctp_profile": "typo",
+                    "account_kind": "sim",
+                    "user_id": "28077",
+                    "td_front": "tcp://old:1",
+                    "ctp_profiles": {
+                        "simnow": {"kind": "sim", "td_front": "tcp://simnow:1"}
+                    },
+                }
+            }
+        }
+    )
+    assert settings.profile == "default"
+    assert settings.td_front == "tcp://old:1"
+
+
+def test_config_loader_reads_password_env_per_profile(tmp_path, monkeypatch) -> None:
+    """档案各自按 password_env / auth_code_env 取密码，默认变量名不变。"""
+    import src.utils.config_loader as config_loader
+
+    monkeypatch.setattr(config_loader, "ensure_runtime_layout", lambda: tmp_path)
+    monkeypatch.setattr(
+        config_loader,
+        "load_secrets",
+        lambda: {"ctp_simnow_password": "simnow-secret"},
+    )
+    monkeypatch.setenv("CTP_PASSWORD", "huatai-secret")
+    monkeypatch.setenv("CTP_AUTH_CODE", "huatai-auth")
+    monkeypatch.delenv("CTP_SIMNOW_PASSWORD", raising=False)
+    path = tmp_path / "config.yaml"
+    path.write_text(
+        "trade:\n"
+        "  ctp:\n"
+        "    auth_code_env: CTP_AUTH_CODE\n"
+        "    ctp_profile: simnow\n"
+        "    ctp_profiles:\n"
+        "      huatai_sim:\n"
+        "        kind: sim\n"
+        "      simnow:\n"
+        "        kind: sim\n"
+        "        password_env: CTP_SIMNOW_PASSWORD\n"
+        "        auth_code_env: ''\n",
+        encoding="utf-8",
+    )
+
+    cfg = config_loader.load_config(path, apply_universe=False)
+    profiles = cfg["trade"]["ctp"]["ctp_profiles"]
+
+    assert profiles["huatai_sim"]["resolved_password"] == "huatai-secret"
+    assert profiles["huatai_sim"]["resolved_auth_code"] == "huatai-auth"
+    assert profiles["simnow"]["resolved_password"] == "simnow-secret"
+    assert profiles["simnow"]["resolved_auth_code"] == ""

@@ -495,14 +495,67 @@ trade:
   # 再叠一个绝对点数上限，和上面同时开就取更严的；0=不用
   max_entry_slip_points: 0
   ctp:
+    # 当前使用哪份券商档案。不写时按下面的旧键生成 default，行为与升级前一致。
+    # 换期货公司/仿真环境时，只加一段 ctp_profiles 并改这里，不改代码。
+    ctp_profile: ""
+    # 公共默认值：档案里没写的字段用这里的。档案同名字段优先。
+    app_id: "client_AutoTrading_1.0"
+    flow_dir: "data/ctp_flow"
+    price_tick: 1
+    max_order_volume: 2
+    order_count_warn: 8
+    cancel_count_warn: 8
+    query_interval_sec: 30
+    order_wait_sec: 8
+    # 报单超时自动撤单；撤单后最多等几秒确认。
+    auto_cancel_on_timeout: true
+    cancel_wait_sec: 3
+    # 上期所、能源中心、大商所会自动拆平今/平昨。这里可再追加品种。
+    close_split_products: ["bu", "c"]
+
+    # 券商档案示例。字段与旧写法同名同义；一份档案一个柜台。
+    # 真实档案 user_id 留空时沿用配置页「资金账号」。
+    # 密码/认证码只写环境变量名，不写明文；默认 CTP_PASSWORD / CTP_LIVE_PASSWORD / CTP_AUTH_CODE。
+    ctp_profiles:
+      huatai_sim:
+        label: 华泰仿真
+        kind: sim
+        td_front: ""
+        # 行情前置必须单独填，程序不再按交易端口推断行情端口。
+        md_front: ""
+        broker_id: ""
+        user_id: ""
+        password_env: "CTP_PASSWORD"
+        auth_code_env: "CTP_AUTH_CODE"
+      simnow:
+        label: SimNow 仿真
+        kind: sim
+        td_front: "tcp://180.168.146.187:10130"
+        md_front: "tcp://180.168.146.187:10131"
+        broker_id: "9999"
+        user_id: ""
+        password_env: "CTP_SIMNOW_PASSWORD"
+        # 该柜台不需要认证码时留空。
+        auth_code_env: ""
+      huatai_live:
+        label: 华泰真实
+        kind: live
+        td_front: ""
+        md_front: ""
+        broker_id: "8080"
+        user_id: ""
+        password_env: "CTP_LIVE_PASSWORD"
+        auth_code_env: "CTP_AUTH_CODE"
+
+    # ---- 旧写法（继续兼容）----
+    # 没有 ctp_profiles 时，程序按下面几项生成 default 档案：
     # sim=仿真账号，live=真实账号。测试窗口和策略共用这一项，只换账号和前置。
     account_kind: sim
-    # 下面几项由华泰技术提供。留空时程序只准备接口，不会去连柜台。
+    # 旧写法：顶层前置只给仿真用；真实前置写在 live 小节。
     td_front: ""
-    # 仿真报价的行情前置。华泰测试环境是交易端口 27226，行情端口 27236。留空时程序会按这个配对。
     md_front: ""
     broker_id: ""
-    # 仿真账号写在这里，例如 28077。不要填真实资金账号。
+    # 仿真账号写在这里，不要填真实资金账号。
     user_id: ""
     sim:
       td_front: ""
@@ -511,29 +564,14 @@ trade:
       user_id: ""
     live:
       # 真实资金账号跟配置页「资金账号」同一号，这里保存时会自动抄一份。
-      # 交易/行情前置必须填华泰给你的实盘地址，不要填仿真前置。
+      # 交易/行情前置必须填柜台给你的实盘地址，不要填仿真前置。
       td_front: ""
       md_front: ""
       broker_id: ""
       user_id: ""
-    app_id: "client_AutoTrading_1.0"
     # 认证码不要写在这个文件里。放到环境变量 CTP_AUTH_CODE，或 config/secrets.local.yaml 的 ctp_auth_code
     # 仿真密码写 secrets.local.yaml 的 ctp_password。真实通道默认用同一份交易密码；若不同再写 ctp_live_password。
     auth_code_env: "CTP_AUTH_CODE"
-    price_tick: 1
-    # 本机单笔手数上限。超过会拦住，不是华泰只许做这么多手。
-    max_order_volume: 2
-    # 报单、撤单笔数提醒。到了只写日志，不是只能做 8 次。
-    order_count_warn: 8
-    cancel_count_warn: 8
-    flow_dir: "data/ctp_flow"
-    query_interval_sec: 30
-    order_wait_sec: 8
-    # 报单超时自动撤单；撤单后最多等几秒确认。
-    auto_cancel_on_timeout: true
-    cancel_wait_sec: 3
-    # 上期所、能源中心、大商所会自动拆平今/平昨。这里可再追加品种。
-    close_split_products: ["bu", "c"]
   gui:
     # 期货通默认无确认弹窗。0=点完买卖就结束，不要按回车。
     # 若账号打开了「下单确认」，改成 1 或 2，并选 enter / click / both。

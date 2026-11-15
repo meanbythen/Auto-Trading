@@ -46,16 +46,56 @@ _CTP_RUNTIME_KEYS = {
 
 
 def _strip_ctp_runtime(ctp: dict[str, Any]) -> dict[str, Any]:
-    """保存时去掉内存里的密码和认证码，sim/live 小节同样处理。"""
+    """保存时去掉内存里的密码和认证码，sim/live 小节和 ctp_profiles 同样处理。"""
     cleaned: dict[str, Any] = {}
     for key, value in ctp.items():
         if key in _CTP_RUNTIME_KEYS:
             continue
-        if key in {"sim", "live"} and isinstance(value, dict):
-            cleaned[key] = {inner: inner_val for inner, inner_val in value.items() if inner not in _CTP_RUNTIME_KEYS}
+        if key in {"sim", "live", "ctp_profiles"} and isinstance(value, dict):
+            if key == "ctp_profiles":
+                cleaned[key] = {
+                    name: (
+                        {inner: inner_val for inner, inner_val in item.items() if inner not in _CTP_RUNTIME_KEYS}
+                        if isinstance(item, dict)
+                        else item
+                    )
+                    for name, item in value.items()
+                }
+            else:
+                cleaned[key] = {inner: inner_val for inner, inner_val in value.items() if inner not in _CTP_RUNTIME_KEYS}
         else:
             cleaned[key] = value
     return cleaned
+
+
+def _read_ctp_secret(env_name: str, secrets: dict[str, Any], *fallbacks: str) -> str:
+    """
+    密码/认证码：先读环境变量，再读 secrets.local.yaml 同名小写键。
+
+    找不到时返回空串。读到了就同步进环境变量，方便其它模块直接读。
+    """
+    name = str(env_name or "").strip()
+    if name:
+        value = os.environ.get(name, "")
+        if value:
+            return value
+    for key in (name.lower(), *fallbacks):
+        if not key:
+            continue
+        value = str(secrets.get(key, "") or "")
+        if value:
+            if name:
+                os.environ[name] = value
+            return value
+    return ""
+
+
+def _same_kind(value: Any, kind: str) -> bool:
+    """配置里的 kind 可能是 live / 真实账号 / real。"""
+    text = str(value or "").strip().lower()
+    if kind == "live":
+        return text in {"live", "real", "prod", "实盘", "真实", "真实账号"}
+    return text not in {"live", "real", "prod", "实盘", "真实", "真实账号"}
 
 
 def ensure_runtime_layout() -> Path:
@@ -306,26 +346,49 @@ def load_config(
     if isinstance(trade, dict):
         ctp = trade.setdefault("ctp", {})
         if isinstance(ctp, dict):
-            auth_env = str(ctp.get("auth_code_env") or "CTP_AUTH_CODE")
-            auth_code = os.environ.get(auth_env, "")
-            if not auth_code:
-                auth_code = str(secrets.get("ctp_auth_code", "") or "")
-                if auth_code:
-                    os.environ[auth_env] = auth_code
-            ctp["resolved_auth_code"] = auth_code
+            from src.trader.ctp_profile import (
+                DEFAULT_AUTH_CODE_ENV,
+                DEFAULT_LIVE_PASSWORD_ENV,
+                DEFAULT_SIM_PASSWORD_ENV,
+            )
+
+            auth_env = str(ctp.get("auth_code_env") or DEFAULT_AUTH_CODE_ENV)
+            ctp["resolved_auth_code"] = _read_ctp_secret(auth_env, secrets)
             # 仿真密码、实盘密码、同花顺密码三套分开，互不顶替。
-            ctp_password = os.environ.get("CTP_PASSWORD", "")
-            if not ctp_password:
-                ctp_password = str(secrets.get("ctp_password", "") or "")
-            live_password = os.environ.get("CTP_LIVE_PASSWORD", "")
-            if not live_password:
-                live_password = str(secrets.get("ctp_live_password", "") or "")
+            ctp_password = _read_ctp_secret(DEFAULT_SIM_PASSWORD_ENV, secrets, "ctp_password")
+            live_password = _read_ctp_secret(DEFAULT_LIVE_PASSWORD_ENV, secrets, "ctp_live_password")
             # 没单独写实盘密码时，CTP 真实通道用同一份交易密码（同花顺登录那一份）。
             if not live_password:
                 live_password = password
             ctp["resolved_sim_password"] = ctp_password
             ctp["resolved_live_password"] = live_password
             ctp["resolved_password"] = ctp_password
+
+            # 券商档案各自的密码/认证码环境变量。旧配置没有这一节时什么都不做。
+            profiles = ctp.get("ctp_profiles")
+            if isinstance(profiles, dict):
+                for item in profiles.values():
+                    if not isinstance(item, dict):
+                        continue
+                    kind_value = item.get("kind")
+                    if kind_value is None:
+                        kind_value = ctp.get("account_kind")
+                    live_profile = _same_kind(kind_value, "live")
+                    pwd_env = str(
+                        item.get("password_env")
+                        or (DEFAULT_LIVE_PASSWORD_ENV if live_profile else DEFAULT_SIM_PASSWORD_ENV)
+                    )
+                    pwd = _read_ctp_secret(pwd_env, secrets)
+                    if not pwd and live_profile:
+                        pwd = live_password or password
+                    item["resolved_password"] = pwd
+                    code_env = item.get("auth_code_env")
+                    if code_env is None:
+                        code_env = auth_env
+                    code_env = str(code_env or "")
+                    item["resolved_auth_code"] = (
+                        _read_ctp_secret(code_env, secrets) if code_env else ""
+                    )
 
     if not password:
         logger.warning(

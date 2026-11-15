@@ -212,9 +212,10 @@ class TradingBot(
         self._stop_requested_at: float | None = None
         # 暂停报单：扫描还在跑，开平仓、止损、清仓都不发出去。和交易台「暂停报单」同一标志。
         self._orders_paused = False
-        # 同花顺真下单前，必须先把价格改成对手价。没改成就不允许点买卖。
-        executor_name = str((cfg.get("trade") or {}).get("executor", "sim"))
-        self._gui_price_ready = not (executor_name == "gui" and not bool(cfg.get("dry_run", True)))
+        # 窗口点击真下单前，必须先把价格改成对手价。没改成就不允许点买卖。
+        self._gui_price_ready = not (
+            self.trader_capabilities.window_driven and not bool(cfg.get("dry_run", True))
+        )
         self.heartbeat_at: str = ""
         self.last_scan_at: str = ""
         self.last_error: str = ""
@@ -270,7 +271,7 @@ class TradingBot(
         self._unprotected_path = root / "data" / "unprotected_positions.json"
         self.state_path = default_state_path(root)
         # 下单意图写前日志：点击前先落盘，成功后清除。若程序在点击与记账之间崩溃，
-        # 下次启动会看到这个文件，提示人工核对同花顺持仓，避免重复开仓/漏平仓。
+        # 下次启动会看到这个文件，提示人工核对交易软件持仓，避免重复开仓/漏平仓。
         from src.account.workspace import intent_dir, intent_file
 
         # 点单意图跟当前账走：模拟盘崩溃核对时，不会误用实盘那份意图文件。
@@ -307,7 +308,7 @@ class TradingBot(
         self._check_pending_intent()
         self._warn_gui_safety()
         # 成交回报可能比 place_order 返回更早。先挂上记账函数，避免全部成交后没人改持仓。
-        if str(trade.get("executor", "sim")) == "ctp" and hasattr(self.trader, "set_fill_handler"):
+        if self.trader_capabilities.orders_via_broker and hasattr(self.trader, "set_fill_handler"):
             self.trader.set_fill_handler(self._on_ctp_fill)
 
     def _position_for(self, symbol: str) -> Any | None:
@@ -874,9 +875,9 @@ class TradingBot(
                 self.risk.current_position -= vol
 
         old_daily = self.risk.daily_pnl
-        # 华泰账的盈亏变动不记进 changes，用账本加总会把日亏打成 0，熔断会短暂失效。
+        # 柜台账的盈亏变动不记进 changes，用账本加总会把日亏打成 0，熔断会短暂失效。
         if str(book.get("funding") or "") == "ctp":
-            logger.info("华泰账当日盈亏跟柜台，不对账本改日亏（当前 {:.2f}）", old_daily)
+            logger.info("柜台账当日盈亏跟柜台，不对账本改日亏（当前 {:.2f}）", old_daily)
         else:
             self.risk.set_daily_pnl(today_realized_pnl(book))
         if changed:
@@ -1159,8 +1160,7 @@ class TradingBot(
 
     def _reconcile_broker_at_startup(self) -> None:
         """启动时先和柜台对一次账；柜台还没登录就推迟到登录完成后再做。"""
-        executor = str((self.cfg.get("trade") or {}).get("executor", "sim"))
-        if executor != "ctp" or self.cfg.get("dry_run", True):
+        if not self.trader_capabilities.can_query_positions or self.cfg.get("dry_run", True):
             return
         if not hasattr(self.trader, "reconcile"):
             return
@@ -1725,8 +1725,7 @@ class TradingBot(
             return
 
         if not self.logged_in:
-            executor = str((self.cfg.get("trade") or {}).get("executor", "sim"))
-            if executor == "ctp":
+            if self.trader_capabilities.orders_via_broker:
                 self._gui_price_ready = True
                 # 连不上就停手，按间隔在下一轮重试；不能拿「已登录」硬着头皮开仓。
                 if not self._arm_ctp():
@@ -1777,10 +1776,9 @@ class TradingBot(
         self._persist_state()
 
     def setup_schedule(self) -> None:
-        """注册每日登录时间点。柜台通道不点同花顺，所以不注册这些钟点。"""
-        executor = str((self.cfg.get("trade") or {}).get("executor", "sim"))
-        if executor == "ctp":
-            logger.info("执行通道是 CTP，跳过同花顺定时登录")
+        """注册每日登录时间点。柜台通道不点交易软件，所以不注册这些钟点。"""
+        if self.trader_capabilities.orders_via_broker:
+            logger.info("执行通道直接连柜台，跳过 GUI 定时登录")
             return
         times = self.cfg.get("schedule", {}).get("login_times", [])
         for t in times:
@@ -1805,10 +1803,10 @@ class TradingBot(
 
     def run_forever(self) -> None:
         """阻塞运行：定时登录 + 周期扫描。Ctrl+C 或 stop() 退出。"""
-        executor = str((self.cfg.get("trade") or {}).get("executor", "sim"))
+        caps = self.trader_capabilities
         # GUI 多品种硬拦：没有自动切合约时挂机过于危险。只检查常驻实际扫描的品种。
         allow_multi = bool((self.cfg.get("trade") or {}).get("gui", {}).get("allow_multi_symbol", False))
-        if executor == "gui" and len(self.scan_symbols) > 1 and not allow_multi:
+        if caps.window_driven and len(self.scan_symbols) > 1 and not allow_multi:
             raise RuntimeError(
                 f"GUI 模式禁止多品种同时挂机：当前 {self.scan_symbols}。"
                 "请在配置里只留一个合约，或标定 symbol_input 并设 trade.gui.allow_multi_symbol=true。"
@@ -1835,7 +1833,14 @@ class TradingBot(
             self.scan_interval,
             getattr(self.strategy, "__class__", type(self.strategy)).__name__,
         )
-        logger.info("账号通道: 华泰期货_CTP主席。执行通道 sim/gui/ctp 都可用；ctp 与测试窗口同一套接口")
+        logger.info(
+            "执行通道: {} | 查持仓={} 查委托={} 确认成交={} 窗口点击={}",
+            type(self.trader).__name__,
+            caps.can_query_positions,
+            caps.can_query_orders,
+            caps.confirms_fill,
+            caps.window_driven,
+        )
 
         # 启动即跑一次盘前行情适配审计：打印所有关注品种 × 各策略的行情适配状态。
         # 独立线程跑，不阻塞启动（K 线拉取有网络延迟）。
@@ -1854,9 +1859,8 @@ class TradingBot(
         from src.login.prepare import startup_should_login
 
         # 准备按钮刚刚登录过，这里再登录会把交易菜单再点开一次。
-        executor = str((self.cfg.get("trade") or {}).get("executor", "sim"))
-        if executor == "ctp":
-            # 柜台通道自己登录 CTP，不再点同花顺。连不上时 logged_in 保持 False，下一轮重试。
+        if caps.orders_via_broker:
+            # 柜台通道自己登录 CTP，不再点交易软件。连不上时 logged_in 保持 False，下一轮重试。
             self._gui_price_ready = True
             self._arm_ctp()
         elif startup_should_login(self.cfg):
