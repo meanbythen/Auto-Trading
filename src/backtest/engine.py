@@ -7,7 +7,6 @@
 from __future__ import annotations
 
 import copy
-import json
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
@@ -19,6 +18,7 @@ from loguru import logger
 from src.backtest.bar_cursor import BarCursor, _ts_to_dt
 from src.backtest.bar_cursor import _trend_frame_for_signal  # noqa: F401  旧调用方仍从 engine 取这个名字
 from src.backtest.evaluation import EvaluationThresholds, evaluate_backtest
+from src.backtest.experiment import archive_report, new_experiment, research_dataset_reference, snapshot_bars
 from src.backtest.exit_policy import (
     carry_stop_price as _carry_stop_price,
     exit_fill_price as _exit_fill_price,
@@ -559,6 +559,7 @@ class _BacktestRun:
     equity_times: list[str] = field(default_factory=list)
     open_meta: dict[str, Any] = field(default_factory=dict)
     rejected: list[RejectedSignal] = field(default_factory=list)
+    ambiguities: list[dict[str, Any]] = field(default_factory=list)
     # 同一交易时段里，同一层、同方向、同一类原因只留第一条。
     seen_rejects: set[tuple[str, str, str, str, str]] = field(default_factory=set)
 
@@ -914,6 +915,19 @@ def _execution_bar(run: _BacktestRun, ctx: _BarContext) -> Any:
     return None
 
 
+def _exit_fill_time(
+    run: _BacktestRun,
+    ctx: _BarContext,
+    *,
+    stop_filled: bool,
+    next_open: float | None,
+) -> datetime:
+    """成交时间跟实际采用的价格走：根内止损用当根，下一根开盘用下一根时间。"""
+    if not stop_filled and next_open is not None and ctx.i + 1 < len(run.bars_signal):
+        return _ts_to_dt(run.bars_signal.index[ctx.i + 1])
+    return ctx.now
+
+
 def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
     """执行开仓/反手/加仓。True=已开仓，False=处理完没开，None=这根直接跳过。"""
     strategy = run.strategy
@@ -948,6 +962,8 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
         held = pos.side
         # 用这根之前已知的止损判定和成交；本根新算的止损下一根才生效。
         pos_stop = stop_before or _position_stop(pos, decision.stop_price)
+        touch_stop = bool(getattr(strategy, "stop_on_touch", True))
+        stop_filled = touch_stop and _stop_breached(held, pos_stop, signal_df)
         exit_px = _exit_fill_price(
             side=held,
             stop=pos_stop,
@@ -955,8 +971,10 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
             next_open=next_open,
             close_px=px,
             fill=run.fill,
-            touch_stop=bool(getattr(strategy, "stop_on_touch", True)),
+            touch_stop=touch_stop,
         )
+        exit_dt = _exit_fill_time(run, ctx, stop_filled=stop_filled, next_open=next_open)
+        exit_time = exit_dt.isoformat(timespec="seconds")
         entry_px = float(pos.entry_price or run.open_meta.get("entry_price") or exit_px)
         vol_now = int(pos.volume or 0)
         gross = (
@@ -971,7 +989,7 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
             volume=vol_now,
             held=vol_now,
             open_meta=run.open_meta,
-            exit_time=now.isoformat(timespec="seconds"),
+            exit_time=exit_time,
         )
         run.cash += pnl
         run.trades.append(
@@ -979,7 +997,7 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
                 symbol=symbol,
                 side=held,
                 entry_time=str(run.open_meta.get("entry_time", "")),
-                exit_time=now.isoformat(timespec="seconds"),
+                exit_time=exit_time,
                 entry_price=entry_px,
                 exit_price=exit_px,
                 volume=vol_now,
@@ -1005,7 +1023,7 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.warning("{} 平仓后进化没跑完: {}", symbol, exc)
-        run.limits.on_close(pnl, vol_now, symbol, at=now)
+        run.limits.on_close(pnl, vol_now, symbol, at=exit_dt)
         run.limits.note_equity(run.cash)
         run.open_meta = {}
         pos = strategy.positions.get(symbol)
@@ -1146,13 +1164,14 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
         open_vol,
         initial_stop=stop,
     )
-    run.limits.on_open(now, decision.action.value, open_vol, symbol)
+    entry_time = _ts_to_dt(entry_ts)
+    run.limits.on_open(entry_time, decision.action.value, open_vol, symbol)
     pos_after = strategy.positions.get(symbol)
     # 有些策略（日内实体）开仓时用真实时钟记 opened_at；
-    # 回测里必须改成这根K线的模拟时间，否则通用止损会把这些历史K线
+    # 回测里必须改成实际成交根的模拟时间，否则通用止损会把这些历史K线
     # 全当成「开仓之前」，整段回测都不会生效。
     if pos_after is not None and pos_after.side != "flat" and not is_add:
-        pos_after.opened_at = now.isoformat(timespec="seconds")
+        pos_after.opened_at = entry_time.isoformat(timespec="seconds")
     open_fee = fee_open(run.contracts, symbol, open_vol)
     if is_add and run.open_meta:
         # 加仓后按真实成交价重算均价；不再用策略内部的信号价。
@@ -1232,15 +1251,62 @@ def _close_position(run: _BacktestRun, ctx: _BarContext) -> bool:
             key="涨跌停不平仓",
         )
         return False
-    exit_px = _exit_fill_price(
+    touch_stop = bool(getattr(strategy, "stop_on_touch", True))
+    stop_filled = touch_stop and _stop_breached(side, pos_stop, fill_bar)
+    stop_px = _exit_fill_price(
         side=side,
         stop=pos_stop,
         bar=fill_bar,
         next_open=exit_next_open,
         close_px=px,
         fill=run.fill,
-        touch_stop=False if flatten_close else bool(getattr(strategy, "stop_on_touch", True)),
+        touch_stop=True,
     )
+    signal_px = _exit_fill_price(
+        side=side,
+        stop=pos_stop,
+        bar=fill_bar,
+        next_open=exit_next_open,
+        close_px=px,
+        fill=run.fill,
+        touch_stop=False,
+    )
+    signal_dt = _exit_fill_time(run, ctx, stop_filled=False, next_open=exit_next_open)
+    use_stop = stop_filled and not flatten_close
+    exit_px = stop_px if use_stop else signal_px
+    exit_dt = now if use_stop else signal_dt
+    ambiguity: dict[str, Any] | None = None
+    optimistic_px = signal_px
+    optimistic_dt = signal_dt
+    explicit_stop = bool(meta.get("generic_stop")) or "止损" in str(decision.reason)
+    if stop_filled and not explicit_stop and abs(stop_px - signal_px) > 1e-9:
+        # 主动离场和止损落在同一根时，OHLC 不能证明根内路径。
+        # 不挑对收益更有利的解释：两种候选里取对持仓更差的价格及其对应时间。
+        use_stop = (side == "long" and stop_px < signal_px) or (
+            side == "short" and stop_px > signal_px
+        )
+        exit_px = stop_px if use_stop else signal_px
+        exit_dt = now if use_stop else signal_dt
+        optimistic_px = signal_px if use_stop else stop_px
+        optimistic_dt = signal_dt if use_stop else now
+        entry_same_bar = str(run.open_meta.get("entry_time") or "") == now.isoformat(
+            timespec="seconds"
+        )
+        ambiguity = {
+            "symbol": symbol,
+            "time": exit_dt.isoformat(timespec="seconds"),
+            "signal_time": now.isoformat(timespec="seconds"),
+            "kind": "entry_stop_and_exit_same_bar" if entry_same_bar else "stop_and_exit_same_bar",
+            "side": side,
+            "stop": float(pos_stop),
+            "selected_exit_price": float(exit_px),
+            "selected_exit_time": exit_dt.isoformat(timespec="seconds"),
+            "optimistic_exit_price": float(optimistic_px),
+            "optimistic_exit_time": optimistic_dt.isoformat(timespec="seconds"),
+            "reason": str(decision.reason),
+            "resolution": "conservative_worst_of_stop_and_signal",
+            "needs_fine_review": True,
+        }
     entry = float(pos.entry_price or run.open_meta.get("entry_price") or exit_px)
     held = int(pos.volume or 0)
     # 减仓：meta.volume / close_volume 指定平多少；否则全平。
@@ -1253,7 +1319,8 @@ def _close_position(run: _BacktestRun, ctx: _BarContext) -> bool:
     else:
         vol = held
     gross = (exit_px - entry) * vol * mult if side == "long" else (entry - exit_px) * vol * mult
-    exit_time = now.isoformat(timespec="seconds")
+    exit_time = exit_dt.isoformat(timespec="seconds")
+    optimistic_meta = copy.deepcopy(run.open_meta) if ambiguity is not None else None
     pnl, fee = _net_pnl_after_fees(
         run.contracts,
         symbol,
@@ -1263,6 +1330,24 @@ def _close_position(run: _BacktestRun, ctx: _BarContext) -> bool:
         open_meta=run.open_meta,
         exit_time=exit_time,
     )
+    if ambiguity is not None and optimistic_meta is not None:
+        optimistic_gross = (
+            (optimistic_px - entry) * vol * mult
+            if side == "long"
+            else (entry - optimistic_px) * vol * mult
+        )
+        optimistic_pnl, _optimistic_fee = _net_pnl_after_fees(
+            run.contracts,
+            symbol,
+            gross=optimistic_gross,
+            volume=vol,
+            held=held,
+            open_meta=optimistic_meta,
+            exit_time=optimistic_dt.isoformat(timespec="seconds"),
+        )
+        ambiguity["volume"] = vol
+        ambiguity["pnl_impact_vs_optimistic"] = round(pnl - optimistic_pnl, 2)
+        run.ambiguities.append(ambiguity)
     run.cash += pnl
     run.trades.append(
         _make_trade_record(
@@ -1295,7 +1380,7 @@ def _close_position(run: _BacktestRun, ctx: _BarContext) -> bool:
             )
         except Exception as exc:  # noqa: BLE001
             logger.warning("{} 平仓后进化没跑完: {}", symbol, exc)
-    run.limits.on_close(pnl, vol, symbol, at=now)
+    run.limits.on_close(pnl, vol, symbol, at=exit_dt)
     run.limits.note_equity(run.cash)
     pos_left = strategy.positions.get(symbol)
     if not pos_left or pos_left.side == "flat" or int(pos_left.volume or 0) <= 0:
@@ -1317,6 +1402,14 @@ def _step_backtest_bar(run: _BacktestRun, i: int, view: Any) -> None:
             ctx.decision = run.pending_exit
         else:
             run.pending_exit = None
+    trades_before = len(run.trades)
+    pos_before = run.strategy.positions.get(run.symbol)
+    upnl_before = 0.0
+    if pos_before and pos_before.side == "long" and pos_before.volume:
+        upnl_before = (ctx.px - pos_before.entry_price) * pos_before.volume * run.mult
+    elif pos_before and pos_before.side == "short" and pos_before.volume:
+        upnl_before = (pos_before.entry_price - ctx.px) * pos_before.volume * run.mult
+    equity_before = run.cash + upnl_before
     opened_this_bar = False
     if ctx.decision.action in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN):
         opened = _open_position(run, ctx)
@@ -1326,6 +1419,15 @@ def _step_backtest_bar(run: _BacktestRun, i: int, view: Any) -> None:
     elif ctx.decision.action == StrategyAction.CLOSE:
         if not _close_position(run, ctx) and run.pending_exit is None:
             return
+    # 下一根才成交的盈亏不能提前记进信号根；信号根仍按当时持仓和收盘价估值。
+    future_open = bool(opened_this_bar and run.fill.on_next_open and ctx.next_open is not None)
+    future_exit = len(run.trades) > trades_before and pd.Timestamp(
+        run.trades[-1].exit_time
+    ) > pd.Timestamp(ctx.now)
+    if future_open or future_exit:
+        run.equity.append(equity_before)
+        run.equity_times.append(ctx.now.isoformat(timespec="seconds"))
+        return
     # 浮动权益：现金 + 未实现盈亏。刚开的仓按下一根开盘成交，当根还不持有，不算浮盈。
     pos = run.strategy.positions.get(run.symbol)
     upnl = 0.0
@@ -1466,6 +1568,15 @@ def _params_snapshot(setup: _BacktestSetup, run: _BacktestRun) -> dict[str, Any]
         "margin_used": peak_margin(run.trades, run.mult, MARGIN_RATE),
         "margin_rate": MARGIN_RATE,
         "skipped_opens": dict(limits.skipped),
+        "ambiguity_count": len(run.ambiguities),
+        "ambiguity_pnl_impact": round(
+            sum(float(row.get("pnl_impact_vs_optimistic") or 0) for row in run.ambiguities), 2
+        ),
+        "ambiguity_note": (
+            "同根止损与离场先后不明时取更差候选；影响是相对乐观口径的净盈亏差，需细粒度复核。"
+            if run.ambiguities
+            else ""
+        ),
     }
 
 
@@ -1620,6 +1731,28 @@ def run_backtest(
         perf.payoff,
         perf.net_pnl,
     )
+    details = {
+        "symbol": symbol,
+        "engine": snap.get("engine", ""),
+        "timeframe": tf,
+        "trail_timeframe": trail_tf,
+        "data_source": snap.get("data_source", ""),
+        "start_date": snap.get("start_date", ""),
+        "end_date": snap.get("end_date", ""),
+        "data_from": snap.get("data_from", ""),
+        "data_to": snap.get("data_to", ""),
+        "random_seed": (cfg.get("backtest") or {}).get("seed", "not_used"),
+        "research_dataset": research_dataset_reference(cfg),
+        "execution_ambiguity": {
+            "count": len(run.ambiguities),
+            "pnl_impact_vs_optimistic": snap["ambiguity_pnl_impact"],
+        },
+        "costs": {
+            "slippage_ticks": snap.get("slippage_ticks"),
+            "price_tick": snap.get("price_tick"),
+            "fill_note": snap.get("fill_note", ""),
+        },
+    }
     result = BacktestResult(
         symbol=symbol,
         timeframe=tf,
@@ -1631,8 +1764,11 @@ def run_backtest(
         equity_times=equity_times,
         params_snapshot=snap,
         rejected=run.rejected,
+        ambiguities=run.ambiguities,
         # 记到秒。同一次回测的摘要和每一笔成交共用这个时间，再导出也不会变。
         ran_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        experiment=new_experiment("backtest", cfg, details=details),
+        _experiment_data=snapshot_bars(signal=bars_signal, trail=bars_trail, trend=bars_trend),
     )
     if eval_thresholds.enabled:
         result.evaluation = evaluate_backtest(result, thresholds=eval_thresholds)
@@ -1641,6 +1777,18 @@ def run_backtest(
 
 def save_backtest_report(result: BacktestResult, out_path: Path | str) -> Path:
     path = Path(out_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(result.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+    details = {
+        "symbol": result.symbol,
+        "timeframe": result.timeframe,
+        "trail_timeframe": result.trail_timeframe,
+        "execution_ambiguity": {
+            "count": len(result.ambiguities),
+            "pnl_impact_vs_optimistic": result.params_snapshot.get("ambiguity_pnl_impact", 0),
+        },
+        "costs": {
+            "slippage_ticks": result.params_snapshot.get("slippage_ticks"),
+            "price_tick": result.params_snapshot.get("price_tick"),
+        },
+    }
+    archive_report(result, path, result.to_dict(), kind="backtest", details=details)
     return path

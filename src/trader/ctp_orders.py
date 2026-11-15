@@ -17,6 +17,7 @@ from src.trader.ctp_logic import (
     close_sides_for_view,
     reverse_open_side,
 )
+from src.trader.order_timeline import new_trace_id
 
 
 def ctp_order(
@@ -29,6 +30,8 @@ def ctp_order(
     stop_price: float | None = None,
     bar_id: str = "",
     remark: str = "",
+    trace_id: str = "",
+    meta: dict[str, Any] | None = None,
 ) -> OrderRequest:
     """组一笔和常驻相同字段的限价单。stop_price / bar_id 只记在本地，不改变柜台报单格式。"""
     return OrderRequest(
@@ -40,6 +43,8 @@ def ctp_order(
         stop_price=stop_price,
         bar_id=str(bar_id or ""),
         remark=str(remark or ""),
+        trace_id=str(trace_id or (meta or {}).get("trace_id") or "") or new_trace_id(),
+        meta=dict(meta or {}),
     )
 
 

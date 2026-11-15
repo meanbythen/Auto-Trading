@@ -14,6 +14,7 @@ from typing import Any
 from loguru import logger
 
 from .base import DEFAULT_CAPABILITIES, Capabilities, OrderRequest, OrderResult, TraderBase
+from .order_timeline import now_iso
 
 
 class SimTrader(TraderBase):
@@ -31,13 +32,21 @@ class SimTrader(TraderBase):
 
     def place_order(self, req: OrderRequest) -> OrderResult:
         order_id = f"SIM-{uuid.uuid4().hex[:8]}"
+        simulated_at = now_iso()
         payload = {
             "order_id": order_id,
+            "trace_id": req.trace_id,
+            "bar_id": req.bar_id,
             "symbol": req.symbol,
             "side": req.side,
             "volume": req.volume,
+            "filled_volume": int(req.volume),
             "price": req.price,
             "remark": req.remark,
+            "simulated_fill": True,
+            "simulated_at": simulated_at,
+            "channel_result_at": simulated_at,
+            "broker_confirmed": False,
         }
         self.orders.append(payload)
 

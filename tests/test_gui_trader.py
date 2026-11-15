@@ -191,9 +191,15 @@ def test_resident_order_does_not_type_a_limit_price(monkeypatch) -> None:
     """常驻即使请求里带了价格，也只核对对手价，不把数字打进价格框。"""
     trader = _trader()
     events = _mute_mouse(monkeypatch, trader, ["对手价", "对手价"])
-    result = trader.place_order(OrderRequest("bu2612", "sell_open", 1, 4720))
+    result = trader.place_order(
+        OrderRequest("bu2612", "sell_open", 1, 4720, bar_id="bar-1", trace_id="OT-GUI-1")
+    )
     assert result.ok
     assert result.assumed_fill is True
+    assert result.raw["trace_id"] == "OT-GUI-1"
+    assert result.raw["bar_id"] == "bar-1"
+    assert "trade_id" not in result.raw
+    assert "trade_time" not in result.raw
     typed = [item[1] for item in events if item[0] == "type"]
     assert typed == ["1"]
     # 常驻只核对对手价，不能把价格框里的字删掉或改成限价。

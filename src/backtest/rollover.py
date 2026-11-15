@@ -24,6 +24,7 @@ from loguru import logger
 
 from src.backtest.engine import BacktestResult, run_backtest
 from src.backtest.evaluation import EvaluationThresholds, evaluate_backtest
+from src.backtest.experiment import fingerprint_file, new_experiment, research_dataset_reference
 from src.backtest.main_table import ManualRow, read_manual_rows
 from src.backtest.metrics import TradeRecord, calc_performance, peak_margin
 from src.risk.delivery import apply_delivery_cutoff, extend_last_before_delivery
@@ -419,6 +420,7 @@ def run_backtest_rollover(
     lasts: list[BacktestResult] = []
     # 各段里「有信号但没开成」的记录也接在一起，换月回测同样能看到为什么没做。
     rejected: list[Any] = []
+    ambiguities: list[dict[str, Any]] = []
     # 每段默认用同一份起始资金：每一段的手数都能直接和单合约回测对照，
     # 不会因为前面几段亏损导致后面的段开不了仓。
     start_capital = float(
@@ -465,6 +467,7 @@ def run_backtest_rollover(
         total_bars += int(result.bars)
         trades.extend(result.trades)
         rejected.extend(result.rejected)
+        ambiguities.extend(result.ambiguities)
         inherit = _carry_from_result(result)
         if result.equity:
             # 固定资金口径：段内从同一份起始资金起算，拼总曲线时把本段整体平移到
@@ -541,6 +544,13 @@ def run_backtest_rollover(
             ),
             # 手续费、保证金都按同一个品种算；这里按全部成交重算峰值。
             "margin_used": peak_margin(trades, mult),
+            "ambiguity_count": len(ambiguities),
+            "ambiguity_pnl_impact": round(
+                sum(float(row.get("pnl_impact_vs_optimistic") or 0) for row in ambiguities), 2
+            ),
+            "ambiguity_note": (
+                "各换月分段合并；同根冲突取更差候选，需细粒度复核。" if ambiguities else ""
+            ),
         }
     )
     # 各段的「没开成原因」合并，方便看出是不是某一类限制一直在拦。
@@ -560,6 +570,45 @@ def run_backtest_rollover(
         perf.win_rate,
         perf.net_pnl,
     )
+    details = {
+        "symbol": f"{product}主力连续",
+        "engine": snap.get("engine", ""),
+        "timeframe": lasts[-1].timeframe,
+        "trail_timeframe": lasts[-1].trail_timeframe,
+        "data_source": snap.get("data_source", ""),
+        "start_date": start_date or "",
+        "end_date": end_date or "",
+        "data_from": snap.get("data_from", ""),
+        "data_to": snap.get("data_to", ""),
+        "random_seed": (cfg.get("backtest") or {}).get("seed", "not_used"),
+        "research_dataset": research_dataset_reference(cfg),
+        "execution_ambiguity": {
+            "count": len(ambiguities),
+            "pnl_impact_vs_optimistic": snap["ambiguity_pnl_impact"],
+        },
+        "main_contract_table": fingerprint_file(table),
+        "costs": {
+            "slippage_ticks": snap.get("slippage_ticks"),
+            "price_tick": snap.get("price_tick"),
+            "fill_note": snap.get("fill_note", ""),
+        },
+    }
+    experiment = new_experiment("backtest_rollover", cfg, details=details)
+    experiment["components"] = [
+        {
+            "experiment_id": (item.experiment or {}).get("experiment_id", ""),
+            "symbol": item.symbol,
+            "config_sha256": (item.experiment.get("config") or {}).get("sha256", "")
+            if item.experiment
+            else "",
+            "details": (item.experiment or {}).get("details") or {},
+        }
+        for item in lasts
+    ]
+    experiment_data: dict[str, Any] = {}
+    for index, item in enumerate(lasts, 1):
+        for name, frame in (item._experiment_data or {}).items():
+            experiment_data[f"segment_{index:03d}_{name}"] = frame
     result = BacktestResult(
         symbol=f"{product}主力连续",
         timeframe=lasts[-1].timeframe,
@@ -571,7 +620,10 @@ def run_backtest_rollover(
         equity_times=equity_times,
         params_snapshot=snap,
         rejected=rejected,
+        ambiguities=ambiguities,
         ran_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        experiment=experiment,
+        _experiment_data=experiment_data,
     )
     th = EvaluationThresholds.from_cfg(cfg)
     if th.enabled:

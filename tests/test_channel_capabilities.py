@@ -12,6 +12,8 @@ from src.strategy.types import StrategyAction, StrategyDecision
 from src.trader.base import Capabilities, TraderBase, capabilities_for
 from src.trader.base import OrderRequest, OrderResult
 from src.trader.factory import create_trader
+from src.trader.order_timeline import OrderTimeline
+from src.trader.sim_trader import SimTrader
 
 
 class _BlindTrader(TraderBase):
@@ -153,6 +155,44 @@ def test_blind_channel_runs_open_and_close_with_assumed_fill() -> None:
     orders = [kw for name, kw in bot._events if name == "order"]  # type: ignore[attr-defined]
     assert len(orders) == 2
     assert all(row["assumed_fill"] is True for row in orders)
+
+
+def test_sim_channel_records_an_explicit_pure_simulation_chain(tmp_path) -> None:
+    """Sim 全链使用同一关联号，成交和入账都明确标成纯模拟。"""
+    bot = _bot()
+    bot.root = tmp_path
+    bot.cfg["trade"]["executor"] = "sim"
+    bot.trader = SimTrader(tmp_path / "data")
+    bot._order_timeline = OrderTimeline(None)
+
+    assert bot._execute(
+        StrategyDecision(
+            StrategyAction.BUY_OPEN,
+            "fu2701",
+            "突破",
+            entry_price=100.0,
+            stop_price=90.0,
+            meta={"bar_id": "bar-1", "market_health": {"signal_bar_time": "10:00"}},
+        )
+    ) is True
+
+    rows = bot._order_timeline.rows
+    stages = [row["stage"] for row in rows]
+    assert stages == [
+        "market_snapshot", "bar_closed", "strategy_decision", "risk_intent",
+        "order_sent", "channel_result", "simulated_fill", "accounted",
+    ]
+    trace_id = bot.trader.orders[0]["trace_id"]
+    assert trace_id
+    assert {row["trace_id"] for row in rows} == {trace_id}
+    simulated = next(row for row in rows if row["stage"] == "simulated_fill")
+    accounted = next(row for row in rows if row["stage"] == "accounted")
+    assert simulated["price_kind"] == "pure_simulation"
+    assert simulated["broker_confirmed"] is False
+    assert "trade_id" not in simulated
+    assert accounted["fill_kind"] == "simulated_fill"
+    assert accounted["broker_confirmed"] is False
+    assert accounted["fill_to_account_ms"] is not None
 
 
 def test_unknown_executor_rejected_when_live() -> None:

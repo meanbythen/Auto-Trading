@@ -47,6 +47,7 @@ from src.trader.ctp_logic import (
     product_code,
 )
 from src.trader.ctp_trader import CtpTrader
+from src.trader.order_timeline import load_rows
 
 
 def test_ctp_missing_dry_run_never_reaches_counter() -> None:
@@ -423,6 +424,53 @@ def test_login_chain_then_buy_open_is_a_real_fill() -> None:
     assert result.raw["fill_price"] == 4569
     assert client.inserts[0]["direction"] == "0"
     assert client.inserts[0]["offset"] == "0"
+
+
+def test_order_timeline_keeps_real_broker_fields(tmp_path) -> None:
+    """假柜台也只走真实回报字段：本地关联号不能替代柜台编号和成交号。"""
+    client = FakeClient()
+
+    def accept_and_fill(listener, order):
+        listener.on_order_status(
+            order["order_ref"], "3", 0, "已报",
+            exchange_id="SHFE", order_sys_id="     13094",
+            detail={"insert_time": "10:00:00"},
+        )
+        listener.on_trade(
+            order["order_ref"], order["price"], order["volume"],
+            {"trade_id": "TRADE-1", "time": "10:00:01", "order_sys_id": "     13094"},
+        )
+
+    client.on_insert = accept_and_fill
+    settings = _settings()
+    settings.project_root = str(tmp_path)
+    gateway = CtpGateway(settings, client)
+    trader = CtpTrader({"dry_run": False, "trade": {"ctp": {}}}, gateway)
+    reports: list[dict] = []
+    trader.set_fill_handler(lambda report: reports.append(report))
+    trader.connect()
+
+    result = trader.place_order(
+        OrderRequest(
+            "bu2612", "buy_open", 1, 4569,
+            bar_id="bar-1", trace_id="OT-CTP-1",
+            meta={"theory_price": 4560, "latest_price": 4565},
+        )
+    )
+
+    assert result.ok is True
+    rows = load_rows(tmp_path, "OT-CTP-1")
+    stages = [row["stage"] for row in rows]
+    assert stages == ["preflight", "order_sent", "broker_report", "trade", "channel_result"]
+    trade = next(row for row in rows if row["stage"] == "trade")
+    assert trade["trade_id"] == "TRADE-1"
+    assert trade["trade_time"] == "10:00:01"
+    assert trade["order_sys_id"] == "     13094"
+    assert trade["broker_confirmed"] is True
+    assert reports[0]["trace_id"] == "OT-CTP-1"
+    assert reports[0]["meta"]["theory_price"] == 4560
+    assert reports[0]["trade_id"] == "TRADE-1"
+    assert reports[0]["trade_received_at"]
 
 
 def test_connect_timeout_releases_client_so_retry_can_restart() -> None:

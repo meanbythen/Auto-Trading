@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -39,6 +40,7 @@ from src.data.periods import (
     overlay_minute_bars,
     period_label,
     resample_ohlc,
+    stale_after_minutes,
 )
 from src.data.tq_source import session_open_minutes
 from src.utils import load_secrets
@@ -145,6 +147,89 @@ class KlineProvider:
         self.max_stale_minutes = float(data_cfg.get("max_stale_minutes", 90))
         # 同一次扫描里，5 分钟和 15 分钟都要用 1 分钟来拼，短时间只下载一次。
         self._minute_cache: tuple[str, float, pd.DataFrame] | None = None
+        # 每个合约/周期保留最近一次下载或失败证据；成功时同一份也挂在 bars.attrs 上。
+        self._market_health: dict[str, dict[str, Any]] = {}
+
+    @staticmethod
+    def _market_health_key(symbol: str, period: str) -> str:
+        return f"{symbol.strip().lower()}|{canonical_period(period)}"
+
+    def get_market_health(self, symbol: str, period: str) -> dict[str, Any]:
+        """取最近一次行情健康记录；断流没有 K 线可挂 attrs 时也能查到。"""
+        return dict(self._market_health.get(self._market_health_key(symbol, period), {}))
+
+    def fetch(
+        self,
+        symbol: str,
+        period: str | None = None,
+        *,
+        max_bars: int | None = None,
+        keep_history: bool = False,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> pd.DataFrame:
+        """获取 K 线，并记录来源、下载耗时、接收时间和最新 K 线年龄。"""
+        canonical = canonical_period(period or self.period)
+        key = self._market_health_key(symbol, canonical)
+        started_at = datetime.now().astimezone()
+        started = time.perf_counter()
+        try:
+            bars = self._fetch_impl(
+                symbol,
+                canonical,
+                max_bars=max_bars,
+                keep_history=keep_history,
+                start=start,
+                end=end,
+            )
+        except Exception as exc:
+            health = {
+                "symbol": symbol,
+                "period": canonical,
+                "source": self.source,
+                "status": "error",
+                "fetch_started_at": started_at.isoformat(timespec="milliseconds"),
+                "received_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                "download_ms": round((time.perf_counter() - started) * 1000.0, 3),
+                "latest_bar_time": "",
+                "latest_bar_age_minutes": None,
+                "from_cache": False,
+                "stale": True,
+                "synthetic": self.source == "demo",
+                "error": str(exc),
+            }
+            self._market_health[key] = health
+            raise
+
+        age = bars_age_minutes(bars)
+        stale_limit = stale_after_minutes(canonical, self.max_stale_minutes)
+        from_cache = bool(bars.attrs.get("from_cache", False))
+        error = str(bars.attrs.get("download_error", "") or "")
+        stale = bool(age is None or age > stale_limit)
+        status = "stale" if stale else ("cache" if from_cache or error else "ok")
+        health = {
+            "symbol": symbol,
+            "period": canonical,
+            "source": self.source,
+            "status": status,
+            "fetch_started_at": started_at.isoformat(timespec="milliseconds"),
+            "received_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            "download_ms": round((time.perf_counter() - started) * 1000.0, 3),
+            "latest_bar_time": str(bars.index[-1]) if len(bars) else "",
+            "latest_bar_age_minutes": None if age is None else round(age, 3),
+            "stale_limit_minutes": stale_limit,
+            "from_cache": from_cache,
+            "stale": stale,
+            "synthetic": self.source == "demo",
+            "error": error,
+        }
+        # 只写元数据，不换数据源、不改 K 线值。调用方可把这份证据带进信号和委托。
+        bars.attrs["source"] = self.source
+        bars.attrs["bars_age_minutes"] = age
+        bars.attrs["stale"] = stale
+        bars.attrs["market_health"] = dict(health)
+        self._market_health[key] = dict(health)
+        return bars
 
     def _to_sina_symbol(self, symbol: str) -> str:
         """
@@ -204,7 +289,7 @@ class KlineProvider:
         except Exception:  # noqa: BLE001
             return 0.0
 
-    def fetch(
+    def _fetch_impl(
         self,
         symbol: str,
         period: str | None = None,
@@ -260,7 +345,9 @@ class KlineProvider:
                     local.index[0],
                     local.index[-1],
                 )
-                return fix_gap_spanning_bars(local)
+                out = fix_gap_spanning_bars(local)
+                out.attrs["from_cache"] = True
+                return out
             raise RuntimeError(
                 f"本地还没有 {symbol} 的同花顺图K线。"
                 "请到历史回测页点「从同花顺图读取K线」。读完再跑回测。"
@@ -278,11 +365,15 @@ class KlineProvider:
             )
             if self.source in {"tq", "ths"}:
                 # 天勤和同花顺图已经是右标签，不再拿新浪的1分钟来重拼。
+                local.attrs["from_cache"] = True
                 return local
             fixed = self._rebuild_with_minutes(symbol, sina_code, period, local)
-            return fix_gap_spanning_bars(fixed) if fixed is not None else fix_gap_spanning_bars(local)
+            out = fix_gap_spanning_bars(fixed) if fixed is not None else fix_gap_spanning_bars(local)
+            out.attrs["from_cache"] = True
+            return out
 
         fresh: pd.DataFrame | None = None
+        download_error = ""
         if self.source == "csv":
             fresh = self._load_csv(symbol, period)
         else:
@@ -306,6 +397,7 @@ class KlineProvider:
                 else:
                     fresh = self._fetch_akshare(sina_code, period, symbol_hint=symbol)
             except Exception as e:  # noqa: BLE001
+                download_error = str(e)
                 if local is not None and len(local) > 0:
                     logger.warning("行情下载失败，先用刚才存下的K线: {}", e)
                 elif self.source == "eastmoney":
@@ -340,6 +432,7 @@ class KlineProvider:
             age = bars_age_minutes(out)
             try:
                 out.attrs["from_cache"] = True
+                out.attrs["download_error"] = download_error
                 out.attrs["bars_age_minutes"] = age
                 out.attrs["stale"] = bool(age is not None and age > self.max_stale_minutes)
             except Exception:  # noqa: BLE001

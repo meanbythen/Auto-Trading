@@ -941,6 +941,7 @@ def test_champion_full_range_failure_returns_skipped_report() -> None:
 @pytest.mark.parametrize(("skipped", "conclusion"), [("测试评估失败", "watch"), ("", "reject")])
 def test_optimization_evaluation_gate_and_training_snapshot(
     monkeypatch,
+    tmp_path,
     gate_on_optimize: bool,
     skipped: str,
     conclusion: str,
@@ -967,7 +968,12 @@ def test_optimization_evaluation_gate_and_training_snapshot(
             return bars
 
     training_result = _champion_eval_result(5)
-    training_result.params_snapshot = {"segment": "train", "entry_bars": 48}
+    training_result.params_snapshot = {
+        "segment": "train",
+        "entry_bars": 48,
+        "slippage_ticks": 1.0,
+        "price_tick": 1.0,
+    }
     eval_calls = []
 
     def train_runner(_cfg, **_kwargs):
@@ -995,26 +1001,36 @@ def test_optimization_evaluation_gate_and_training_snapshot(
     )
     monkeypatch.setattr("src.backtest.optimizer._evaluate_champion_full_range", fake_full_eval)
 
-    result = optimize_strategy(
-        {
-            "strategy": {
-                "engine": "trend_follow",
-                "timeframe": "5",
-                "trail_timeframe": "5",
-                "symbols": ["fu2701"],
-                "trend_follow": {"entry_bars": 36},
-            },
-            "evaluation": {"enabled": True, "gate_on_optimize": gate_on_optimize},
+    cfg = {
+        "strategy": {
+            "engine": "trend_follow",
+            "timeframe": "5",
+            "trail_timeframe": "5",
+            "symbols": ["fu2701"],
+            "trend_follow": {"entry_bars": 36},
         },
+        "trade": {"executor": "sim"},
+        "risk": {"risk_per_trade_pct": 0.01},
+        "evaluation": {"enabled": True, "gate_on_optimize": gate_on_optimize},
+    }
+    original = copy.deepcopy(cfg)
+    result = optimize_strategy(
+        cfg,
         symbol="fu2701",
         grid={"entry_bars": [48]},
         start_date="2026-01-01",
         end_date="2026-01-02",
     )
 
+    assert cfg == original
     assert result.accepted is (not gate_on_optimize)
     assert result.evaluation_ok is False
-    assert result.best_limits == {"segment": "train", "entry_bars": 48}
+    assert result.best_limits == {
+        "segment": "train",
+        "entry_bars": 48,
+        "slippage_ticks": 1.0,
+        "price_tick": 1.0,
+    }
     assert eval_calls[0]["best_params"] == {"entry_bars": 48}
     assert eval_calls[0]["start_date"] == "2026-01-01"
     assert eval_calls[0]["end_date"] == "2026-01-02"
@@ -1022,6 +1038,20 @@ def test_optimization_evaluation_gate_and_training_snapshot(
         assert "这次不写入" in result.evaluation_reason
     else:
         assert "仅提示，不拦截写入" in result.evaluation_reason
+
+    import json
+
+    from src.backtest.optimizer import save_optimization_report
+
+    path = save_optimization_report(result, tmp_path / "optimization.json")
+    folder = path.parent / "experiments" / result.experiment["experiment_id"]
+    manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
+    assert manifest["kind"] == "optimization"
+    assert manifest["details"]["random_seed"] == 42
+    assert manifest["review_gate"]["snapshot_complete"] is True
+    assert manifest["promotion"]["live_approval"] == "not_approved"
+    assert manifest["data"]["files"]
+    assert cfg == original
 
 
 def test_optimize_walk_mode_keeps_rolling_search(monkeypatch) -> None:

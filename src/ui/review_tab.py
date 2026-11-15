@@ -226,6 +226,12 @@ class ReviewTabMixin:
                     text = f"{text}\n\n{summarize_text(self.root_dir)}"
                 except Exception:  # noqa: BLE001
                     logger.debug("滑点汇总失败，已忽略", exc_info=True)
+                try:
+                    from src.trader.order_timeline import format_recent_text
+
+                    text = f"{text}\n\n{format_recent_text(self.root_dir)}"
+                except Exception:  # noqa: BLE001
+                    logger.debug("订单时间线读取失败，已忽略", exc_info=True)
                 self._post_to_main(lambda t=text: self._set_result_text(self.rv_result_box, t))
                 self._post_to_main(lambda: self._append_log(f"复盘完成 {symbol} {raw_day}"))
             except Exception as e:  # noqa: BLE001

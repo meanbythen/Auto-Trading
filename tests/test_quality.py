@@ -1,5 +1,6 @@
 """接口原样库与清洗库分开存；质量检查只读本地、不下单。"""
 
+import json
 from datetime import datetime
 
 import pandas as pd
@@ -12,6 +13,8 @@ from src.data.quality import (
     format_quality_book_text,
     inspect_quote,
     inspect_quote_book,
+    summarize_market_health,
+    write_market_health_summary,
     write_quality_report,
 )
 
@@ -193,3 +196,71 @@ def test_book_asks_to_download_when_only_one_source(tmp_path) -> None:
     assert book.status in {"watch", "empty"}
     assert book.clean_cmp["n_sources"] == 1
     assert "只有" in book.message or "只有" in (book.clean_cmp.get("message") or "")
+
+
+def test_market_health_summary_groups_latency_by_symbol_source_and_hour(tmp_path) -> None:
+    """逐轮日志可按品种、来源和小时统计，坏行不影响其它样本。"""
+    folder = tmp_path / "data"
+    folder.mkdir()
+    base = {
+        "symbol": "fu2701",
+        "period": "5",
+        "source": "eastmoney",
+        "received_at": "2026-11-16T09:00:01+08:00",
+        "scan_gap_sec": 30.0,
+    }
+    rows = [
+        {
+            **base,
+            "download_ms": 100.0,
+            "signal_bar_age_minutes": 2.0,
+            "evaluation_ms": 10.0,
+            "stale": False,
+            "from_cache": False,
+            "status": "ok",
+            "issue": "",
+        },
+        {
+            **base,
+            "received_at": "2026-11-16T09:30:01+08:00",
+            "download_ms": 300.0,
+            "signal_bar_age_minutes": 4.0,
+            "evaluation_ms": 30.0,
+            "stale": True,
+            "from_cache": True,
+            "status": "stale",
+            "issue": "cache_stale",
+        },
+        {
+            **base,
+            "received_at": "2026-11-16T10:00:01+08:00",
+            "download_ms": 5000.0,
+            "evaluation_ms": None,
+            "stale": True,
+            "from_cache": False,
+            "status": "error",
+            "issue": "download_error",
+        },
+    ]
+    text = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
+    (folder / "market_health.jsonl").write_text(text + "\n不是JSON\n", encoding="utf-8")
+
+    table = summarize_market_health(tmp_path)
+
+    assert len(table) == 2
+    first = table.iloc[0]
+    assert first["时段"] == "2026-11-16 09:00"
+    assert first["样本数"] == 2
+    assert first["下载平均ms"] == 200.0
+    assert first["下载P95ms"] == 290.0
+    assert first["信号年龄最大分钟"] == 4.0
+    assert first["计算平均ms"] == 20.0
+    assert first["陈旧次数"] == 1
+    assert first["缓存回退次数"] == 1
+    assert first["断流次数"] == 0
+    assert "cache_stale" in first["异常分类"]
+    assert table.iloc[1]["断流次数"] == 1
+    path = write_market_health_summary(tmp_path)
+    wb = load_workbook(path, read_only=True)
+    assert "按小时汇总" in wb.sheetnames
+    assert wb["按小时汇总"].max_row == 3

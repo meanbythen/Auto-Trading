@@ -11,6 +11,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any, Literal
 
+from src.trader.order_timeline import new_trace_id
+
 
 Side = Literal["buy_open", "sell_open", "close"]
 
@@ -79,6 +81,9 @@ class OrderRequest:
     position_side: str | None = None
     stop_price: float | None = None
     bar_id: str = ""
+    # 本地时间线关联号和价格证据；不会作为柜台编号或柜台成交证明。
+    trace_id: str = field(default_factory=new_trace_id)
+    meta: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass

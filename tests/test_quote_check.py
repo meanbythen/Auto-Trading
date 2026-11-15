@@ -153,3 +153,65 @@ def test_eastmoney_fetch_does_not_ask_sina(tmp_path) -> None:
     saved = provider.store.load("bu2612@eastmoney", "5")
     assert saved is not None
     assert float(saved.iloc[-1]["open"]) == 4720
+
+
+def test_fetch_health_records_download_latency_and_bar_age(tmp_path, monkeypatch) -> None:
+    """模拟 250ms 下载：接收时间、来源、耗时和最新 K 线年龄必须可核对。"""
+    provider = KlineProvider(
+        {
+            "_project_root": str(tmp_path),
+            "data": {"source": "akshare", "cache_dir": "klines", "min_bars": 1},
+        }
+    )
+    frame = pd.DataFrame(
+        [{"open": 100, "high": 101, "low": 99, "close": 100.5, "volume": 10}],
+        index=pd.DatetimeIndex([pd.Timestamp.now().floor("min")]),
+    )
+    provider._fetch_impl = lambda *_args, **_kwargs: frame  # type: ignore[method-assign]
+    ticks = iter([100.0, 100.25])
+    monkeypatch.setattr("src.data.kline.time.perf_counter", lambda: next(ticks))
+
+    got = provider.fetch("bu2612", period="5")
+
+    health = got.attrs["market_health"]
+    assert health["source"] == "akshare"
+    assert health["download_ms"] == 250.0
+    assert health["fetch_started_at"] and health["received_at"]
+    assert health["latest_bar_time"] == str(frame.index[-1])
+    assert health["latest_bar_age_minutes"] >= 0
+    assert health["from_cache"] is False
+    assert provider.get_market_health("bu2612", "5") == health
+
+
+def test_eastmoney_outage_only_falls_back_to_eastmoney_cache(tmp_path) -> None:
+    """东财断流只能读 @eastmoney 本地库，不能悄悄换成新浪或演示数据。"""
+    provider = KlineProvider(
+        {
+            "_project_root": str(tmp_path),
+            "data": {"source": "eastmoney", "cache_dir": "klines", "min_bars": 1},
+        }
+    )
+    cached = pd.DataFrame(
+        [{"open": 100, "high": 101, "low": 99, "close": 100.5, "volume": 10}],
+        index=pd.DatetimeIndex([pd.Timestamp.now().floor("min")]),
+    )
+    provider.store.upsert("bu2612@eastmoney", "5", cached)
+
+    def offline(*_args, **_kwargs):
+        raise ConnectionError("模拟东财断流")
+
+    provider._fetch_eastmoney = offline  # type: ignore[method-assign]
+    provider._fetch_akshare = lambda *_args, **_kwargs: (_ for _ in ()).throw(  # type: ignore[method-assign]
+        AssertionError("不能跨到新浪")
+    )
+    provider._rebuild_with_minutes = lambda _symbol, _code, _period, full: full  # type: ignore[method-assign]
+
+    got = provider.fetch("bu2612", period="5")
+
+    health = got.attrs["market_health"]
+    assert health["source"] == "eastmoney"
+    assert health["from_cache"] is True
+    assert health["status"] == "cache"
+    assert "模拟东财断流" in health["error"]
+    assert got.attrs["source"] == "eastmoney"
+    assert provider.source == "eastmoney"

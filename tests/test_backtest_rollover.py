@@ -196,6 +196,9 @@ def test_rollover_fixed_capital_and_merges_trades(tmp_path, monkeypatch) -> None
     # 净值曲线把各段盈亏累计平移：总盈亏 = 各段之和，衔接处不重复记一笔
     assert result.equity == [1000.0, 1100.0, 1200.0, 1300.0]
     assert result.params_snapshot["rollover_chain"] is False
+    assert result.experiment["kind"] == "backtest_rollover"
+    assert len(result.experiment["components"]) == 3
+    assert len(result.experiment["details"]["main_contract_table"]["sha256"]) == 64
 
 
 def test_rollover_chain_capital_links_equity(tmp_path, monkeypatch) -> None:
@@ -525,6 +528,34 @@ def test_rollover_passes_carry_into_next_segment(tmp_path, monkeypatch) -> None:
     )
     assert seen[0] is None
     assert seen[1] == {"side": "long", "volume": 1}
+
+
+def test_rollover_merges_execution_ambiguities(tmp_path, monkeypatch) -> None:
+    """换月总报告不能只留下最后一段的歧义数量和影响。"""
+    path = tmp_path / "2026年主力合约表.xlsx"
+    _write_table(path, _periods())
+
+    def fake(cfg, symbol: str, *, initial_capital: float, **kwargs) -> BacktestResult:
+        result = _fake_backtest(symbol, initial_capital=initial_capital, **kwargs)
+        result.ambiguities = [{"symbol": symbol, "pnl_impact_vs_optimistic": -5.0}]
+        return result
+
+    monkeypatch.setattr(rollover, "run_backtest", fake)
+    result = rollover.run_backtest_rollover(
+        {"risk": {"capital": 1000, "contracts": {"rb": {"multiplier": 10}}}},
+        symbol="rb2610",
+        start_date="2026-01-05",
+        end_date="2026-10-30",
+        table_path=path,
+    )
+
+    assert len(result.ambiguities) == 3
+    assert result.params_snapshot["ambiguity_count"] == 3
+    assert result.params_snapshot["ambiguity_pnl_impact"] == -15.0
+    assert result.experiment["details"]["execution_ambiguity"] == {
+        "count": 3,
+        "pnl_impact_vs_optimistic": -15.0,
+    }
 
 
 def test_format_rollover_lines_explains_fallback() -> None:

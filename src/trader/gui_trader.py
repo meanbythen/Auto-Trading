@@ -1020,7 +1020,14 @@ class GuiTrader(TraderBase):
                     message=msg,
                     order_id=order_id,
                     assumed_fill=False,
-                    raw={"assumed_fill": False, "executor": "gui", "simulator": True, "price": typed_price},
+                    raw={
+                        "assumed_fill": False,
+                        "executor": "gui",
+                        "simulator": True,
+                        "price": typed_price,
+                        "trace_id": req.trace_id,
+                        "bar_id": req.bar_id,
+                    },
                 )
             msg = "GUI 下单指令已发送" if not self.dry_run else "GUI 模拟点击完成"
             logger.info("{} side={} symbol={} vol={}", msg, req.side, req.symbol, req.volume)
@@ -1030,7 +1037,12 @@ class GuiTrader(TraderBase):
                 message=msg,
                 order_id=order_id,
                 assumed_fill=not self.dry_run,
-                raw={"assumed_fill": not self.dry_run, "executor": "gui"},
+                raw={
+                    "assumed_fill": not self.dry_run,
+                    "executor": "gui",
+                    "trace_id": req.trace_id,
+                    "bar_id": req.bar_id,
+                },
             )
         except Exception as e:  # noqa: BLE001
             if clicked:
@@ -1079,5 +1091,7 @@ class GuiTrader(TraderBase):
                 "executor": "gui",
                 "unclean": True,
                 "detail": detail,
+                "trace_id": req.trace_id,
+                "bar_id": req.bar_id,
             },
         )

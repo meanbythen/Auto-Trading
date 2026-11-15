@@ -8,6 +8,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -1118,16 +1119,123 @@ def write_quality_report(root: Path | str, report: QualityReport | QuoteQualityB
     return dated
 
 
+def summarize_market_health(root: Path | str) -> pd.DataFrame:
+    """按合约、周期、来源和小时汇总逐轮延迟；只读 market_health.jsonl。"""
+    base = Path(root) / "data"
+    records: list[dict[str, Any]] = []
+    for name in ("market_health.jsonl.1", "market_health.jsonl"):
+        path = base / name
+        if not path.exists():
+            continue
+        for line in path.read_text(encoding="utf-8").splitlines():
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(row, dict):
+                records.append(row)
+    columns = [
+        "symbol",
+        "period",
+        "source",
+        "时段",
+        "样本数",
+        "下载平均ms",
+        "下载P95ms",
+        "下载最大ms",
+        "信号年龄平均分钟",
+        "信号年龄最大分钟",
+        "计算平均ms",
+        "计算P95ms",
+        "计算最大ms",
+        "扫描间隔平均秒",
+        "陈旧次数",
+        "缓存回退次数",
+        "断流次数",
+        "异常分类",
+    ]
+    if not records:
+        return pd.DataFrame(columns=columns)
+    frame = pd.DataFrame(records)
+    for name in ("received_at", "ts"):
+        if name not in frame:
+            frame[name] = pd.NaT
+    for name in ("stale", "from_cache"):
+        if name not in frame:
+            frame[name] = False
+    for name in ("status", "issue", "symbol", "period", "source"):
+        if name not in frame:
+            frame[name] = ""
+    frame["issue"] = frame["issue"].fillna("")
+    received = pd.to_datetime(frame["received_at"], errors="coerce", utc=True)
+    fallback = pd.to_datetime(frame["ts"], errors="coerce", utc=True)
+    frame["时段"] = (
+        received.fillna(fallback)
+        .dt.tz_convert("Asia/Shanghai")
+        .dt.floor("h")
+        .dt.strftime("%Y-%m-%d %H:00")
+    )
+    for name in ("download_ms", "signal_bar_age_minutes", "evaluation_ms", "scan_gap_sec"):
+        if name not in frame:
+            frame[name] = float("nan")
+        frame[name] = pd.to_numeric(frame[name], errors="coerce")
+    frame["_stale"] = frame["stale"].fillna(False).astype(bool)
+    frame["_cache"] = frame["from_cache"].fillna(False).astype(bool)
+    frame["_error"] = frame["status"].eq("error")
+    grouped = (
+        frame.groupby(["symbol", "period", "source", "时段"], dropna=False)
+        .agg(
+            样本数=("source", "size"),
+            下载平均ms=("download_ms", "mean"),
+            下载P95ms=("download_ms", lambda values: values.quantile(0.95)),
+            下载最大ms=("download_ms", "max"),
+            信号年龄平均分钟=("signal_bar_age_minutes", "mean"),
+            信号年龄最大分钟=("signal_bar_age_minutes", "max"),
+            计算平均ms=("evaluation_ms", "mean"),
+            计算P95ms=("evaluation_ms", lambda values: values.quantile(0.95)),
+            计算最大ms=("evaluation_ms", "max"),
+            扫描间隔平均秒=("scan_gap_sec", "mean"),
+            陈旧次数=("_stale", "sum"),
+            缓存回退次数=("_cache", "sum"),
+            断流次数=("_error", "sum"),
+            异常分类=("issue", lambda values: "；".join(sorted({str(x) for x in values if x}))),
+        )
+        .reset_index()
+    )
+    numeric = grouped.select_dtypes(include="number").columns
+    grouped[numeric] = grouped[numeric].round(3)
+    return grouped[columns].sort_values(["时段", "symbol", "period", "source"]).reset_index(drop=True)
+
+
+def write_market_health_summary(root: Path | str) -> Path:
+    """生成 data/行情延迟摘要.xlsx；没有样本时也写出带表头的空表。"""
+    table = summarize_market_health(root)
+    path = Path(root) / "data" / "行情延迟摘要.xlsx"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with pd.ExcelWriter(path, engine="openpyxl") as writer:
+        table.to_excel(writer, sheet_name="按小时汇总", index=False)
+        sheet = writer.sheets["按小时汇总"]
+        sheet.freeze_panes = "A2"
+        sheet.auto_filter.ref = sheet.dimensions
+    return path
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="检查本地K线质量，不访问网络、不下单")
     parser.add_argument("--symbol", default="", help="合约，例如 fu2701")
     parser.add_argument("--period", default="5", help="周期，例如 5")
     parser.add_argument("--source", default="", help="只查这一家；空=各家并排")
+    parser.add_argument("--market-health", action="store_true", help="只汇总实时行情延迟日志")
     args = parser.parse_args(argv)
     from src.utils import load_config
     from src.utils.paths import project_root
 
     root = project_root()
+    if args.market_health:
+        table = summarize_market_health(root)
+        path = write_market_health_summary(root)
+        print(f"行情延迟样本 {len(table)} 组，已保存 {path}")
+        return 0 if len(table) else 1
     cfg = load_config()
     symbol = str(args.symbol or ((cfg.get("strategy") or {}).get("symbols") or ["fu2701"])[0])
     period = str(args.period or (cfg.get("strategy") or {}).get("timeframe") or "5")

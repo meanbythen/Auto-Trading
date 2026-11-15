@@ -36,6 +36,7 @@ from src.trader.ctp_logic import (
     symbol_key,
     three_way_diff,
 )
+from src.trader.order_timeline import OrderTimeline, elapsed_ms, now_iso
 
 
 class CtpTrader(TraderBase):
@@ -46,6 +47,8 @@ class CtpTrader(TraderBase):
         # 测试可以塞进一个假的网关。这时用网关自己的连接参数，避免和空配置各算各的。
         self.settings = gateway.settings if gateway is not None else CtpSettings.from_cfg(cfg)
         self.gateway = gateway or CtpGateway(self.settings)
+        self._timeline = OrderTimeline(self.settings.project_root or cfg.get("_project_root"))
+        self.gateway.order_event_handler = self._record_gateway_event
         self._books_match = False
         self._last_query = 0.0
         self._last_note = "还没有和柜台对过账"
@@ -306,6 +309,80 @@ class CtpTrader(TraderBase):
             time.sleep(0.2)
         return OrderResult(ok=True, message="；".join(notes), assumed_fill=False)
 
+    def _record_gateway_event(self, stage: str, payload: dict[str, Any]) -> None:
+        row = dict(payload)
+        trace_id = str(row.pop("trace_id", "") or "")
+        try:
+            self._timeline.record(stage, trace_id=trace_id, **row)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CTP 订单时间线写失败 {}: {}", stage, exc)
+
+    def _record_preflight(
+        self,
+        req: OrderRequest,
+        started_at: str,
+        *,
+        ok: bool,
+        check: str,
+        message: str,
+    ) -> dict[str, Any]:
+        finished_at = now_iso()
+        try:
+            return self._timeline.record(
+                "preflight",
+                trace_id=req.trace_id,
+                symbol=req.symbol,
+                side=req.side,
+                volume=int(req.volume),
+                theory_price=(req.meta or {}).get("theory_price"),
+                latest_price=(req.meta or {}).get("latest_price"),
+                latest_price_at=(req.meta or {}).get("latest_price_at") or "",
+                order_price=req.price,
+                bar_id=req.bar_id,
+                ok=bool(ok),
+                check=check,
+                message=message,
+                account_kind=self.settings.account_kind,
+                dry_run=bool(self.cfg.get("dry_run", True)),
+                broker_ready=bool(self.gateway.session.ready and not self.gateway.session.need_order_check),
+                preflight_at=finished_at,
+                stage_ms=elapsed_ms(started_at, finished_at),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CTP 前置检查时间线写失败: {}", exc)
+            return {"ts": finished_at}
+
+    def _reject_order(self, req: OrderRequest, started_at: str, check: str, message: str) -> OrderResult:
+        row = self._record_preflight(req, started_at, ok=False, check=check, message=message)
+        finished_at = now_iso()
+        try:
+            self._timeline.record(
+                "channel_result",
+                trace_id=req.trace_id,
+                symbol=req.symbol,
+                side=req.side,
+                volume=int(req.volume),
+                order_price=req.price,
+                ok=False,
+                message=message,
+                channel_result_at=finished_at,
+                stage_ms=elapsed_ms(started_at, finished_at),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CTP 拒绝结果时间线写失败: {}", exc)
+        return OrderResult(
+            ok=False,
+            message=message,
+            assumed_fill=False,
+            raw={
+                "trace_id": req.trace_id,
+                "bar_id": req.bar_id,
+                "meta": dict(req.meta or {}),
+                "preflight_at": row.get("ts") or "",
+                "channel_result_at": finished_at,
+            },
+        )
+
     def place_order(self, req: OrderRequest) -> OrderResult:
         """
         提交报单。交易台按钮和常驻策略的唯一发单入口。
@@ -313,13 +390,14 @@ class CtpTrader(TraderBase):
         开仓一笔。平仓在沥青、玉米上按今仓昨仓拆开，可能变成两笔。
         只有柜台确认全部成交才算 filled。点击成功不算成交。
         """
+        started_at = now_iso()
         if self.cfg.get("dry_run", True):
-            return OrderResult(ok=False, message="模拟开关开着，不会向 CTP 发单", assumed_fill=False)
+            return self._reject_order(req, started_at, "dry_run", "模拟开关开着，不会向 CTP 发单")
         missing = self.settings.missing()
         if missing:
-            return OrderResult(ok=False, message="CTP 还缺：" + "、".join(missing), assumed_fill=False)
+            return self._reject_order(req, started_at, "config", "CTP 还缺：" + "、".join(missing))
         if req.price is None or float(req.price) <= 0:
-            return OrderResult(ok=False, message="CTP 限价单需要价格", assumed_fill=False)
+            return self._reject_order(req, started_at, "price", "CTP 限价单需要价格")
         blocked = check_order_instruction(
             req.symbol,
             float(req.price),
@@ -329,36 +407,43 @@ class CtpTrader(TraderBase):
         )
         if blocked:
             logger.error(blocked)
-            return OrderResult(ok=False, message=blocked, assumed_fill=False)
+            return self._reject_order(req, started_at, "instruction", blocked)
         if self.gateway.trading_paused and req.side != "close":
             text = "已暂停开新仓，本笔没有发到柜台"
             logger.warning(text)
-            return OrderResult(ok=False, message=text, assumed_fill=False)
+            return self._reject_order(req, started_at, "paused", text)
         if not self.settings.desk_session and self.has_working_order(req.symbol):
             text = (
                 f"{req.symbol} 还有未成交委托占着仓。"
                 "请先点「查委托」确认，再点「撤最近一笔」或「全撤未成交」，然后才能改价重报。"
             )
             logger.warning(text)
-            return OrderResult(ok=False, message=text, assumed_fill=False)
+            return self._reject_order(req, started_at, "working_order", text)
         if not self.gateway.session.ready or self.gateway.session.need_order_check:
             ok, message = self.connect()
             if not ok:
-                return OrderResult(ok=False, message=message, assumed_fill=False)
+                return self._reject_order(req, started_at, "connection", message)
 
         volume = int(req.volume)
         if volume <= 0:
-            return OrderResult(ok=False, message="手数必须大于 0", assumed_fill=False)
+            return self._reject_order(req, started_at, "volume", "手数必须大于 0")
 
         if req.side == "close":
             slices, direction, error = self._close_plan(req)
             if error:
-                return OrderResult(ok=False, message=error, assumed_fill=False)
+                return self._reject_order(req, started_at, "position", error)
         else:
             # 买开、卖开都是开仓，不拆今昨。
             slices = [CloseSlice(OFFSET_OPEN, volume)]
             direction = open_direction(req.side)
 
+        preflight = self._record_preflight(
+            req,
+            started_at,
+            ok=True,
+            check="config,instruction,connection,position",
+            message="CTP 前置检查通过",
+        )
         orders = []
         for piece in slices:
             order = self.gateway.submit(
@@ -369,6 +454,8 @@ class CtpTrader(TraderBase):
                 price=float(req.price),
                 stop_price=req.stop_price,
                 bar_id=req.bar_id,
+                trace_id=req.trace_id,
+                meta=req.meta,
             )
             orders.append(order)
             logger.info(
@@ -396,32 +483,65 @@ class CtpTrader(TraderBase):
         avg = _avg_price(orders)
         # 还在柜台排队、或者已经部分成交，都说明这一笔已经发出去过。
         working = any(order.status in {"submitted", "partial"} for order in orders)
+        finished_at = now_iso()
+        raw = {
+            "trace_id": req.trace_id,
+            "meta": dict(req.meta or {}),
+            "preflight_at": preflight.get("ts") or "",
+            "channel_result_at": finished_at,
+            "filled": all_filled,
+            "accounted": filled_volume > 0 and accounted_volume >= filled_volume,
+            "fill_price": avg,
+            "filled_volume": filled_volume,
+            "accounted_volume": accounted_volume,
+            # 每笔报单的成交情况。拆平今/平昨时会不止一笔，补记要按报单逐笔算增量。
+            "orders": [
+                {
+                    "order_ref": order.order_ref,
+                    "trace_id": order.trace_id,
+                    "meta": dict(order.meta or {}),
+                    "filled": int(order.filled),
+                    "accounted_volume": int(order.accounted_volume),
+                    "avg_price": float(order.avg_price or 0),
+                    "status": order.status,
+                    "foreign": bool(order.foreign),
+                    "sent_at": order.sent_at,
+                    "last_report_received_at": order.last_report_received_at,
+                    "last_trade_received_at": order.last_trade_received_at,
+                    "insert_time": order.insert_time,
+                    "order_sys_id": order.order_sys_id,
+                }
+                for order in orders
+            ],
+            "statuses": texts,
+            "working": working,
+        }
+        try:
+            self._timeline.record(
+                "channel_result",
+                trace_id=req.trace_id,
+                symbol=req.symbol,
+                side=req.side,
+                volume=volume,
+                order_id=",".join(order.order_ref for order in orders if order.order_ref),
+                order_price=req.price,
+                message=message or "没有收到回报",
+                ok=all_filled or working or filled_volume > 0,
+                filled_volume=filled_volume,
+                accounted_volume=accounted_volume,
+                fill_price=avg or None,
+                fill_kind="broker" if filled_volume > 0 else "none",
+                channel_result_at=finished_at,
+                stage_ms=elapsed_ms(started_at, finished_at),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("CTP 通道结果时间线写失败: {}", exc)
         return OrderResult(
             ok=all_filled or working or filled_volume > 0,
             message=message or "没有收到回报",
             order_id=",".join(order.order_ref for order in orders if order.order_ref),
             assumed_fill=False,
-            raw={
-                "filled": all_filled,
-                "accounted": filled_volume > 0 and accounted_volume >= filled_volume,
-                "fill_price": avg,
-                "filled_volume": filled_volume,
-                "accounted_volume": accounted_volume,
-                # 每笔报单的成交情况。拆平今/平昨时会不止一笔，补记要按报单逐笔算增量。
-                "orders": [
-                    {
-                        "order_ref": order.order_ref,
-                        "filled": int(order.filled),
-                        "accounted_volume": int(order.accounted_volume),
-                        "avg_price": float(order.avg_price or 0),
-                        "status": order.status,
-                        "foreign": bool(order.foreign),
-                    }
-                    for order in orders
-                ],
-                "statuses": texts,
-                "working": working,
-            },
+            raw=raw,
         )
 
     def _close_plan(self, req: OrderRequest) -> tuple[list[Any], str, str]:

@@ -31,6 +31,7 @@ from src.backtest.evaluation import (
     evaluate_backtest,
     verdict_text,
 )
+from src.backtest.experiment import archive_report, new_experiment, snapshot_bars
 from src.data.kline import KlineProvider
 from src.data.periods import canonical_period
 from src.strategy.generic_stop import GenericStopConfig, normalize_generic_stop
@@ -1126,6 +1127,8 @@ class OptimizationResult:
     perturbation: dict[str, Any] = field(default_factory=dict)
     evaluation_ok: bool = True
     evaluation_reason: str = ""
+    experiment: dict[str, Any] = field(default_factory=dict)
+    _experiment_data: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -1164,6 +1167,7 @@ class OptimizationResult:
             "perturbation": self.perturbation,
             "evaluation_ok": self.evaluation_ok,
             "evaluation_reason": self.evaluation_reason,
+            "experiment": self.experiment,
         }
 
 
@@ -2427,6 +2431,26 @@ def optimize_strategy(
                 accepted = False
             reason = (reason + eval_reason).strip()
 
+    experiment_details = {
+        "symbol": symbol,
+        "engine": engine_name,
+        "mode": mode,
+        "depth": depth,
+        "start_date": str(start_date or ""),
+        "end_date": str(end_date or ""),
+        "data_source": (cfg.get("data") or {}).get("source", ""),
+        "random_seed": int(seed),
+        "max_trials": int(max_trials),
+        "min_trades": int(min_trades),
+        "grid": grid,
+        "cross_symbols": list(cross_symbols or []),
+        "costs": {
+            "slippage_ticks": (
+                best_result.params_snapshot.get("slippage_ticks") if best_result is not None else None
+            ),
+            "price_tick": best_result.params_snapshot.get("price_tick") if best_result is not None else None,
+        },
+    }
     opt = OptimizationResult(
         symbol=symbol,
         best_params=best_params,
@@ -2465,6 +2489,8 @@ def optimize_strategy(
         walk_efficiency=float(walk_metrics.get("walk_efficiency") or 0),
         oos_win_rate=float(walk_metrics.get("oos_win_rate") or 0),
         param_stability=str(walk_metrics.get("param_stability") or ""),
+        experiment=new_experiment("optimization", cfg, details=experiment_details),
+        _experiment_data=snapshot_bars(signal=bars_signal, trail=bars_trail),
     )
     _report(total_steps, total_steps, "整理结果")
     return opt
@@ -2587,13 +2613,22 @@ def apply_params_to_config(
 
 def save_optimization_report(result: OptimizationResult, out_path: Path | str) -> Path:
     path = Path(out_path)
-    path.parent.mkdir(parents=True, exist_ok=True)
     # 报告太大时只保留前 30 名明细
     payload = result.to_dict()
     payload["trials"] = payload["trials"][:30]
     # 跑完时刻写进结果文件；导出 Excel 时作为「测试时间」，用来分清是哪一次优化。
     payload["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    details = {
+        "symbol": result.symbol,
+        "engine": result.engine,
+        "mode": result.mode,
+        "depth": result.depth,
+        "costs": {
+            "slippage_ticks": result.best_limits.get("slippage_ticks"),
+            "price_tick": result.best_limits.get("price_tick"),
+        },
+    }
+    archive_report(result, path, payload, kind="optimization", details=details)
     return path
 
 

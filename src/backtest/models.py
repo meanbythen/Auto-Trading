@@ -44,8 +44,13 @@ class BacktestResult:
     evaluation: EvaluationReport | None = None
     # 有信号但没开成的记录。为空表示这段行情里每个开仓信号都成交了。
     rejected: list[RejectedSignal] = field(default_factory=list)
+    # 同一根 OHLC 内止损与离场先后不明时，保守成交及其相对乐观口径的影响。
+    ambiguities: list[dict[str, Any]] = field(default_factory=list)
     # 这次回测跑完的本地时间。导出 Excel 时原样写进每一行，用来区分前后几次回测。
     ran_at: str = ""
+    # 实验清单与归档前暂存的 K 线副本。老结果不填也能继续读取和导出。
+    experiment: dict[str, Any] = field(default_factory=dict)
+    _experiment_data: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -57,7 +62,9 @@ class BacktestResult:
             "performance": self.performance.to_dict(),
             "trades": [t.to_dict() for t in self.trades],
             "rejected": [r.to_dict() for r in self.rejected],
+            "ambiguities": self.ambiguities,
             "equity_last": self.equity[-1] if self.equity else None,
             "params_snapshot": self.params_snapshot,
             "evaluation": self.evaluation.to_dict() if self.evaluation else {},
+            "experiment": self.experiment,
         }

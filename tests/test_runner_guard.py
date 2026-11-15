@@ -13,6 +13,7 @@ from src.scheduler.runner import TradingBot, entry_slip_blocked
 from src.strategy.base import StrategyBase
 from src.strategy.types import StrategyAction, StrategyDecision
 from src.trader.base import DEFAULT_CAPABILITIES
+from src.trader.order_timeline import OrderTimeline
 
 
 def test_entry_slip_gate_blocks_chasing_and_leaves_the_other_side_alone() -> None:
@@ -261,6 +262,7 @@ def test_unclean_click_counts_as_sent_and_keeps_intent(tmp_path) -> None:
     intent = tmp_path / "order_intent.json"
     bot = _intent_bot(intent)
     bot.trader = _GuiTrader()  # type: ignore[assignment]
+    bot._order_timeline = OrderTimeline(None)
 
     ok = bot._execute(
         StrategyDecision(
@@ -277,6 +279,11 @@ def test_unclean_click_counts_as_sent_and_keeps_intent(tmp_path) -> None:
     assert bot._sent_bar["fu2701"] == "2026-11-05 09:05"
     assert intent.exists()
     assert bot.risk.halt_kind == "pending_intent"  # type: ignore[attr-defined]
+    assumed = next(row for row in bot._order_timeline.rows if row["stage"] == "assumed_fill")
+    assert assumed["price_kind"] == "reference_assumed"
+    assert assumed["broker_confirmed"] is False
+    assert assumed["trade_id"] == ""
+    assert assumed["trade_time"] == ""
 
 
 def test_runtime_leftover_intent_blocks_next_order(tmp_path) -> None:
@@ -728,5 +735,145 @@ def test_evaluate_symbol_no_longer_swallows_type_error() -> None:
     bot.strategy = _StrategyRaisingTypeError()
     with pytest.raises(TypeError, match="策略内部真正的 bug"):
         bot._evaluate_symbol("fu2701", None, now="T")
+
+
+def _market_scan_bot(root: Path) -> TradingBot:
+    return TradingBot(
+        {
+            "dry_run": True,
+            "trade": {"symbol": "fu2701", "executor": "sim", "volume": 1},
+            "strategy": {
+                "engine": "daily_body",
+                "timeframe": "5",
+                "trail_timeframe": "5",
+                "symbols": ["fu2701"],
+                "catch_up_on_start": {"enabled": False},
+            },
+            "schedule": {"scan_interval_sec": 30, "trading_sessions": [["09:00", "15:00"]]},
+            "risk": {"sizing_mode": "fixed", "capital": 10000},
+            "data": {"max_stale_minutes": 90},
+            "_project_root": str(root),
+        }
+    )
+
+
+def _stale_market_bars():
+    from datetime import datetime, timedelta
+
+    import pandas as pd
+
+    end = datetime.now() - timedelta(hours=3)
+    index = pd.DatetimeIndex([end - timedelta(minutes=5 * (39 - i)) for i in range(40)])
+    close = pd.Series(100.0, index=index)
+    bars = pd.DataFrame(
+        {"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 10}
+    )
+    bars.attrs["market_health"] = {
+        "source": "eastmoney",
+        "status": "stale",
+        "from_cache": True,
+        "stale": True,
+        "download_ms": 125.0,
+        "latest_bar_time": str(index[-1]),
+        "latest_bar_age_minutes": 180.0,
+        "error": "模拟断流",
+    }
+    return bars
+
+
+def test_stale_open_is_blocked_with_health_alert_and_throttled_event(tmp_path) -> None:
+    """陈旧缓存禁止开仓；两轮都有完整延迟记录，但异常事件和告警只写一次。"""
+    bot = _market_scan_bot(tmp_path)
+    bars = _stale_market_bars()
+    decision = StrategyDecision(
+        StrategyAction.BUY_OPEN,
+        "fu2701",
+        "模拟开仓",
+        entry_price=100.0,
+        meta={"bar_id": str(bars.index[-1])},
+    )
+    with (
+        patch.object(bot.kline, "fetch", return_value=bars),
+        patch.object(bot, "_evaluate_symbol", return_value=decision),
+        patch.object(bot, "_execute", return_value=True) as execute,
+        patch("src.ops.alerts.emit_alert") as alert,
+    ):
+        bot.scan_symbol("fu2701")
+        bot.scan_symbol("fu2701")
+
+    assert not execute.called
+    events = [
+        json.loads(line)
+        for line in (tmp_path / "data" / "events.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert sum(row["event"] == "stale_block_open" for row in events) == 2
+    assert sum(row["event"] == "market_health_warning" for row in events) == 1
+    assert alert.call_count == 1
+    blocked = next(row for row in events if row["event"] == "stale_block_open")
+    assert blocked["market_health"]["source"] == "eastmoney"
+    assert blocked["signal_bar_age_minutes"] >= 90
+    health_rows = [
+        json.loads(line)
+        for line in (tmp_path / "data" / "market_health.jsonl").read_text(encoding="utf-8").splitlines()
+    ]
+    assert len(health_rows) == 2
+    assert health_rows[-1]["download_ms"] == 125.0
+    assert health_rows[-1]["evaluation_ms"] >= 0
+    assert health_rows[-1]["decision_action"] == "buy_open"
+    assert "cache_stale" in health_rows[-1]["issues"]
+    snap = bot.status_snapshot()["market_health"]["fu2701|5"]
+    assert snap["signal_bar_time"] == str(bars.index[-1])
+    assert decision.meta["market_health"]["source"] == "eastmoney"
+
+
+def test_stale_market_does_not_block_close_protection(tmp_path) -> None:
+    """同一份陈旧行情下，平仓决策仍交给执行链，不被开仓闸门误伤。"""
+    bot = _market_scan_bot(tmp_path)
+    bars = _stale_market_bars()
+    decision = StrategyDecision(
+        StrategyAction.CLOSE,
+        "fu2701",
+        "模拟保护平仓",
+        entry_price=99.0,
+        meta={"bar_id": str(bars.index[-1])},
+    )
+    with (
+        patch.object(bot.kline, "fetch", return_value=bars),
+        patch.object(bot, "_evaluate_symbol", return_value=decision),
+        patch.object(bot, "_execute", return_value=True) as execute,
+        patch("src.ops.alerts.emit_alert"),
+    ):
+        bot.scan_symbol("fu2701")
+
+    assert execute.call_count == 1
+    sent = execute.call_args.args[0]
+    assert sent.action == StrategyAction.CLOSE
+    assert sent.meta["market_health"]["stale"] is True
+    events = (tmp_path / "data" / "events.jsonl").read_text(encoding="utf-8")
+    assert "stale_block_open" not in events
+
+
+def test_order_intent_contains_market_health_evidence(tmp_path) -> None:
+    """委托落盘能追到信号 K 线、行情来源、年龄和下载耗时。"""
+    bot = _intent_bot(tmp_path / "order_intent.json")
+    health = {
+        "source": "eastmoney",
+        "signal_bar_time": "2026-11-05 09:05:00",
+        "signal_bar_age_minutes": 2.5,
+        "download_ms": 125.0,
+    }
+    decision = StrategyDecision(
+        StrategyAction.BUY_OPEN,
+        "fu2701",
+        "带行情证据",
+        meta={"bar_id": "2026-11-05 09:05:00", "market_health": health},
+    )
+
+    bot._write_order_intent(decision, 1)
+
+    payload = json.loads((tmp_path / "order_intent.json").read_text(encoding="utf-8"))
+    assert payload["bar_id"] == health["signal_bar_time"]
+    assert payload["market_health"] == health
+    bot._clear_order_intent()
 
 

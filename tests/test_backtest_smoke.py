@@ -175,3 +175,87 @@ def test_session_break_is_not_called_a_gap_but_a_hole_is() -> None:
     assert "中间断了" in note
     assert "09:35" in note
     assert "空档里的涨跌没有算进去" in note
+
+
+def test_backtest_archive_is_reproducible_and_does_not_change_live_config(tmp_path) -> None:
+    """同一输入的关键结果和数据指纹一致，账号秘密不入档，研究过程不改原配置。"""
+    import copy
+    import json
+
+    import pandas as pd
+
+    from src.backtest.engine import save_backtest_report
+
+    cfg = {
+        "dry_run": True,
+        "strategy": {
+            "engine": "daily_body",
+            "timeframe": "15",
+            "trail_timeframe": "15",
+            "symbols": ["bu2612"],
+            "flatten_times": ["14:55", "22:55"],
+            "daily_body": {"eth_minutes": 0, "regime_filter": False},
+        },
+        "trade": {
+            "symbol": "bu2612",
+            "volume": 1,
+            "executor": "sim",
+            "ctp": {
+                "resolved_password": "do-not-archive",
+                "investor_id": "secret-account",
+                "password_env": "CTP_PASSWORD",
+            },
+        },
+        "risk": {"capital": 1_000_000, "risk_per_trade_pct": 0.01, "contracts": {"bu": {"multiplier": 10}}},
+        "data": {"source": "demo", "cache_dir": "data/klines", "min_bars": 60},
+        "schedule": {"trading_sessions": [["09:00", "23:00"]]},
+    }
+    original = copy.deepcopy(cfg)
+    bars = KlineProvider(cfg).fetch("bu2612", "15")
+    first = run_backtest(cfg, symbol="bu2612", bars_signal=bars, bars_trail=bars)
+    second = run_backtest(cfg, symbol="bu2612", bars_signal=bars, bars_trail=bars)
+    assert cfg == original
+
+    first_path = save_backtest_report(first, tmp_path / "data" / "backtest_first.json")
+    first_manifest = json.loads(
+        (first_path.parent / "experiments" / first.experiment["experiment_id"] / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    first_hashes = [row["sha256"] for row in first_manifest["data"]["files"]]
+
+    # 实验结束后再改当前配置和原始 K 线，已经复制的实验输入不受影响。
+    cfg["strategy"]["engine"] = "trend_follow"
+    cfg["risk"]["risk_per_trade_pct"] = 0.5
+    bars.iloc[0, bars.columns.get_loc("close")] += 9999
+    second_path = save_backtest_report(second, tmp_path / "data" / "backtest_second.json")
+    second_manifest = json.loads(
+        (second_path.parent / "experiments" / second.experiment["experiment_id"] / "manifest.json").read_text(
+            encoding="utf-8"
+        )
+    )
+
+    assert first.experiment["experiment_id"] != second.experiment["experiment_id"]
+    assert first_manifest["config"] == second_manifest["config"]
+    assert [row["sha256"] for row in second_manifest["data"]["files"]] == first_hashes
+    assert first.performance.net_pnl == second.performance.net_pnl
+    assert [trade.to_dict() for trade in first.trades] == [trade.to_dict() for trade in second.trades]
+    assert first_manifest["review_gate"]["snapshot_complete"] is True
+    assert first_manifest["promotion"] == {
+        "stage": "research",
+        "simulation_status": "not_run",
+        "live_approval": "not_approved",
+    }
+    snapshot = first_manifest["config"]["snapshot"]
+    assert snapshot["trade"]["ctp"]["resolved_password"] == "<已脱敏>"
+    assert snapshot["trade"]["ctp"]["investor_id"] == "<已脱敏>"
+    assert snapshot["trade"]["ctp"]["password_env"] == "CTP_PASSWORD"
+    assert "do-not-archive" not in first_path.read_text(encoding="utf-8")
+    assert "secret-account" not in first_path.read_text(encoding="utf-8")
+    assert first_manifest["details"]["costs"]["slippage_ticks"] is not None
+
+    data_file = first_manifest["data"]["files"][0]
+    archived = pd.read_csv(first_path.parent / "experiments" / first.experiment["experiment_id"] / data_file["path"])
+    assert data_file["rows"] == len(archived) > 0
+    index = json.loads((tmp_path / "data" / "experiments" / "index.json").read_text(encoding="utf-8"))
+    assert len(index["experiments"]) == 2

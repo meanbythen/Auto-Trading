@@ -210,6 +210,24 @@ class DashboardMixin:
         flow = str(snap.get("ctp_flow") or "") if running else ""
         if flow:
             dyn_text = f"{flow}\n{dyn_text}" if dyn_text else flow
+        market_notes: list[str] = []
+        market = snap.get("market_health") if running else None
+        if isinstance(market, dict):
+            for row in market.values():
+                if not isinstance(row, dict):
+                    continue
+                age = row.get("signal_bar_age_minutes", row.get("latest_bar_age_minutes"))
+                age_text = "未知" if age is None else f"{float(age):.1f}分钟"
+                state = str(row.get("issue") or row.get("status") or "未知")
+                market_notes.append(
+                    f"行情 {row.get('symbol', '')} {row.get('source', '')}/{row.get('period', '')} "
+                    f"{state} · K线 {row.get('signal_bar_time') or row.get('latest_bar_time') or '未知'}"
+                    f" · 年龄 {age_text} · 下载 {row.get('download_ms') or 0}ms"
+                    f" · 计算 {row.get('evaluation_ms') or 0}ms"
+                )
+        if market_notes:
+            market_text = "\n".join(market_notes)
+            dyn_text = f"{market_text}\n{dyn_text}" if dyn_text else market_text
         if running and snap.get("orders_paused"):
             alert_text = (alert_text + "  " if alert_text else "") + "已暂停报单，开平仓不会发出去"
         self._show_status_notes(alert_text, health_text, health_tone, dyn_text)

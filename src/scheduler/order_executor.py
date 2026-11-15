@@ -15,8 +15,9 @@ from loguru import logger
 
 from src.kernel.risk_chain import TradeIntent, run_early_gates, run_send_gates
 from src.strategy import StrategyAction, StrategyDecision
-from src.trader.base import Capabilities
+from src.trader.base import Capabilities, OrderRequest
 from src.trader.ctp_orders import ctp_order
+from src.trader.order_timeline import elapsed_ms, new_trace_id, now_iso
 
 
 def _same_contract(left: object, right: object) -> bool:
@@ -65,6 +66,84 @@ class OrderExecutorMixin:
         """当前通道能力。调度只看能力，不看具体是哪一家。"""
         return getattr(self.trader, "capabilities", None) or Capabilities()
 
+    def _timeline_trace(self, decision: StrategyDecision) -> str:
+        """给决策补上本地关联号和价格证据；柜台编号仍由 CTP 单独返回。"""
+        meta = dict(decision.meta or {})
+        trace_id = str(meta.get("trace_id") or "") or new_trace_id()
+        meta["trace_id"] = trace_id
+        meta.setdefault("decided_at", now_iso())
+        if "theory_price" not in meta:
+            if decision.action in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN):
+                meta["theory_price"] = decision.entry_price
+            elif decision.action == StrategyAction.CLOSE and decision.stop_price:
+                meta["theory_price"] = decision.stop_price
+        decision.meta = meta
+        return trace_id
+
+    def _record_order_timeline(
+        self,
+        stage: str,
+        decision: StrategyDecision,
+        **fields: Any,
+    ) -> None:
+        """记录器不存在时安静跳过，兼容 __new__ 构造的测试替身。"""
+        timeline = getattr(self, "_order_timeline", None)
+        if timeline is None:
+            return
+        trace_id = self._timeline_trace(decision)
+        meta = decision.meta or {}
+        row = {
+            "symbol": decision.symbol,
+            "side": decision.action.value,
+            "bar_id": str(meta.get("bar_id") or ""),
+            "theory_price": meta.get("theory_price"),
+            "latest_price": meta.get("latest_price"),
+            "latest_price_at": meta.get("latest_price_at") or "",
+            "order_price": meta.get("order_price"),
+        }
+        row.update(fields)
+        try:
+            timeline.record(stage, trace_id=trace_id, **row)
+        except Exception as exc:  # noqa: BLE001
+            # 时间线是旁路证据，尤其不能因为写盘异常阻断止损和平仓。
+            logger.warning("订单时间线记录失败 {}: {}", stage, exc)
+
+    def _start_decision_timeline(self, decision: StrategyDecision) -> None:
+        """串起行情、已完成信号 K 线和策略决策；只有可执行动作才建订单链。"""
+        self._timeline_trace(decision)
+        meta = decision.meta or {}
+        health = dict(meta.get("market_health") or {})
+        try:
+            volume = int(meta.get("volume") or 0)
+        except (TypeError, ValueError):
+            volume = 0
+        self._record_order_timeline(
+            "market_snapshot",
+            decision,
+            volume=volume,
+            market_time=health.get("latest_bar_time") or health.get("signal_bar_time") or "",
+            source=health.get("source") or "",
+            market_health=health,
+        )
+        self._record_order_timeline(
+            "bar_closed",
+            decision,
+            volume=volume,
+            signal_bar_time=health.get("signal_bar_time") or meta.get("bar_id") or "",
+            timeframe=health.get("period") or health.get("timeframe") or "",
+        )
+        decided_at = str(meta.get("decided_at") or "")
+        self._record_order_timeline(
+            "strategy_decision",
+            decision,
+            volume=volume,
+            reason=decision.reason,
+            signal_price=decision.entry_price,
+            stop_price=decision.stop_price,
+            decided_at=decided_at,
+            stage_ms=elapsed_ms(health.get("evaluated_at"), decided_at),
+        )
+
     def _intent_files(self) -> list[Path]:
         """盘上所有还没清理的委托意图：按笔目录里的每一笔，加上升级前的单文件。"""
         files: list[Path] = []
@@ -85,6 +164,10 @@ class OrderExecutorMixin:
             "side": decision.action.value,
             "volume": int(vol),
             "bar_id": str((decision.meta or {}).get("bar_id", "") or ""),
+            "trace_id": str((decision.meta or {}).get("trace_id", "") or ""),
+            "theory_price": (decision.meta or {}).get("theory_price"),
+            "latest_price": (decision.meta or {}).get("latest_price"),
+            "market_health": dict((decision.meta or {}).get("market_health") or {}),
             "reason": decision.reason,
             "executor": "gui",
         }
@@ -633,6 +716,7 @@ class OrderExecutorMixin:
         *,
         fill_key: str = "",
         stop_price: float | None = None,
+        fill_evidence: dict[str, Any] | None = None,
     ) -> bool:
         """更新策略仓位、风控、信号账户，并且只落盘一次。返回这一笔是否已经入账。"""
         # 同一份回报再来一次时，账本会跳过。这里也直接返回，避免把仓位再改一遍。
@@ -770,14 +854,19 @@ class OrderExecutorMixin:
         except Exception as exc:  # noqa: BLE001
             logger.exception("风控净仓同步失败: {}", exc)
 
-        # 滑点记录：理论价（开仓=信号入场价，止损平仓=止损价）对比实际成交价，追加到 data/slippage_log.csv。
+        # 滑点记录：优先用发单时保存的理论价，避免 CTP 回报里的成交价覆盖信号价。
         # 只记录，不参与任何决策；出错不能影响记账。
+        theory: float | None = None
+        slip: float | None = None
         try:
             from src.account.slippage_log import record_fill
             from src.risk.universe_table import product_key
 
-            theory = None
-            if decision.action in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN):
+            meta = decision.meta or {}
+            raw_theory = meta.get("theory_price")
+            if raw_theory not in (None, ""):
+                theory = float(raw_theory)
+            elif decision.action in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN):
                 theory = float(decision.entry_price or 0) or None
             elif decision.action == StrategyAction.CLOSE and decision.stop_price:
                 theory = float(decision.stop_price)
@@ -799,6 +888,7 @@ class OrderExecutorMixin:
                 side_before=side_before,
                 executor=str((self.cfg.get("trade") or {}).get("executor", "")),
                 dry_run=bool(self.cfg.get("dry_run", True)),
+                assumed_fill=str((fill_evidence or {}).get("fill_kind") or "") == "assumed_fill",
             )
             if slip is not None:
                 logger.info("滑点记录 | {} {} 理论 {} 成交 {} | {:+.2f} 跳", symbol, decision.action.value, theory, fill_price, slip)
@@ -836,11 +926,40 @@ class OrderExecutorMixin:
                 daily_pnl=self.risk.daily_pnl,
             )
 
-        # 模拟测试也会走到这里，用来看内存里的仓对不对。不能把假成交写进正在用的账，也不能盖掉真实持仓文件。
-        if self.cfg.get("dry_run", True):
-            return True
-        self._persist_state()
-        return ok
+        # 真实盘先按原逻辑落一次状态，再补最后的「程序入账」节点。
+        if not self.cfg.get("dry_run", True):
+            self._persist_state()
+        evidence = dict(fill_evidence or {})
+        accounted_at = now_iso()
+        fill_received_at = str(
+            evidence.get("fill_received_at")
+            or evidence.get("trade_received_at")
+            or evidence.get("channel_result_at")
+            or ""
+        )
+        self._record_order_timeline(
+            "accounted",
+            decision,
+            volume=int(vol),
+            ok=bool(ok),
+            fill_kind=str(evidence.get("fill_kind") or "channel_fill"),
+            price_kind=str(evidence.get("price_kind") or ""),
+            broker_confirmed=bool(evidence.get("broker_confirmed", False)),
+            order_id=str(evidence.get("order_id") or ""),
+            order_ref=str(evidence.get("order_ref") or ""),
+            order_sys_id=str(evidence.get("order_sys_id") or ""),
+            trade_id=str(evidence.get("trade_id") or ""),
+            trade_time=str(evidence.get("trade_time") or ""),
+            fill_price=float(fill_price),
+            theory_price=theory,
+            slip_ticks=slip,
+            fill_received_at=fill_received_at,
+            accounted_at=accounted_at,
+            stage_ms=elapsed_ms(fill_received_at, accounted_at),
+            fill_to_account_ms=elapsed_ms(fill_received_at, accounted_at),
+        )
+        # 模拟测试只更新内存，不能把假成交写进正在用的账，也不能盖掉真实持仓文件。
+        return True if self.cfg.get("dry_run", True) else ok
 
     def _record_signal_account(
         self,
@@ -1086,6 +1205,22 @@ class OrderExecutorMixin:
         elif code in {"order_blocked_stage", "risk_block", "size_skip"}:
             extra = {"reason": reason}
         self._record_event(code, symbol=decision.symbol, side=side, **extra)
+        risk_at = now_iso()
+        decision.meta = {**(decision.meta or {}), "risk_at": risk_at}
+        try:
+            volume = int((decision.meta or {}).get("volume") or 0)
+        except (TypeError, ValueError):
+            volume = 0
+        self._record_order_timeline(
+            "risk_intent",
+            decision,
+            volume=volume,
+            allowed=False,
+            code=code,
+            reason=reason,
+            risk_at=risk_at,
+            stage_ms=elapsed_ms((decision.meta or {}).get("decided_at"), risk_at),
+        )
         # 暂停、挂单未完、上线阶段未到：这一根还应该能再试，不要把策略标记锁死。
         if (
             decision.action in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN)
@@ -1115,6 +1250,7 @@ class OrderExecutorMixin:
         if decision.action == StrategyAction.HOLD:
             logger.debug("{}: {}", decision.symbol, decision.reason)
             return False
+        self._start_decision_timeline(decision)
         # 收盘后 / 周末不下单：挂着的老信号不能拿到已收盘的市场上去点。
         if not self._order_session_open():
             logger.warning(
@@ -1128,6 +1264,18 @@ class OrderExecutorMixin:
                 symbol=decision.symbol,
                 side=decision.action.value,
                 reason=decision.reason,
+            )
+            risk_at = now_iso()
+            decision.meta = {**(decision.meta or {}), "risk_at": risk_at}
+            self._record_order_timeline(
+                "risk_intent",
+                decision,
+                volume=0,
+                allowed=False,
+                code="order_outside_session",
+                reason="现在不在交易时段",
+                risk_at=risk_at,
+                stage_ms=elapsed_ms((decision.meta or {}).get("decided_at"), risk_at),
             )
             return False
         bar_key = str((decision.meta or {}).get("bar_id", "") or "")
@@ -1160,6 +1308,7 @@ class OrderExecutorMixin:
                     "先平掉原来的仓，再开反向",
                     entry_price=decision.entry_price,
                     stop_price=decision.stop_price,
+                    meta=dict(decision.meta or {}),
                 )
             )
             # 平仓递归会改这个标记；外层开仓还没点出去，必须清掉，否则异常时会误以为已下单。
@@ -1199,6 +1348,19 @@ class OrderExecutorMixin:
             self._reject_gate(decision, send.code, send.reason, bar_key)
             return False
 
+        risk_at = now_iso()
+        decision.meta = {**(decision.meta or {}), "risk_at": risk_at, "volume": int(vol)}
+        self._record_order_timeline(
+            "risk_intent",
+            decision,
+            volume=int(vol),
+            allowed=True,
+            code="passed",
+            reason=size_note,
+            risk_at=risk_at,
+            stage_ms=elapsed_ms((decision.meta or {}).get("decided_at"), risk_at),
+            decision_to_risk_ms=elapsed_ms((decision.meta or {}).get("decided_at"), risk_at),
+        )
         # 定价和发单一起放进 _dispatch：GUI 真下单时整段由委托意图上下文包住，
         # 中途出错保留意图文件给下次启动核对，正常走完（成功或明确失败）自动清掉。
         return self._dispatch(decision, vol, side, size_note, bar_key)
@@ -1234,6 +1396,13 @@ class OrderExecutorMixin:
             price = decision.entry_price
         else:
             price = None
+
+        decision.meta = {
+            **(decision.meta or {}),
+            "order_price": price,
+            "price_mode": "limit" if price is not None else "opponent",
+        }
+        self._timeline_trace(decision)
 
         def place() -> bool:
             return self._send_and_book(
@@ -1287,6 +1456,21 @@ class OrderExecutorMixin:
         caps = self.trader_capabilities
         self._order_dispatch_started = True
         self._order_unclean = False
+        trace_id = self._timeline_trace(decision)
+        dispatch_started_at = now_iso()
+        decision.meta = {**(decision.meta or {}), "dispatch_started_at": dispatch_started_at}
+        if not caps.orders_via_broker:
+            decision.meta = {**(decision.meta or {}), "sent_at": dispatch_started_at}
+            self._record_order_timeline(
+                "order_sent",
+                decision,
+                volume=int(vol),
+                order_price=price,
+                sent_at=dispatch_started_at,
+                stage_ms=elapsed_ms((decision.meta or {}).get("decided_at"), dispatch_started_at),
+                decision_to_send_ms=elapsed_ms((decision.meta or {}).get("decided_at"), dispatch_started_at),
+                risk_to_send_ms=elapsed_ms((decision.meta or {}).get("risk_at"), dispatch_started_at),
+            )
         if caps.orders_via_broker:
             # 和交易台同一份 OrderRequest、同一个 place_order。价格来自策略/最新收盘，人点时来自盘口。
             result = self.trader.place_order(
@@ -1299,16 +1483,55 @@ class OrderExecutorMixin:
                     stop_price=decision.stop_price,
                     bar_id=str((decision.meta or {}).get("bar_id", "") or ""),
                     remark=decision.reason,
+                    trace_id=trace_id,
+                    meta=dict(decision.meta or {}),
                 )
             )
-        elif decision.action == StrategyAction.BUY_OPEN:
-            result = self.trader.buy_open(decision.symbol, vol, price)
-        elif decision.action == StrategyAction.SELL_OPEN:
-            result = self.trader.sell_open(decision.symbol, vol, price)
         else:
-            result = self.trader.close_position(decision.symbol, vol, price)
+            request = OrderRequest(
+                decision.symbol,
+                decision.action.value,  # type: ignore[arg-type]
+                vol,
+                price,
+                remark=decision.reason,
+                position_side=position_side,
+                stop_price=decision.stop_price,
+                bar_id=str((decision.meta or {}).get("bar_id") or ""),
+                trace_id=trace_id,
+                meta=dict(decision.meta or {}),
+            )
+            place_order = getattr(self.trader, "place_order", None)
+            if callable(place_order):
+                result = place_order(request)
+            elif decision.action == StrategyAction.BUY_OPEN:
+                # 旧的鸭子类型测试替身只实现便捷方法；真实通道统一走 OrderRequest。
+                result = self.trader.buy_open(decision.symbol, vol, price)
+            elif decision.action == StrategyAction.SELL_OPEN:
+                result = self.trader.sell_open(decision.symbol, vol, price)
+            else:
+                result = self.trader.close_position(decision.symbol, vol, price)
 
-        raw = getattr(result, "raw", None)
+        raw_value = getattr(result, "raw", None)
+        raw = raw_value if isinstance(raw_value, dict) else {}
+        channel_result_at = str(raw.get("channel_result_at") or "") or now_iso()
+        raw.setdefault("trace_id", trace_id)
+        raw.setdefault("bar_id", str((decision.meta or {}).get("bar_id") or ""))
+        raw.setdefault("meta", dict(decision.meta or {}))
+        raw.setdefault("order_price", price)
+        raw.setdefault("channel_result_at", channel_result_at)
+        decision.meta = {**(decision.meta or {}), "channel_result_at": channel_result_at}
+        if not caps.orders_via_broker:
+            self._record_order_timeline(
+                "channel_result",
+                decision,
+                volume=int(vol),
+                order_id=str(getattr(result, "order_id", "") or ""),
+                ok=bool(getattr(result, "ok", False)),
+                message=str(getattr(result, "message", "") or ""),
+                channel_result_at=channel_result_at,
+                stage_ms=elapsed_ms(dispatch_started_at, channel_result_at),
+                send_to_channel_result_ms=elapsed_ms(dispatch_started_at, channel_result_at),
+            )
         if result.ok and isinstance(raw, dict) and raw.get("unclean"):
             # 点击已经落下去，只是收尾出错。按已发出处理，记账照常，但留住意图文件等人工核对。
             self._order_unclean = True
@@ -1401,15 +1624,60 @@ class OrderExecutorMixin:
                     self._record_event("order_no_price", symbol=decision.symbol, side=side)
                     return False
 
-            if getattr(result, "assumed_fill", False):
+            assumed = bool(getattr(result, "assumed_fill", False))
+            executor_name = str((self.cfg.get("trade") or {}).get("executor") or "").strip().lower()
+            simulated = executor_name == "sim" or (bool(self.cfg.get("dry_run", True)) and not assumed)
+            fill_kind = "assumed_fill" if assumed else "simulated_fill" if simulated else "channel_fill"
+            if assumed:
                 logger.warning(
                     "假定成交记账（请尽快核对交易软件真实持仓）| {} {} vol={}",
                     decision.action.value,
                     decision.symbol,
                     vol,
                 )
+                # GUI 只能确认点击动作；这里的价格是程序记账参考价，不是柜台成交价。
+                self._record_order_timeline(
+                    "assumed_fill",
+                    decision,
+                    volume=int(vol),
+                    order_id=str(getattr(result, "order_id", "") or ""),
+                    assumed_price=fill_price,
+                    assumed_at=channel_result_at,
+                    price_kind="reference_assumed",
+                    broker_confirmed=False,
+                    trade_id="",
+                    trade_time="",
+                )
+            elif simulated:
+                simulated_at = str(raw.get("simulated_at") or "") or channel_result_at
+                self._record_order_timeline(
+                    "simulated_fill",
+                    decision,
+                    volume=int(vol),
+                    order_id=str(getattr(result, "order_id", "") or ""),
+                    fill_price=fill_price,
+                    simulated_at=simulated_at,
+                    price_kind="pure_simulation",
+                    broker_confirmed=False,
+                )
 
-            self._apply_fill_accounting(decision.symbol, decision, vol, fill_price, fill_price)
+            evidence = {
+                **raw,
+                "fill_kind": fill_kind,
+                "price_kind": "reference_assumed" if assumed else "pure_simulation" if simulated else "channel_reported",
+                "broker_confirmed": bool(caps.confirms_fill and not simulated),
+                "order_id": str(getattr(result, "order_id", "") or ""),
+                "channel_result_at": channel_result_at,
+                "fill_received_at": str(raw.get("simulated_at") or "") if simulated else "",
+            }
+            self._apply_fill_accounting(
+                decision.symbol,
+                decision,
+                vol,
+                fill_price,
+                fill_price,
+                fill_evidence=evidence,
+            )
             logger.info(
                 "已执行 {} {} vol={} | {} | stop={} | {}",
                 decision.action.value,
@@ -1429,6 +1697,7 @@ class OrderExecutorMixin:
                 stop=decision.stop_price,
                 sizing=size_note,
                 assumed_fill=bool(getattr(result, "assumed_fill", False)),
+                market_health=dict((decision.meta or {}).get("market_health") or {}),
             )
             return True
         else:
@@ -1505,6 +1774,12 @@ class OrderExecutorMixin:
             return None
         if price <= 0:
             return None
+        decision.meta = {
+            **(decision.meta or {}),
+            "latest_price": price,
+            "latest_price_at": now_iso(),
+            "latest_price_source": "kline_close",
+        }
         # 平多是卖出、平空是买入：往对手价方向让几跳，确保能成交。
         protect = self._price_tick_for(decision.symbol) * self._close_protect_ticks()
         pos = self._position_for(decision.symbol)
@@ -1553,13 +1828,17 @@ class OrderExecutorMixin:
         if price <= 0:
             logger.error("CTP 成交回报缺少价格，不记账")
             return False
+        raw_meta = report.get("meta")
+        meta = dict(raw_meta) if isinstance(raw_meta, dict) else {}
+        meta["bar_id"] = str(report.get("bar_id") or meta.get("bar_id") or "")
+        meta["trace_id"] = str(report.get("trace_id") or meta.get("trace_id") or "")
         decision = StrategyDecision(
             action=action,
             symbol=str(report.get("symbol") or ""),
             reason="CTP成交回报",
             stop_price=report.get("stop_price"),
             entry_price=price,
-            meta={"bar_id": str(report.get("bar_id") or "")},
+            meta=meta,
         )
         ref = str(report.get("order_ref") or "").strip()
         fill_key = ctp_fill_key(ref, filled_total)
@@ -1576,6 +1855,16 @@ class OrderExecutorMixin:
             price,
             fill_key=fill_key,
             stop_price=float(stop) if stop else None,
+            fill_evidence={
+                **report,
+                "fill_kind": "broker_fill",
+                "price_kind": "broker_reported",
+                "broker_confirmed": True,
+                "order_id": ref,
+                "fill_received_at": str(
+                    report.get("trade_received_at") or report.get("last_trade_received_at") or ""
+                ),
+            },
         )
         if not ok:
             return False
@@ -1637,6 +1926,15 @@ class OrderExecutorMixin:
                 price,
                 fill_key=ctp_fill_key(ref, filled_row),
                 stop_price=decision.stop_price,
+                fill_evidence={
+                    **row,
+                    "fill_kind": "broker_fill",
+                    "price_kind": "broker_reported",
+                    "broker_confirmed": True,
+                    "order_id": ref,
+                    "channel_result_at": str(raw.get("channel_result_at") or ""),
+                    "fill_received_at": str(row.get("last_trade_received_at") or ""),
+                },
             )
             self._record_event(
                 "order",
@@ -1729,6 +2027,15 @@ class OrderExecutorMixin:
                         fill_price,
                         fill_key=ctp_fill_key(ref, filled),
                         stop_price=decision.stop_price,
+                        fill_evidence={
+                            **raw,
+                            "fill_kind": "broker_fill",
+                            "price_kind": "broker_reported",
+                            "broker_confirmed": True,
+                            "order_id": ref,
+                            "order_ref": ref,
+                            "fill_received_at": str(raw.get("last_trade_received_at") or ""),
+                        },
                     )
                     self._record_event(
                         "order",

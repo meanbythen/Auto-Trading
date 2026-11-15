@@ -13,6 +13,7 @@ from src.account.signal_book import load_book
 from src.scheduler.runner import TradingBot
 from src.trader.ctp_gateway import CtpGateway, CtpSettings
 from src.trader.ctp_logic import TrackedOrder
+from src.trader.order_timeline import load_rows, now_iso
 
 
 def _cfg(root) -> dict:
@@ -126,6 +127,40 @@ def test_fill_lock_timeout_returns_false(tmp_path):
     finally:
         bot._trade_lock = real_lock
     assert "fill_lock_timeout" in _events(tmp_path)
+
+
+def test_fill_preserves_trace_theory_and_broker_evidence(tmp_path):
+    """CTP 原价信号、柜台编号和本机成交接收时刻要一直带到入账节点。"""
+    bot = TradingBot(_cfg(tmp_path))
+    bot._recent_fill_keys = OrderedDict()
+    report = _report("6001")
+    report.update(
+        {
+            "trace_id": "OT-CTP-6001",
+            "meta": {"theory_price": 3490, "latest_price": 3492, "bar_id": "bar-1"},
+            "bar_id": "bar-1",
+            "order_sys_id": "     6001",
+            "trade_id": "TRADE-6001",
+            "trade_time": "10:00:01",
+            "trade_received_at": now_iso(),
+        }
+    )
+
+    assert bot._on_ctp_fill(report) is True
+
+    rows = load_rows(tmp_path, "OT-CTP-6001")
+    accounted = [row for row in rows if row.get("stage") == "accounted"]
+    assert len(accounted) == 1
+    row = accounted[0]
+    assert row["theory_price"] == 3490
+    assert row["fill_price"] == 3500
+    assert row["slip_ticks"] == 10
+    assert row["order_ref"] == "6001"
+    assert row["order_sys_id"] == "     6001"
+    assert row["trade_id"] == "TRADE-6001"
+    assert row["trade_time"] == "10:00:01"
+    assert row["broker_confirmed"] is True
+    assert row["fill_to_account_ms"] is not None
 
 
 def test_gateway_sets_waiter_before_accounting() -> None:

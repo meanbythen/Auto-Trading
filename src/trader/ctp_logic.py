@@ -411,6 +411,11 @@ class TrackedOrder:
     foreign: bool = False
     stop_price: float | None = None
     bar_id: str = ""
+    trace_id: str = ""
+    meta: dict[str, Any] = field(default_factory=dict)
+    sent_at: str = ""
+    last_report_received_at: str = ""
+    last_trade_received_at: str = ""
     # 撤单时柜台要这些编号。回报到达之前是空的。
     exchange_id: str = ""
     order_sys_id: str = ""
@@ -435,6 +440,13 @@ class TrackedOrder:
             "message": self.message,
             "stop_price": self.stop_price,
             "bar_id": self.bar_id,
+            "trace_id": self.trace_id,
+            "meta": dict(self.meta or {}),
+            "sent_at": self.sent_at,
+            "last_report_received_at": self.last_report_received_at,
+            "last_trade_received_at": self.last_trade_received_at,
+            "insert_time": self.insert_time,
+            "order_sys_id": self.order_sys_id,
         }
 
 

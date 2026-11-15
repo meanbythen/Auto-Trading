@@ -20,7 +20,7 @@ import schedule
 from loguru import logger
 
 from src.data import KlineProvider
-from src.data.kline import is_bars_stale
+from src.data.kline import bars_age_minutes, is_bars_stale
 from src.data.periods import drop_forming_bar, period_label, stale_after_minutes
 from src.login import AppLoginManager
 from src.risk import PositionSizer, RiskGuardian
@@ -33,6 +33,7 @@ from src.strategy.decision_guard import apply_delivery_gate, apply_generic_stop
 from src.strategy.generic_stop import GenericStopOverlay
 from src.trader import create_trader
 from src.trader.ctp_logic import position_avg_price
+from src.trader.order_timeline import OrderTimeline, now_iso
 from src.utils.state_store import (
     default_state_path,
     format_position_text,
@@ -220,6 +221,10 @@ class TradingBot(
         self.last_scan_at: str = ""
         self.last_error: str = ""
         self._health_report: dict[str, Any] | None = None
+        # 行情健康按「合约|周期」保留；完整延迟逐轮写独立日志，异常事件/告警限流。
+        self._market_health: dict[str, dict[str, Any]] = {}
+        self._market_scan_at: dict[str, float] = {}
+        self._throttled_event_at: dict[str, float] = {}
         # 动态减仓：最近一次说明、各品种已收盘 K 线、已经减过的标记（避免每轮重复减）。
         self._dynamic_note: str = ""
         self._last_signal_bars: dict[str, Any] = {}
@@ -261,6 +266,8 @@ class TradingBot(
         root = Path(cfg.get("_project_root", "."))
         self.root = root
         self.event_log = root / "data" / "events.jsonl"
+        self.market_health_log = root / "data" / "market_health.jsonl"
+        self._order_timeline = OrderTimeline(root)
         self.event_log.parent.mkdir(parents=True, exist_ok=True)
         # 休市日历外置：读不到就用内置 2026 表（老行为）。实盘启动再检查覆盖范围。
         from src.utils.holidays import calendar_from_config
@@ -1344,6 +1351,122 @@ class TradingBot(
         self.cfg.setdefault("risk", {})["max_daily_loss"] = max_daily_loss
         self.risk.set_max_daily_loss(float(max_daily_loss))
 
+    def _record_event_throttled(
+        self, event: str, key: str, *, cooldown_sec: float = 600.0, **kwargs: Any
+    ) -> None:
+        """持续异常只按间隔写关键事件，完整行情延迟另走 market_health.jsonl。"""
+        now = time.monotonic()
+        stamps = getattr(self, "_throttled_event_at", None)
+        if stamps is None:
+            stamps = {}
+            self._throttled_event_at = stamps
+        if now - float(stamps.get(key, float("-inf"))) < cooldown_sec:
+            return
+        stamps[key] = now
+        self._record_event(event, **kwargs)
+
+    def _capture_market_health(
+        self,
+        symbol: str,
+        period: str,
+        bars: Any = None,
+        *,
+        error: str = "",
+    ) -> dict[str, Any]:
+        """从 K 线 attrs 或 Provider 取健康记录；测试替身没有 attrs 时也保留基本年龄。"""
+        raw = getattr(bars, "attrs", {}).get("market_health", {}) if bars is not None else {}
+        health = dict(raw) if isinstance(raw, dict) else {}
+        if not health:
+            getter = getattr(self.kline, "get_market_health", None)
+            if callable(getter):
+                try:
+                    stored = getter(symbol, str(period))
+                    if isinstance(stored, dict):
+                        health = dict(stored)
+                except Exception:  # noqa: BLE001
+                    pass
+        age = bars_age_minutes(bars)
+        stale_limit = stale_after_minutes(str(period), self.max_stale_minutes)
+        health.setdefault("symbol", symbol)
+        health.setdefault("period", str(period))
+        health.setdefault("source", str(getattr(self.kline, "source", "") or ""))
+        health.setdefault("fetch_started_at", "")
+        health.setdefault(
+            "received_at", datetime.now().astimezone().isoformat(timespec="milliseconds")
+        )
+        health.setdefault("download_ms", None)
+        health.setdefault("latest_bar_time", str(bars.index[-1]) if bars is not None and len(bars) else "")
+        health.setdefault("latest_bar_age_minutes", None if age is None else round(age, 3))
+        health.setdefault("stale_limit_minutes", stale_limit)
+        health.setdefault("from_cache", False)
+        health.setdefault("synthetic", health.get("source") == "demo")
+        health.setdefault("error", "")
+        health.setdefault(
+            "stale", bool(age is None or age > stale_limit) if bars is not None else True
+        )
+        health.setdefault("status", "stale" if health["stale"] else "ok")
+        if error:
+            health.update({"status": "error", "error": str(error), "stale": True})
+        return health
+
+    def _store_market_health(self, health: dict[str, Any]) -> None:
+        """逐轮写延迟证据；异常写关键事件和告警，但同一种异常最多 10 分钟一次。"""
+        symbol = str(health.get("symbol") or "")
+        period = str(health.get("period") or "")
+        key = f"{symbol.strip().lower()}|{period}"
+        rows = getattr(self, "_market_health", None)
+        if rows is None:
+            rows = {}
+            self._market_health = rows
+        rows[key] = dict(health)
+        try:
+            path = getattr(self, "market_health_log", None)
+            if path is None:
+                path = self.root / "data" / "market_health.jsonl"
+                self.market_health_log = path
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists() and path.stat().st_size >= EVENT_LOG_MAX_BYTES:
+                backup = path.with_name(path.name + ".1")
+                backup.unlink(missing_ok=True)
+                path.replace(backup)
+            row = {
+                "ts": datetime.now().isoformat(timespec="milliseconds"),
+                "run_id": self.run_id,
+                **health,
+            }
+            with path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(row, ensure_ascii=False, allow_nan=False) + "\n")
+        except OSError as exc:
+            logger.warning("写行情健康日志失败（不影响平仓保护）: {}", exc)
+
+        issue = str(health.get("issue") or "")
+        status = str(health.get("status") or "")
+        if not issue and status == "ok" and not health.get("synthetic"):
+            return
+        event_key = f"market_health|{key}|{issue or status}"
+        age = health.get("signal_bar_age_minutes", health.get("latest_bar_age_minutes"))
+        age_text = "未知" if age is None else f"{float(age):.1f}分钟"
+        message = (
+            f"{symbol} {period} 行情异常：{issue or status}；来源 {health.get('source') or '未知'}；"
+            f"K线 {health.get('signal_bar_time') or health.get('latest_bar_time') or '未知'}；"
+            f"年龄 {age_text}；下载 {health.get('download_ms') or 0}ms"
+        )
+        if health.get("error"):
+            message += f"；{health['error']}"
+        before = dict(getattr(self, "_throttled_event_at", {}) or {})
+        self._record_event_throttled(
+            "market_health_warning", event_key, market_health=dict(health), message=message
+        )
+        after = getattr(self, "_throttled_event_at", {})
+        if after.get(event_key) == before.get(event_key):
+            return
+        try:
+            from src.ops.alerts import emit_alert
+
+            emit_alert("market_health", message, level="warning", root=self.root)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("行情告警写入失败: {}", exc)
+
     def status_snapshot(self) -> dict[str, Any]:
         """给界面看的健康快照。"""
         return {
@@ -1362,6 +1485,10 @@ class TradingBot(
             "symbols": self.symbols,
             "last_alert": _safe_last_alert(self.risk.max_daily_loss),
             "health": getattr(self, "_health_report", None),
+            "market_health": {
+                key: dict(value)
+                for key, value in (getattr(self, "_market_health", {}) or {}).items()
+            },
             "dynamic": self._dynamic_status_text(),
             "reconcile": dict(self._reconcile_state or {}),
             "frozen_symbols": sorted(self._frozen_symbols),
@@ -1380,10 +1507,23 @@ class TradingBot(
                 self._record_event("symbol_frozen", symbol=symbol)
             return
 
+        scan_started = time.perf_counter()
+        previous_scan = getattr(self, "_market_scan_at", {}).get(key)
+        scan_gap_sec = None if previous_scan is None else scan_started - previous_scan
+        self._market_scan_at[key] = scan_started
         signal_tf = getattr(self.strategy, "timeframe", "15")
         trail_tf = getattr(self.strategy, "trail_timeframe", signal_tf)
 
-        bars = self.kline.fetch(symbol, period=str(signal_tf))
+        try:
+            bars = self.kline.fetch(symbol, period=str(signal_tf))
+        except Exception as exc:
+            health = self._capture_market_health(
+                symbol, str(signal_tf), error=str(exc)
+            )
+            health["issue"] = "download_error"
+            self._store_market_health(health)
+            raise
+        health = self._capture_market_health(symbol, str(signal_tf), bars)
         # 只去掉「墙上时钟还没到结束时刻」的最后一根。
         # 午休后第一根已收盘若被盲删，会一直以为最新还是上午那根，止损会晚好几分钟。
         closed = drop_forming_bar(bars)
@@ -1490,13 +1630,29 @@ class TradingBot(
                     price_gap=hit.price_gap,
                 )
 
-        decision = self._evaluate_symbol(
-            symbol,
-            eval_bars,
-            trail_bars=eval_trail,
-            trend_bars=eval_trend,
-            now=_eval_now(eval_bars, closed, catch_up=catch_up_used),
-        )
+        evaluation_started_at = datetime.now().astimezone()
+        evaluation_started = time.perf_counter()
+        try:
+            decision = self._evaluate_symbol(
+                symbol,
+                eval_bars,
+                trail_bars=eval_trail,
+                trend_bars=eval_trend,
+                now=_eval_now(eval_bars, closed, catch_up=catch_up_used),
+            )
+        except Exception as exc:
+            health.update(
+                {
+                    "issue": "compute_error",
+                    "compute_error": str(exc),
+                    "evaluation_started_at": evaluation_started_at.isoformat(timespec="milliseconds"),
+                    "evaluation_ms": round((time.perf_counter() - evaluation_started) * 1000.0, 3),
+                    "scan_gap_sec": scan_gap_sec,
+                }
+            )
+            self._store_market_health(health)
+            raise
+        evaluation_ms = (time.perf_counter() - evaluation_started) * 1000.0
 
         # 柜台对账补进来的仓：不让策略加仓、反手，只保留通用止损。
         pos_now = self._position_for(symbol)
@@ -1579,11 +1735,58 @@ class TradingBot(
         # 日线、周线不能沿用「90 分钟就算过期」，否则昨天的日线永远开不了仓。
         stale_limit = stale_after_minutes(str(signal_tf), self.max_stale_minutes)
         stale = is_bars_stale(closed, stale_limit)
+        signal_age = bars_age_minutes(closed)
+        signal_bar_time = str(closed.index[-1]) if closed is not None and len(closed) else ""
+        download_ms = float(health.get("download_ms") or 0.0)
+        evaluation_ms = (time.perf_counter() - evaluation_started) * 1000.0
+        issues: list[str] = []
+        if health.get("error"):
+            issues.append("download_fallback" if health.get("from_cache") else "download_error")
+        if health.get("synthetic"):
+            issues.append("synthetic")
+        if stale:
+            if forming is not None and len(forming) > 0:
+                issues.append("bar_forming")
+            issues.append("cache_stale" if health.get("from_cache") else "source_stale")
+        slow_ms = max(5.0, float(getattr(self, "scan_interval", 30))) * 1000.0
+        if download_ms > slow_ms:
+            issues.append("download_slow")
+        if evaluation_ms > slow_ms:
+            issues.append("compute_slow")
+        if stale:
+            market_status = "stale"
+        elif health.get("synthetic"):
+            market_status = "synthetic"
+        elif issues:
+            market_status = "slow" if any(x.endswith("_slow") for x in issues) else "cache"
+        else:
+            market_status = "ok"
+        health.update(
+            {
+                "status": market_status,
+                "stale": stale,
+                "signal_bar_time": signal_bar_time,
+                "signal_bar_age_minutes": None if signal_age is None else round(signal_age, 3),
+                "forming_bar": bool(forming is not None and len(forming) > 0),
+                "evaluation_started_at": evaluation_started_at.isoformat(timespec="milliseconds"),
+                "evaluated_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
+                "evaluation_ms": round(evaluation_ms, 3),
+                "scan_gap_sec": None if scan_gap_sec is None else round(scan_gap_sec, 3),
+                "issue": "+".join(issues),
+                "issues": issues,
+                "decision_action": decision.action.value,
+                "bar_id": str((decision.meta or {}).get("bar_id", "") or signal_bar_time),
+            }
+        )
         self._last_signal_bars[symbol] = closed
         if decision.action == StrategyAction.HOLD:
             cut = self._maybe_dynamic_cut(symbol)
             if cut is not None:
                 decision = cut
+        health["decision_action"] = decision.action.value
+        health["bar_id"] = str((decision.meta or {}).get("bar_id", "") or signal_bar_time)
+        decision.meta = {**(decision.meta or {}), "market_health": dict(health)}
+        self._store_market_health(health)
 
         if stale and decision.action in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN):
             logger.error(
@@ -1592,7 +1795,14 @@ class TradingBot(
                 period_label(str(signal_tf)),
                 decision.reason,
             )
-            self._record_event("stale_block_open", symbol=symbol, reason=decision.reason)
+            self._record_event(
+                "stale_block_open",
+                symbol=symbol,
+                reason=decision.reason,
+                bar_id=health.get("bar_id", ""),
+                signal_bar_age_minutes=health.get("signal_bar_age_minutes"),
+                market_health=dict(health),
+            )
             return
 
         # 滑点闸门：信号价是那根 K 的收盘，真正点出去还要几秒。
@@ -1604,10 +1814,19 @@ class TradingBot(
         ):
             # 现价优先用未收线那根（就是当前价）；数据只到收盘那根时，去要一次最新的 1 分钟价。
             live_price = _last_close(forming)
+            latest_price_source = "forming_bar_close"
             if live_price <= 0:
                 live_price = self.kline.latest_price(symbol)
+                latest_price_source = "latest_price_api"
             if live_price <= 0:
                 live_price = _last_close(closed)
+                latest_price_source = "signal_bar_close"
+            decision.meta = {
+                **(decision.meta or {}),
+                "latest_price": live_price,
+                "latest_price_at": now_iso(),
+                "latest_price_source": latest_price_source if live_price > 0 else "unavailable",
+            }
             atr = _latest_atr(closed, self.strategy)
             limit_atr = float((self.cfg.get("trade") or {}).get("max_entry_slip_atr", 0.5) or 0)
             limit_points = float((self.cfg.get("trade") or {}).get("max_entry_slip_points", 0) or 0)
@@ -1753,12 +1972,22 @@ class TradingBot(
                 # 行情没拿到时只写一句原因。整段英文报错会占满运行日志，看起来像程序崩了。
                 self.last_error = str(exc)
                 logger.warning("扫描 {} 这一轮没有做成: {}", symbol, exc)
-                self._record_event("scan_error", symbol=symbol, error=str(exc))
+                self._record_event_throttled(
+                    "scan_error",
+                    f"scan_error|{symbol.strip().lower()}|runtime",
+                    symbol=symbol,
+                    error=str(exc),
+                )
             except Exception as e:  # noqa: BLE001
                 # 含行情拉取失败：跳过本品种，不中断其它品种
                 self.last_error = str(e)
                 logger.exception("扫描 {} 失败: {}", symbol, e)
-                self._record_event("scan_error", symbol=symbol, error=str(e))
+                self._record_event_throttled(
+                    "scan_error",
+                    f"scan_error|{symbol.strip().lower()}|exception",
+                    symbol=symbol,
+                    error=str(e),
+                )
             if not self._running:
                 return
         if getattr(self, "_unprotected_resume", False):

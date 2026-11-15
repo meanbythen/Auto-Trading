@@ -33,6 +33,26 @@ def test_record_sign_convention(tmp_path):
     assert rows[3]["slip_ticks"] == ""
 
 
+def test_strategy_action_values_use_the_same_sign_convention(tmp_path):
+    """调度层传的是小写 buy_open/sell_open/close，也必须算出滑点。"""
+    buy = record_fill(
+        tmp_path, symbol="fu2701", action="buy_open", volume=1,
+        theory_price=3000, fill_price=3002, tick=1, executor="ctp", dry_run=False,
+    )
+    close_long = record_fill(
+        tmp_path, symbol="fu2701", action="close", volume=1, side_before="long",
+        theory_price=3000, fill_price=2998, tick=1, executor="ctp", dry_run=False,
+    )
+    assumed = record_fill(
+        tmp_path, symbol="fu2701", action="close", volume=1, side_before="long",
+        theory_price=3000, fill_price=2990, tick=1, executor="gui", dry_run=False,
+        assumed_fill=True,
+    )
+    assert buy == 2.0
+    assert close_long == 2.0
+    assert assumed == 0.0
+
+
 def test_summarize_prefers_real_ctp(tmp_path):
     # 一笔 GUI 假定成交（滑点0）+ 两笔 CTP 真实成交
     record_fill(tmp_path, symbol="fu2701", action="BUY_OPEN", volume=1,

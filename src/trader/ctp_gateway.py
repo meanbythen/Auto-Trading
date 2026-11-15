@@ -23,6 +23,7 @@ from urllib.parse import urlparse
 
 from loguru import logger
 
+from src.trader.order_timeline import elapsed_ms, new_trace_id, now_iso
 from src.trader.ctp_logic import (
     CTP_KIND_SIM,
     OrderTable,
@@ -219,6 +220,8 @@ class CtpGateway:
         self.account: dict[str, Any] = {}
         self.contracts: list[dict[str, Any]] = []
         self.fill_handler: Callable[[dict[str, Any]], None] | None = None
+        # 只读时间线监听器，和真实成交入账 handler 分开；记录异常不能影响报单。
+        self.order_event_handler: Callable[[str, dict[str, Any]], None] | None = None
         self._last_quote_line = ""
         self._lock = threading.RLock()
         self._ready_event = threading.Event()
@@ -347,8 +350,13 @@ class CtpGateway:
         price: float,
         stop_price: float | None = None,
         bar_id: str = "",
+        trace_id: str = "",
+        meta: dict[str, Any] | None = None,
     ) -> TrackedOrder:
         """发一笔限价单，等到全部成交、拒单、撤单，或等待超时。"""
+        local_trace = str(trace_id or "") or new_trace_id()
+        context = dict(meta or {})
+        context.setdefault("trace_id", local_trace)
         with self._lock:
             if not self.session.ready or self.session.need_order_check:
                 order = TrackedOrder(
@@ -360,6 +368,8 @@ class CtpGateway:
                     price=price,
                     status="rejected",
                     message=self.session.last_error or "还没完成登录和报单核对",
+                    trace_id=local_trace,
+                    meta=context,
                 )
                 return order
             ref = self.table.new_ref()
@@ -372,10 +382,24 @@ class CtpGateway:
                 price=float(price),
                 stop_price=stop_price,
                 bar_id=bar_id,
+                trace_id=local_trace,
+                meta=context,
             )
             self.table.add(order)
             waiter = threading.Event()
             self._waiters[ref] = waiter
+        # 本地发送时刻紧挨 insert；柜台自己的 InsertTime 另行保存，绝不混用。
+        order.sent_at = now_iso()
+        self._emit_order_event(
+            "order_sent",
+            self._order_event_payload(
+                order,
+                sent_at=order.sent_at,
+                stage_ms=elapsed_ms(context.get("decided_at"), order.sent_at),
+                decision_to_send_ms=elapsed_ms(context.get("decided_at"), order.sent_at),
+                risk_to_send_ms=elapsed_ms(context.get("risk_at"), order.sent_at),
+            ),
+        )
         try:
             self.client.insert(
                 self.settings,
@@ -404,6 +428,31 @@ class CtpGateway:
         if not is_terminal(order.status) and self.settings.submit_auto_cancel():
             self._cancel_stale(order)
         return order
+
+    def _order_event_payload(self, order: TrackedOrder, **fields: Any) -> dict[str, Any]:
+        """快照报单字段，避免回调锁外写日志时又被下一条回报改掉。"""
+        payload = order.to_dict()
+        meta = dict(order.meta or {})
+        payload.update(
+            {
+                "order_price": float(order.price or 0),
+                "theory_price": meta.get("theory_price"),
+                "latest_price": meta.get("latest_price"),
+                "latest_price_at": meta.get("latest_price_at") or "",
+            }
+        )
+        payload.update(fields)
+        return payload
+
+    def _emit_order_event(self, stage: str, payload: dict[str, Any]) -> None:
+        """时间线只旁路观测；监听器坏了也不能拖死报单或真实成交入账。"""
+        handler = self.order_event_handler
+        if handler is None:
+            return
+        try:
+            handler(stage, payload)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("订单时间线事件记录失败 {}: {}", stage, exc)
 
     def _cancel_stale(self, order: TrackedOrder) -> None:
         """撤掉等待超时还没结束的报单，并等柜台把终态回报送回来。"""
@@ -598,19 +647,31 @@ class CtpGateway:
             self._ready_event.set()
 
     def on_reject(self, order_ref: str, message: str) -> None:
+        received_at = now_iso()
         report = None
         waiter = None
+        event = None
         with self._lock:
             order = self.table.get(order_ref)
             if order is None:
                 self._note_foreign_report()
                 return
+            order.last_report_received_at = received_at
             apply_order_report(order, status_code="rejected", message=message or "拒单")
             logger.error("柜台返回错误，报单 {}：{}", order_ref, order.message)
             report, waiter = self._finish_locked(order)
+            event = self._order_event_payload(
+                order,
+                received_at=received_at,
+                stage_ms=elapsed_ms(order.sent_at, received_at),
+                send_to_report_ms=elapsed_ms(order.sent_at, received_at),
+                broker_time=order.insert_time,
+            )
         # 先唤醒等报单结果的线程，再去记账：记账要抢交易锁，主线程可能正持锁等这里。
         if waiter is not None:
             waiter.set()
+        if event is not None:
+            self._emit_order_event("broker_report", event)
         self._account_fill(report)
 
     def on_order_status(
@@ -625,8 +686,10 @@ class CtpGateway:
         session_id: int = 0,
         detail: dict[str, Any] | None = None,
     ) -> None:
+        received_at = now_iso()
         report = None
         waiter = None
+        event = None
         with self._lock:
             order = self.table.get(order_ref)
             extra = detail or {}
@@ -651,6 +714,7 @@ class CtpGateway:
                 order.front_id = int(front_id)
             if session_id:
                 order.session_id = int(session_id)
+            order.last_report_received_at = received_at
             self._stamp_order_meta(order, extra)
             apply_order_report(order, status_code=status_code, filled=filled, message=message)
             logger.info(
@@ -660,9 +724,18 @@ class CtpGateway:
                 message,
             )
             report, waiter = self._finish_locked(order)
+            event = self._order_event_payload(
+                order,
+                received_at=received_at,
+                stage_ms=elapsed_ms(order.sent_at, received_at),
+                send_to_report_ms=elapsed_ms(order.sent_at, received_at),
+                broker_time=order.insert_time,
+            )
         # 先唤醒等报单结果的线程，再去记账：记账要抢交易锁，主线程可能正持锁等这里。
         if waiter is not None:
             waiter.set()
+        if event is not None:
+            self._emit_order_event("broker_report", event)
         self._account_fill(report)
 
     def on_cancel_error(self, order_ref: str, message: str) -> None:
@@ -686,15 +759,18 @@ class CtpGateway:
             logger.info("仿真公用账号上有别人的历史回报。那些单不是这次登录发出的，后面不再逐条显示。")
 
     def on_trade(self, order_ref: str, price: float, volume: int, detail: dict[str, Any] | None = None) -> None:
+        received_at = now_iso()
         extra = detail or {}
         report = None
         waiter = None
+        event = None
         with self._lock:
             self._remember_fill(order_ref, price, volume, extra)
             order = self.table.get(order_ref)
             if order is None:
                 self._note_foreign_report()
                 return
+            order.last_trade_received_at = received_at
             apply_trade(order, price, volume)
             logger.info(
                 "报单 {} {} 价 {} 手数 {}",
@@ -704,9 +780,33 @@ class CtpGateway:
                 volume,
             )
             report, waiter = self._finish_locked(order)
+            if report is not None:
+                report.update(
+                    {
+                        "trade_id": str(extra.get("trade_id") or ""),
+                        "trade_time": str(extra.get("time") or ""),
+                        "trade_received_at": received_at,
+                    }
+                )
+            event = self._order_event_payload(
+                order,
+                received_at=received_at,
+                trade_received_at=received_at,
+                stage_ms=elapsed_ms(order.sent_at, received_at),
+                send_to_trade_ms=elapsed_ms(order.sent_at, received_at),
+                trade_id=str(extra.get("trade_id") or ""),
+                trade_time=str(extra.get("time") or ""),
+                broker_time=str(extra.get("time") or ""),
+                order_sys_id=str(extra.get("order_sys_id") or order.order_sys_id or ""),
+                fill_price=float(price or 0),
+                fill_volume=int(volume or 0),
+                broker_confirmed=True,
+            )
         # 先唤醒等报单结果的线程，再去记账：记账要抢交易锁，主线程可能正持锁等这里。
         if waiter is not None:
             waiter.set()
+        if event is not None:
+            self._emit_order_event("trade", event)
         self._account_fill(report)
 
     def on_query_trade(self, row: dict[str, Any] | None, is_last: bool) -> None:

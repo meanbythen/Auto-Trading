@@ -17,7 +17,7 @@ from src.backtest.engine import (
     run_backtest,
 )
 from src.strategy.trend_base import TrendStrategyBase
-from src.strategy.types import PositionState, StrategyAction
+from src.strategy.types import PositionState, StrategyAction, StrategyDecision
 
 
 def _frame(rows: list[tuple[str, float, float, float]]) -> pd.DataFrame:
@@ -487,5 +487,220 @@ def test_new_trail_stop_only_applies_from_the_next_bar() -> None:
     )
     assert decision.action == StrategyAction.CLOSE
     assert decision.stop_price == 111.0
+
+
+class _ScriptedExitStrategy(TrendStrategyBase):
+    """时序测试策略：固定根开仓，另一根主动离场，止损始终为 95。"""
+
+    label = "时序测试"
+
+    def __init__(
+        self,
+        cfg: dict,
+        entry_at: str,
+        exit_at: str | None,
+        *,
+        entry_volume: int | None = None,
+        close_volume: int | None = None,
+    ) -> None:
+        super().__init__(cfg)
+        self.test_entry_at = pd.Timestamp(entry_at)
+        self.test_exit_at = pd.Timestamp(exit_at) if exit_at else None
+        self.test_entry_volume = entry_volume
+        self.test_close_volume = close_volume
+
+    @property
+    def required_bars(self) -> int:
+        return 0
+
+    def prepare(self, bars: pd.DataFrame) -> dict[str, object]:
+        return {}
+
+    def entry_signal(self, bars: pd.DataFrame, bar: pd.Series, ind: dict[str, object]):
+        if pd.Timestamp(bar.name) != self.test_entry_at:
+            return None
+        meta = {"volume": self.test_entry_volume} if self.test_entry_volume is not None else {}
+        return "long", 95.0, "测试开仓", meta
+
+    def exit_reason(
+        self, bars: pd.DataFrame, bar: pd.Series, pos: PositionState, ind: dict[str, object]
+    ) -> str | None:
+        if self.test_exit_at is not None and pd.Timestamp(bar.name) == self.test_exit_at:
+            return "测试主动离场"
+        return None
+
+    def _close_decision(
+        self,
+        symbol: str,
+        pos: PositionState,
+        now: datetime,
+        bar_id: str,
+        reason: str,
+        *,
+        stop_price: float | None = None,
+    ) -> StrategyDecision:
+        decision = super()._close_decision(
+            symbol, pos, now, bar_id, reason, stop_price=stop_price
+        )
+        if self.test_close_volume is not None and "主动离场" in reason:
+            decision.meta["close_volume"] = self.test_close_volume
+        return decision
+
+
+def _ohlc_frame(rows: list[tuple[str, float, float, float, float]]) -> pd.DataFrame:
+    return pd.DataFrame(
+        {
+            "open": [row[1] for row in rows],
+            "high": [row[2] for row in rows],
+            "low": [row[3] for row in rows],
+            "close": [row[4] for row in rows],
+            "volume": [100.0 for _ in rows],
+        },
+        index=pd.to_datetime([row[0] for row in rows]),
+    )
+
+
+def _run_scripted(
+    monkeypatch,
+    bars: pd.DataFrame,
+    exit_at: str | None,
+    cfg: dict | None = None,
+    *,
+    entry_volume: int | None = None,
+    close_volume: int | None = None,
+):
+    config = cfg or _cfg(slippage_ticks=0)
+    strategy = _ScriptedExitStrategy(
+        config,
+        "2026-10-16 09:00",
+        exit_at,
+        entry_volume=entry_volume,
+        close_volume=close_volume,
+    )
+    monkeypatch.setattr("src.backtest.engine.create_strategy", lambda _cfg: strategy)
+    return run_backtest(config, symbol="bu", bars_signal=bars, warmup=0, volume=1)
+
+
+def test_normal_exit_uses_next_open_price_and_actual_fill_time(monkeypatch) -> None:
+    """日盘信号在夜盘开盘成交时，价格、成交时间和权益时间都不能留在信号根。"""
+    bars = _ohlc_frame(
+        [
+            ("2026-10-16 09:00", 99, 101, 98, 100),
+            ("2026-10-16 09:05", 100, 103, 99, 101),
+            ("2026-10-16 14:55", 102, 103, 101, 102),
+            ("2026-10-16 21:00", 90, 92, 89, 91),
+            ("2026-10-16 21:05", 91, 93, 90, 92),
+        ]
+    )
+    result = _run_scripted(monkeypatch, bars, "2026-10-16 14:55")
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.entry_time == "2026-10-16T09:05:00"
+    assert trade.exit_time == "2026-10-16T21:00:00"
+    assert trade.exit_price == 90.0
+    signal_equity = result.equity[result.equity_times.index("2026-10-16T14:55:00")]
+    assert signal_equity == 14020.0
+
+
+def test_next_open_exit_time_controls_close_today_fee(monkeypatch) -> None:
+    """周五日盘开到当晚夜盘平已跨期货交易日，不能按信号根误算平今。"""
+    bars = _ohlc_frame(
+        [
+            ("2026-10-16 09:00", 99, 101, 98, 100),
+            ("2026-10-16 09:05", 100, 103, 99, 101),
+            ("2026-10-16 14:55", 102, 103, 101, 102),
+            ("2026-10-16 21:00", 90, 92, 89, 91),
+            ("2026-10-16 21:05", 91, 93, 90, 92),
+        ]
+    )
+    cfg = _cfg(slippage_ticks=0)
+    cfg["risk"]["contracts"]["bu"].update({"commission": 2, "commission_close_today": 20})
+    result = _run_scripted(monkeypatch, bars, "2026-10-16 14:55", cfg)
+
+    assert result.trades[0].exit_time == "2026-10-16T21:00:00"
+    assert result.trades[0].commission == 4.0
+
+
+def test_next_open_entry_can_stop_inside_its_execution_bar(monkeypatch) -> None:
+    """下一根开盘建仓后，初始止损对该根后续行情有效；成交仍按止损价而非下一根。"""
+    bars = _ohlc_frame(
+        [
+            ("2026-10-16 09:00", 99, 101, 98, 100),
+            ("2026-10-16 09:05", 100, 106, 94, 105),
+            ("2026-10-16 09:10", 104, 105, 103, 104),
+        ]
+    )
+    result = _run_scripted(monkeypatch, bars, None)
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.entry_price == 100.0
+    assert trade.exit_price == 95.0
+    assert trade.entry_time == "2026-10-16T09:05:00"
+    assert trade.exit_time == "2026-10-16T09:05:00"
+    assert "止损" in trade.reason_exit
+
+
+def test_stop_and_active_exit_same_bar_use_conservative_price_and_report_impact(monkeypatch) -> None:
+    """OHLC 无法还原根内路径时取两种规则中更差者，并单列相对乐观口径的影响。"""
+    for next_open, expected_exit, expected_time in (
+        (90.0, 90.0, "2026-10-16T09:10:00"),
+        (110.0, 95.0, "2026-10-16T09:05:00"),
+    ):
+        bars = _ohlc_frame(
+            [
+                ("2026-10-16 09:00", 99, 101, 98, 100),
+                ("2026-10-16 09:05", 100, 106, 94, 105),
+                ("2026-10-16 09:10", next_open, next_open + 1, next_open - 1, next_open),
+                ("2026-10-16 09:15", next_open, next_open + 1, next_open - 1, next_open),
+            ]
+        )
+        result = _run_scripted(monkeypatch, bars, "2026-10-16 09:05")
+
+        assert len(result.trades) == 1
+        trade = result.trades[0]
+        assert trade.exit_price == expected_exit
+        assert trade.exit_time == expected_time
+        assert len(result.ambiguities) == 1
+        ambiguity = result.ambiguities[0]
+        optimistic = max(95.0, next_open)
+        expected_impact = round((expected_exit - optimistic) * 10, 2)
+        assert ambiguity["optimistic_exit_price"] == optimistic
+        assert ambiguity["pnl_impact_vs_optimistic"] == expected_impact
+        assert ambiguity["needs_fine_review"] is True
+        assert result.params_snapshot["ambiguity_count"] == 1
+        assert result.params_snapshot["ambiguity_pnl_impact"] == expected_impact
+        assert result.to_dict()["ambiguities"] == result.ambiguities
+
+
+def test_partial_close_keeps_volume_fee_allocation_and_actual_exit_time(monkeypatch) -> None:
+    """部分平仓仍按手数分摊开仓费；剩余仓结束强平，两笔都用各自实际时间算平今。"""
+    bars = _ohlc_frame(
+        [
+            ("2026-10-16 09:00", 99, 101, 98, 100),
+            ("2026-10-16 09:05", 100, 103, 99, 101),
+            ("2026-10-16 14:55", 102, 103, 101, 102),
+            ("2026-10-16 21:00", 100, 102, 99, 101),
+            ("2026-10-16 21:05", 101, 103, 100, 102),
+        ]
+    )
+    cfg = _cfg(slippage_ticks=0)
+    cfg["risk"]["apply_limits"] = False
+    cfg["risk"]["contracts"]["bu"].update({"commission": 2, "commission_close_today": 20})
+    result = _run_scripted(
+        monkeypatch,
+        bars,
+        "2026-10-16 14:55",
+        cfg,
+        entry_volume=2,
+        close_volume=1,
+    )
+
+    assert [trade.volume for trade in result.trades] == [1, 1]
+    assert [trade.commission for trade in result.trades] == [4.0, 4.0]
+    assert result.trades[0].exit_time == "2026-10-16T21:00:00"
+    assert result.trades[1].reason_exit == "回测结束强平"
+    assert result.ambiguities == []
 
 

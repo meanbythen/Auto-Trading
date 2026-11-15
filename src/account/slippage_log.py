@@ -50,6 +50,7 @@ def record_fill(
     side_before: str = "",
     executor: str = "",
     dry_run: bool = True,
+    assumed_fill: bool = False,
 ) -> float | None:
     """
     追加一条成交的滑点记录。返回滑点跳数（算不出时返回 None）。
@@ -63,12 +64,16 @@ def record_fill(
     if tick <= 0:
         tick = 1.0
     theory = float(theory_price or 0)
+    action_key = str(action or "").strip().lower()
     slip: float | None = None
     if theory > 0:
+        # GUI 只有点击成功的假定成交，参考价差不能冒充真实滑点。
+        if assumed_fill:
+            slip = 0.0
         # 买入方向成交价越高越亏；卖出方向越低越亏。不利方向记正数。
-        if action == "BUY_OPEN" or (action == "CLOSE" and side_before == "short"):
+        elif action_key == "buy_open" or (action_key == "close" and side_before == "short"):
             slip = (fill - theory) / tick
-        elif action == "SELL_OPEN" or (action == "CLOSE" and side_before == "long"):
+        elif action_key == "sell_open" or (action_key == "close" and side_before == "long"):
             slip = (theory - fill) / tick
     path = _csv_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
