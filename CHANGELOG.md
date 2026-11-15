@@ -4,6 +4,28 @@
 
 规则写在 README 的「版本」一节。已经写在这里的旧版本不再改写，新的改动加在最上面。
 
+## 44.12.0 — 2026-11-15
+
+功能与安全更新（批次 A）。补齐实盘上线前的四项硬门槛：节假日日历不再写死在代码里、告警能推到手机、每次运行可定位、主进程消失后有可选的冷备守护。默认配置下开平仓规则、回测数字与 44.11.0 完全一致。
+
+- **A2 节假日日历外置**：新增 `config/holidays.yaml` 与 `src/utils/holidays.py`，2026 年内容与原先硬编码表逐日一致；`schedule.holidays_file`、`schedule.holiday_min_cover_days`（默认 60 天）。实盘（`trade.executor=ctp` 且非 `dry_run`）启动时若日历没覆盖到未来 60 天，只禁止开仓（风控熔断 `holiday_calendar_missing` + 告警），止损与收盘清仓照常；补上日历年重启自动解除。回测与缺口说明读同一份日历，区间缺年份时在覆盖说明里提示「结果可能偏差」。
+- **A3 告警外发（飞书）**：新增 `src/ops/notify.py`，`runtime.alerts.external=webhook` 时把 `error` 级告警推到飞书群机器人。异步队列（容量 200，满时丢最旧）、单线程发送、5 秒超时、失败重试 1 次；同一 `code` 每小时默认最多 10 条；失败只记本地 `notify_failed`，不影响扫描与告警落盘。默认 `off`，webhook URL 只存本地配置、不写日志。
+- **A4 `run_id` 贯穿**：每次启动生成 `YYYYMMDD-HHMMSS-PID-随机4位`，写入 `events.jsonl`、`alerts.jsonl`、`bot_state.json`（含 `pid`、`started_at`）和运行台状态卡短号；旧日志没有该字段时按空处理，复盘读取不受影响。
+- **A5 断线/进程消失保护**：标准 CTP 没有原生止损单（`CtpNativeStopAdapter.supported()` 仍为 `False`），本版先交付冷备守护 `tools/guardian.py`，`runtime.guardian.enabled` 默认 `false`。仅当「有仓 + 心跳过期 + 主进程 PID 不存在 + 在交易时段 + CTP 配置齐全」同时满足才独立连柜台对手价平仓，写 `data/guardian_actions.jsonl` 与 `guardian_flatten` 告警；PID 还活着只告警不连接，避免把主进程踢下线。主程序启动时若发现守护平过仓，先提醒并走原有三方对账。整机断电/断网时守护同样不在，这类场景仍要等券商侧条件单。
+- 新增测试 `test_holidays.py`、`test_notify.py`、`test_run_events.py`、`test_guardian.py`；全量 pytest、`ruff check src tests tools`、mypy 通过。
+- 文档：README、本文件、`docs/实盘交易简易说明书.md`、`docs/配置说明书.md`、`docs/TODO.md` 同步；批次 A 规格见 [docs/project-review-2026/batch-a/spec.md](docs/project-review-2026/batch-a/spec.md)。A1 两项人工演练需仿真/实盘账号，仍留在 TODO。
+
+## 44.11.0 — 2026-11-15
+
+功能与安全更新。修完 4 项 P0 实盘风险（成交回报并发、关窗不等待、缺少三方对账、无柜台保护），并把项目文档重新分层整理。开平仓规则、默认配置和界面用法不变。
+
+- **P0-1 成交回报并发改仓**：CTP 成交/委托/拒单回报统一先唤醒等待者，再在 `_trade_lock`（10 秒超时）内入账；新增进程内 `_recent_fill_keys` 二级去重；`_apply_fill_accounting` 返回 `bool`，账本拒记时可重试。锁超时写 `fill_lock_timeout` 事件，不再与扫描线程并发改同一份仓位。
+- **P0-2 关窗等待后台线程**：`TradingBot.wait_stopped()` + `_stopped` 事件；`BotWorker.stop(wait=True, timeout=15)` 返回是否真正退出；关窗时若有持仓/挂单先确认，超时二次确认并记 `force_close`；取消关闭后恢复界面定时器。
+- **P0-3 三方对账**：新增 `ReconcileReport` / `three_way_diff`，「柜台 ↔ 账本 ↔ 内存」启动与每轮各对一次；未认领仓进内存并冻结、幽灵仓连续两轮确认才补记、柜台≠账本时只保留通用止损；`PositionState.origin` 区分来源；运行台横幅可「认领 / 平掉 / 忽略」，忽略只清待办、保持冻结。
+- **P0-4 看门狗与退出保护**：新增 `TradingWatchdog`（5 秒轮询，阈值 `max(3×扫描间隔, 180 秒)`，空仓/休市不判），扫描停滞即暂停报单、风控熔断 `stale_heartbeat` 并写 `heartbeat_stale`；带仓退出写 `data/unprotected_positions.json`，重启先对账评估止损再恢复报单；新增 `ProtectiveOrderAdapter` 接口，`CtpNativeStopAdapter.supported()` 恒 `False`（柜台条件单待接入）。
+- 新增测试 `test_ctp_fill_accounting.py`、`test_bot_worker_stop.py`、`test_reconcile_three_way.py`、`test_watchdog.py`、`test_unprotected_recovery.py`；全量 pytest 与 `ruff check src tests` 通过，mypy 通过。
+- 文档整理：README、本文件、`docs/实盘交易简易说明书.md`、`docs/project-review-2026/project-review-2026.html` 按最新功能更新；新增 [docs/TODO.md](docs/TODO.md) 作为唯一待办清单；已完成的阶段性文档移入 `docs/archive/`，`docs/4套日内策略.md`、多因子/凯利/以损定开/长线箱体突破等策略目录删除，四套日内策略与 vnpy 的对照表并入 [docs/策略编辑器使用说明.md](docs/策略编辑器使用说明.md)。
+
 ## 44.10.0 — 2026-11-15
 
 功能更新。新增「自定义规则（DSL）」策略和「策略编辑器」页：不写代码，用指标条件组合搭策略；编辑器里能直接回测当前规则并生成绩效报告。
@@ -13,7 +35,7 @@
 - 规则写错时只停这一套策略并写告警，不会悄悄回退成内置策略；配置页策略下拉识别 `rule_dsl:<文件名>`，旧配置和已删除策略的回退规则不变。
 - 策略编辑器新增「回测当前规则」：直接复用历史回测引擎，品种、周期、日期、行情来源、滑点和开仓限制沿用「历史回测」页；报告显示在编辑框下方，并照旧写入 `data\backtest_last.json`，可在历史回测页导出 Excel。规则有未保存修改时会先提示保存。
 - 出厂带 5 份规则模板：`dual_ma_equiv`、`dualthrust`、`r_breaker`、`turtle_adx`、`adx_atr_break`。首次运行或升级时只补缺失模板，不覆盖用户改过的同名文件。
-- 打包脚本带上 `config\rules`，验收脚本核对模板与新增模块；新增 [docs/策略编辑器使用说明.md](docs/策略编辑器使用说明.md) 和 [docs/策略编辑器底层支持.md](docs/策略编辑器底层支持.md)。
+- 打包脚本带上 `config\rules`，验收脚本核对模板与新增模块；新增 [docs/策略编辑器使用说明.md](docs/策略编辑器使用说明.md)（原「策略编辑器底层支持」内容已并入本文，该文件于 44.11.0 删除）。
 - 配置说明书按 10 个页签更新；新增 `tests/test_rule_dsl.py`、策略工厂回测接线和真实窗口 UI 回归，全量 pytest 通过。
 
 ## 44.9.2 — 2026-11-15

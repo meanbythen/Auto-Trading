@@ -159,6 +159,7 @@ footer .sources .src-url { display: block; margin-top: .15rem; font-size: .82rem
   <a href="#score">维度评分</a>
   <a href="#target">目标设计 v2</a>
   <a href="#roadmap">优化路线</a>
+  <a href="#docs">文档与待办</a>
 </nav>
 
 <!-- ============================================================ -->
@@ -537,7 +538,7 @@ stateDiagram-v2
 
 <h3>P0 · 严重（实盘资金安全，建议立即处理）</h3>
 
-<p>2026-11-15：4 项 P0 已按 <a href="p0-fix/spec.md">修复规格</a> 与 <a href="p0-fix/tasks.md">任务清单</a> 全部实现；<code>ruff check src tests</code> 全绿，<code>pytest tests/ -q</code> 1200+ 项全部通过。当前为工作区改动，尚未提交 git，因此以「已修复（工作区）」标注。</p>
+<p>2026-11-15：4 项 P0 已按 <a href="p0-fix/spec.md">修复规格</a> 与 <a href="p0-fix/tasks.md">任务清单</a> 全部实现；<code>ruff check src tests</code> 全绿，<code>pytest tests/ -q</code> 1200+ 项全部通过。四次提交：P0-1 <code>0ee2d75</code>、P0-2 <code>481b613</code>、P0-3 <code>5e8db07</code>、P0-4 <code>21b4ba1</code>，随 44.11.0 发布。下表以「已修复（44.11.0）」标注。剩余两项需仿真/实盘账号的人工演练（T5.3、T5.4）列在 <a href="../TODO.md">TODO.md</a> 第一节。</p>
 
 <div class="table-wrap">
 <table>
@@ -547,19 +548,19 @@ stateDiagram-v2
 <td>1</td><td>成交回报线程直接回写策略仓位、风控净仓与账本，未持 <code>_trade_lock</code>；而发单路径持锁</td>
 <td>与扫描线程/手动平仓并发，重复回报可能二次改仓，账本与仓位错位</td>
 <td class="mono">order_executor.py:495-570<br>ctp_gateway.py:1030-1048<br>ctp_td.py:463-470</td>
-<td>仓位与账本变更收敛到 ExecutionService，成对加锁 + <code>fill_key</code> 幂等；回调只投递事件<br><span class="badge b-ok">已修复（工作区）</span> 回调改为 <code>_on_ctp_fill</code> 持 <code>_trade_lock</code>（10 秒超时回退补记）+ 进程内 <code>_recent_fill_keys</code> 二级去重；网关先 <code>waiter.set()</code> 再记账，消除死锁；<code>_apply_fill_accounting</code> 返回 <code>bool</code> 让失败可重试</td>
+<td>仓位与账本变更收敛到 ExecutionService，成对加锁 + <code>fill_key</code> 幂等；回调只投递事件<br><span class="badge b-ok">已修复（44.11.0）</span> 回调改为 <code>_on_ctp_fill</code> 持 <code>_trade_lock</code>（10 秒超时回退补记）+ 进程内 <code>_recent_fill_keys</code> 二级去重；网关先 <code>waiter.set()</code> 再记账，消除死锁；<code>_apply_fill_accounting</code> 返回 <code>bool</code> 让失败可重试</td>
 </tr>
 <tr>
 <td>2</td><td>关闭窗口立即 <code>destroy()</code>，常驻交易线程是 daemon，只发停止标志不 join</td>
 <td>在途报单、未落盘记账、CTP 未登出即被进程终止</td>
 <td class="mono">run_tab.py:1269-1281<br>bot_worker.py:58-64</td>
-<td>关窗前确认；<code>stop()</code> + <code>join(timeout)</code>；超时提示可强制退出；确保 CTP logout<br><span class="badge b-ok">已修复（工作区）</span> <code>TradingBot.wait_stopped()</code> + <code>_stopped</code> 事件；<code>BotWorker.stop(wait=True, timeout=15)</code> 返回是否退出；关窗先按持仓/挂单确认，超时二次确认并记 <code>force_close</code> 告警</td>
+<td>关窗前确认；<code>stop()</code> + <code>join(timeout)</code>；超时提示可强制退出；确保 CTP logout<br><span class="badge b-ok">已修复（44.11.0）</span> <code>TradingBot.wait_stopped()</code> + <code>_stopped</code> 事件；<code>BotWorker.stop(wait=True, timeout=15)</code> 返回是否退出；关窗先按持仓/挂单确认，超时二次确认并记 <code>force_close</code> 告警</td>
 </tr>
 <tr>
 <td>3</td><td>启动对账以「本地信号账本」为唯一事实源；柜台推送的非本程序成交只记录不入账</td>
 <td>崩溃/重连后可能出现柜台有仓、程序无仓，本地止损与清仓都失效</td>
 <td class="mono">runner.py:515-550<br>ctp_gateway.py:676-680</td>
-<td>启动先查柜台持仓与当日成交，做「柜台 ↔ 账本 ↔ 内存」三方对账；差异未消除前阻断自动开仓并告警<br><span class="badge b-ok">已修复（工作区）</span> 新增 <code>ReconcileReport</code>/<code>three_way_diff</code>，启动与每轮运行都做三方对账；未认领仓进内存并冻结、幽灵仓两轮确认后补记、柜台≠账本时只保留通用止损；状态文件与界面暴露 <code>reconcile</code>，支持认领/平掉/忽略</td>
+<td>启动先查柜台持仓与当日成交，做「柜台 ↔ 账本 ↔ 内存」三方对账；差异未消除前阻断自动开仓并告警<br><span class="badge b-ok">已修复（44.11.0）</span> 新增 <code>ReconcileReport</code>/<code>three_way_diff</code>，启动与每轮运行都做三方对账；未认领仓进内存并冻结、幽灵仓两轮确认后补记、柜台≠账本时只保留通用止损；状态文件与界面暴露 <code>reconcile</code>，支持认领/平掉/忽略</td>
 </tr>
 <tr>
 <td>4</td><td>止损完全依赖本地扫描，未使用柜台条件单；登录未 ready 时所有报单被拒</td>
@@ -634,7 +635,7 @@ stateDiagram-v2
 <tr><td>可观测性</td><td><strong>B+</strong></td><td>events.jsonl、告警冷却、健康检查、回测审计</td><td>告警缺 run_id/账号/合约；文件不轮转</td></tr>
 <tr><td>测试</td><td><strong>B</strong></td><td>100 个测试文件，覆盖 DSL、UI 回归、风控</td><td>缺断线/部分成交/重启的故障注入与契约测试</td></tr>
 <tr><td>风控设计</td><td><strong>A-</strong></td><td>暂停只拦开仓、账本失败不改仓、过期 K 线只拦开仓</td><td>依赖本地止损与本地对账</td></tr>
-<tr><td>文档</td><td><strong>A-</strong></td><td>15 份设计/使用文档，DSL 与底层支持说明完整</td><td>缺一页「故障恢复手册」与状态机图</td></tr>
+<tr><td>文档</td><td><strong>A-</strong></td><td>文档分层清晰：README / CHANGELOG / 实盘说明书 / 配置说明书 / 策略编辑器 / TODO；阶段文档已归档</td><td>缺一页「故障恢复手册」与状态机图</td></tr>
 </tbody>
 </table>
 </div>
@@ -785,6 +786,51 @@ flowchart LR
   <p><strong>结论</strong>：这套系统已经越过「能不能用」的阶段，进入「能不能放心托管资金」的阶段。把 Sprint 0 的四个 P0 修完，实盘风险会从「不可控」降到「可监控」；再完成 Sprint 1–2，才具备长期无人值守的基础。</p>
 </div>
 
+<h2 id="docs"><span class="num">10</span>文档体系与后续待办</h2>
+
+<p>44.11.0 把散落的阶段性文档重新分层：介绍与日志进 README / CHANGELOG，操作细节进说明书，设计规划留在本页，<strong>没做完的事只保留一份清单</strong>。已完成的阶段文档移到 <code>docs/archive/</code>，与现行功能冲突的策略目录已删除。</p>
+<p>44.12.0 补齐批次 A 的四项硬门槛：节假日日历外置（<code>config/holidays.yaml</code>，实盘缺年份只禁开仓）、飞书告警外发（<code>runtime.alerts</code>，默认关）、<code>run_id</code> 贯穿事件/告警/状态、冷备守护（<code>tools/guardian.py</code>，默认关）。完整设计与验收标准见 <a href="batch-a/spec.md">batch-a/spec.md</a>；A1 两项人工演练与华泰条件单确认仍待执行。</p>
+
+<div class="table-wrap">
+<table>
+<thead><tr><th style="width:26%">文档</th><th style="width:18%">定位</th><th>内容</th><th style="width:14%">状态</th></tr></thead>
+<tbody>
+<tr><td><a href="../../README.md">README.md</a></td><td>项目介绍</td><td>能做什么、怎么装、路线选择、配置、FAQ、文档索引</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../../CHANGELOG.md">CHANGELOG.md</a></td><td>版本日志</td><td>逐版本记录功能、修复与行为变化，最新 44.12.0</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../实盘交易简易说明书.md">实盘交易简易说明书.md</a></td><td>操作手册</td><td>盘前到收盘五步、CTP 四步上线、对账处理、止损边界、排错</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../配置说明书.md">配置说明书.md</a></td><td>控件字典</td><td>十个页签逐项编号说明；44.12.0 新增日历、告警外发、冷备守护配置（HD-14～HD-23）</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../策略编辑器使用说明.md">策略编辑器使用说明.md</a></td><td>DSL 手册</td><td>YAML 语法、指标库、五个内置模板、与 vnpy 原版对照</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../扩展能力规划.md">扩展能力规划.md</a></td><td>未来设计</td><td>重构方案第六条五项能力的详细设计，尚未实施</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../TODO.md">TODO.md</a></td><td>唯一待办</td><td>人工验收、CTP 上线、策略增强、评估缺口、运维与文档补齐</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../archive/">archive/</a></td><td>存档</td><td>系统蓝图、代码重构方案、策略基础逻辑、CTP 上线流程、旧操作说明书、specs 等</td><td><span class="badge">归档</span></td></tr>
+<tr><td>已删除</td><td>过时</td><td>4 套日内策略、多因子复合 CTA、凯利突破、以损定开、长线箱体突破等策略说明（有效内容已并入编辑器手册与 TODO）</td><td><span class="badge">删除</span></td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>10.1 P0 修复后的状态</h3>
+<ul>
+  <li><strong>已完成</strong>：P0-1 成交回报加锁去重、P0-2 关窗等待后台线程、P0-3 三方对账与未认领仓、P0-4 看门狗与退出保护。均有单测，全量 pytest 与 ruff 通过。</li>
+  <li><strong>待人工验收</strong>：T5.3 带仓关窗 → 重启 → 核对持仓/账本/告警；T5.4 仿真账号制造 phantom，确认补记只发生一次。需仿真或实盘账号。</li>
+  <li><strong>批次 A（44.12.0）已完成</strong>：A2 节假日日历外置与缺年份阻断、A3 飞书告警外发、A4 <code>run_id</code> 贯穿、A5.3 冷备守护（默认关）。</li>
+  <li><strong>批次 A 仍待</strong>：A1 两项人工演练；A5.1 向华泰确认条件单/预埋单接口；A5.5 守护的仿真演练。</li>
+  <li><strong>仍是缺口</strong>：标准 CTP 无原生止损单，整机断电/断网期间仍无柜台保护；缺故障注入测试；缺故障恢复手册与状态机图。</li>
+</ul>
+
+<h3>10.2 后续优先级</h3>
+<table>
+<thead><tr><th style="width:14%">优先级</th><th>事项</th><th style="width:20%">详见</th></tr></thead>
+<tbody>
+<tr><td>P0 收尾</td><td>T5.3 / T5.4 人工演练；华泰条件单能力确认；冷备守护演练；CTP 主通道自动降级</td><td><a href="../TODO.md">TODO 第一、二节</a></td></tr>
+<tr><td>P1</td><td>订单时间线、成交质量回流、连续偏离禁开总闸；策略增强（多因子相关性、凯利滚动胜率、箱体加仓/移仓、VPVR）</td><td><a href="../TODO.md">TODO 第一、三节</a></td></tr>
+<tr><td>P2</td><td>评估体系补齐（组合相关性/保证金/蒙特卡洛）、多账户 A/B、告警通道扩展（微信/钉钉/邮件）、故障恢复手册</td><td><a href="../TODO.md">TODO 第四、五节</a></td></tr>
+</tbody>
+</table>
+
+<div class="callout">
+  <p><strong>维护约定</strong>：有新的阶段性分析先在本页或 <code>docs/</code> 下短期存放，结论一旦落地就并入对应文档；已完成的分支文档归档，不再在正文引用；未完成项只写进 <code>docs/TODO.md</code>，避免多处清单互相矛盾。</p>
+</div>
+
 <footer>
   <div class="sources">
     <h2>审查依据（代码与文档索引）</h2>
@@ -796,7 +842,7 @@ flowchart LR
       <li id="cite-5"><span class="src-title">数据管道：kline.py、bar_store.py、quality.py、ths_chart.py</span><a class="src-url" href="file:///d:/Auto-Trading/src/data/kline.py" target="_blank" rel="noopener">file:///d:/Auto-Trading/src/data/kline.py</a></li>
       <li id="cite-6"><span class="src-title">界面与生命周期：app.py、run_tab.py、config_support.py、dashboard.py</span><a class="src-url" href="file:///d:/Auto-Trading/src/ui/app.py" target="_blank" rel="noopener">file:///d:/Auto-Trading/src/ui/app.py</a></li>
       <li id="cite-7"><span class="src-title">策略 DSL 与指标：rule_dsl.py、indicators.py、factory.py</span><a class="src-url" href="file:///d:/Auto-Trading/src/strategy/rule_dsl.py" target="_blank" rel="noopener">file:///d:/Auto-Trading/src/strategy/rule_dsl.py</a></li>
-      <li id="cite-8"><span class="src-title">项目文档：策略编辑器使用说明、底层支持、4 套日内策略等</span><a class="src-url" href="file:///d:/Auto-Trading/docs/" target="_blank" rel="noopener">file:///d:/Auto-Trading/docs/</a></li>
+      <li id="cite-8"><span class="src-title">项目文档：README、CHANGELOG、实盘交易简易说明书、配置说明书、策略编辑器使用说明、TODO、archive 归档</span><a class="src-url" href="file:///d:/Auto-Trading/docs/" target="_blank" rel="noopener">file:///d:/Auto-Trading/docs/</a></li>
     </ol>
   </div>
 </footer>
