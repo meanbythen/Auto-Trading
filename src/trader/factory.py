@@ -57,17 +57,31 @@ def create_trader(cfg: dict[str, Any]) -> TraderBase:
     返回:
         TraderBase 子类实例
     """
-    raw = str(cfg.get("trade", {}).get("executor", DEFAULT_EXECUTOR)).lower().strip()
-    name = raw or DEFAULT_EXECUTOR
-    factory = REGISTRY.get(name)
+    raw = str((cfg.get("trade") or {}).get("executor") or "").lower().strip()
+    is_live = not bool(cfg.get("dry_run", True))
+    if not raw:
+        if is_live:
+            raise ValueError(
+                "trade.executor 未填写，真实交易下拒绝启动；"
+                f"可选: {', '.join(list_executors())}"
+            )
+        raw = DEFAULT_EXECUTOR
+
+    factory = REGISTRY.get(raw)
     if factory is None:
+        if is_live:
+            # 通道名写错时宁可启动失败，也不能把实盘静默换成模拟盘。
+            raise ValueError(
+                f"未知 trade.executor={raw!r}，真实交易下拒绝启动；"
+                f"可选: {', '.join(list_executors())}"
+            )
         logger.warning(
             "未知 trade.executor={}，可选: {}；回退到 {}",
-            name,
+            raw,
             ", ".join(list_executors()),
             DEFAULT_EXECUTOR,
         )
-        name = DEFAULT_EXECUTOR
+        raw = DEFAULT_EXECUTOR
         factory = REGISTRY[DEFAULT_EXECUTOR]
 
     trader = factory(cfg)
@@ -75,7 +89,7 @@ def create_trader(cfg: dict[str, Any]) -> TraderBase:
 
     logger.info(
         "执行通道已加载: executor={} class={} 上线阶段={}",
-        name,
+        raw,
         type(trader).__name__,
         stage_label(current_stage_from_cfg(cfg)),
     )

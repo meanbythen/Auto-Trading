@@ -1,6 +1,6 @@
 # Auto-Trading 待办清单（TODO）
 
-对应版本 **44.12.0**（2026-11-15）。
+对应版本 **44.13.0**（2026-11-15）。
 
 这份文档只收「**还没做**」的事。已经做完的功能去 [CHANGELOG.md](../CHANGELOG.md) 查，整体设计与审阅结论去 [project-review-2026.html](project-review-2026/project-review-2026.html) 查，操作步骤去 [实盘交易简易说明书.md](实盘交易简易说明书.md) 查。
 

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import pytest
+
 from src.domain.position import PositionState
 from src.kernel.risk_chain import TradeIntent, run_pretrade_gates
 from src.scheduler.runner import TradingBot
@@ -9,6 +11,7 @@ from src.strategy.base import StrategyBase
 from src.strategy.types import StrategyAction, StrategyDecision
 from src.trader.base import Capabilities, TraderBase, capabilities_for
 from src.trader.base import OrderRequest, OrderResult
+from src.trader.factory import create_trader
 
 
 class _BlindTrader(TraderBase):
@@ -150,6 +153,28 @@ def test_blind_channel_runs_open_and_close_with_assumed_fill() -> None:
     orders = [kw for name, kw in bot._events if name == "order"]  # type: ignore[attr-defined]
     assert len(orders) == 2
     assert all(row["assumed_fill"] is True for row in orders)
+
+
+def test_unknown_executor_rejected_when_live() -> None:
+    """真实交易下通道名写错必须启动失败，不能静默换成模拟盘。"""
+    with pytest.raises(ValueError, match="未知 trade.executor"):
+        create_trader({"dry_run": False, "trade": {"executor": "ctpp"}})
+
+
+def test_missing_executor_rejected_when_live() -> None:
+    """真实交易下漏填通道也不能默认进模拟盘。"""
+    with pytest.raises(ValueError, match="未填写"):
+        create_trader({"dry_run": False, "trade": {}})
+
+
+def test_unknown_executor_falls_back_to_sim_in_dry_run(tmp_path) -> None:
+    """模拟试跑仍允许回退 sim，方便旧配置临时使用。"""
+    from src.trader.sim_trader import SimTrader
+
+    trader = create_trader(
+        {"dry_run": True, "trade": {"executor": "ctpp"}, "_project_root": str(tmp_path)}
+    )
+    assert isinstance(trader, SimTrader)
 
 
 def test_blind_channel_skips_broker_only_gates() -> None:
