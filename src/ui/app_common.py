@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any
 
 import customtkinter as ctk
@@ -33,7 +34,34 @@ ENGINE_CHOICES: list[str] = [
 
 _ENGINE_ALIASES = dict(ENGINE_ALIASES)
 
+
 _REMOVED_ENGINES: set[str] = set(REMOVED_ENGINES)
+
+
+def register_rule_engines(directory: str | Path | None = None) -> list[str]:
+    """
+    把 config/rules/*.yaml 注册成可选策略：引擎代号 rule_dsl:<文件名>。
+
+    程序启动时调一次；配置页保存/删除规则后再调一次，策略下拉框立刻能选到或去掉。
+    重复调用不会重复添加；yaml 已被删除的自定义引擎会被剔出下拉。
+    返回这次新加进去的代号。
+    """
+    from src.strategy.rule_dsl import RULE_ENGINE_PREFIX, list_rule_files, rule_engine_code
+
+    existing = {rule_engine_code(info["stem"]): info for info in list_rule_files(directory)}
+    # 先剔除已不存在的自定义规则引擎，保证删除后下拉框立即少一项。
+    for code in [c for c in ENGINE_CHOICES if c.startswith(RULE_ENGINE_PREFIX)]:
+        if code not in existing:
+            ENGINE_CHOICES.remove(code)
+            ENGINE_LABELS.pop(code, None)
+    added: list[str] = []
+    for info in existing.values():
+        code = rule_engine_code(info["stem"])
+        ENGINE_LABELS[code] = f"自定义：{info['name']}"
+        if code not in ENGINE_CHOICES:
+            ENGINE_CHOICES.append(code)
+            added.append(code)
+    return added
 
 
 def _ui_engine(name: object) -> str:

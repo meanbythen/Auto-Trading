@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from loguru import logger
+from src.strategy.rule_dsl import rule_engine_stem
 from src.ui.app_common import _clock_text
 from src.utils import load_config
 from src.utils import load_secrets
@@ -127,6 +128,14 @@ class ConfigCollectMixin:
 
         st = self.cfg.setdefault("strategy", {})
         st["engine"] = self.engine_var.get()
+        # 自定义规则引擎（rule_dsl:文件名）同时把文件指针写回去，兼容只读 rule_dsl.file 的旧路径。
+        rule_stem = rule_engine_stem(st["engine"])
+        if rule_stem:
+            rule_box = st.get("rule_dsl")
+            if not isinstance(rule_box, dict):
+                rule_box = {}
+                st["rule_dsl"] = rule_box
+            rule_box["file"] = f"rules/{rule_stem}.yaml"
         st["timeframe"] = self._period_code(self.tf_var, self.tf_custom_var)
         st["trail_timeframe"] = self._period_code(self.trail_var, self.trail_custom_var)
         # 以关注下拉框里的整份名单为准。选中的排在第一个，其余合约也要留下来。

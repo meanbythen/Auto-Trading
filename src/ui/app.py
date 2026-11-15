@@ -113,6 +113,10 @@ class AutoTradingApp(
         from src.utils.config_loader import ensure_runtime_layout
 
         ensure_runtime_layout()
+        # 自定义规则也是一套策略：把 config/rules/*.yaml 注册进引擎下拉框。
+        from src.ui.app_common import register_rule_engines
+
+        register_rule_engines()
         self.cfg = load_config()
         setup_logger(
             log_dir=str(self.root_dir / self.cfg.get("logging", {}).get("dir", "logs")),
@@ -219,6 +223,7 @@ class AutoTradingApp(
         self.tabs.pack(fill="both", expand=True, padx=28, pady=(6, 22))
         self.tabs.add("运行")
         self.tabs.add("配置")
+        self.tabs.add("策略编辑器")
         self.tabs.add("历史回测")
         self.tabs.add("数据管理")
         self.tabs.add("交叉测试")
@@ -229,6 +234,7 @@ class AutoTradingApp(
 
         self._build_run_tab(self.tabs.tab("运行"))
         self._build_config_tab(self.tabs.tab("配置"))
+        self._build_rule_editor_tab(self.tabs.tab("策略编辑器"))
         self._build_backtest_tab(self.tabs.tab("历史回测"))
         self._build_data_tab(self.tabs.tab("数据管理"))
         self._build_picker_tab(self.tabs.tab("交叉测试"))

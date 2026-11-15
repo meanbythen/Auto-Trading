@@ -1,0 +1,52 @@
+# ============================================================
+# ADX + ATR 波动率突破（复刻 docs/4套日内策略.md 第 4 套）
+#
+# 原版逻辑（lookback=20，ADX=14，阈值 22，ATR=20，倍数 1.5）：
+#   mid = close 最近 20 根均值   upper = mid + 1.5 * ATR20   lower = mid - 1.5 * ATR20
+#   ADX >= 22 才允许开仓：突破 upper 做多，跌破 lower 做空。
+#   持多止损 close - ATR20，持空止损 close + ATR20（每根刷新）。
+#
+# 本文件的实现口径（和原版的差异，务必知道）：
+#   1. 原版在收盘时挂下一根生效的停止单；这里按收盘确认突破，成交由引擎负责。
+#      条件用 {prev: upper, n: 1}，档位只用上一根及更早的数据算，避免当根自己撑大均线。
+#   2. 原版"逐根刷新"的止损在本文件里是 exit 条件（收盘价跌破上一根的 close-ATR）；
+#      另外加 2ATR 固定止损兜底，两者谁先触发谁平。
+#   3. ADX 只过滤开仓，不影响离场，和原版一致。
+#   4. 手数沿用配置页的每笔风险%，不读原版的 atr_risk。
+# ============================================================
+
+schema: 1
+builtin: true
+name: "ADX+ATR 波动率突破"
+
+indicators:
+  mid20: { kind: sma, period: 20 }
+  atr20: { kind: atr, period: 20 }
+  adx14: { kind: adx, period: 14 }
+  upper: { kind: expr, formula: "mid20 + 1.5 * atr20" }
+  lower: { kind: expr, formula: "mid20 - 1.5 * atr20" }
+  trail_long: { kind: expr, formula: "close - atr20" }
+  trail_short: { kind: expr, formula: "close + atr20" }
+
+filters:
+  - { gte: { left: adx14, right: 22 } }
+
+entry:
+  long:
+    { gt: { left: close, right: { prev: upper, n: 1 } } }
+  short:
+    { lt: { left: close, right: { prev: lower, n: 1 } } }
+
+exit:
+  long:
+    { lt: { left: close, right: { prev: trail_long, n: 1 } } }
+  short:
+    { gt: { left: close, right: { prev: trail_short, n: 1 } } }
+
+stop:
+  kind: atr
+  mult: 2.0
+  atr_ref: atr20
+
+sizing:
+  mode: inherit

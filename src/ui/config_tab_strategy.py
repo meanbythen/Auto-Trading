@@ -100,7 +100,7 @@ def build_strategy_section(
     except Exception:  # noqa: BLE001
         pass
     app._refresh_tq_hint()
-    app._option_row(left, "策略引擎", app.engine_var, list(engine_choices), width=220)
+    app.engine_menu = app._option_row(left, "策略引擎", app.engine_var, list(engine_choices), width=220)
     ctk.CTkLabel(
         left,
         text=(
@@ -871,6 +871,39 @@ def build_strategy_section(
     param_entry(app, sbox, "止损缓冲ATR", app.sbox_stop_atr_var, hint="多单止损在箱顶下面这么多倍 ATR，默认 0.5")
     param_entry(app, sbox, "跟踪ATR倍数", app.sbox_trail_atr_var, hint="浮盈够了以后，止损离新高/新低几倍 ATR，默认 2")
     param_entry(app, sbox, "几倍箱高才跟踪", app.sbox_trail_h_var, hint="浮盈达到箱子高度的几倍才开始跟踪，默认 1")
+
+    rule_box = detail_panel(
+        app,
+        "rule_dsl",
+        "自定义规则（DSL）",
+        "规则文件由「策略编辑器」页签维护；这里只显示当前策略对应的规则。",
+    )
+    ctk.CTkLabel(
+        rule_box,
+        textvariable=app.rule_summary_var,
+        font=T.FONT_SMALL,
+        text_color=T.TEXT,
+        wraplength=420,
+        justify="left",
+        anchor="w",
+    ).pack(fill="x", padx=6, pady=(2, 6))
+    ctk.CTkButton(
+        rule_box,
+        text="打开策略编辑器 →",
+        width=140,
+        command=app._open_rule_editor,
+        fg_color=T.ACCENT,
+        hover_color=T.ACCENT_HOVER,
+        text_color=T.TEXT,
+    ).pack(anchor="w", padx=6, pady=(0, 6))
+    note_block(
+        rule_box,
+        "支持：开仓、离场、ATR/百分比/摆动点止损，可加移动止损、保本、限持仓根数和高周期过滤；"
+        "暂不支持加减仓和反手。\n"
+        "内置模板只读：dualthrust / r_breaker / turtle_adx / adx_atr_break / dual_ma_equiv。\n"
+        "保存规则不会自动切换运行策略，需要时在左侧策略引擎里选。",
+        pady=(0, 4),
+    )
 
     try:
         app.engine_var.trace_add("write", app._refresh_strategy_param_panel)

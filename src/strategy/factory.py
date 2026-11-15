@@ -14,6 +14,7 @@ from typing import Any, Callable, Protocol
 
 from loguru import logger
 
+from .base import StrategyBase
 from .cta_filter import ensure_cta_filter_box
 from .market_state import (
     TREND_FILTER_SECTIONS,
@@ -33,6 +34,7 @@ from .dual_ma import DualMaStrategy
 from .macd_swing import MacdSwingStrategy
 from .multi_factor import MultiFactorStrategy
 from .params import DEFAULT_ENGINE, ENGINE_SECTION_DEFAULTS, StrategyParams
+from .rule_dsl import RuleConfigError, RuleStrategy, rule_engine_stem
 from .sar_trend import SarTrendStrategy
 from .supertrend import SuperTrendStrategy
 from .swing_box import SwingBoxStrategy
@@ -208,6 +210,7 @@ ENGINE_LABELS: dict[str, str] = {
     "multi_factor": "多因子CTA（加权打分）",
     "swing_trend": "长线趋势加减仓",
     "swing_box": "长线箱体突破",
+    "rule_dsl": "自定义规则（DSL）",
 }
 
 # 选股交叉测试名单里的短名：同一策略不重复标「主推」。
@@ -250,6 +253,7 @@ ENGINE_AUDIT_MODES: dict[str, MarketFilterMode | None] = {
     "cta": "trend",         # 别名
     "swing_trend": "trend",
     "swing_box": None,  # 箱子和 ADX 写在策略里
+    "rule_dsl": None,  # 过滤条件写在用户规则文件里
 }
 
 
@@ -285,6 +289,8 @@ REGISTRY: dict[str, StrategyFactory] = {
     "swing_trend": SwingTrendStrategy,
     # 震荡箱子收盘突破后顺着拿趋势（信号/止损周期跟配置页）
     "swing_box": SwingBoxStrategy,
+    # 用户自己写的指标条件组合（rules/*.yaml），不写代码就能加策略
+    "rule_dsl": RuleStrategy,
 }
 
 # 只含正式引擎名（不含别名），顺序与注册表一致。审计/复盘按这个顺序列策略。
@@ -443,9 +449,10 @@ def sanitize_strategy_config(cfg: dict[str, Any]) -> dict[str, Any]:
             ensure_cta_filter_box(box, section)
 
     # 引擎名别名收成正式名；已删的回退到日内实体。
+    # rule_dsl:<文件名> 是配置页新增的自定义规则，原样保留，文件名由规则目录决定。
     raw_engine = str(st.get("engine") or DEFAULT_ENGINE).strip().lower()
-    engine = _ENGINE_ALIASES.get(raw_engine, raw_engine)
-    if engine in _REMOVED_ENGINES or engine not in REGISTRY:
+    engine = raw_engine if rule_engine_stem(raw_engine) else _ENGINE_ALIASES.get(raw_engine, raw_engine)
+    if engine in _REMOVED_ENGINES or (engine not in REGISTRY and not rule_engine_stem(engine)):
         engine = DEFAULT_ENGINE
     st["engine"] = engine
 
@@ -470,8 +477,14 @@ def sanitize_strategy_config(cfg: dict[str, Any]) -> dict[str, Any]:
 
 
 def normalize_engine(name: Any) -> str:
-    """把别名/大小写收成正式引擎名；认不出返回空串。"""
+    """把别名/大小写收成正式引擎名；认不出返回空串。
+
+    rule_dsl:<文件名> 是配置页里新建的自定义规则，只要前缀对就原样返回，
+    文件在不在由 create_strategy 加载时报错（缺文件会走 _BlockedStrategy）。
+    """
     key = str(name or "").strip().lower()
+    if rule_engine_stem(key):
+        return key
     key = _ENGINE_ALIASES.get(key, key)
     return key if key in REGISTRY else ""
 
@@ -504,6 +517,49 @@ def list_engines() -> list[str]:
     return sorted(REGISTRY.keys())
 
 
+class _BlockedStrategy(StrategyBase):
+    """
+    规则文件不合法时的占位策略：只发 HOLD，并把原因写进告警。
+
+    宁可一整天不开仓，也不能静默换成别的策略——用户以为在跑自己的规则，
+    实际却在跑双均线，这种错误比不交易严重得多。
+    """
+
+    def __init__(self, cfg: dict[str, Any], reason: str) -> None:
+        super().__init__()
+        st = cfg.get("strategy") or {}
+        trade = cfg.get("trade") or {}
+        self.reason = str(reason)
+        self.timeframe = str(st.get("timeframe", "15"))
+        self.trail_timeframe = self.timeframe
+        self.symbols: list[str] = list(st.get("symbols") or [trade.get("symbol", "bu2612")])
+        self.flatten_at_close = bool(st.get("flatten_at_close", True))
+        self.stop_mode = "close"
+        self.stop_on_touch = False
+        self.entry_mode = "close"
+
+    def is_flatten_time(self, now: Any = None) -> bool:
+        return False
+
+    def evaluate(self, symbol: str, bars: Any, now: Any = None, trail_bars: Any = None) -> StrategyDecision:
+        _ = (bars, now, trail_bars)
+        return StrategyDecision(
+            StrategyAction.HOLD,
+            symbol,
+            f"自定义规则不可用，已停止开仓：{self.reason}",
+        )
+
+    def on_filled(
+        self,
+        symbol: str,
+        action: StrategyAction,
+        price: float,
+        volume: int,
+        initial_stop: float | None = None,
+    ) -> None:
+        _ = (symbol, action, price, volume, initial_stop)
+
+
 def create_strategy(cfg: dict[str, Any]) -> StrategyLike:
     """
     创建策略实例。
@@ -527,7 +583,8 @@ def create_strategy(cfg: dict[str, Any]) -> StrategyLike:
         )
         name = DEFAULT_ENGINE
 
-    factory = REGISTRY.get(name)
+    stem = rule_engine_stem(name)
+    factory = REGISTRY.get("rule_dsl" if stem else name)
     if factory is None:
         logger.warning(
             "未知 strategy.engine={}，可选: {}；回退到 {}",
@@ -537,8 +594,22 @@ def create_strategy(cfg: dict[str, Any]) -> StrategyLike:
         )
         name = DEFAULT_ENGINE
         factory = REGISTRY[DEFAULT_ENGINE]
+        stem = None
 
-    strategy = factory(cfg)
+    try:
+        strategy = RuleStrategy(cfg, rule_path=f"rules/{stem}.yaml") if stem else factory(cfg)
+    except RuleConfigError as exc:
+        # 规则写错时只停这一套策略，不换别的策略：用户以为在跑自己的规则，
+        # 实际跑成双均线比一天不交易更危险。
+        message = f"自定义规则加载失败，已停止开仓：{exc}"
+        logger.error("{}", message)
+        try:
+            from src.ops.alerts import emit_alert
+
+            emit_alert("rule_dsl", message, level="error")
+        except Exception as alert_exc:  # noqa: BLE001
+            logger.warning("规则错误告警写入失败: {}", alert_exc)
+        strategy = _BlockedStrategy(cfg, str(exc))
     # 两个全策略公共开关统一塞一份到实例上，避免每个策略再各自从 cfg 读一遍。
     # 个别策略也可以在 __init__ 里覆写（目前没有）。
     from .types import entry_mode_from_cfg, stop_mode_from_cfg

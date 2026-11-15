@@ -33,6 +33,10 @@ if beicha.exists():
 # 主力合约表：回测按它的「主力时段」在换月日自动切到新主力。放进 config，用户可自己更新。
 for table in sorted((ROOT / "config").glob("*主力合约表*.xlsx")):
     datas.append((str(table), "config"))
+# 自定义规则模板：rule_dsl 引擎的出厂规则，首次运行拷到 exe 旁 config/rules 供用户复制修改。
+rules_dir = ROOT / "config" / "rules"
+if rules_dir.is_dir():
+    datas.append((str(rules_dir), "config/rules"))
 if (ROOT / "strategies").exists():
     datas.append((str(ROOT / "strategies"), "strategies"))
 

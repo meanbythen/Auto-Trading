@@ -51,7 +51,8 @@ schedule:
 # ---------- 策略引擎（见文件顶部路线菜单） ----------
 strategy:
   # 切换策略：daily_body | trend_follow | supertrend |
-  # dual_ma | ema_swing | bollinger | sar_trend | multi_factor | swing_trend | swing_box
+  # dual_ma | ema_swing | bollinger | sar_trend | multi_factor | swing_trend | swing_box |
+  # rule_dsl（自己写的规则文件，见本文件底部 rule_dsl 小节）
   engine: "daily_body"
   # 信号周期：5 / 15 / 60 是分钟。日线写 D，周线写 W。自定义分钟直接写数字，如 120
   timeframe: "5"
@@ -388,6 +389,23 @@ strategy:
     trail_start_h: 1.0
     vol_mult: 0
     flatten_at_close: false
+
+  # 自定义规则（engine=rule_dsl）。不写代码，用指标条件组合搭一套策略。
+  # 规则写在 config/rules/ 下的 YAML 里，只改下面这一行指向自己的文件。
+  # 条件只按已收盘的 K 线判断，成交价仍由回测/实盘引擎决定，不会出现未来函数。
+  # 规则写错时程序会拒绝开仓并写一条告警，不会悄悄换成别的策略。
+  # 完整写法见 config/rules/dual_ma_equiv.yaml（文件里逐行注释了每种条件）。
+  # 现成模板：dual_ma_equiv / dualthrust / r_breaker / turtle_adx / adx_atr_break。
+  # 指标支持 expr 公式（+ - * /、括号、max/min/abs），能表达 DualThrust、R-Breaker 的档位算法。
+  # 顶部「策略编辑器」页签可以直接编辑并保存 YAML；每次保存都会注册成
+  # 一个独立引擎 rule_dsl:<文件名>，在配置页的策略引擎下拉里就能选（engine 填这个代号即可）。
+  # 保存不会自动切换运行策略，需要时自己去下拉里选。
+  # config/rules/ 下带 builtin: true 的是程序自带模板，不能删改/覆盖；想改就
+  # 在编辑器里换个文件名「保存」另存为自己的规则，再在下拉里选新引擎。
+  rule_dsl:
+    file: "rules/dual_ma_equiv.yaml"
+    # 是否接公共行情过滤（ADX/波动率）。规则里自己写了 filters 时可保持 false。
+    use_market_filter: false
 
 data:
   source: "akshare"

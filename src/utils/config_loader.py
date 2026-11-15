@@ -67,8 +67,8 @@ def ensure_runtime_layout() -> Path:
     """
     root = project_root()
     res = resource_root()
-    # 需要落在 exe 旁的目录（reviews 给收盘复盘存 txt/json）
-    for name in ("config", "data", "data/reviews", "logs", "strategies"):
+    # 需要落在 exe 旁的目录（reviews 给收盘复盘存 txt/json，rules 给自定义规则策略）
+    for name in ("config", "config/rules", "data", "data/reviews", "logs", "strategies"):
         (root / name).mkdir(parents=True, exist_ok=True)
 
     # 从打包资源复制缺省文件（不覆盖用户已有配置）
@@ -79,6 +79,8 @@ def ensure_runtime_layout() -> Path:
         ("config/品种与合约.xlsx", "config/品种与合约.xlsx"),
         # 优化参数表：网格档位和中文名都在这里，打包后落在 exe 旁方便直接改。
         ("config/优化参数.xlsx", "config/优化参数.xlsx"),
+        # 自定义规则模板：rule_dsl 引擎的出厂规则，用户复制一份改成自己的。
+        ("config/rules", "config/rules"),
         ("strategies", "strategies"),
         ("README.md", "README.md"),
         ("CHANGELOG.md", "CHANGELOG.md"),
@@ -95,6 +97,13 @@ def ensure_runtime_layout() -> Path:
         if src.is_dir():
             if not dst.exists() or not any(dst.iterdir()):
                 shutil.copytree(src, dst, dirs_exist_ok=True)
+            elif src_rel == "config/rules":
+                # 升级时补上新增的出厂规则模板（新模板会直接出现在策略下拉里）；
+                # 用户改过的同名文件一律不动。
+                for item in src.glob("*.yaml"):
+                    target = dst / item.name
+                    if not target.exists():
+                        shutil.copy2(item, target)
         elif not dst.exists():
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)

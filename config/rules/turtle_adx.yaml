@@ -1,0 +1,53 @@
+# ============================================================
+# 海龟唐奇安 + ADX 过滤（复刻 docs/4套日内策略.md 第 3 套）
+#
+# 原版逻辑（entry_window=20，exit_window=10，ADX=14，阈值 25）：
+#   entry_high = high 最近 20 根最高   entry_low = low 最近 20 根最低
+#   ADX >= 25 才允许开仓：突破 entry_high 做多，跌破 entry_low 做空。
+#   exit_low = low 最近 10 根最低      exit_high = high 最近 10 根最高
+#   持多跌破 exit_low 平仓，持空涨过 exit_high 平仓；2N（2×ATR20）止损。
+#
+# 本文件的实现口径（和原版的差异，务必知道）：
+#   1. 原版在收盘时挂下一根生效的停止单；这里按收盘确认突破，成交由引擎负责。
+#      条件用 {prev: entry_high, n: 1}，即"上一根为止的 20 根最高"，也就是标准的
+#      唐奇安通道上轨，不含当根自己。
+#   2. ADX 只过滤开仓（filters），不影响离场，和原版一致。
+#   3. 手数沿用配置页的每笔风险%，不读原版的 atr_risk。
+#   4. 原版可自选不日内平仓；要隔夜就把 config.yaml 的 flatten_times 清空。
+# ============================================================
+
+schema: 1
+builtin: true
+name: "海龟唐奇安+ADX"
+
+indicators:
+  entry_high: { kind: highest, period: 20 }
+  entry_low: { kind: lowest, period: 20 }
+  exit_high: { kind: highest, period: 10 }
+  exit_low: { kind: lowest, period: 10 }
+  atr20: { kind: atr, period: 20 }
+  adx14: { kind: adx, period: 14 }
+
+# ADX 低于阈值只禁止开新仓，已有持仓照常按离场条件走。
+filters:
+  - { gte: { left: adx14, right: 25 } }
+
+entry:
+  long:
+    { gt: { left: close, right: { prev: entry_high, n: 1 } } }
+  short:
+    { lt: { left: close, right: { prev: entry_low, n: 1 } } }
+
+exit:
+  long:
+    { lt: { left: close, right: { prev: exit_low, n: 1 } } }
+  short:
+    { gt: { left: close, right: { prev: exit_high, n: 1 } } }
+
+stop:
+  kind: atr
+  mult: 2.0
+  atr_ref: atr20
+
+sizing:
+  mode: inherit

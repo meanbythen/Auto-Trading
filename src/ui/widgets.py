@@ -56,7 +56,7 @@ class WidgetsMixin:
         var: ctk.StringVar,
         values: list[str],
         width: int = 220,
-    ) -> None:
+    ) -> ctk.CTkOptionMenu:
         """
         一行：左侧固定宽标签 + 右侧下拉框。
         原理：控件必须挂在同一 row 上再 pack(side=left)，

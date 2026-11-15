@@ -96,6 +96,29 @@ def test_removed_liquidity_exhaustion_falls_back() -> None:
     assert isinstance(s, DailyBodyStrategy)
 
 
+def test_rule_dsl_engine_code_loads_its_own_file() -> None:
+    """配置页里每条自定义规则都是独立引擎：rule_dsl:<文件名> 按代号找 rules/<文件名>.yaml。"""
+    from src.strategy.rule_dsl import RuleStrategy
+
+    cfg = _cfg("rule_dsl:turtle_adx")
+    # 就算旧配置里还留着别的 rule_dsl.file，也应该按引擎代号加载。
+    cfg["strategy"]["rule_dsl"] = {"file": "rules/dual_ma_equiv.yaml"}
+    strategy = create_strategy(cfg)
+    assert isinstance(strategy, RuleStrategy)
+    assert strategy.rule.name == "海龟唐奇安+ADX"
+
+
+def test_rule_dsl_engine_code_survives_sanitize() -> None:
+    """保存配置时不能把自定义规则名当成未知策略改回日内实体。"""
+    from src.strategy.factory import normalize_engine, sanitize_strategy_config
+
+    assert normalize_engine("rule_dsl:turtle_adx") == "rule_dsl:turtle_adx"
+    assert normalize_engine("rule_dsl:") == ""
+    cfg = _cfg("rule_dsl:Turtle_ADX")
+    sanitize_strategy_config(cfg)
+    assert cfg["strategy"]["engine"] == "rule_dsl:turtle_adx"
+
+
 def test_removed_jesse_casper_falls_back() -> None:
     """Jesse Casper 已删除：旧配置写这个名字时回退到日内实体。"""
     for name in ("jesse_casper", "casper", "jesse"):

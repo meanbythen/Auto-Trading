@@ -40,7 +40,7 @@ DEPTHS = ("精简", "标准", "完整")
 
 # 写进 Excel / 从 Excel 读回时用的策略引擎键。中文名统一由策略工厂提供。
 # 参数表暂不列以损定开和凯利突破：它们的网格维度和其它策略差别太大。
-_ENGINE_NAMES_EXCLUDED = {"liq_stop", "kelly_break"}
+_ENGINE_NAMES_EXCLUDED = {"liq_stop", "kelly_break", "rule_dsl"}
 ENGINE_NAMES: dict[str, str] = {
     key: label
     for key, label in _FACTORY_ENGINE_LABELS.items()

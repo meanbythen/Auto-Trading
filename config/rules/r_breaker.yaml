@@ -1,0 +1,66 @@
+# ============================================================
+# R-Breaker 日内策略（复刻 docs/4套日内策略.md 第 2 套）
+#
+# 原版公式（N=20，k1=0.35，k2=0.07，k3=0.25）：
+#   h = high 最近 N 根最高    l = low 最近 N 根最低    c = 当根收盘
+#   r3 = h + k1 * (c - l)     r2 = h - k2 * (h - l)    r1 = c + k3 * (h - l)
+#   s1 = c - k3 * (h - l)     s2 = l + k2 * (h - l)    s3 = l - k1 * (c - l)
+#   空仓：突破 r3 做多、跌破 s3 做空；涨到 r1 做空、跌到 s1 做多（区间反转）。
+#   持多跌破 s2 平仓，持空涨过 r2 平仓。
+#
+# 本文件的实现口径（和原版的差异，务必知道）：
+#   1. 原版四个档位都是停止单，盘中谁先碰到谁成交；这里按收盘价判定，成交由引擎负责。
+#      因此用 {prev: r3, n: 1} 取上一根收盘算出的档位，不拿当根数据算档位。
+#   2. 原版 r1/s1 的反转单和 r3/s3 的突破单同时挂着，靠触碰顺序区分；收盘口径分不出
+#      先后，这里用"落在 r1~r3 之间做空、s1~s3 之间做多"表示区间反转，越界则走突破。
+#   3. 原版持仓只靠 s2/r2 离场；这里额外加 2ATR 固定止损兜底，防止单边行情无限扛。
+#   4. 14:55 强平由 config.yaml 的 strategy.flatten_times 负责，规则里不写。
+# ============================================================
+
+schema: 1
+builtin: true
+name: "R-Breaker 六档"
+
+indicators:
+  hh20: { kind: highest, period: 20 }
+  ll20: { kind: lowest, period: 20 }
+  width: { kind: expr, formula: "hh20 - ll20" }
+  r3: { kind: expr, formula: "hh20 + 0.35 * (close - ll20)" }
+  r2: { kind: expr, formula: "hh20 - 0.07 * width" }
+  r1: { kind: expr, formula: "close + 0.25 * width" }
+  s1: { kind: expr, formula: "close - 0.25 * width" }
+  s2: { kind: expr, formula: "ll20 + 0.07 * width" }
+  s3: { kind: expr, formula: "ll20 - 0.35 * (close - ll20)" }
+  atr20: { kind: atr, period: 20 }
+
+entry:
+  long:
+    any:
+      # 趋势突破：收在 r3 上方
+      - { gt: { left: close, right: { prev: r3, n: 1 } } }
+      # 区间反转：跌回 s1 之下但还没破 s3
+      - all:
+          - { lt: { left: close, right: { prev: s1, n: 1 } } }
+          - { gte: { left: close, right: { prev: s3, n: 1 } } }
+  short:
+    any:
+      # 趋势突破：收在 s3 下方
+      - { lt: { left: close, right: { prev: s3, n: 1 } } }
+      # 区间反转：涨过 r1 但还没破 r3
+      - all:
+          - { gt: { left: close, right: { prev: r1, n: 1 } } }
+          - { lte: { left: close, right: { prev: r3, n: 1 } } }
+
+exit:
+  long:
+    { lt: { left: close, right: { prev: s2, n: 1 } } }
+  short:
+    { gt: { left: close, right: { prev: r2, n: 1 } } }
+
+stop:
+  kind: atr
+  mult: 2.0
+  atr_ref: atr20
+
+sizing:
+  mode: inherit

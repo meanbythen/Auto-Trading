@@ -13,10 +13,10 @@ DIST = ROOT / "dist" / "Auto-Trading"
 
 
 def _enumerate_modules() -> list[str]:
-    """自动枚举 src/ 和 tools/ 下所有 .py 模块，避免手动维护 REQUIRED_MODULES 漏写。"""
+    """自动枚举 src/ 下所有 .py 模块，避免手动维护 REQUIRED_MODULES 漏写。"""
     modules: set[str] = set()
     self_path = Path(__file__).resolve()
-    for root in (ROOT / "src", ROOT / "tools"):
+    for root in (ROOT / "src",):
         if not root.exists():
             continue
         for py in root.rglob("*.py"):
@@ -34,7 +34,8 @@ def _enumerate_modules() -> list[str]:
 
 
 # 自动从源码目录枚举，加新文件后无需手动维护
-REQUIRED_MODULES = _enumerate_modules()
+# tools/ 下是命令行脚本，只有被界面动态 import 的才需要在 PYZ 里。
+REQUIRED_MODULES = _enumerate_modules() + ["tools.refresh_universe"]
 
 def main() -> int:
     errors: list[str] = []
@@ -61,6 +62,11 @@ def main() -> int:
         "config/全品种备查.txt",
         "config/品种与合约.xlsx",
         "config/优化参数.xlsx",
+        "config/rules/dual_ma_equiv.yaml",
+        "config/rules/dualthrust.yaml",
+        "config/rules/r_breaker.yaml",
+        "config/rules/turtle_adx.yaml",
+        "config/rules/adx_atr_break.yaml",
         "使用说明.txt",
         "strategies",
         "strategies/daily_body.yaml",
@@ -73,8 +79,8 @@ def main() -> int:
         "strategies/sar_trend.yaml",
         "strategies/multi_factor.yaml",
         "strategies/swing_box.yaml",
-        "docs/长线箱体突破操作说明书.md",
         "docs/均线波段.md",
+        "docs/日内浮盈飘单.md",
         "VERSION",
         "CHANGELOG.md",
         "docs/日内实体操作说明书.md",

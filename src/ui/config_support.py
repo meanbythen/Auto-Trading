@@ -9,6 +9,7 @@ from src.ui import theme as T
 from src.ui.app_common import ENGINE_CHOICES
 from src.ui.app_common import _same_contract
 from src.ui.app_common import _ui_engine
+from src.strategy.rule_dsl import rule_engine_stem
 from src.utils import load_config
 from src.utils import save_config
 from tkinter import messagebox
@@ -27,6 +28,12 @@ class ConfigSupportMixin:
         from src.ui.config_tab import build_config_tab
 
         build_config_tab(self, tab, ENGINE_CHOICES)
+
+    def _build_rule_editor_tab(self, tab: ctk.CTkFrame) -> None:
+        """「策略编辑器」页签，界面在 src/ui/rule_editor_page.py。"""
+        from src.ui.rule_editor_page import build_rule_editor_tab
+
+        build_rule_editor_tab(self, tab)
 
 
     def _pack_watch_editor(self, parent: ctk.CTkFrame) -> None:
@@ -112,6 +119,10 @@ class ConfigSupportMixin:
         if not panels:
             return
         current = _ui_engine(self.engine_var.get())
+        # 自定义规则（rule_dsl:<文件名>）共用同一块面板，面板里可以换文件。
+        is_rule_engine = bool(rule_engine_stem(current))
+        if is_rule_engine and "rule_dsl" in panels:
+            current = "rule_dsl"
         # 别名都指到同一块面板（如 ma_cross / dual_ma）。
         show = panels.get(current)
         if show is None:
@@ -131,12 +142,14 @@ class ConfigSupportMixin:
                 pass
         if show is not None:
             show.pack(fill="x", anchor="n")
+        # 切到自定义规则时，把对应的 YAML 读进编辑框。
+        if is_rule_engine:
+            self._refresh_rule_editor()
         # 换策略后说明文字换行宽度跟着右侧实际宽度走。
         try:
             self.after_idle(self._sync_strategy_param_wrap)
         except Exception:  # noqa: BLE001
             self._sync_strategy_param_wrap()
-
 
     def _refresh_generic_stop_param_panel(self, *_args: object) -> None:
         """
@@ -979,6 +992,326 @@ class ConfigSupportMixin:
         combined = " ".join(part for part in (delivery_text, main_text) if part).strip()
         self._set_main_contract_hint(combined, warn=bool(delivery_warn or (found and main_text)))
 
+    # ---------------------------------------------------------- 自定义规则编辑器
+
+    def _refresh_rule_list(self, highlight: str = "") -> None:
+        page = getattr(self, "rule_page", None)
+        if page is not None:
+            page.refresh_list(highlight)
+
+    def _refresh_rule_editor(self, select_stem: str = "") -> None:
+        """刷新左侧文件列表，并把选中的规则读进编辑框。"""
+        from src.strategy.rule_dsl import list_rule_files, rule_engine_stem
+
+        if getattr(self, "rule_editor", None) is None:
+            return
+        stems = [str(info["stem"]) for info in list_rule_files()]
+        stem = select_stem or rule_engine_stem(self.engine_var.get())
+        if not stem:
+            configured = (self.cfg.get("strategy") or {}).get("rule_dsl") or {}
+            stem = Path(str(configured.get("file") or "")).stem
+        if stem not in stems:
+            stem = stems[0] if stems else ""
+        if not stem:
+            self._rule_loaded_stem = ""
+            self.rule_name_var.set("")
+            self._rule_saved_text = ""
+            self._rule_dirty = False
+            self._set_rule_dirty(False, "")
+            self._refresh_rule_list()
+            self.rule_status_var.set("还没有规则文件，点左下角「新建规则」写一条。")
+            return
+        self._load_rule_text(stem)
+
+    def _load_rule_text(self, stem: str) -> None:
+        from src.strategy.rule_dsl import NEW_RULE_TEXT, is_builtin_rule, rules_dir
+
+        self._rule_loaded_stem = stem
+        self.rule_name_var.set(stem)
+        try:
+            text = (rules_dir() / f"{stem}.yaml").read_text(encoding="utf-8")
+        except OSError:
+            text = NEW_RULE_TEXT
+        self.rule_editor.delete("1.0", "end")
+        self.rule_editor.insert("1.0", text)
+        self._rule_saved_text = text
+        self._rule_dirty = False
+        try:
+            self.rule_editor.edit_modified(False)
+        except Exception:  # noqa: BLE001
+            pass
+        self._refresh_rule_list(highlight=stem)
+        self._set_rule_dirty(False, stem)
+        builtin = is_builtin_rule(stem)
+        tag = "（程序自带，不可删改，可另存为）" if builtin else ""
+        self.rule_status_var.set(f"正在编辑 {stem}.yaml{tag}；改完点「保存」。")
+
+    def _on_rule_open(self, stem: str) -> None:
+        """点左侧文件列表；有未保存修改先确认。"""
+        if not stem or stem == getattr(self, "_rule_loaded_stem", ""):
+            return
+        if not self._confirm_discard_rule():
+            return
+        self._load_rule_text(stem)
+
+    def _on_rule_new(self) -> None:
+        from src.strategy.rule_dsl import NEW_RULE_TEXT
+
+        if not self._confirm_discard_rule():
+            return
+        self._rule_loaded_stem = ""
+        self.rule_name_var.set("")
+        self.rule_editor.delete("1.0", "end")
+        self.rule_editor.insert("1.0", NEW_RULE_TEXT)
+        self._rule_saved_text = ""
+        self._rule_dirty = False
+        try:
+            self.rule_editor.edit_modified(False)
+        except Exception:  # noqa: BLE001
+            pass
+        self._refresh_rule_list()
+        self._set_rule_dirty(False, "")
+        self.rule_status_var.set("填个文件名（小写字母/数字/下划线），写好后点「保存」。")
+
+    def _on_rule_modified(self) -> None:
+        """编辑框变动时维护未保存标记，标题上的 * 跟着变。"""
+        editor = getattr(self, "rule_editor", None)
+        if editor is None:
+            return
+        try:
+            if not editor.edit_modified():
+                return
+            editor.edit_modified(False)
+            text = editor.get("1.0", "end")
+        except Exception:  # noqa: BLE001
+            return
+        dirty = text.strip() != (self._rule_saved_text or "").strip()
+        self._set_rule_dirty(dirty, getattr(self, "_rule_loaded_stem", ""))
+
+    def _set_rule_dirty(self, dirty: bool, stem: str) -> None:
+        self._rule_dirty = dirty
+        page = getattr(self, "rule_page", None)
+        if page is not None:
+            page.set_dirty(dirty, stem)
+
+    def _confirm_discard_rule(self) -> bool:
+        if not getattr(self, "_rule_dirty", False):
+            return True
+        return bool(
+            messagebox.askyesno("未保存的修改", "当前规则有未保存的修改，放弃并继续？", parent=self)
+        )
+
+    def _on_rule_check(self) -> None:
+        """只编译不写盘。"""
+        from src.strategy.rule_dsl import RuleConfigError, compile_rule_text
+
+        text = self.rule_editor.get("1.0", "end").strip()
+        try:
+            rule = compile_rule_text(text)
+        except RuleConfigError as exc:
+            self.rule_status_var.set(f"校验没通过：{exc}")
+            return
+        self.rule_status_var.set(f"校验通过：{rule.name}。还没写盘，点「保存」才会存成文件。")
+
+    def _save_rule_from_editor(self) -> str:
+        """校验并写盘当前编辑内容。成功返回文件名，失败返回空串并更新状态行。"""
+        from src.strategy.rule_dsl import (
+            RuleConfigError,
+            is_rule_stem,
+            rules_dir,
+            save_rule_text,
+        )
+        from src.ui.app_common import register_rule_engines
+
+        stem = self.rule_name_var.get().strip().lower()
+        if not is_rule_stem(stem):
+            self.rule_status_var.set("文件名只能用小写字母、数字、下划线或短横线，且以字母或数字开头。")
+            return ""
+        text = self.rule_editor.get("1.0", "end").strip()
+        try:
+            rule = save_rule_text(rules_dir() / f"{stem}.yaml", text)
+        except RuleConfigError as exc:
+            self.rule_status_var.set(f"没有保存：{exc}")
+            return ""
+        register_rule_engines()
+        try:
+            self.engine_menu.configure(values=list(ENGINE_CHOICES))
+        except Exception:  # noqa: BLE001
+            pass
+        self._refresh_rule_editor(select_stem=stem)
+        self.rule_status_var.set(
+            f"已保存：{stem}.yaml（{rule.name}）。要在运行/回测里用它，"
+            "到「配置」页的策略引擎下拉里选择；保存本身不会切换运行策略。"
+        )
+        return stem
+
+
+    def _on_rule_save(self) -> None:
+        """校验通过才写盘；只注册进策略下拉，不自动切换当前运行策略。"""
+        self._save_rule_from_editor()
+
+    def _on_rule_backtest(self) -> None:
+        """用「历史回测」页的条件跑当前规则并生成绩效报告。
+
+        不另写回测：品种、周期、日期、行情来源、滑点和开仓限制都读历史回测页，
+        只把策略换成正在编辑的规则；报告照旧写到 data/backtest_last.json，
+        同时显示在编辑框下方的报告框里。
+        """
+        from src.strategy.rule_dsl import (
+            RuleConfigError,
+            compile_rule_text,
+            is_builtin_rule,
+            is_rule_stem,
+            rule_engine_code,
+            rules_dir,
+        )
+
+        stem = self._current_rule_stem()
+        if not is_rule_stem(stem):
+            self.rule_status_var.set("先填一个合法的文件名（小写字母/数字/下划线），再回测当前规则。")
+            return
+        text = self.rule_editor.get("1.0", "end").strip()
+        try:
+            compile_rule_text(text)
+        except RuleConfigError as exc:
+            self.rule_status_var.set(f"规则没通过校验，未开始回测：{exc}")
+            return
+        path = rules_dir() / f"{stem}.yaml"
+        if text != (self._rule_saved_text or "").strip() or not path.exists():
+            if is_builtin_rule(stem):
+                messagebox.showwarning(
+                    "内置规则不能覆盖",
+                    f"{stem}.yaml 是程序自带规则。要回测改动后的内容，"
+                    "请先在文件名里填新名字并「保存」为自己的规则。",
+                )
+                return
+            if not messagebox.askyesno(
+                "回测前先保存",
+                f"当前规则有未保存的修改。\n回测读的是磁盘上的 {stem}.yaml，先保存再跑？",
+            ):
+                return
+            if not self._save_rule_from_editor():
+                messagebox.showwarning("没有保存", "规则没写盘，回测没有开始。看编辑框下方的提示。")
+                return
+        self._start_backtest(
+            engine_override=rule_engine_code(stem),
+            result_box=getattr(self, "rule_bt_result_box", None),
+            switch_tab=False,
+            header="规则回测",
+        )
+
+    def _update_rule_summary(self) -> None:
+        """配置页里「当前运行策略对应哪个规则文件」的摘要。"""
+        from src.strategy.rule_dsl import is_builtin_rule, rule_engine_stem
+
+        stem = rule_engine_stem(self.engine_var.get())
+        if stem:
+            if is_builtin_rule(stem):
+                self.rule_summary_var.set(f"当前运行策略：{stem}.yaml（程序自带只读，可另存为）")
+            else:
+                self.rule_summary_var.set(f"当前运行策略：{stem}.yaml（自己的规则，可改可删）")
+            return
+        if str(self.engine_var.get()).startswith("rule_dsl:"):
+            self.rule_summary_var.set("这条规则文件已不存在；运行时会回退到「日内实体」。")
+        else:
+            self.rule_summary_var.set("当前运行策略不是 DSL 规则；要写自定义策略，点下面按钮。")
+
+    def _open_rule_editor(self) -> None:
+        """从配置页跳到策略编辑器，并顺手载入当前运行策略对应的规则。"""
+        from src.strategy.rule_dsl import rule_engine_stem
+
+        try:
+            self.tabs.set("策略编辑器")
+        except Exception:  # noqa: BLE001
+            pass
+        stem = rule_engine_stem(self.engine_var.get())
+        if stem and stem != getattr(self, "_rule_loaded_stem", ""):
+            if self._confirm_discard_rule():
+                self._load_rule_text(stem)
+        elif not getattr(self, "_rule_loaded_stem", ""):
+            self._refresh_rule_editor()
+
+    def _current_rule_stem(self) -> str:
+        """取当前编辑的规则文件名：优先已加载的规则，其次文件名字段。"""
+        loaded = getattr(self, "_rule_loaded_stem", "") or ""
+        if loaded:
+            return loaded
+        return self.rule_name_var.get().strip().lower()
+
+    def _on_rule_delete(self) -> None:
+        """删除当前用户规则；内置规则拒绝。"""
+        from src.strategy.rule_dsl import (
+            RuleConfigError,
+            delete_rule_file,
+            is_builtin_rule,
+        )
+        from src.ui.app_common import register_rule_engines
+
+        stem = self._current_rule_stem()
+        if not stem:
+            self.rule_status_var.set("先选一条要删除的规则（非内置）。")
+            return
+        if is_builtin_rule(stem):
+            self.rule_status_var.set(f"{stem}.yaml 是程序自带规则，不能删除；想改就「另存为」自己的规则。")
+            return
+        try:
+            delete_rule_file(stem)
+        except RuleConfigError as exc:
+            self.rule_status_var.set(f"没有删除：{exc}")
+            return
+        register_rule_engines()
+        try:
+            self.engine_menu.configure(values=list(ENGINE_CHOICES))
+        except Exception:  # noqa: BLE001
+            pass
+        # 删的是当前引擎就回退到日内实体，避免界面引用已删除的策略。
+        if rule_engine_stem(self.engine_var.get()) == stem:
+            self.engine_var.set("daily_body")
+        self._rule_loaded_stem = ""
+        self._refresh_rule_editor()
+        self.rule_status_var.set(f"已删除 {stem}.yaml，并从策略下拉移除。")
+
+    def _on_rule_rename(self) -> None:
+        """把当前加载的规则改名为文件名字段里的新名字；内置规则拒绝。"""
+        from src.strategy.rule_dsl import (
+            RuleConfigError,
+            is_builtin_rule,
+            rename_rule_file,
+            rule_engine_code,
+            rule_engine_stem,
+        )
+        from src.ui.app_common import register_rule_engines
+
+        old = getattr(self, "_rule_loaded_stem", "") or ""
+        new = self.rule_name_var.get().strip().lower()
+        if not old:
+            self.rule_status_var.set("先加载一条用户规则，再在文件名字段填新名字后点重命名。")
+            return
+        if not new:
+            self.rule_status_var.set("重命名需要在文件名字段填上新名字。")
+            return
+        if old == new:
+            self.rule_status_var.set("新旧文件名一样，没有改。")
+            return
+        if is_builtin_rule(old):
+            self.rule_status_var.set(f"{old}.yaml 是程序自带规则，不能改名；想改就「另存为」自己的规则。")
+            return
+        try:
+            rename_rule_file(old, new)
+        except RuleConfigError as exc:
+            self.rule_status_var.set(f"没有改名：{exc}")
+            return
+        register_rule_engines()
+        try:
+            self.engine_menu.configure(values=list(ENGINE_CHOICES))
+        except Exception:  # noqa: BLE001
+            pass
+        # 当前引擎指向旧名字时切到新名字。
+        if rule_engine_stem(self.engine_var.get()) == old:
+            self.engine_var.set(rule_engine_code(new))
+        self._rule_loaded_stem = new
+        self._refresh_rule_editor(select_stem=new)
+        self.rule_status_var.set(f"已把 {old}.yaml 改名为 {new}.yaml。")
 
     def _sync_bt_symbol_menu(self, prefer: str | None = None, force: bool = False) -> None:
         """

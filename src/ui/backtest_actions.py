@@ -48,33 +48,140 @@ class BacktestActionsMixin:
         return f"跳过开仓  {total} 次（" + "，".join(parts) + "）"
 
 
+    def _backtest_summary_text(
+        self,
+        result,
+        *,
+        report_path: Path,
+        stress_note: str = "",
+        engine_fallback: str = "",
+        header: str = "历史回测完成",
+        max_trades: int = 15,
+    ) -> str:
+        """把一次回测结果写成绩效报告文本。历史回测页和策略编辑器共用这一份。"""
+        from src.backtest.evaluation import format_evaluation_lines
+        from src.backtest.metrics import format_expectancy_line, format_payoff_lines
+        from src.backtest.rollover import format_rollover_lines
+        from src.screen.picker import format_cover_lines
+
+        p = result.performance
+        snap = result.params_snapshot or {}
+        rollover_text = format_rollover_lines(snap)
+        note = ""
+        if p.trades < 3:
+            note = (
+                f"\n注意：K线 {result.bars} 根、成交仅 {p.trades} 笔，"
+                "胜率参考价值低（可改成「全部可用」再试）。"
+            )
+        lines = [
+            f"{header}  {result.symbol}",
+            f"跑完时间  {result.ran_at}",
+            f"策略      {snap.get('engine', engine_fallback)}",
+            "收盘清仓  开（到点强平）"
+            if snap.get("flatten_at_close", True)
+            else "收盘清仓  关（可留过收盘；区间最后一根仍会按收盘价结算未平的仓）",
+            f"周期      信号{period_label(result.timeframe)} / 止损{period_label(result.trail_timeframe)}",
+            self._format_limit_lines(snap),
+            f"你选的区间  {snap.get('start_date') or '不限'} ~ {snap.get('end_date') or '到最新'}",
+            f"行情能给的  {str(snap.get('available_from', ''))[:16]}  →  {str(snap.get('available_to', ''))[:16]}",
+            f"实际区间    {str(snap.get('data_from', ''))[:16]}  →  {str(snap.get('data_to', ''))[:16]}",
+            str(snap.get("coverage_note") or "").strip(),
+            *([rollover_text] if rollover_text else []),
+            str(snap.get("fill_note") or "").strip(),
+            f"K线根数   {result.bars}",
+            f"成交      {p.trades} 笔（赢{p.wins} / 亏{p.losses}）",
+            f"没开成    {len(result.rejected)} 条开仓信号（被策略过滤或风控挡住，明细在下面）"
+            if result.rejected
+            else "没开成    无（每个开仓信号都成交了）",
+            f"胜率      {p.win_rate:.0%}",
+            *format_payoff_lines(p.avg_win, p.avg_loss, p.payoff),
+            format_expectancy_line(p.win_rate, p.avg_win, p.avg_loss, p.expectancy),
+            f"净盈亏    {p.net_pnl:.0f} 元",
+            f"盈利因子  {p.profit_factor:.2f}",
+            f"最大回撤  {p.max_drawdown:.0f} 元（{p.max_drawdown_pct:.2%}）",
+            *format_cover_lines(
+                p.net_pnl,
+                p.max_drawdown,
+                p.trades,
+                str(snap.get("data_from") or ""),
+                str(snap.get("data_to") or ""),
+            ),
+            stress_note,
+            *format_evaluation_lines(result.evaluation),
+            f"报告      {report_path}",
+            note.strip(),
+            "",
+            f"—— 成交明细（最多显示最近 {max_trades} 笔）——",
+        ]
+        for t in result.trades[-max_trades:]:
+            lines.append(
+                f"{t.entry_time[:16]}→{t.exit_time[:16]} {t.side}{t.volume}手 "
+                f"{t.entry_price:.1f}->{t.exit_price:.1f} "
+                f"pnl={t.pnl:.0f} | {t.reason_exit[:40]}"
+            )
+        if result.rejected:
+            lines.append("")
+            lines.append(
+                f"—— 有开仓信号但没做（同一交易时段同类原因只记一次，共 "
+                f"{len(result.rejected)} 条，最多显示最近 20 条）——"
+            )
+            for item in result.rejected[-20:]:
+                price = f"{item.price:.2f}" if item.price else "—"
+                stop = f"{item.stop:.2f}" if item.stop else "—"
+                lines.append(
+                    f"{item.time[:16]} {item.side} 价{price} 止损{stop} "
+                    f"| {item.stage}：{item.reason[:80]}"
+                )
+        return "\n".join(x for x in lines if x is not None)
+
+
     def _on_backtest(self) -> None:
         """后台跑历史回测，结果写本页 + data/backtest_last.json。"""
+        self._start_backtest()
+
+
+    def _start_backtest(
+        self,
+        *,
+        engine_override: str | None = None,
+        result_box: object | None = None,
+        switch_tab: bool = True,
+        header: str = "历史回测",
+    ) -> None:
+        """按历史回测页的条件跑一次回测。
+
+        engine_override：策略编辑器用，临时把策略换成正在编辑的规则，不改页面上的下拉。
+        result_box：为空时写历史回测页的结果框；策略编辑器传自己的报告框。
+        """
         prepared = self._prepare_backtest_run()
         if prepared is None:
             return
         cfg, symbol, start, end = prepared
         st = cfg["strategy"]
+        if engine_override:
+            st["engine"] = engine_override
+        box = result_box if result_box is not None else getattr(self, "bt_result_box", None)
 
         self._append_log(
-            f"开始历史回测… engine={st['engine']} symbol={symbol} "
+            f"开始{header}… engine={st['engine']} symbol={symbol} "
             f"行情={self.bt_source_var.get()} "
             f"区间={start or '起'}~{end or '止'} "
             f"换月={'按主力时段' if self.bt_rollover_var.get() else '否'} "
             f"口径={'真实账户' if self.bt_rollover_chain_var.get() else '固定起始资金'}"
         )
-        self.tabs.set("历史回测")
-        if hasattr(self, "bt_result_box"):
+        if switch_tab:
+            self.tabs.set("历史回测")
+        if box is not None:
             self._set_result_text(
-                self.bt_result_box,
-                "历史回测进行中，请稍候…\n正在下载行情。网络慢时最多大约 20 秒，然后改用电脑里已经有的K线。\n",
+                box,
+                f"{header}进行中，请稍候…\n正在下载行情。网络慢时最多大约 20 秒，然后改用电脑里已经有的K线。\n",
             )
 
         def _run() -> None:
             try:
                 from src.backtest.engine import run_backtest, save_backtest_report
-                from src.backtest.evaluation import EvaluationThresholds, format_evaluation_lines
-                from src.backtest.rollover import run_backtest_rollover, format_rollover_lines
+                from src.backtest.evaluation import EvaluationThresholds
+                from src.backtest.rollover import run_backtest_rollover
                 from src.backtest.stress import evaluate_with_stress
 
                 chain = bool(self.bt_rollover_chain_var.get())
@@ -117,97 +224,33 @@ class BacktestActionsMixin:
                     thresholds=th,
                     runner=_runner,
                     on_start=lambda: self._post_to_main(
-                        lambda: self._append_log("历史回测完成，开始滑点压力测试与参数扰动…")
+                        lambda: self._append_log(f"{header}完成，开始滑点压力测试与参数扰动…")
                     ),
                 )
                 path = self.root_dir / "data" / "backtest_last.json"
                 save_backtest_report(result, path)
-                snap = result.params_snapshot or {}
-                rollover_text = format_rollover_lines(snap)
-                note = ""
-                if p.trades < 3:
-                    note = (
-                        f"\n注意：K线 {result.bars} 根、成交仅 {p.trades} 笔，"
-                        "胜率参考价值低（可改成「全部可用」再试）。"
-                    )
-                from src.backtest.metrics import format_expectancy_line, format_payoff_lines
-                from src.screen.picker import format_cover_lines
-
                 # 摘要 + 最近几笔成交。盈利覆盖等和交叉测试同一套算法，方便对照。
-                lines = [
-                    f"历史回测完成  {result.symbol}",
-                    f"跑完时间  {result.ran_at}",
-                    f"策略      {snap.get('engine', st['engine'])}",
-                    "收盘清仓  开（到点强平）"
-                    if snap.get("flatten_at_close", True)
-                    else "收盘清仓  关（可留过收盘；区间最后一根仍会按收盘价结算未平的仓）",
-                    f"周期      信号{period_label(result.timeframe)} / 止损{period_label(result.trail_timeframe)}",
-                    self._format_limit_lines(snap),
-                    f"你选的区间  {snap.get('start_date') or '不限'} ~ {snap.get('end_date') or '到最新'}",
-                    f"行情能给的  {str(snap.get('available_from', ''))[:16]}  →  {str(snap.get('available_to', ''))[:16]}",
-                    f"实际区间    {str(snap.get('data_from', ''))[:16]}  →  {str(snap.get('data_to', ''))[:16]}",
-                    str(snap.get("coverage_note") or "").strip(),
-                    *([rollover_text] if rollover_text else []),
-                    str(snap.get("fill_note") or "").strip(),
-                    f"K线根数   {result.bars}",
-                    f"成交      {p.trades} 笔（赢{p.wins} / 亏{p.losses}）",
-                    f"没开成    {len(result.rejected)} 条开仓信号（被策略过滤或风控挡住，明细在下面）"
-                    if result.rejected
-                    else "没开成    无（每个开仓信号都成交了）",
-                    f"胜率      {p.win_rate:.0%}",
-                    *format_payoff_lines(p.avg_win, p.avg_loss, p.payoff),
-                    format_expectancy_line(p.win_rate, p.avg_win, p.avg_loss, p.expectancy),
-                    f"净盈亏    {p.net_pnl:.0f} 元",
-                    f"盈利因子  {p.profit_factor:.2f}",
-                    f"最大回撤  {p.max_drawdown:.0f} 元（{p.max_drawdown_pct:.2%}）",
-                    *format_cover_lines(
-                        p.net_pnl,
-                        p.max_drawdown,
-                        p.trades,
-                        str(snap.get("data_from") or ""),
-                        str(snap.get("data_to") or ""),
-                    ),
-                    stress_note,
-                    *format_evaluation_lines(result.evaluation),
-                    f"报告      {path}",
-                    note.strip(),
-                    "",
-                    "—— 成交明细（最多显示最近 15 笔）——",
-                ]
-                for t in result.trades[-15:]:
-                    lines.append(
-                        f"{t.entry_time[:16]}→{t.exit_time[:16]} {t.side}{t.volume}手 "
-                        f"{t.entry_price:.1f}->{t.exit_price:.1f} "
-                        f"pnl={t.pnl:.0f} | {t.reason_exit[:40]}"
-                    )
-                if result.rejected:
-                    lines.append("")
-                    lines.append(
-                        f"—— 有开仓信号但没做（同一交易时段同类原因只记一次，共 "
-                        f"{len(result.rejected)} 条，最多显示最近 20 条）——"
-                    )
-                    for item in result.rejected[-20:]:
-                        price = f"{item.price:.2f}" if item.price else "—"
-                        stop = f"{item.stop:.2f}" if item.stop else "—"
-                        lines.append(
-                            f"{item.time[:16]} {item.side} 价{price} 止损{stop} "
-                            f"| {item.stage}：{item.reason[:80]}"
-                        )
-                text = "\n".join(x for x in lines if x is not None)
+                text = self._backtest_summary_text(
+                    result,
+                    report_path=path,
+                    stress_note=stress_note,
+                    engine_fallback=st["engine"],
+                    header=f"{header}完成",
+                )
                 self._post_to_main(lambda: self._append_log(
-                    f"历史回测完成 {result.symbol} | {result.bars}根 | "
+                    f"{header}完成 {result.symbol} | {result.bars}根 | "
                     f"{p.trades}笔 胜率{p.win_rate:.0%} 盈亏比{p.payoff:.2f} "
                     f"期望{p.expectancy:.2f} 净盈亏{p.net_pnl:.0f}"
                 ))
-                if hasattr(self, "bt_result_box"):
-                    self._post_to_main(lambda t=text: self._set_result_text(self.bt_result_box, t))
+                if box is not None:
+                    self._post_to_main(lambda t=text: self._set_result_text(box, t))
             except Exception as e:  # noqa: BLE001
-                logger.exception("历史回测失败")
+                logger.exception("{}失败", header)
                 err = str(e)
-                self._post_to_main(lambda: self._append_log(f"历史回测失败: {err}"))
-                if hasattr(self, "bt_result_box"):
-                    self._post_to_main(lambda m=err: self._set_result_text(self.bt_result_box, f"历史回测失败:\n{m}"))
-                self._post_to_main(lambda m=err: messagebox.showerror("历史回测失败", m))
+                self._post_to_main(lambda: self._append_log(f"{header}失败: {err}"))
+                if box is not None:
+                    self._post_to_main(lambda m=err: self._set_result_text(box, f"{header}失败:\n{m}"))
+                self._post_to_main(lambda m=err: messagebox.showerror(f"{header}失败", m))
 
         threading.Thread(target=_run, daemon=True).start()
 

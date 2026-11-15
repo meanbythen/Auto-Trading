@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import threading
 from datetime import date
+from pathlib import Path
 from tkinter import messagebox
 
 import pytest
@@ -11,7 +12,18 @@ from src.strategy.generic_stop import GENERIC_STOP_LABELS
 from src.utils import load_config, save_config
 
 
-TAB_NAMES = ["运行", "配置", "历史回测", "数据管理", "交叉测试", "策略优化", "复盘", "账户分析", "规律候选"]
+TAB_NAMES = [
+    "运行",
+    "配置",
+    "策略编辑器",
+    "历史回测",
+    "数据管理",
+    "交叉测试",
+    "策略优化",
+    "复盘",
+    "账户分析",
+    "规律候选",
+]
 
 
 def test_real_app_builds_all_tabs_and_backtest_initial_state(real_app) -> None:
@@ -27,8 +39,9 @@ def test_real_app_builds_all_tabs_and_backtest_initial_state(real_app) -> None:
 def test_strategy_and_generic_stop_panels_switch_without_recreation(real_app) -> None:
     strategy_panels = real_app._strategy_detail_panels
     stop_panels = real_app._generic_stop_detail_panels
-    assert len(strategy_panels) == 13
+    assert len(strategy_panels) == 14
     assert len(stop_panels) == 5
+    assert "rule_dsl" in strategy_panels
     strategy_ids = {key: id(panel) for key, panel in strategy_panels.items()}
     stop_ids = {key: id(panel) for key, panel in stop_panels.items()}
     real_app.risk_pct_var.set("1.25")
@@ -50,6 +63,323 @@ def test_strategy_and_generic_stop_panels_switch_without_recreation(real_app) ->
     assert {key: id(panel) for key, panel in strategy_panels.items()} == strategy_ids
     assert {key: id(panel) for key, panel in stop_panels.items()} == stop_ids
     assert real_app.risk_pct_var.get() == "1.25"
+
+
+def test_rule_engine_panel_loads_yaml_into_editor(real_app) -> None:
+    """选中 rule_dsl:<文件名> 时仍显示自定义规则面板，并把对应 YAML 读进编辑框。"""
+    real_app.engine_var.set("rule_dsl:turtle_adx")
+    real_app._refresh_strategy_param_panel()
+    real_app.update_idletasks()
+    assert real_app._strategy_detail_panels["rule_dsl"].winfo_manager() == "pack"
+    assert real_app.rule_name_var.get() == "turtle_adx"
+    assert "海龟唐奇安" in real_app.rule_editor.get("1.0", "end")
+
+
+def test_rule_editor_save_writes_yaml_without_switching_engine(real_app, tmp_path, monkeypatch) -> None:
+    """编辑器保存 → 先校验再写 yaml；保存本身不切换运行策略。"""
+    import src.strategy.rule_dsl as rule_dsl
+    import src.ui.app_common as app_common
+
+    monkeypatch.setattr(rule_dsl, "rules_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        rule_dsl,
+        "list_rule_files",
+        lambda directory=None: [
+            {"stem": path.stem, "name": "临时规则", "builtin": False, "path": str(path)} for path in tmp_path.glob("*.yaml")
+        ],
+    )
+    monkeypatch.setattr(app_common, "register_rule_engines", lambda directory=None: [])
+
+    text = (
+        'schema: 1\nname: "临时规则"\n'
+        "indicators:\n  ma3: {kind: sma, period: 3}\n"
+        "entry:\n  long: {gt: {left: close, right: ma3}}\n"
+        "stop: {kind: percent, pct: 2}\n"
+    )
+    before_engine = real_app.engine_var.get()
+    real_app.rule_name_var.set("tmp_rule")
+    real_app.rule_editor.delete("1.0", "end")
+    real_app.rule_editor.insert("1.0", text)
+    real_app._on_rule_save()
+
+    assert (tmp_path / "tmp_rule.yaml").read_text(encoding="utf-8").startswith("schema: 1")
+    assert real_app.engine_var.get() == before_engine
+    assert "已保存" in real_app.rule_status_var.get()
+
+    # 校验失败时不写盘、不切引擎
+    real_app.rule_name_var.set("bad_rule")
+    real_app.rule_editor.delete("1.0", "end")
+    real_app.rule_editor.insert("1.0", "schema: 1\nentry: {}\nstop: {kind: none}\n")
+    real_app._on_rule_save()
+    assert not (tmp_path / "bad_rule.yaml").exists()
+    assert real_app.engine_var.get() == before_engine
+
+
+def test_rule_editor_page_lists_files_and_marks_dirty(real_app, tmp_path, monkeypatch) -> None:
+    """独立页签：列表分组显示规则文件，改编辑框后标题打上未保存星号。"""
+    import src.strategy.rule_dsl as rule_dsl
+
+    (tmp_path / "mine.yaml").write_text(
+        'schema: 1\nname: "我的规则"\n'
+        "indicators:\n  ma3: {kind: sma, period: 3}\n"
+        "entry:\n  long: {gt: {left: close, right: ma3}}\n"
+        "stop: {kind: percent, pct: 2}\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(rule_dsl, "rules_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        rule_dsl,
+        "list_rule_files",
+        lambda directory=None: [
+            {"stem": path.stem, "name": path.stem, "builtin": False, "path": str(path)}
+            for path in tmp_path.glob("*.yaml")
+        ],
+    )
+
+    page = getattr(real_app, "rule_page", None)
+    assert page is not None and page.list_host is not None
+    real_app._refresh_rule_list()
+    labels = [
+        str(widget.cget("text"))
+        for widget in page.list_host.winfo_children()
+        if hasattr(widget, "cget")
+    ]
+    assert any("mine.yaml" in text for text in labels)
+    assert any("我的规则" in text for text in labels)
+
+    real_app._load_rule_text("mine")
+    assert real_app._rule_loaded_stem == "mine"
+    assert real_app.rule_title_var.get() == "当前：mine.yaml"
+
+    real_app.rule_editor.insert("end", "\n# 改一笔\n")
+    real_app._on_rule_modified()
+    assert real_app._rule_dirty is True
+    assert real_app.rule_title_var.get().endswith("*")
+
+    # 切到别的文件/新建时先确认；这里选「不放弃」，编辑内容原地保留
+    monkeypatch.setattr(messagebox, "askyesno", lambda *args, **kwargs: False)
+    real_app._on_rule_new()
+    assert real_app._rule_loaded_stem == "mine"
+    assert real_app._rule_dirty is True
+
+
+def test_rule_editor_check_only_does_not_write(real_app, tmp_path, monkeypatch) -> None:
+    """「仅校验」只编译不落盘。"""
+    import src.strategy.rule_dsl as rule_dsl
+
+    monkeypatch.setattr(rule_dsl, "rules_dir", lambda: tmp_path)
+    real_app.rule_name_var.set("only_check")
+    real_app.rule_editor.delete("1.0", "end")
+    real_app.rule_editor.insert(
+        "1.0",
+        'schema: 1\nname: "仅校验"\n'
+        "indicators:\n  ma3: {kind: sma, period: 3}\n"
+        "entry:\n  long: {gt: {left: close, right: ma3}}\n"
+        "stop: {kind: percent, pct: 2}\n",
+    )
+    real_app._on_rule_check()
+    assert "校验通过" in real_app.rule_status_var.get()
+    assert not (tmp_path / "only_check.yaml").exists()
+
+    real_app.rule_editor.delete("1.0", "end")
+    real_app.rule_editor.insert("1.0", "schema: 1\nentry: {}\nstop: {kind: none}\n")
+    real_app._on_rule_check()
+    assert "校验没通过" in real_app.rule_status_var.get()
+
+
+def test_rule_editor_delete_user_rule_removes_file(real_app, tmp_path, monkeypatch) -> None:
+    """删除用户规则：文件被删，引擎回退到日内实体。"""
+    import src.strategy.rule_dsl as rule_dsl
+    import src.ui.app_common as app_common
+
+    user_text = (
+        'schema: 1\nname: "用户规则"\n'
+        "indicators:\n  ma3: {kind: sma, period: 3}\n"
+        "entry:\n  long: {gt: {left: close, right: ma3}}\n"
+        "stop: {kind: percent, pct: 2}\n"
+    )
+    (tmp_path / "mine.yaml").write_text(user_text, encoding="utf-8")
+
+    def _list(directory=None):
+        root = Path(directory) if directory is not None else tmp_path
+        return [
+            {"stem": p.stem, "name": "用户规则", "builtin": False, "path": str(p)}
+            for p in root.glob("*.yaml")
+        ]
+
+    monkeypatch.setattr(rule_dsl, "rules_dir", lambda: tmp_path)
+    monkeypatch.setattr(rule_dsl, "list_rule_files", _list)
+    monkeypatch.setattr(app_common, "register_rule_engines", lambda directory=None: [])
+
+    real_app._load_rule_text("mine")
+    real_app.engine_var.set("rule_dsl:mine")
+    real_app._on_rule_delete()
+    assert not (tmp_path / "mine.yaml").exists()
+    assert real_app.engine_var.get() == "daily_body"
+    assert "已删除" in real_app.rule_status_var.get()
+
+
+def test_rule_editor_delete_builtin_rule_rejected(real_app, tmp_path, monkeypatch) -> None:
+    """内置规则点删除：拒绝，文件保留。"""
+    import src.strategy.rule_dsl as rule_dsl
+    import src.ui.app_common as app_common
+
+    builtin_text = (
+        'schema: 1\nbuiltin: true\nname: "内置规则"\n'
+        "indicators:\n  ma3: {kind: sma, period: 3}\n"
+        "entry:\n  long: {gt: {left: close, right: ma3}}\n"
+        "stop: {kind: percent, pct: 2}\n"
+    )
+    (tmp_path / "builtin_rule.yaml").write_text(builtin_text, encoding="utf-8")
+
+    def _list(directory=None):
+        root = Path(directory) if directory is not None else tmp_path
+        return [
+            {"stem": p.stem, "name": "内置规则", "builtin": True, "path": str(p)}
+            for p in root.glob("*.yaml")
+        ]
+
+    monkeypatch.setattr(rule_dsl, "rules_dir", lambda: tmp_path)
+    monkeypatch.setattr(rule_dsl, "list_rule_files", _list)
+    monkeypatch.setattr(app_common, "register_rule_engines", lambda directory=None: [])
+
+    real_app._load_rule_text("builtin_rule")
+    real_app._on_rule_delete()
+    assert (tmp_path / "builtin_rule.yaml").exists()
+    assert "程序自带规则" in real_app.rule_status_var.get()
+
+
+def test_rule_editor_rename_user_rule(real_app, tmp_path, monkeypatch) -> None:
+    """重命名用户规则：旧文件消失，新文件出现，引擎切到新名字。"""
+    import src.strategy.rule_dsl as rule_dsl
+    import src.ui.app_common as app_common
+
+    (tmp_path / "old.yaml").write_text(
+        'schema: 1\nname: "旧规则"\n'
+        "indicators:\n  ma3: {kind: sma, period: 3}\n"
+        "entry:\n  long: {gt: {left: close, right: ma3}}\n"
+        "stop: {kind: percent, pct: 2}\n",
+        encoding="utf-8",
+    )
+
+    def _list(directory=None):
+        root = Path(directory) if directory is not None else tmp_path
+        return [
+            {"stem": p.stem, "name": p.stem, "builtin": False, "path": str(p)}
+            for p in root.glob("*.yaml")
+        ]
+
+    monkeypatch.setattr(rule_dsl, "rules_dir", lambda: tmp_path)
+    monkeypatch.setattr(rule_dsl, "list_rule_files", _list)
+    monkeypatch.setattr(app_common, "register_rule_engines", lambda directory=None: [])
+
+    real_app._load_rule_text("old")
+    real_app.rule_name_var.set("new")
+    real_app.engine_var.set("rule_dsl:old")
+    real_app._on_rule_rename()
+    assert not (tmp_path / "old.yaml").exists()
+    assert (tmp_path / "new.yaml").exists()
+    assert real_app.engine_var.get() == "rule_dsl:new"
+    assert "改名为" in real_app.rule_status_var.get()
+
+
+def test_rule_editor_backtest_saves_rule_and_reuses_history_backtest(real_app, tmp_path, monkeypatch) -> None:
+    """编辑器「回测当前规则」：先存盘，再走历史回测同一套入口，且不跳到回测页。"""
+    import src.strategy.rule_dsl as rule_dsl
+
+    monkeypatch.setattr(rule_dsl, "rules_dir", lambda: tmp_path)
+    monkeypatch.setattr(
+        rule_dsl,
+        "list_rule_files",
+        lambda directory=None: [
+            {"stem": path.stem, "name": path.stem, "builtin": False, "path": str(path)}
+            for path in tmp_path.glob("*.yaml")
+        ],
+    )
+    monkeypatch.setattr(rule_dsl, "is_builtin_rule", lambda stem, directory=None: False)
+    monkeypatch.setattr("src.ui.app_common.register_rule_engines", lambda directory=None: [])
+
+    real_app._rule_loaded_stem = ""
+    real_app._rule_saved_text = ""
+    real_app.rule_name_var.set("bt_rule")
+    real_app.rule_editor.delete("1.0", "end")
+    real_app.rule_editor.insert(
+        "1.0",
+        'schema: 1\nname: "回测规则"\n'
+        "indicators:\n  ma3: {kind: sma, period: 3}\n"
+        "entry:\n  long: {gt: {left: close, right: ma3}}\n"
+        "stop: {kind: percent, pct: 2}\n",
+    )
+    recorded: dict = {}
+    monkeypatch.setattr(messagebox, "askyesno", lambda *args, **kwargs: True)
+    monkeypatch.setattr(real_app, "_start_backtest", lambda **kwargs: recorded.update(kwargs))
+
+    real_app._on_rule_backtest()
+
+    assert (tmp_path / "bt_rule.yaml").exists()
+    assert recorded["engine_override"] == "rule_dsl:bt_rule"
+    assert recorded["switch_tab"] is False
+    assert recorded["result_box"] is real_app.rule_bt_result_box
+
+
+def test_indicator_builder_inserts_configured_indicator(real_app) -> None:
+    """在可视化面板里选类型、填参数，点插入后编辑框的 indicators 段会多一行。"""
+    builder = getattr(real_app, "rule_indicator_builder", None)
+    assert builder is not None, "策略编辑器应挂上指标库面板"
+
+    real_app.rule_editor.delete("1.0", "end")
+    real_app.rule_editor.insert(
+        "1.0",
+        'schema: 1\nname: "面板测试"\n'
+        "indicators:\n  ma20: { kind: ema, period: 20 }\n\n"
+        "entry:\n  long: { gt: { left: close, right: ma20 } }\n"
+        "stop: { kind: none }\n",
+    )
+    # 默认选中的是 EMA，改周期与名字后预览与插入内容都要跟着变
+    builder.param_vars["period"].set("60")
+    builder.name_var.set("ema60")
+    assert "kind: ema, period: 60" in builder.snippet_var.get()
+    assert "EMA(60)" in builder.formula_var.get()
+
+    builder.insert()
+    text = real_app.rule_editor.get("1.0", "end")
+    assert "  ema60: { kind: ema, period: 60 }" in text
+    assert "已插入 ema60" in builder.status_var.get()
+
+    # 同名再点一次会被拦住，不会写出重复的指标名
+    builder.insert()
+    assert "已经有叫 ema60" in builder.status_var.get()
+
+
+def test_indicator_builder_rejects_bad_params(real_app) -> None:
+    """参数越界时面板给出校验提示，且不会写进编辑框。"""
+    builder = real_app.rule_indicator_builder
+    real_app.rule_editor.delete("1.0", "end")
+    real_app.rule_editor.insert("1.0", 'schema: 1\nname: "t"\nentry: {}\nstop: { kind: none }\n')
+    before = real_app.rule_editor.get("1.0", "end")
+    builder.name_var.set("ma20")
+    builder.param_vars["period"].set("1")
+    builder.insert()
+    assert "校验没通过" in builder.status_var.get()
+    assert real_app.rule_editor.get("1.0", "end") == before
+
+
+def test_indicator_builder_exposes_every_library_indicator(real_app) -> None:
+    """指标库里的 kind 必须都能在下拉里选到，并能带出各自的参数。"""
+    from src.strategy.rule_dsl import INDICATOR_LIBRARY
+    from src.ui.rule_indicator_builder import _KIND_LABELS
+
+    kinds = {str(item["kind"]) for item in INDICATOR_LIBRARY}
+    assert kinds == set(_KIND_LABELS)
+
+    builder = real_app.rule_indicator_builder
+    builder.kind_var.set(_KIND_LABELS["supertrend"])
+    assert set(builder.param_vars) == {"period", "mult"}
+    assert "kind: supertrend" in builder.snippet_var.get()
+
+    builder.kind_var.set(_KIND_LABELS["expr"])
+    assert "formula" in builder.param_vars
+    assert builder.formula_entry is not None
 
 
 def test_backtest_source_hint_margin_trace_and_opt_sync(real_app, monkeypatch) -> None:

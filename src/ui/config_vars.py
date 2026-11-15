@@ -28,6 +28,15 @@ class ConfigVarsMixin:
         secrets = load_secrets()
 
         self.engine_var = ctk.StringVar(value=_ui_engine(st.get("engine", "daily_body")))
+        # 自定义规则编辑器：保存用的文件名、状态提示。
+        self.rule_name_var = ctk.StringVar(value="")
+        self.rule_status_var = ctk.StringVar(value="")
+        # 「策略编辑器」页签的标题（当前文件 + 内置标记 + 未保存星号）与配置页摘要。
+        self.rule_title_var = ctk.StringVar(value="当前：未命名")
+        self.rule_summary_var = ctk.StringVar(value="")
+        self._rule_loaded_stem = ""
+        self._rule_saved_text = ""
+        self._rule_dirty = False
         self.exec_var = ctk.StringVar(value=str(trade.get("executor", "sim")))
         from src.trader.ctp_logic import CTP_KIND_LABELS, ctp_kind_label
 

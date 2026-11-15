@@ -33,7 +33,8 @@ def _readme_txt(version: str) -> str:
 - 「复盘」页含成绩单、信号质量、缺陷诊断；基本面补充框下有按品种推荐的手动来源
 - 运行页「测试工具」含：试跑一轮信号、点击下单自检、完整自检（三项分选）
 - 历史回测「把本页参数写入配置页」会写回策略、品种、周期、开关和开仓限制（不改实盘余额）
-- 当前策略：日内实体、趋势跟随、SuperTrend、双均线、长线趋势加减仓、长线箱体突破、多因子
+- 当前策略：日内实体、趋势跟随、SuperTrend、双均线、长线趋势加减仓、长线箱体突破、多因子、自定义规则（DSL）
+- 自定义规则：config\\rules\\ 下的 YAML 用指标条件组合搭策略，不写代码；改完重启生效，写错会停止开仓并写告警
 - 日内实体怎么挂机：看 docs\\日内实体操作说明书.md
 - 日期用日历选择，查看/删除本地K线用时分下拉；同花顺图只给回测，不写进实盘来源
 - 已删除的策略（如均线Pin动量、缺口C、SAR、MACD 等）不会再出现在程序里；旧配置会回退到日内实体
@@ -47,7 +48,7 @@ def _readme_txt(version: str) -> str:
 三、目录
   Auto-Trading.exe     主程序
   VERSION              版本号（与窗口左上角一致）
-  config\\              配置（可改）；含品种与合约.xlsx（保证金/乘数）、优化参数.xlsx 与全品种备查.txt
+  config\\              配置（可改）；含品种与合约.xlsx（保证金/乘数）、优化参数.xlsx、全品种备查.txt 与 rules\\（自定义规则）
   data\\                状态、回测、复盘（reviews 子目录）
   logs\\                运行日志
   strategies\\          策略说明
@@ -100,6 +101,11 @@ def main() -> int:
     else:
         print(f"[警告] 未找到 {param_src}，首次运行会按内置默认生成")
 
+    # 自定义规则模板：不写代码加策略的入口，用户复制一份改成自己的。
+    rules_src = ROOT / "config" / "rules"
+    if rules_src.is_dir():
+        shutil.copytree(rules_src, DIST / "config" / "rules", dirs_exist_ok=True)
+
     # 主力合约表：回测按它的「主力时段」换月；放 exe 旁的 config，用户可改、界面可更新。
     main_tables = sorted((ROOT / "config").glob("*主力合约表*.xlsx"))
     for table in main_tables:
@@ -116,6 +122,8 @@ def main() -> int:
     docs_dst.mkdir(parents=True, exist_ok=True)
     for doc_name in (
         "日内实体操作说明书.md",
+        "日内浮盈飘单.md",
+        "均线波段.md",
         "配置说明书.md",
         "实盘交易简易说明书.md",
         "CTP上线流程.md",

@@ -225,6 +225,11 @@ ENGINE_SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "vol_mult": 0.0,
         "flatten_at_close": False,
     },
+    "rule_dsl": {
+        # 规则文件相对 config/ 目录；换成自己的规则只改这里
+        "file": "rules/dual_ma_equiv.yaml",
+        "use_market_filter": False,
+    },
 }
 
 

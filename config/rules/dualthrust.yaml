@@ -1,0 +1,57 @@
+# ============================================================
+# DualThrust 日内突破（复刻 docs/4套日内策略.md 第 1 套）
+#
+# 原版公式（N=20，k1=k2=0.7）：
+#   hh = high 最近 N 根最高    ll = low 最近 N 根最低
+#   hc = close 最近 N 根最高   lc = close 最近 N 根最低
+#   range = max(hh - lc, hc - ll)
+#   up = 当根开盘 + k1 * range   dn = 当根开盘 - k2 * range
+#   收盘价站上 up 做多，跌破 dn 做空；持多止损 low - ATR(20)，持空止损 high + ATR(20)。
+#
+# 本文件的实现口径（和原版的差异，务必知道）：
+#   1. 原版在收盘时按 up/dn 挂出下一根生效的停止单，盘中触及即成交；
+#      这里改成"这一根收盘确认突破"，再由回测/实盘引擎成交（回测下一根开盘）。
+#      所以条件里用 {prev: up, n: 1}：拿上一根收盘时算出的档位，避免用当根自己的
+#      最高/最低把 range 撑大，导致永远突破不了。
+#   2. 原版逐根刷新止损（low/high ± ATR）；DSL 只用固定止损，这里用
+#      开仓价 ± 2ATR 兜底，原版的逐根刷新由 exit 里的 {prev: 守卫价} 近似。
+#   3. 手数沿用配置页的每笔风险%，不读原版的 atr_risk。
+#   4. 14:55 强平由 config.yaml 的 strategy.flatten_times 负责，规则里不写。
+# ============================================================
+
+schema: 1
+builtin: true
+name: "DualThrust 日内突破"
+
+indicators:
+  hh20: { kind: highest, period: 20 }
+  ll20: { kind: lowest, period: 20 }
+  hc20: { kind: highest, period: 20, field: close }
+  lc20: { kind: lowest, period: 20, field: close }
+  # range = max(hh - lc, hc - ll)
+  dt_range: { kind: expr, formula: "max(hh20 - lc20, hc20 - ll20)" }
+  up: { kind: expr, formula: "open + 0.7 * dt_range" }
+  dn: { kind: expr, formula: "open - 0.7 * dt_range" }
+  atr20: { kind: atr, period: 20 }
+  long_guard: { kind: expr, formula: "low - atr20" }
+  short_guard: { kind: expr, formula: "high + atr20" }
+
+entry:
+  long:
+    { gt: { left: close, right: { prev: up, n: 1 } } }
+  short:
+    { lt: { left: close, right: { prev: dn, n: 1 } } }
+
+exit:
+  long:
+    { lt: { left: close, right: { prev: long_guard, n: 1 } } }
+  short:
+    { gt: { left: close, right: { prev: short_guard, n: 1 } } }
+
+stop:
+  kind: atr
+  mult: 2.0
+  atr_ref: atr20
+
+sizing:
+  mode: inherit

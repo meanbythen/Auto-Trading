@@ -1,0 +1,81 @@
+# ============================================================
+# 自定义规则模板：双均线交叉（和内置 dual_ma 等价）
+#
+# 这份文件就是「不写代码加策略」的入口。复制成 my_rule.yaml，
+# 改条件、改周期，再把 config.yaml 的 strategy.rule_dsl.file 指过去，
+# 重启程序即可。规则写错时程序会拒绝开仓并写一条告警，不会悄悄换策略。
+#
+# 语法速查（一个条件只能写一个判断，组合用 all / any / not）：
+#   {"gt":  {"left": A, "right": B}}    A > B      gte / lt / lte / eq 同理
+#   {"cross_above": {"left": A, "right": B}}        上一根 A<=B 且这一根 A>B
+#   {"cross_below": {"left": A, "right": B}}        上一根 A>=B 且这一根 A<B
+#   {"between": {"value": A, "low": 1, "high": 9}}  A 落在 1~9
+#   {"rising": {"ref": A, "bars": 2}}               A 连涨 2 根（falling 连跌）
+#   A / B 只能是：open / high / low / close / volume、indicators 里的名字、数字，
+#   或 {"prev": A, "n": 2}（往前数 2 根）。n 必须 >= 1，负数会被判非法。
+#
+# 指标 kind：共 38 种，常用有 ema / sma / stddev / atr / atr_pct / adx / plus_di / minus_di /
+#            highest / lowest / donchian_mid / rsi / macd_hist|dif|dea / boll_upper|lower|mid|width /
+#            keltner_upper|lower / stoch_k|d / cci / williams_r / roc / obv / vol_sma /
+#            supertrend / psar / vwap / day_open / prev_day_high|low|close /
+#            opening_range_high|low / expr(formula)
+#           完整参数见 docs/策略编辑器使用说明.md 第 4.1 节。
+#   highest/lowest 默认取 high/low，可加 field: open|high|low|close 换成别的列。
+#   expr 用四则运算组合已有字段和指标，支持 + - * /、括号、一元负号、
+#   max/min/abs/sqrt/log/sign/pow/clip，以及 avg/std/hhv/llv/sum(序列, N) 滚动统计，例如
+#     spread: { kind: expr, formula: "max(hh20 - lc20, hc20 - ll20)" }
+#     up:     { kind: expr, formula: "open + 0.7 * spread" }
+#   公式只能引用 open/high/low/close/volume 和「前面」已经定义过的指标（不支持前向引用）。
+#   任何指标都能在条件里用 {prev: 指标名, n: 1} 取上一根的值。
+#
+# 止损 kind：atr(mult, atr_ref) / percent(pct) / swing(lookback) / none
+# 可选：trail 移动止损（同上三种算法）、breakeven 保本、max_hold_bars 限持仓根数、
+#       filters_htf 高周期过滤。暂不支持加减仓、反手、分批止盈。
+# ============================================================
+
+schema: 1
+builtin: true
+name: "双均线 20/60"
+
+# 不写 timeframe 时跟随 config.yaml 的 strategy.timeframe。
+# 想让这套规则固定跑 60 分钟，取消下一行注释即可。
+# timeframe: "60"
+
+# 指标名自己起，下面条件里按名字引用。不能和 open/high/low/close/volume 重名。
+indicators:
+  ma_short: { kind: ema, period: 20 }
+  ma_long: { kind: ema, period: 60 }
+  atr14: { kind: atr, period: 14 }
+
+# 可选：全局过滤。任何一个不成立，这一根多空都不开。
+# 不需要就把整段删掉。
+# filters:
+#   - { gt: { left: adx14, right: 20 } }
+
+# 开仓：短均线上穿长均线，且收盘站上长均线才做多；下穿且收在长均线下方才做空。
+entry:
+  long:
+    all:
+      - { cross_above: { left: ma_short, right: ma_long } }
+      - { gte: { left: close, right: ma_long } }
+  short:
+    all:
+      - { cross_below: { left: ma_short, right: ma_long } }
+      - { lte: { left: close, right: ma_long } }
+
+# 离场：短均线重新回到长均线的另一侧就平。不写 exit 就只靠止损。
+exit:
+  long:
+    { lt: { left: ma_short, right: ma_long } }
+  short:
+    { gt: { left: ma_short, right: ma_long } }
+
+# 初始止损：开仓价外侧 2 倍 ATR。atr_ref 必须指向 indicators 里 kind=atr 的那条。
+stop:
+  kind: atr
+  mult: 2.0
+  atr_ref: atr14
+
+# 手数沿用配置页的每笔风险%，所以这里只允许 inherit。
+sizing:
+  mode: inherit
