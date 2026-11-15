@@ -19,12 +19,25 @@ from loguru import logger
 FILE_NAME = "alerts.jsonl"
 _COOLDOWN_SEC = 600.0
 _last_emit: dict[str, float] = {}
+# 当前这次运行的标识，由 TradingBot 启动时设置；没设置时写空串。
+_run_id: str = ""
 # 熔断告警正文里「已超过限额 100」这一段数字，用来对照现在配置页填的日最大亏损。
 _HALT_LIMIT_RE = re.compile(r"已超过限额\s*([0-9]+(?:\.[0-9]+)?)")
 
 
 def alerts_path(root: Path | str) -> Path:
     return Path(root) / "data" / FILE_NAME
+
+
+def set_run_id(run_id: str | None) -> None:
+    """设置当前运行标识，之后写的告警都会带上它。"""
+    global _run_id
+    _run_id = str(run_id or "")
+
+
+def current_run_id() -> str:
+    """当前运行标识；还没设置时是空串。"""
+    return _run_id
 
 
 def emit_alert(
@@ -55,10 +68,18 @@ def emit_alert(
         "level": str(level or "warning"),
         "code": str(code or ""),
         "message": str(message or ""),
+        "run_id": _run_id,
     }
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(row, ensure_ascii=False) + "\n")
     logger.warning("告警 [{}] {}", code, message)
+    # 外发只入队，失败由 notify 自己降级，不能影响告警写入。
+    try:
+        from src.ops.notify import notify
+
+        notify(row)
+    except Exception:  # noqa: BLE001
+        logger.debug("告警外发入队失败，忽略")
     return True
 
 
