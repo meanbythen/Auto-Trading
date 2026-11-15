@@ -597,6 +597,7 @@ risk:
 # 挂机防休眠：常驻运行时调用 Windows SetThreadExecutionState
 runtime:
   keep_display_awake: true
+  watchdog_enabled: true  # 主循环心跳看门狗；阈值 max(3×扫描间隔, 180 秒)
   # 收盘后自动关机（默认关）。有夜盘时等到夜盘最后清仓之后，不会在下午 14:55 就关
   auto_shutdown_after_close: false
   shutdown_grace_minutes: 5   # 过了最后收盘时刻后再等几分钟
