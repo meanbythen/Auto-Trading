@@ -46,7 +46,7 @@ _CTP_RUNTIME_KEYS = {
 
 
 def _strip_ctp_runtime(ctp: dict[str, Any]) -> dict[str, Any]:
-    """保存时去掉内存里的密码和认证码，sim/live 小节和 ctp_profiles 同样处理。"""
+    """保存时去掉内存里的密码和认证码，ctp_profiles 同样处理。"""
     cleaned: dict[str, Any] = {}
     for key, value in ctp.items():
         if key in _CTP_RUNTIME_KEYS:

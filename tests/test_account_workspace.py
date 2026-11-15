@@ -123,7 +123,17 @@ def _ctp_cfg(kind: str, user_id: str) -> dict:
     return {
         "trade": {
             "executor": "ctp",
-            "ctp": {"account_kind": kind, "user_id": user_id, kind: {"user_id": user_id}},
+            "ctp": {
+                "account_kind": kind,
+                "ctp_profile": "test",
+                "ctp_profiles": {
+                    "test": {
+                        "kind": kind,
+                        "user_id": user_id,
+                        "td_front": "tcp://1.2.3.4:1",
+                    }
+                },
+            },
         },
         "account": {"user_id": user_id if kind == "live" else ""},
     }

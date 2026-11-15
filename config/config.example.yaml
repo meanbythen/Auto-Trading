@@ -495,10 +495,12 @@ trade:
   # 再叠一个绝对点数上限，和上面同时开就取更严的；0=不用
   max_entry_slip_points: 0
   ctp:
-    # 当前使用哪份券商档案。不写时按下面的旧键生成 default，行为与升级前一致。
+    # 当前使用哪份券商档案；必须与 ctp_profiles 里的名字一致。
     # 换期货公司/仿真环境时，只加一段 ctp_profiles 并改这里，不改代码。
-    ctp_profile: ""
+    ctp_profile: huatai_sim
     # 公共默认值：档案里没写的字段用这里的。档案同名字段优先。
+    # 上线阶段会同步这一项，一般不用手改。
+    account_kind: sim
     app_id: "client_AutoTrading_1.0"
     flow_dir: "data/ctp_flow"
     price_tick: 1
@@ -513,7 +515,7 @@ trade:
     # 上期所、能源中心、大商所会自动拆平今/平昨。这里可再追加品种。
     close_split_products: ["bu", "c"]
 
-    # 券商档案示例。字段与旧写法同名同义；一份档案一个柜台。
+    # 券商档案示例。一份档案一个柜台，仿真与实盘用同一套字段。
     # 真实档案 user_id 留空时沿用配置页「资金账号」。
     # 密码/认证码只写环境变量名，不写明文；默认 CTP_PASSWORD / CTP_LIVE_PASSWORD / CTP_AUTH_CODE。
     ctp_profiles:
@@ -547,28 +549,8 @@ trade:
         password_env: "CTP_LIVE_PASSWORD"
         auth_code_env: "CTP_AUTH_CODE"
 
-    # ---- 旧写法（继续兼容）----
-    # 没有 ctp_profiles 时，程序按下面几项生成 default 档案：
-    # sim=仿真账号，live=真实账号。测试窗口和策略共用这一项，只换账号和前置。
-    account_kind: sim
-    # 旧写法：顶层前置只给仿真用；真实前置写在 live 小节。
-    td_front: ""
-    md_front: ""
-    broker_id: ""
-    # 仿真账号写在这里，不要填真实资金账号。
-    user_id: ""
-    sim:
-      td_front: ""
-      md_front: ""
-      broker_id: ""
-      user_id: ""
-    live:
-      # 真实资金账号跟配置页「资金账号」同一号，这里保存时会自动抄一份。
-      # 交易/行情前置必须填柜台给你的实盘地址，不要填仿真前置。
-      td_front: ""
-      md_front: ""
-      broker_id: ""
-      user_id: ""
+    # 旧写法（trade.ctp.sim / live、顶层 td_front/md_front/broker_id/user_id）已删除，
+    # 程序只读 ctp_profiles。仿真与实盘用同一套字段，换柜台时改档案里的前置和 kind 即可。
     # 认证码不要写在这个文件里。放到环境变量 CTP_AUTH_CODE，或 config/secrets.local.yaml 的 ctp_auth_code
     # 仿真密码写 secrets.local.yaml 的 ctp_password。真实通道默认用同一份交易密码；若不同再写 ctp_live_password。
     auth_code_env: "CTP_AUTH_CODE"

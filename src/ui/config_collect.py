@@ -631,26 +631,7 @@ class ConfigCollectMixin:
         # 账号种类以上线阶段为准，手工台和策略始终对同一本账。
         ctp_box["account_kind"] = account_kind_for_stage(self.go_live_var.get())
         self.ctp_kind_var.set(ctp_kind_label(ctp_box["account_kind"]))
-        live_box = ctp_box.setdefault("live", {})
-        if not isinstance(live_box, dict):
-            live_box = {}
-            ctp_box["live"] = live_box
-        # 真实资金账号跟「资金账号」同一格，保存时抄一份到 live，界面不再单独填。
-        live_box["user_id"] = str(self.user_var.get() or "").strip()
-        live_box["td_front"] = str(self.ctp_live_td_var.get() or "").strip()
-        live_box["md_front"] = str(self.ctp_live_md_var.get() or "").strip()
-        if not str(live_box.get("broker_id") or "").strip():
-            live_box["broker_id"] = str(ctp_box.get("broker_id") or "8080")
-        sim_box = ctp_box.setdefault("sim", {})
-        if not isinstance(sim_box, dict):
-            sim_box = {}
-            ctp_box["sim"] = sim_box
-        # 顶层仍留给旧配置和仿真窗口。有值时同步进 sim 小节，避免两处对不上。
-        for key in ("td_front", "md_front", "user_id", "broker_id"):
-            top = str(ctp_box.get(key) or "").strip()
-            if top and not str(sim_box.get(key) or "").strip():
-                sim_box[key] = top
-        # 券商档案：页面上改的是当前选中的那一份。保存时才落新格式，旧键继续保留。
+        # 券商档案：页面上改的是当前选中的那一份。旧写法不再读写。
         profile_name = str(self.ctp_profile_var.get() or "").strip()
         if profile_name:
             profiles = ctp_box.get("ctp_profiles")

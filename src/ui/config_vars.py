@@ -41,11 +41,8 @@ class ConfigVarsMixin:
         from src.trader.ctp_logic import CTP_KIND_LABELS, ctp_kind_label
 
         ctp_box = trade.get("ctp") or {}
-        live_box = ctp_box.get("live") if isinstance(ctp_box.get("live"), dict) else {}
         self.ctp_kind_var = ctk.StringVar(value=ctp_kind_label(ctp_box.get("account_kind")))
         self.ctp_kind_choices = list(CTP_KIND_LABELS.values())
-        self.ctp_live_td_var = ctk.StringVar(value=str(live_box.get("td_front") or ""))
-        self.ctp_live_md_var = ctk.StringVar(value=str(live_box.get("md_front") or ""))
         # 券商档案：下拉选 ctp_profile，下面的输入框改的是当前档案。
         from src.trader.ctp_profile import list_profiles, selected_profile_name
 
@@ -755,7 +752,7 @@ class ConfigVarsMixin:
         return [x.strip() for x in raw.replace("，", ",").split(",") if x.strip()]
 
     def _fill_ctp_profile_vars(self) -> None:
-        """把当前券商档案的字段填进配置页。没有新档案时按旧键取，界面不会空着。"""
+        """把当前券商档案的字段填进配置页。还没建档时留空，由首次保存创建 default。"""
         from src.trader.ctp_profile import (
             list_profiles,
             profile_validation_notes,
@@ -774,11 +771,7 @@ class ConfigVarsMixin:
             self._ctp_profile_syncing = True
             self.ctp_profile_var.set(name)
             self._ctp_profile_syncing = False
-        resolved = resolve_ctp_profile(
-            ctp_box,
-            account,
-            name=name if ctp_box.get("ctp_profiles") else None,
-        )
+        resolved = resolve_ctp_profile(ctp_box, account, name=name)
         self.ctp_profile_td_var.set(str(resolved.get("td_front") or ""))
         self.ctp_profile_md_var.set(str(resolved.get("md_front") or ""))
         self.ctp_profile_broker_var.set(str(resolved.get("broker_id") or ""))
@@ -808,12 +801,9 @@ class ConfigVarsMixin:
         from src.trader.ctp_logic import ctp_kind_label
 
         ctp_box = trade.get("ctp") or {}
-        live_box = ctp_box.get("live") if isinstance(ctp_box.get("live"), dict) else {}
         from src.trader.ctp_profile import selected_profile_name
 
         self.ctp_kind_var.set(ctp_kind_label(ctp_box.get("account_kind")))
-        self.ctp_live_td_var.set(str(live_box.get("td_front") or ""))
-        self.ctp_live_md_var.set(str(live_box.get("md_front") or ""))
         self._ctp_profile_syncing = True
         self.ctp_profile_var.set(selected_profile_name(ctp_box))
         self._ctp_profile_syncing = False

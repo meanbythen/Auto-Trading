@@ -4,8 +4,8 @@ CTP 券商档案。
 功能：
   把「用哪家期货公司、连哪个前置、用哪个账号」收进 trade.ctp_profiles。
   trade.ctp 里仍可写公共默认值，档案里的同名字段覆盖它。
-  旧配置（trade.ctp.td_front / sim / live / account_kind）不改也能跑：
-  加载时按旧键生成一份 default 档案，字段与升级前逐项一致。
+  45.0.0 起只认 ctp_profiles：旧写法（trade.ctp.td_front / sim / live）不再读取，
+  档案缺失或档案名写错时留空连接字段，交给登录阶段明确报错。
 
 原理：这里只合并配置，不连柜台、不读密码文件。密码和认证码由 config_loader 按档案的
 password_env / auth_code_env 解析后写回 resolved_*，本模块只负责按档案选值。
@@ -26,6 +26,8 @@ DEFAULT_AUTH_CODE_ENV = "CTP_AUTH_CODE"
 
 # 这些是档案小节，不参与「公共默认」的合并。
 _PROFILE_SECTIONS = {"sim", "live", "ctp_profiles", "ctp_profile", "profiles"}
+# 已删除的旧写法里的连接字段。残留时一律忽略，避免旧值偷偷接上柜台。
+_LEGACY_CONNECTION_KEYS = {"td_front", "md_front", "broker_id", "user_id", "sim", "live"}
 # 运行时字段。档案里只认 resolved_password / resolved_auth_code，旧的 sim/live 密码不沿用。
 _RUNTIME_KEYS = {
     "resolved_password",
@@ -137,7 +139,7 @@ def _profiles_box(ctp: dict[str, Any] | None) -> dict[str, Any]:
 
 
 def list_profiles(ctp: dict[str, Any] | None) -> list[str]:
-    """配置页下拉用。没有新档案时给一份 default，避免下拉是空的。"""
+    """配置页下拉用。还没建档时给一份 default，保存后落成正式档案。"""
     names = [str(name) for name in _profiles_box(ctp)]
     return names or [DEFAULT_PROFILE_NAME]
 
@@ -146,8 +148,8 @@ def selected_profile_name(ctp: dict[str, Any] | None) -> str:
     """
     当前用哪份档案。
 
-    优先 trade.ctp_profile；没写时选与 account_kind 同类的第一份。
-    都没有就交给旧配置生成 default。
+    优先 trade.ctp_profile；没写时选与上线阶段账号种类相同的第一份；
+    都没有时返回 default，由配置页首次保存时建档。
     """
     raw = ctp or {}
     profiles = _profiles_box(raw)
@@ -164,11 +166,13 @@ def selected_profile_name(ctp: dict[str, Any] | None) -> str:
 
 
 def _join_public(ctp: dict[str, Any]) -> dict[str, Any]:
-    """trade.ctp 里的公共默认值，去掉档案小节和运行时密码。"""
+    """trade.ctp 里的公共默认值，去掉档案小节、运行时密码和已删除的旧连接字段。"""
     return {
         key: value
         for key, value in ctp.items()
-        if key not in _PROFILE_SECTIONS and key not in _RUNTIME_KEYS
+        if key not in _PROFILE_SECTIONS
+        and key not in _RUNTIME_KEYS
+        and key not in _LEGACY_CONNECTION_KEYS
     }
 
 
@@ -229,58 +233,39 @@ def _resolve_named(
     return merged
 
 
-def _resolve_legacy(
+def _resolve_missing(
     ctp: dict[str, Any],
     account: dict[str, Any],
     kind_override: Any = None,
+    name: str = "",
 ) -> dict[str, Any]:
     """
-    旧配置生成 default 档案。
+    没有可用档案时的空连接字段。
 
-    仿真：顶层参数 + sim 小节的非空字段，资金账号不参与。
-    真实：前置只认 live 小节，资金账号取配置页那一号。
+    旧写法（trade.ctp.sim / live、顶层前置）已删除，不再回退；
+    这里只保留公共参数和账号种类，让登录因缺少前置而明确失败。
     """
     kind = normalize_ctp_kind(
         kind_override if kind_override is not None else ctp.get("account_kind")
     )
-    nested = ctp.get(kind)
-    nested = dict(nested) if isinstance(nested, dict) else {}
     merged = _join_public(ctp)
     merged.pop("kind", None)
-    if kind == CTP_KIND_LIVE:
-        merged["td_front"] = str(nested.get("td_front") or "").strip()
-        merged["md_front"] = str(nested.get("md_front") or "").strip()
-        merged["broker_id"] = str(
-            nested.get("broker_id") or ctp.get("broker_id") or ""
-        ).strip()
-        merged["user_id"] = str(account.get("user_id") or "").strip() or str(
-            nested.get("user_id") or ""
-        ).strip()
-        merged["resolved_password"] = str(
+    for key in ("td_front", "md_front", "broker_id", "user_id"):
+        merged[key] = ""
+    merged["resolved_password"] = str(
+        (
             ctp.get("resolved_live_password")
-            or nested.get("resolved_password")
-            or account.get("resolved_password")
-            or ""
-        ).strip()
-    else:
-        for key in ("td_front", "md_front", "user_id", "broker_id"):
-            overlay = str(nested.get(key) or "").strip()
-            if overlay:
-                merged[key] = overlay
-        merged["resolved_password"] = str(
-            ctp.get("resolved_sim_password")
-            or ctp.get("resolved_password")
-            or nested.get("resolved_password")
-            or ""
-        ).strip()
-    merged["resolved_auth_code"] = str(
-        ctp.get("resolved_auth_code")
-        or nested.get("resolved_auth_code")
+            if kind == CTP_KIND_LIVE
+            else ctp.get("resolved_sim_password")
+        )
+        or account.get("resolved_password")
         or ""
     ).strip()
+    merged["resolved_auth_code"] = str(ctp.get("resolved_auth_code") or "").strip()
     merged["account_kind"] = kind
-    merged["profile"] = DEFAULT_PROFILE_NAME
-    merged["profile_label"] = "默认档案"
+    merged["profile"] = ""
+    merged["profile_label"] = ""
+    merged["profile_missing"] = name or DEFAULT_PROFILE_NAME
     merged.setdefault("auth_code_env", DEFAULT_AUTH_CODE_ENV)
     merged.setdefault("password_env", default_password_env(kind))
     return merged
@@ -295,26 +280,24 @@ def resolve_ctp_profile(
     """
     得到柜台连接实际使用的一份字段。
 
-    ctp_profiles 存在时按档案合并；否则按旧键生成 default，行为与升级前一致。
-    档案名写错时不猜别的券商，直接回到旧配置路径，避免连错柜台。
+    只认 trade.ctp_profiles；档案缺失或档案名写错时返回空连接字段，
+    不再回退旧写法，避免连错柜台。
     """
     raw = dict(ctp or {})
     acc = account if isinstance(account, dict) else {}
     profiles = _profiles_box(raw)
-    if not profiles:
-        return _resolve_legacy(raw, acc, kind_override=kind)
     chosen = str(name or raw.get("ctp_profile") or "").strip()
     if not chosen:
         chosen = selected_profile_name(raw)
+    if not profiles:
+        return _resolve_missing(raw, acc, kind_override=kind)
     data = profiles.get(chosen)
     if not isinstance(data, dict):
-        return _resolve_legacy(raw, acc, kind_override=kind)
+        return _resolve_missing(raw, acc, kind_override=kind, name=chosen)
     resolved = _resolve_named(raw, chosen, data, acc)
     if kind is not None:
         # 界面上的「CTP操作账」临时预览：只换账号种类，不改档案本身。
-        return _resolve_legacy(raw, acc, kind_override=kind) if not profiles else _preview_kind(
-            resolved, raw, normalize_ctp_kind(kind), acc
-        )
+        return _preview_kind(resolved, raw, normalize_ctp_kind(kind), acc)
     return resolved
 
 
@@ -341,6 +324,11 @@ def profile_validation_notes(
     raw = ctp or {}
     resolved = resolve_ctp_profile(raw, account)
     notes: list[str] = []
+    if not _profiles_box(raw):
+        notes.append("还没有配置券商档案 ctp_profiles，请先在配置页建档")
+    elif not str(resolved.get("profile") or "").strip():
+        name = str(resolved.get("profile_missing") or "").strip()
+        notes.append(f"券商档案 {name or '（未命名）'} 不存在，请重新选择")
     kind = normalize_ctp_kind(resolved.get("account_kind"))
     if kind == CTP_KIND_LIVE:
         if not str(resolved.get("td_front") or "").strip():

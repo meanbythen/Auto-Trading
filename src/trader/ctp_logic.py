@@ -272,7 +272,7 @@ def overlay_ctp_profile(
     把仿真或实盘账号叠到共用参数上。
 
     真正的档案合并放在 ctp_profile.resolve_ctp_profile：
-    有 ctp_profiles 时按档案取，没有时按旧键生成 default，行为与升级前一致。
+    只认 ctp_profiles，没有档案时连接字段留空，不再回退旧写法。
     """
     from src.trader.ctp_profile import resolve_ctp_profile
 

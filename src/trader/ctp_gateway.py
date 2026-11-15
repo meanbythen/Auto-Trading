@@ -130,7 +130,7 @@ class CtpSettings:
 
         trade = cfg.get("trade") or {}
         account = cfg.get("account") or {}
-        # 公共默认 + 券商档案覆盖；旧配置没有 ctp_profiles 时生成 default，行为不变。
+        # 公共默认 + 券商档案覆盖；没有档案或档案名写错时连接字段留空，登录会明确报错。
         ctp = resolve_ctp_profile(trade.get("ctp") or {}, account=account)
         for note in profile_validation_notes(trade.get("ctp") or {}, account=account):
             logger.debug("CTP 档案提示：{}", note)

@@ -262,13 +262,9 @@ class ConfigSupportMixin:
         """只测交易前置的 IP 端口通不通，不做认证登录。"""
         from src.trader.ctp_gateway import probe_front_tcp
 
-        front = str(
-            self.ctp_profile_td_var.get()
-            or self.ctp_live_td_var.get()
-            or ""
-        ).strip()
+        front = str(self.ctp_profile_td_var.get() or "").strip()
         if not front:
-            self._append_log("测试前置连通：还没有填交易前置（券商档案或实盘交易前置）")
+            self._append_log("测试前置连通：还没有填「档案交易前置」")
             return
         result = probe_front_tcp(front)
         if result is None:

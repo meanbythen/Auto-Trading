@@ -554,7 +554,7 @@ class CtpProbeWindow(tk.Toplevel):
         ctp = (cfg.get("trade") or {}).get("ctp") or {}
         preview = overlay_ctp_profile(ctp, kind, account=cfg.get("account"))
         if kind == "live" and not str(preview.get("td_front") or "").strip():
-            self._say("真实账号还缺交易前置。请到配置页填「实盘交易前置」，或在 config.yaml 的 trade.ctp.live 里填。")
+            self._say("真实账号还缺交易前置。请到配置页在「档案交易前置」里填实盘地址。")
             return None
         if kind == "live" and not str(preview.get("user_id") or "").strip():
             self._say("真实账号还缺资金账号。请到配置页「账号与登录」填「资金账号」。")

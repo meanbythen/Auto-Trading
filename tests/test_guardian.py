@@ -23,12 +23,19 @@ def _cfg(
     trade: dict = {"symbol": "bu2612", "executor": "ctp"}
     if ctp:
         trade["ctp"] = {
-            "td_front": "tcp://127.0.0.1:1",
-            "broker_id": "9999",
-            "user_id": "test",
-            "resolved_password": "pw",
+            "account_kind": "sim",
+            "ctp_profile": "test",
+            "ctp_profiles": {
+                "test": {
+                    "kind": "sim",
+                    "td_front": "tcp://127.0.0.1:1",
+                    "broker_id": "9999",
+                    "user_id": "test",
+                    "resolved_password": "pw",
+                    "resolved_auth_code": "auth",
+                }
+            },
             "app_id": "client_AutoTrading_1.0",
-            "resolved_auth_code": "auth",
         }
     return {
         "trade": trade,

@@ -1016,20 +1016,6 @@ def build_strategy_section(
     ).pack(anchor="w", pady=(2, 8))
     app._entry_row(
         left,
-        "实盘交易前置",
-        app.ctp_live_td_var,
-        hint="旧写法，保留兼容；新配置请优先填上面的「档案交易前置」",
-        width=160,
-    )
-    app._entry_row(
-        left,
-        "实盘行情前置",
-        app.ctp_live_md_var,
-        hint="旧写法，保留兼容；新配置请优先填上面的「档案行情前置」",
-        width=160,
-    )
-    app._entry_row(
-        left,
         "开仓滑点上限(×ATR)",
         app.max_slip_var,
         hint="信号价和现价差超过它就不开这一根，等下一根；0=关闭",
