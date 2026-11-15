@@ -11,7 +11,7 @@ import json
 from dataclasses import dataclass, field
 from datetime import date, datetime, time, timedelta
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import pandas as pd
 from loguru import logger
@@ -47,6 +47,9 @@ from src.strategy.generic_stop import GenericStopOverlay, generic_stop_snapshot
 from src.strategy.session_scope import session_kind
 from src.strategy.types import PositionState
 from src.utils.trading_day import EXCHANGE_HOLIDAYS, futures_trading_day
+
+if TYPE_CHECKING:
+    from src.utils.holidays import HolidayCalendar
 
 # 同一进程内同一 (symbol, period, start, end) 的 K 线只拉一次。
 # stress 评估 / 参数扰动 / 多次回测同区间会反复用，避免每轮都读 DB+CSV+upsert。
@@ -202,17 +205,30 @@ _SESSION_SEGMENTS: tuple[tuple[time, time], ...] = (
 _CLOSED_WEEKDAYS = EXCHANGE_HOLIDAYS
 
 
-def session_bar_times(day: date, step_minutes: int, *, include_night: bool = True) -> list[datetime]:
+def _closed_day(day: date, calendar: HolidayCalendar | None = None) -> bool:
+    """这一天是不是休市。传了外置日历时只认它，否则用内置 2026 表。"""
+    if calendar is not None:
+        return calendar.is_closed(day)
+    return day in _CLOSED_WEEKDAYS
+
+
+def session_bar_times(
+    day: date,
+    step_minutes: int,
+    *,
+    include_night: bool = True,
+    calendar: HolidayCalendar | None = None,
+) -> list[datetime]:
     """
     这一天按交易时段应该有的K线收盘时间。
 
     只生成连续交易的那些分钟。午休和 10:15 之后的休息不生成，所以正常休盘不会被当成缺口。
     """
-    if day.weekday() >= 5 or day in _CLOSED_WEEKDAYS:
+    if day.weekday() >= 5 or _closed_day(day, calendar):
         return []
     step = max(int(step_minutes), 1)
     # 第二天休市时，前一天晚上通常没有夜盘。没有夜盘不算数据断开。
-    night_closed = (day + timedelta(days=1)) in _CLOSED_WEEKDAYS
+    night_closed = _closed_day(day + timedelta(days=1), calendar)
     segments = _SESSION_SEGMENTS if include_night and not night_closed else _SESSION_SEGMENTS[:3]
     closes: list[datetime] = []
     for start, end in segments:
@@ -224,7 +240,12 @@ def session_bar_times(day: date, step_minutes: int, *, include_night: bool = Tru
     return closes
 
 
-def describe_bar_gaps(df: pd.DataFrame | None, period: str) -> str:
+def describe_bar_gaps(
+    df: pd.DataFrame | None,
+    period: str,
+    *,
+    calendar: HolidayCalendar | None = None,
+) -> str:
     """
     说明回测用的K线中间有没有断开。
 
@@ -249,7 +270,9 @@ def describe_bar_gaps(df: pd.DataFrame | None, period: str) -> str:
     missing: list[datetime] = []
     day = first.date()
     while day <= last.date():
-        for close_ts in session_bar_times(day, step, include_night=include_night):
+        for close_ts in session_bar_times(
+            day, step, include_night=include_night, calendar=calendar
+        ):
             if first < close_ts < last and close_ts not in present:
                 missing.append(close_ts)
         day += timedelta(days=1)
@@ -433,19 +456,42 @@ def _range_start_index(df: pd.DataFrame | None, start: str | datetime | None) ->
     return int(hits.nonzero()[0][0])
 
 
+def _calendar_warning(
+    calendar: HolidayCalendar | None,
+    bars_signal: pd.DataFrame | None,
+) -> str:
+    """回测区间里有没有年份没配节假日表。缺了就提示结果可能偏差。"""
+    if calendar is None or bars_signal is None or len(bars_signal) == 0:
+        return ""
+    try:
+        first_year = int(pd.Timestamp(bars_signal.index[0]).year)
+        last_year = int(pd.Timestamp(bars_signal.index[-1]).year)
+    except (TypeError, ValueError):
+        return ""
+    missing = [year for year in range(first_year, last_year + 1) if not calendar.covers(date(year, 1, 1))]
+    if not missing:
+        return ""
+    years = "、".join(str(year) for year in missing)
+    return f"{years} 年节假日表缺失，结果可能偏差"
+
+
 def _coverage_with_gaps(
     note: str,
     bars_signal: pd.DataFrame | None,
     signal_period: str,
     bars_trail: pd.DataFrame | None,
     trail_period: str,
+    calendar: HolidayCalendar | None = None,
 ) -> str:
     """日期说明后面补上断开说明。信号和止损周期断在同一处时只写一遍。"""
-    signal_gap = describe_bar_gaps(bars_signal, signal_period)
+    signal_gap = describe_bar_gaps(bars_signal, signal_period, calendar=calendar)
     trail_gap = ""
     if bars_trail is not None and canonical_period(trail_period) != canonical_period(signal_period):
-        trail_gap = describe_bar_gaps(bars_trail, trail_period)
+        trail_gap = describe_bar_gaps(bars_trail, trail_period, calendar=calendar)
     pieces = [note.strip()] if note.strip() else []
+    warning = _calendar_warning(calendar, bars_signal)
+    if warning:
+        pieces.append(warning)
     if signal_gap:
         pieces.append(signal_gap if not trail_gap or trail_gap == signal_gap else f"信号{period_label(signal_period)}{signal_gap}")
     if trail_gap and trail_gap != signal_gap:
@@ -482,6 +528,7 @@ class _BacktestSetup:
     trade_from: int
     loop_start: int
     carry: dict[str, Any] | None
+    calendar: Any = None
 
 
 @dataclass
@@ -705,6 +752,9 @@ def _prepare_backtest(
         warmup,
         max_bars,
     )
+    from src.utils.holidays import calendar_from_config
+
+    calendar = calendar_from_config(cfg, cfg.get("_project_root"))
     return _BacktestSetup(
         cfg=cfg,
         st=st,
@@ -731,6 +781,7 @@ def _prepare_backtest(
         trade_from=trade_from,
         loop_start=loop_start,
         carry=carry,
+        calendar=calendar,
     )
 
 
@@ -1378,6 +1429,7 @@ def _params_snapshot(setup: _BacktestSetup, run: _BacktestRun) -> dict[str, Any]
             setup.tf,
             bars_trail,
             setup.trail_tf,
+            setup.calendar,
         ),
         # 日内实体相关：ETH 观察分钟、箱沿让跳（写在 daily_body 小节）。
         "eth_minutes": (st.get("daily_body") or {}).get("eth_minutes"),

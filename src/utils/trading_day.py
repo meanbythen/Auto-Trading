@@ -11,6 +11,10 @@ from __future__ import annotations
 
 from collections.abc import Iterable
 from datetime import date, datetime, time as dtime, timedelta
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from src.utils.holidays import HolidayCalendar
 
 # 夜盘开始时间。到了这个点，就已经是下一个交易日了。
 NIGHT_START = dtime(21, 0)
@@ -61,13 +65,46 @@ def parse_closed_days(raw: Iterable[object] | None) -> set[date]:
     return out
 
 
-def is_trading_day(day: date, *, extra_closed: Iterable[date] | None = None) -> bool:
-    """这一天交易所开不开市：周末、内置节假日、配置里的临时休市都不开。"""
+def is_trading_day(
+    day: date,
+    *,
+    extra_closed: Iterable[date] | None = None,
+    calendar: HolidayCalendar | None = None,
+) -> bool:
+    """
+    这一天交易所开不开市：周末、节假日、配置里的临时休市都不开。
+
+    传了 calendar 就只看外置日历；没传才用内置的 2026 表，
+    这样没配 config/holidays.yaml 的环境行为和以前完全一致。
+    """
     if day.weekday() >= 5:
         return False
-    if day in EXCHANGE_HOLIDAYS:
+    if calendar is not None:
+        if calendar.is_closed(day):
+            return False
+    elif day in EXCHANGE_HOLIDAYS:
         return False
     return day not in set(extra_closed or ())
+
+
+def calendar_coverage_ok(
+    calendar: HolidayCalendar | None,
+    now: datetime | date | None = None,
+    *,
+    min_days: int = 60,
+) -> bool:
+    """
+    节假日表是否覆盖到「未来 min_days 天」。
+
+    没配置外置日历时按内置表处理并一律放行：这是旧环境的默认路径，不能因为
+    新增检查就突然禁止开仓。配置了但缺年份，实盘就该停开仓。
+    """
+    if calendar is None:
+        return True
+    moment = now or datetime.now()
+    day = moment.date() if isinstance(moment, datetime) else moment
+    horizon = day + timedelta(days=max(int(min_days), 0))
+    return calendar.covers(horizon)
 
 
 def _parse_moment(moment: datetime | date | str | None) -> datetime | date:

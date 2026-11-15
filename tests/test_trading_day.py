@@ -2,7 +2,13 @@
 
 from datetime import date, datetime
 
-from src.utils.trading_day import futures_trading_day, settlement_session_day, trading_days_between
+from src.utils.holidays import HolidayCalendar
+from src.utils.trading_day import (
+    futures_trading_day,
+    is_trading_day,
+    settlement_session_day,
+    trading_days_between,
+)
 
 
 def test_day_session_belongs_to_the_same_day() -> None:
@@ -47,6 +53,15 @@ def test_settlement_session_flips_before_night_login() -> None:
     # 盈亏换日仍是 21:00，两套规则不要混。
     assert futures_trading_day(datetime(2026, 11, 2, 20, 50)) == date(2026, 11, 2)
     assert settlement_session_day(datetime(2026, 10, 30, 20, 50)) == date(2026, 11, 2)
+
+
+def test_calendar_overrides_builtin_table() -> None:
+    """传了外置日历就只看它：2027 的节假日内置表不认识，日历认识。"""
+    calendar = HolidayCalendar({2027: frozenset({date(2027, 10, 1)})}, source="test")
+    assert not is_trading_day(date(2027, 10, 1), calendar=calendar)
+    assert is_trading_day(date(2027, 10, 1))
+    # 日历只配了 2027：2026 没配置的年份按「不休息」处理，缺覆盖由启动检查拦开仓。
+    assert is_trading_day(date(2026, 1, 1), calendar=calendar)
 
 
 def test_trading_days_between_same_session_is_zero() -> None:

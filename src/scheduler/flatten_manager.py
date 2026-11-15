@@ -48,7 +48,11 @@ class FlattenManagerMixin:
             self._flatten_try.clear()
             return
         # 节假日/临时休市不点单：待办保留到下一个交易日。手动强制平仓不受限制。
-        if not force and not is_trading_day(now.date(), extra_closed=self._closed_days()):
+        if not force and not is_trading_day(
+            now.date(),
+            extra_closed=self._closed_days(),
+            calendar=getattr(self, "holiday_calendar", None),
+        ):
             return
         if force:
             # 新的一轮清仓开始：重新计数、允许重新尝试（上一轮的「已发单」标记作废）。
@@ -156,13 +160,14 @@ class FlattenManagerMixin:
             return None
         now = now or datetime.now()
         closed = self._closed_days()
+        calendar = getattr(self, "holiday_calendar", None)
         soonest: datetime | None = None
         # 不能只顺延一天：周五收盘后顺延到周六，周策略会说「那天不清仓」，
         # 定时器就再也定不上，周末的仓位没人管。国庆连休 7 天时还要跨过整段假期，
         # 所以向后翻半个月找交易日。
         for offset in range(0, 16):
             day = (now + timedelta(days=offset)).date()
-            if not is_trading_day(day, extra_closed=closed):
+            if not is_trading_day(day, extra_closed=closed, calendar=calendar):
                 continue
             for clock in clocks:
                 try:
