@@ -4,6 +4,19 @@
 
 规则写在 README 的「版本」一节。已经写在这里的旧版本不再改写，新的改动加在最上面。
 
+## 45.2.0 — 2026-11-16
+
+功能更新。行情数据以天勤为主、新浪备用，补上 tick 的采集、清洗、合成与历史下载；默认扫描、策略和下单规则不变。
+
+- **依赖**：新增 `vnpy` 与 `vnpy_sqlite`，tick 入库走 vnpy 官方 `save_tick_data()`，按「合约 + 时间」去重，不裸写 SQL。
+- **tick 常驻采集**：新增 `src/data/tick/recorder.py`，独立线程、独立 `TqApi`，按合约记录最后一条时间做去重；免费账号可采实时 tick。断线按 5/10/30/60 秒退避重连，退出前先停线程再写盘，心跳写 `data/ticks/recorder_status.json`。命令 `python -m src.main --tick-record`，`--tick-status` 看心跳和库存；图形界面「数据管理」页也有卡片可启停。
+- **tick 清洗与合成**：新增 `clean.py`、`synthesize.py`。只丢坏时间、坏价格、负盘口、交叉盘口、负成交量和重复记录；1 分钟用右标签重采样，成交量取末笔累计减首笔累计，持仓量取末笔，夜盘归下一期货交易日，只写已完成 K 线。合成库 `data/klines/tick_bars.sqlite`，库存名带 `@tick`；命令 `--tick-bars 开始 结束`。
+- **tick 只读回测来源**：历史回测、策略优化、交叉测试的行情来源新增「tick合成」，只读本地合成库、不联网；本地缺数据时明确提示先合成，不会改用别家。
+- **历史 tick 批量下载**：新增 `downloader.py`，按天切片调用天勤 `DataDownloader` 拉取专业版历史 tick，写入同一个 tick 库；命令 `--tick-download 开始 结束`，需要 `tq_dl` 权限。
+- **天勤回退新浪**：天勤登录、断流或取数失败时，按 `data.fallback_source`（默认新浪）再拉一次，成功后在行情健康、K 线 attrs 和调度里标记 `fallback_from=tq`；`data.fallback_allow_entry` 默认 `true`，设成 `false` 时回退行情只允许平仓、不开新仓。
+- **配置**：`config/config.example.yaml` 新增 `data.tq.history_tick`、`data.tick`（合约、刷新间隔、批量、数据库、心跳文件、重连退避、合成库、合成周期）、`data.fallback_source`、`data.fallback_allow_entry`。
+- **验证**：新增 7 组 tick 相关用例（存储、清洗、合成、tick 来源、采集、下载、回退），全部不联网、mock 外部行情；全量 pytest 通过，Ruff（`src` / `tests`）无问题，mypy（212 个源文件）通过。
+
 ## 45.1.0 — 2026-11-16
 
 功能与回测可信度更新。新增可复现实验、可追溯研究数据集、行情健康证据和统一订单时间线；回测修复下一根开盘成交时间、跨期货交易日平今费、权益时点及同根 OHLC 歧义的保守处理。默认实盘策略、执行通道和风险配置不会因此自动切换；真实 CTP 前向演练与分钟/Tick 细粒度复核仍待完成。

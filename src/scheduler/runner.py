@@ -236,6 +236,8 @@ class TradingBot(
         # 收盘后关机：每天最多预约一次
         self._shutdown_armed_date: str = ""
         self.max_stale_minutes = float((cfg.get("data") or {}).get("max_stale_minutes", 90))
+        # 天勤失败回退备用源时，是否允许用回退行情开新仓。false 时只保护持仓、不加新仓。
+        self.fallback_allow_entry = bool((cfg.get("data") or {}).get("fallback_allow_entry", True))
         # 启动常驻后的第一轮扫描才做回溯补开仓；做完就关掉，避免每轮重复补单。
         self._catch_up_pending = False
         # 收盘清仓：按时钟直接平，不等新K线。每个品种隔多少秒重试一次。
@@ -1742,6 +1744,8 @@ class TradingBot(
         issues: list[str] = []
         if health.get("error"):
             issues.append("download_fallback" if health.get("from_cache") else "download_error")
+        if health.get("fallback_from"):
+            issues.append("fallback_source")
         if health.get("synthetic"):
             issues.append("synthetic")
         if stale:
@@ -1757,6 +1761,8 @@ class TradingBot(
             market_status = "stale"
         elif health.get("synthetic"):
             market_status = "synthetic"
+        elif health.get("fallback_from"):
+            market_status = "fallback"
         elif issues:
             market_status = "slow" if any(x.endswith("_slow") for x in issues) else "cache"
         else:
@@ -1801,6 +1807,30 @@ class TradingBot(
                 reason=decision.reason,
                 bar_id=health.get("bar_id", ""),
                 signal_bar_age_minutes=health.get("signal_bar_age_minutes"),
+                market_health=dict(health),
+            )
+            return
+
+        # 回退行情：是不是允许开新仓由配置决定。不允许时仍保留持仓、止损和平仓信号。
+        if (
+            health.get("fallback_from")
+            and not self.fallback_allow_entry
+            and decision.action in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN)
+        ):
+            logger.error(
+                "{} 行情已回退到备用源 {}（天勤失败：{}），按配置拒绝开仓 | {}",
+                symbol,
+                health.get("source"),
+                health.get("fallback_reason"),
+                decision.reason,
+            )
+            self._record_event(
+                "fallback_block_open",
+                symbol=symbol,
+                fallback_from=health.get("fallback_from"),
+                fallback_reason=health.get("fallback_reason"),
+                reason=decision.reason,
+                bar_id=health.get("bar_id", ""),
                 market_health=dict(health),
             )
             return

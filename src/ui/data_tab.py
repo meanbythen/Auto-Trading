@@ -166,6 +166,61 @@ class DataTabMixin:
         ).pack(anchor="w", padx=4, pady=(0, 8))
 
         ctk.CTkLabel(
+            left,
+            text="天勤 tick",
+            font=T.FONT_TITLE,
+            text_color=T.TEXT,
+        ).pack(anchor="w", padx=4, pady=(8, 4))
+        ctk.CTkLabel(
+            left,
+            textvariable=self.tick_status_var,
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=380,
+            justify="left",
+        ).pack(anchor="w", padx=4, pady=(0, 4))
+        tick_row = ctk.CTkFrame(left, fg_color="transparent")
+        tick_row.pack(fill="x", padx=4, pady=(0, 4))
+        self.tick_toggle_btn = ctk.CTkButton(
+            tick_row,
+            text="启动 tick 采集",
+            height=34,
+            command=self._on_toggle_tick_record,
+        )
+        self.tick_toggle_btn.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ctk.CTkButton(
+            tick_row,
+            text="合成K线",
+            height=34,
+            width=110,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_synth_tick_bars,
+        ).pack(side="left")
+        ctk.CTkLabel(
+            left,
+            textvariable=self.tick_inventory_var,
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=380,
+            justify="left",
+        ).pack(anchor="w", padx=4, pady=(0, 6))
+        ctk.CTkLabel(
+            left,
+            text=(
+                "免费账号盘中挂机即可攒 tick，落 data/ticks/vnpy_data.db。"
+                "合成后的 K 线单独存 tick_bars 库，回测数据源选「tick合成」，不覆盖天勤官方 K 线。"
+            ),
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=380,
+            justify="left",
+        ).pack(anchor="w", padx=4, pady=(0, 8))
+
+        ctk.CTkLabel(
             left, text="本地库存", font=T.FONT_TITLE, text_color=T.TEXT
         ).pack(anchor="w", padx=4, pady=(8, 4))
         inv_row = ctk.CTkFrame(left, fg_color="transparent")
@@ -815,3 +870,125 @@ class DataTabMixin:
         messagebox.showinfo(title, f"{report.message}\n\n已保存 {path}")
         self._open_local_file(path)
         self._dm_write(f"行情质量 {symbol} {report.status} | {path}")
+
+    # ---------- 天勤 tick ----------
+
+    def _refresh_tick_card(self) -> None:
+        """刷 tick 采集心跳和本地库存摘要。每 2 秒由主心跳调用，只读文件。"""
+        from src.data.tick.recorder import read_status, tick_settings
+        from src.data.tick.vnpy_store import tick_overview
+
+        try:
+            settings = tick_settings(self.cfg)
+            status = read_status(settings["status_file"])
+        except Exception as exc:  # noqa: BLE001
+            self.tick_status_var.set(f"tick 采集：状态读取失败 {exc}")
+            return
+
+        recorder = getattr(self, "_tick_recorder", None)
+        running = bool(recorder is not None and recorder.running)
+        button = getattr(self, "tick_toggle_btn", None)
+        if button is not None:
+            button.configure(text="停止 tick 采集" if running else "启动 tick 采集")
+
+        if status:
+            names = {
+                "running": "采集中",
+                "reconnecting": "重连中",
+                "stopped": "已停止",
+                "idle": "未启动",
+            }
+            state = names.get(str(status.get("state")), str(status.get("state") or "未知"))
+            text = (
+                f"tick 采集：{state}｜今日 {status.get('ticks_today', 0)} 条"
+                f"｜缓冲 {status.get('buffered', 0)}｜最后 {status.get('last_tick_at') or '—'}"
+            )
+            if status.get("symbols"):
+                text += f"\n订阅：{'、'.join(str(s) for s in status['symbols'])}"
+            if status.get("error"):
+                text += f"\n错误：{status['error']}"
+        else:
+            text = "tick 采集：未启动（还没有心跳文件）"
+        self.tick_status_var.set(text)
+
+        try:
+            overview = tick_overview(database=settings["database"])
+        except Exception as exc:  # noqa: BLE001
+            self.tick_inventory_var.set(f"tick 库存：读不了（{exc}）")
+            return
+        if overview:
+            total = sum(int(item["count"]) for item in overview)
+            latest = max((str(item["end"]) for item in overview if item.get("end")), default="")
+            self.tick_inventory_var.set(
+                f"tick 库存：{len(overview)} 个合约，{total} 条，最新 {latest or '—'}"
+            )
+        else:
+            self.tick_inventory_var.set("tick 库存：空，先启动采集或下载历史 tick")
+
+    def _on_toggle_tick_record(self) -> None:
+        """启动/停止天勤 tick 常驻采集。免费账号也能用，只存 tick 不下单。"""
+        from tkinter import messagebox
+
+        from src.data.tick.recorder import TickRecorder
+
+        recorder = getattr(self, "_tick_recorder", None)
+        if recorder is not None and recorder.running:
+            recorder.stop(timeout=5)
+            self._tick_recorder = None
+            self._dm_write("天勤 tick 采集已停止")
+            self._refresh_tick_card()
+            return
+        try:
+            recorder = TickRecorder(self.cfg)
+            recorder.start()
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("启动 tick 采集失败")
+            messagebox.showerror("tick 采集", str(exc))
+            return
+        self._tick_recorder = recorder
+        self._dm_write("天勤 tick 采集已启动：盘中挂机即可攒 tick，断线会自动重连")
+        self._refresh_tick_card()
+
+    def _on_synth_tick_bars(self) -> None:
+        """把本地 tick 合成为各周期 K 线。耗时长，放后台线程，日志进运行日志。"""
+        from tkinter import messagebox
+
+        from src.data.tick.synthesize import synthesize_symbol
+
+        if getattr(self, "_tick_synth_busy", False):
+            self._dm_write("tick 合成还在跑，等这一轮结束再点")
+            return
+        symbols = [str(item) for item in (self._watch_symbols or []) if str(item).strip()]
+        if not symbols:
+            messagebox.showwarning("还不能合成", "配置页还没有关注品种。")
+            return
+        from src.data.tick.recorder import tick_settings
+
+        settings = tick_settings(self.cfg)
+        self._tick_synth_busy = True
+        self._dm_write(f"开始合成 tick K 线：{'、'.join(symbols)}")
+
+        def work() -> None:
+            try:
+                for symbol in symbols:
+                    try:
+                        report = synthesize_symbol(
+                            symbol,
+                            database=settings["database"],
+                            bar_store=settings["bar_store"],
+                            periods=settings["synth_periods"],
+                        )
+                        logger.info(
+                            "tick 合成 {}：tick {} 条（丢 {}），写库 {}",
+                            symbol,
+                            report["ticks"],
+                            report["dropped"],
+                            report["bars"],
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        logger.opt(exception=exc).error("tick 合成 {} 失败", symbol)
+                        logger.warning("tick 合成 {} 失败：{}", symbol, exc)
+            finally:
+                self._tick_synth_busy = False
+
+        threading.Thread(target=work, name="TickSynth", daemon=True).start()

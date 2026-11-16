@@ -1326,6 +1326,13 @@ class RunTabMixin:
 
     def _on_close(self) -> None:
         self._closing = True
+        recorder = getattr(self, "_tick_recorder", None)
+        if recorder is not None:
+            try:
+                recorder.stop(timeout=3)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("关闭窗口时停止 tick 采集失败：{}", exc)
+            self._tick_recorder = None
         for name in ("_tick_after_id", "_log_after_id", "_login_tick_after_id"):
             after_id = getattr(self, name, None)
             if after_id:

@@ -17,3 +17,5 @@ keyboard>=0.13.5              # 标定同花顺按钮坐标时监听按键
 pytest>=7.4.0                 # 单元测试（可选）
 openctp-ctp>=6.7.0            # CTP 交易接口的 Python 封装。华泰指定的 dll 仍放在 ctp/api，优先使用
 tqsdk>=3.0.0                  # 天勤行情（需账号密码登录，一分钟及以上K线）
+vnpy>=4.5.0                   # tick 官方数据结构与入库接口（save_tick_data）
+vnpy_sqlite>=1.1.3            # vnpy 官方 sqlite 库，tick 落本地库用

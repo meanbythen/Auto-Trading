@@ -137,6 +137,9 @@ class AutoTradingApp(
         self._show_password = ctk.BooleanVar(value=False)
         self._show_tq_password = ctk.BooleanVar(value=False)
         self._prep_busy = False
+        # 天勤 tick 常驻采集器。界面上点启动/停止，关窗口时要先停掉。
+        self._tick_recorder = None
+        self._tick_synth_busy = False
         self._login_fired: set[str] = set()
         # 准备按钮已经登录成功时，下一次启动常驻不再登录。
         self._skip_next_bot_login = False

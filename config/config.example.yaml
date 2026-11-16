@@ -425,6 +425,34 @@ data:
   tq:
     user: ""
     password: ""
+    # 专业版试用期才打开：批量下载历史 tick（免费账号没有这个权限）。
+    # 先单品种单月验证，再按需扩品种和日期。下载原始 csv 会保留，可断点续传。
+    history_tick:
+      enabled: false
+      main_cont_list:            # 天勤主连代码：KQ.m@交易所.品种
+        - "KQ.m@SHFE.fu"
+      start: "2026-10-01"
+      end: "2026-10-31"
+      chunk_days: 1              # 每段下载天数，也是断点续传粒度
+      out_dir: "data/ticks/history"
+      keep_raw_csv: true
+  # 天勤 tick：免费账号盘中常驻采集，落本地库，收盘后合成 K 线供回测。
+  tick:
+    enabled: false               # 默认不自动启动，避免没配账号时反复重连
+    symbols: []                  # 空=用配置页关注品种；也可填真实合约如 fu2701
+    resolve_main: true           # 只填品种时自动解析当前主力真实合约
+    flush_seconds: 5
+    batch_size: 2000
+    database: "data/ticks/vnpy_data.db"
+    raw_csv: false               # 额外保留原始 csv.gz
+    status_file: "data/ticks/recorder_status.json"
+    reconnect_seconds: 5
+    max_backoff_seconds: 60
+    bar_store: "data/klines/tick_bars.sqlite"
+    synth_periods: ["1", "5", "15", "30", "60", "D"]
+  # 天勤失败时是否回退新浪。回退数据单独按新浪原名入库，并带 fallback_from=tq 标记。
+  fallback_source: "akshare"
+  fallback_allow_entry: true     # 回退行情是否允许开新仓；false 时只允许平仓/止损
   symbol_map:
     bu: "BU0"
     c: "C0"

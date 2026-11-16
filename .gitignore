@@ -17,7 +17,7 @@ dist/
 
 # 运行产物
 logs/
-data/
+/data/
 @AutomationLog.txt
 *.log
 

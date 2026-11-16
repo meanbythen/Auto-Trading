@@ -383,6 +383,10 @@ class DashboardMixin:
             self._pull_signal_balance()
         except Exception as exc:  # noqa: BLE001
             logger.warning("账户余额刷新跳过一轮: {}", exc)
+        try:
+            self._refresh_tick_card()
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("tick 卡片刷新跳过一轮: {}", exc)
         finally:
             if not self._closing:
                 try:

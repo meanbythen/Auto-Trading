@@ -126,7 +126,13 @@ class KlineProvider:
         from src.data.quote_check import normalize_source
 
         # akshare 是新浪。eastmoney 是东方财富。tq 是天勤。ths 是同花顺图（只给回测）。
+        # tick 是本地 tick 合成 K 线（只读、不联网，只给回测）。
         self.source = normalize_source(data_cfg.get("source", "akshare"))
+        # 天勤挂了以后可以退到哪一家。默认回新浪；回退数据按备用源自己的库存名保存。
+        self.fallback_source = normalize_source(data_cfg.get("fallback_source", "akshare"))
+        self.fallback_allow_entry = bool(data_cfg.get("fallback_allow_entry", True))
+        tick_cfg = data_cfg.get("tick") or {}
+        self.tick_bar_store = root / tick_cfg.get("bar_store", "data/klines/tick_bars.sqlite")
         self._cfg = cfg
         # 天勤要账号密码。账号写在配置里，密码优先环境变量，其次本地密钥文件。
         tq_cfg = data_cfg.get("tq") or {}
@@ -205,12 +211,21 @@ class KlineProvider:
         stale_limit = stale_after_minutes(canonical, self.max_stale_minutes)
         from_cache = bool(bars.attrs.get("from_cache", False))
         error = str(bars.attrs.get("download_error", "") or "")
+        fallback_from = str(bars.attrs.get("fallback_from", "") or "")
+        actual_source = str(bars.attrs.get("source") or self.source)
         stale = bool(age is None or age > stale_limit)
-        status = "stale" if stale else ("cache" if from_cache or error else "ok")
+        if fallback_from:
+            status = "fallback"
+        else:
+            status = "stale" if stale else ("cache" if from_cache or error else "ok")
         health = {
             "symbol": symbol,
             "period": canonical,
-            "source": self.source,
+            "source": actual_source,
+            "configured_source": self.source,
+            "fallback_from": fallback_from,
+            "fallback_reason": str(bars.attrs.get("fallback_reason", "") or ""),
+            "allow_entry": bool(bars.attrs.get("allow_entry", True)),
             "status": status,
             "fetch_started_at": started_at.isoformat(timespec="milliseconds"),
             "received_at": datetime.now().astimezone().isoformat(timespec="milliseconds"),
@@ -224,7 +239,7 @@ class KlineProvider:
             "error": error,
         }
         # 只写元数据，不换数据源、不改 K 线值。调用方可把这份证据带进信号和委托。
-        bars.attrs["source"] = self.source
+        bars.attrs["source"] = actual_source
         bars.attrs["bars_age_minutes"] = age
         bars.attrs["stale"] = stale
         bars.attrs["market_health"] = dict(health)
@@ -276,7 +291,9 @@ class KlineProvider:
         try:
             if self.source == "ths":
                 return 0.0
-            if self.source == "tq":
+            if self.source == "tick":
+                frame = BarStore(self.tick_bar_store).load(self._stored_symbol(symbol), "1", limit=1)
+            elif self.source == "tq":
                 frame = self._fetch_tq(symbol, "1", limit=5)
             elif self.source == "eastmoney":
                 frame = self._fetch_eastmoney(symbol, "1", limit=5)
@@ -333,6 +350,16 @@ class KlineProvider:
 
         if self.source == "demo":
             return self._clip(self._demo_bars(symbol, period, n=limit), limit)
+
+        if self.source == "tick":
+            return self._fetch_tick_bars(
+                symbol,
+                period,
+                limit=limit,
+                keep_history=keep_history,
+                start=start,
+                end=end,
+            )
 
         local = self._prepare_local(symbol, period, limit=None if keep_history else limit)
         if self.source == "ths":
@@ -451,9 +478,20 @@ class KlineProvider:
                 "这一轮先不判断开仓。不会拿新浪的K线来顶替，下一轮会再试。"
             )
         if self.source == "tq":
+            fallback = self._try_fallback(
+                symbol,
+                period,
+                limit=limit,
+                keep_history=keep_history,
+                start=start,
+                end=end,
+                reason=download_error or "天勤未返回K线",
+            )
+            if fallback is not None:
+                return fallback
             raise RuntimeError(
                 f"天勤这次没有拿到 {symbol} 的{period_label(period)}K线。"
-                "这一轮先不判断开仓。不会拿别家的K线来顶替，下一轮会再试。"
+                "这一轮先不判断开仓；备用源也没连上，下一轮会再试。"
             )
         if self.source == "ths":
             raise RuntimeError(
@@ -464,6 +502,61 @@ class KlineProvider:
             f"无法获取真实K线 symbol={symbol} period={period_label(period)}。"
             "请检查网络；已禁止回退演示数据，以免错误下单。"
         )
+
+    def _try_fallback(
+        self,
+        symbol: str,
+        period: str,
+        *,
+        limit: int,
+        keep_history: bool,
+        start: str | None,
+        end: str | None,
+        reason: str,
+    ) -> pd.DataFrame | None:
+        """
+        天勤失败后改拉备用源（默认新浪）。
+
+        回退数据按备用源自己的库存名存放（新浪原名），不会写进 @tq，
+        返回表带上 fallback_from / fallback_reason / allow_entry，供风控和界面追溯。
+        备用源也失败就返回 None，由调用方报错，不做第二轮回退。
+        """
+        target = self.fallback_source
+        if target in {"", "tq", "tick", "ths", "demo", "csv"}:
+            logger.warning("天勤不可用，但备用数据源是 {}，不回退", target or "未配置")
+            return None
+        cfg = dict(self._cfg)
+        data_cfg = dict(self._cfg.get("data") or {})
+        data_cfg["source"] = target
+        cfg["data"] = data_cfg
+        try:
+            provider = KlineProvider(cfg)
+            frame = provider.fetch(
+                symbol,
+                period,
+                max_bars=None if keep_history else limit,
+                keep_history=keep_history,
+                start=start,
+                end=end,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("天勤失败（{}），备用源 {} 也没连上：{}", reason, target, exc)
+            return None
+        if frame is None or len(frame) == 0:
+            return None
+        out = frame.copy()
+        out.attrs["fallback_from"] = "tq"
+        out.attrs["fallback_reason"] = reason
+        out.attrs["source"] = target
+        out.attrs["allow_entry"] = bool(self.fallback_allow_entry)
+        logger.warning(
+            "天勤失败（{}），已回退 {}：{} 根，允许开仓={}",
+            reason,
+            target,
+            len(out),
+            self.fallback_allow_entry,
+        )
+        return out
 
     def _local_covers_requested(
         self,
@@ -981,6 +1074,48 @@ class KlineProvider:
             "inventory_path": inventory_path,
             "frame": merged,
         }
+
+    def _fetch_tick_bars(
+        self,
+        symbol: str,
+        period: str,
+        *,
+        limit: int,
+        keep_history: bool,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> pd.DataFrame:
+        """
+        读本地 tick 合成 K 线，不联网。
+
+        这是回测专用来源：库由 tick 合成脚本写入（键 <合约>@tick），
+        没有库存时直接报错，不去任何行情商取数，也不改实盘数据源。
+        """
+        code = canonical_period(period)
+        store = BarStore(self.tick_bar_store)
+        frame = store.load(
+            self._stored_symbol(symbol),
+            code,
+            limit=None if keep_history else limit,
+        )
+        if frame is None or len(frame) == 0:
+            raise RuntimeError(
+                f"本地还没有 {symbol} 的{period_label(code)}tick合成K线。"
+                f"请先在天勤 tick 采集后执行「合成K线」（库：{self.tick_bar_store}）。"
+            )
+        if keep_history and (start or end):
+            if start:
+                frame = frame.loc[frame.index >= pd.Timestamp(start)]
+            if end:
+                finish = pd.Timestamp(end).normalize() + pd.Timedelta(days=1)
+                frame = frame.loc[frame.index < finish]
+            if len(frame) == 0:
+                raise RuntimeError(
+                    f"tick合成K线没有覆盖 {start or '起'} ~ {end or '止'} 区间：{self.tick_bar_store}"
+                )
+        out = frame.copy()
+        out.attrs["from_cache"] = True
+        return out if keep_history else self._clip(out, limit)
 
     def _fetch_tq(self, symbol: str, period: str, *, limit: int = 200) -> pd.DataFrame:
         """向天勤要 K 线。账号密码来自配置和本地密钥，不写进代码。"""

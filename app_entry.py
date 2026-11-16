@@ -14,10 +14,20 @@ if str(_ROOT) not in sys.path:
 
 
 def _want_gui(argv: list[str]) -> bool:
-    """无参数或显式 --gui → 开界面；--once / --sim-test → 命令行。"""
+    """无参数或显式 --gui → 开界面；--once / --sim-test / tick 命令 → 命令行。"""
     if "--gui" in argv:
         return True
-    if any(a in argv for a in ("--once", "--sim-test", "-h", "--help")):
+    cli_flags = (
+        "--once",
+        "--sim-test",
+        "-h",
+        "--help",
+        "--tick-record",
+        "--tick-status",
+        "--tick-bars",
+        "--tick-download",
+    )
+    if any(a in argv for a in cli_flags):
         return False
     # 打包 exe 默认 GUI；源码直接跑本文件也默认 GUI
     return len(argv) == 0

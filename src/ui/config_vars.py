@@ -446,6 +446,9 @@ class ConfigVarsMixin:
         self.dm_end_time_var = ctk.StringVar(value=now.strftime("%H:%M"))
         # 库存检查/删除弹窗的默认数据源，跟配置页当前行情源一致。
         self.dm_source_var = ctk.StringVar(value=quote_label)
+        # 天勤 tick：采集心跳和本地 tick 库存摘要。
+        self.tick_status_var = ctk.StringVar(value="tick 采集：未启动")
+        self.tick_inventory_var = ctk.StringVar(value="tick 库存：未读取")
         # 成交近似：下一根开盘成交与滑点跳数，只影响回测。配置页和历史回测页共用这一组。
         self.bt_fill_next_open_var = ctk.BooleanVar(value=bool(bt.get("fill_on_next_open", True)))
         self.bt_slippage_var = ctk.StringVar(value=str(bt.get("slippage_ticks", 1)))

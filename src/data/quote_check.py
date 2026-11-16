@@ -15,9 +15,16 @@ import requests
 
 # 界面上的名字，和配置文件里的代码。
 # 实盘只用前三家。同花顺图只出现在历史回测，读图会抢鼠标，不能拿去扫描下单。
+# tick 合成 K 线也只给回测：来自本地 tick 库，不联网，不参与实盘自动回退。
 SOURCE_LABELS = ("新浪", "东方财富", "天勤")
-BACKTEST_SOURCE_LABELS = ("新浪", "东方财富", "天勤", "同花顺图")
-_CODE_BY_LABEL = {"新浪": "akshare", "东方财富": "eastmoney", "天勤": "tq", "同花顺图": "ths"}
+BACKTEST_SOURCE_LABELS = ("新浪", "东方财富", "天勤", "同花顺图", "tick合成")
+_CODE_BY_LABEL = {
+    "新浪": "akshare",
+    "东方财富": "eastmoney",
+    "天勤": "tq",
+    "同花顺图": "ths",
+    "tick合成": "tick",
+}
 _LABEL_BY_CODE = {
     "akshare": "新浪",
     "sina": "新浪",
@@ -25,6 +32,7 @@ _LABEL_BY_CODE = {
     "tq": "天勤",
     "tqsdk": "天勤",
     "ths": "同花顺图",
+    "tick": "tick合成",
 }
 
 # 东方财富期货市场编号。只用来找合约。
@@ -80,6 +88,8 @@ def normalize_source(value: str | None) -> str:
         return "tq"
     if lowered in {"ths", "tonghuashun", "同花顺", "同花顺图"}:
         return "ths"
+    if lowered in {"tick", "tickbars", "tick合成", "tick_bars"}:
+        return "tick"
     if lowered in {"csv", "demo"}:
         return lowered
     return "akshare"
@@ -105,13 +115,18 @@ def is_ths_source(value: str | None) -> bool:
     return normalize_source(value) == "ths"
 
 
+def is_tick_source(value: str | None) -> bool:
+    """是不是读本地 tick 合成 K 线。只读、不联网，只给历史回测。"""
+    return normalize_source(value) == "tick"
+
+
 def storage_symbol(symbol: str, source: str | None) -> str:
     """
     本地库存用的合约名。
 
     新浪仍是 bu2612，已经存下的文件不用搬家。
     东方财富写成 bu2612@eastmoney，天勤写成 fu2701@tq，
-    同花顺图写成 fu2701@ths，各家不会叠在同一根 K 线上。
+    同花顺图写成 fu2701@ths，tick 合成写成 fu2701@tick，各家不会叠在同一根 K 线上。
     """
     code = normalize_source(source)
     if code == "eastmoney":
@@ -120,6 +135,8 @@ def storage_symbol(symbol: str, source: str | None) -> str:
         return f"{symbol}@tq"
     if code == "ths":
         return f"{symbol}@ths"
+    if code == "tick":
+        return f"{symbol}@tick"
     return str(symbol)
 
 
