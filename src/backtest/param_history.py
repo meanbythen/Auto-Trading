@@ -237,6 +237,31 @@ FACTORY_DEFAULT_SNAPSHOT: dict[str, Any] = {
         "vol_mult": 0.0,
         "flatten_at_close": False,
     },
+    "dual_donchian": {
+        "trend_timeframe": "D",
+        "entry_bars": 55,
+        "exit_bars": 20,
+        "htf_donchian": 55,
+        "adx_period": 14,
+        "adx_min": 22.0,
+        "atr_period": 14,
+        "atr_mult": 2.5,
+        "flatten_at_close": False,
+    },
+    "dual_fractal": {
+        "trend_timeframe": "D",
+        "trend_mode": "ema",
+        "trend_ema": 20,
+        "htf_donchian": 55,
+        "adx_period": 14,
+        "adx_min": 22.0,
+        "macd_fast": 12,
+        "macd_slow": 26,
+        "macd_signal": 9,
+        "atr_period": 14,
+        "atr_mult": 2.8,
+        "flatten_at_close": False,
+    },
     "trade_symbol": "bu2612",
 }
 
@@ -267,6 +292,8 @@ _ENGINE_SECTION = {
     "float_hold": "float_hold",
     "swing_trend": "swing_trend",
     "swing_box": "swing_box",
+    "dual_donchian": "dual_donchian",
+    "dual_fractal": "dual_fractal",
 }
 # 自己起的名字最长这么多字，避免下拉菜单被一行撑爆。
 MAX_NAME_LENGTH = 60
@@ -430,6 +457,8 @@ def extract_strategy_snapshot(cfg: dict[str, Any]) -> dict[str, Any]:
         "float_hold": st.get("float_hold") or {},
         "swing_trend": st.get("swing_trend") or {},
         "swing_box": st.get("swing_box") or {},
+        "dual_donchian": st.get("dual_donchian") or {},
+        "dual_fractal": st.get("dual_fractal") or {},
         "trade_symbol": trade.get("symbol"),
         "data_source": (cfg.get("data") or {}).get("source") or "akshare",
     }
@@ -481,6 +510,10 @@ def apply_snapshot_to_config(cfg: dict[str, Any], snap: dict[str, Any]) -> dict[
         st["swing_trend"] = copy.deepcopy(snap["swing_trend"])
     if snap.get("swing_box") is not None:
         st["swing_box"] = copy.deepcopy(snap["swing_box"])
+    if snap.get("dual_donchian") is not None:
+        st["dual_donchian"] = copy.deepcopy(snap["dual_donchian"])
+    if snap.get("dual_fractal") is not None:
+        st["dual_fractal"] = copy.deepcopy(snap["dual_fractal"])
     if snap.get("trade_symbol"):
         trade["symbol"] = snap["trade_symbol"]
     elif snap.get("symbols"):

@@ -8,6 +8,8 @@
   - 多品种验收：参数在优化用的合约上过关后，再拿到其它关注品种上跑一遍，不重新挑参数。
   - 前一段赚钱、检验段亏掉超过一半，或其它品种上大半都大亏，不准写入。
   - 前一段分数接近时，留更靠近出厂参数的一组。
+  - 最终半年默认冻结：搜索碰不到；过关后再验收一次，看过就不能再用同一段。
+  - 把检验成交打乱重抽：净盈亏经常变成亏的，不准写入。
 """
 
 from __future__ import annotations
@@ -32,6 +34,24 @@ from src.backtest.evaluation import (
     verdict_text,
 )
 from src.backtest.experiment import archive_report, new_experiment, snapshot_bars
+from src.backtest.frozen_oos import (
+    MIN_FROZEN_BARS,
+    attempt_key,
+    describe_freeze_shortage,
+    freeze_days_from_cfg,
+    freeze_enabled_from_cfg,
+    freeze_start_from_bars,
+    has_seen_freeze,
+    record_freeze_attempt,
+    registry_path,
+    split_searchable_frozen,
+)
+from src.backtest.monte_carlo import (
+    DEFAULT_MC_RUNS,
+    judge_monte_carlo,
+    run_trade_monte_carlo,
+    trade_pnls,
+)
 from src.data.kline import KlineProvider
 from src.data.periods import canonical_period
 from src.strategy.generic_stop import GenericStopConfig, normalize_generic_stop
@@ -235,6 +255,26 @@ GRID_SWING: dict[str, list[Any]] = {
     "reduce_extend_atr": [2.0, 2.5, 3.5],
     "max_adds": [1, 2],
 }
+GRID_DUAL_DONCHIAN_LIGHT: dict[str, list[Any]] = {
+    "entry_bars": [20, 55],
+    "atr_mult": [2.0, 2.5],
+}
+GRID_DUAL_DONCHIAN: dict[str, list[Any]] = {
+    "entry_bars": [20, 55],
+    "exit_bars": [10, 20],
+    "atr_mult": [2.0, 2.5, 3.0],
+    "adx_min": [18.0, 22.0],
+}
+GRID_DUAL_FRACTAL_LIGHT: dict[str, list[Any]] = {
+    "trend_ema": [20, 40],
+    "atr_mult": [2.5, 2.8],
+}
+GRID_DUAL_FRACTAL: dict[str, list[Any]] = {
+    "trend_ema": [20, 40],
+    "atr_mult": [2.5, 2.8, 3.5],
+    "adx_min": [18.0, 22.0],
+    "trend_mode": ["ema", "donchian"],
+}
 GRID_SWING_BOX_LIGHT: dict[str, list[Any]] = {
     "lookback": [30, 40],
     "adx_min": [18, 22],
@@ -291,6 +331,8 @@ _ENGINE_PARAM_SECTION = {
     "cta": "multi_factor",
     "swing_trend": "swing_trend",
     "swing_box": "swing_box",
+    "dual_donchian": "dual_donchian",
+    "dual_fractal": "dual_fractal",
 }
 
 # 默认网格跟主策略日内实体一致
@@ -420,6 +462,10 @@ def default_grid_for_engine(engine: str, depth: str = "标准") -> dict[str, lis
         return _depth_grid(GRID_SWING_LIGHT, GRID_SWING, None, d)
     if e == "swing_box":
         return _depth_grid(GRID_SWING_BOX_LIGHT, GRID_SWING_BOX, None, d)
+    if e == "dual_donchian":
+        return _depth_grid(GRID_DUAL_DONCHIAN_LIGHT, GRID_DUAL_DONCHIAN, None, d)
+    if e == "dual_fractal":
+        return _depth_grid(GRID_DUAL_FRACTAL_LIGHT, GRID_DUAL_FRACTAL, None, d)
     # 未知引擎：不搜参数，避免误改别的策略小节
     return copy.deepcopy(GRID_FIXED)
 
@@ -1042,6 +1088,166 @@ def judge_holdout(train_net: float, hold_net: float, hold_trades: int) -> tuple[
     )
 
 
+def _prepare_searchable_bars(
+    cfg: dict[str, Any],
+    bars_signal: pd.DataFrame,
+    bars_trail: pd.DataFrame | None,
+) -> tuple[pd.DataFrame, pd.DataFrame | None, dict[str, Any]]:
+    """
+    打开冻结时：最后 N 天从搜索里拿掉。不够长就直接报错，不偷偷缩短冻结天数。
+    """
+    meta: dict[str, Any] = {
+        "enabled": False,
+        "days": 0,
+        "start": "",
+        "end": "",
+        "search_end": "",
+        "bars": 0,
+        "searchable_bars": len(bars_signal),
+    }
+    if not freeze_enabled_from_cfg(cfg):
+        return bars_signal, bars_trail, meta
+    days = freeze_days_from_cfg(cfg)
+    freeze_start = freeze_start_from_bars(bars_signal, days)
+    searchable, frozen = split_searchable_frozen(bars_signal, freeze_start)
+    search_n = 0 if searchable is None else len(searchable)
+    frozen_n = 0 if frozen is None else len(frozen)
+    shortage = describe_freeze_shortage(search_n, frozen_n, days)
+    if shortage:
+        raise RuntimeError(shortage)
+    search_trail, _frozen_trail = split_searchable_frozen(bars_trail, freeze_start)
+    last_search = searchable.index[-1]
+    last_all = bars_signal.index[-1]
+    meta.update(
+        {
+            "enabled": True,
+            "days": days,
+            "start": _stamp(freeze_start),
+            "end": _stamp(last_all),
+            "search_end": _stamp(last_search),
+            "bars": frozen_n,
+            "searchable_bars": search_n,
+            "freeze_start_ts": freeze_start,
+        }
+    )
+    return searchable, search_trail if bars_trail is not None else None, meta
+
+
+def _gate_freeze_and_monte_carlo(
+    cfg: dict[str, Any],
+    *,
+    accepted: bool,
+    reason: str,
+    symbol: str,
+    engine_name: str,
+    params: dict[str, Any],
+    bars_signal: pd.DataFrame,
+    bars_trail: pd.DataFrame | None,
+    freeze_meta: dict[str, Any],
+    train_net: float,
+    oos_trades: list[Any],
+    gate: bool,
+    report: Callable[[str], None] | None = None,
+) -> tuple[bool, str, dict[str, Any], dict[str, Any]]:
+    """
+    最终半年只验收一次，再把检验段成交打乱。
+
+    前面的训练/检验没过关时，不看最终半年，免得先偷看再改参数。
+    """
+    freeze_box: dict[str, Any] = {
+        "enabled": bool(freeze_meta.get("enabled")),
+        "days": int(freeze_meta.get("days") or 0),
+        "start": str(freeze_meta.get("start") or ""),
+        "end": str(freeze_meta.get("end") or ""),
+        "bars": int(freeze_meta.get("bars") or 0),
+        "already_seen": False,
+        "performance": {},
+        "reason": "",
+        "skip_reason": "",
+    }
+    mc_trades = list(oos_trades or [])
+    freeze_start_ts = freeze_meta.get("freeze_start_ts")
+    if accepted and freeze_meta.get("enabled") and params:
+        period = str((cfg.get("strategy") or {}).get("timeframe") or "")
+        key = attempt_key(
+            engine=engine_name,
+            symbol=symbol,
+            period=period,
+            freeze_start=str(freeze_meta.get("start") or ""),
+            freeze_end=str(freeze_meta.get("end") or ""),
+        )
+        path = registry_path(cfg)
+        if has_seen_freeze(path, key):
+            freeze_box["already_seen"] = True
+            freeze_box["reason"] = (
+                "这段最终半年已经看过一次，不能再当验收。"
+                "请等后面长出还没看过的新行情，或把结束日往前挪、另留一段没看过的。"
+            )
+            if gate:
+                accepted = False
+            reason = (reason + freeze_box["reason"]).strip()
+        else:
+            if report is not None:
+                report("最终半年只验收一次")
+            frozen_n = int(freeze_meta.get("bars") or 0)
+            if frozen_n < MIN_FROZEN_BARS:
+                freeze_box["skip_reason"] = describe_freeze_shortage(
+                    int(freeze_meta.get("searchable_bars") or 0), frozen_n, int(freeze_meta.get("days") or 0)
+                )
+                if gate:
+                    accepted = False
+                reason = (reason + freeze_box["skip_reason"]).strip()
+            else:
+                freeze_perf, freeze_trades = _holdout_perf_for_params(
+                    cfg,
+                    symbol=symbol,
+                    engine_name=engine_name,
+                    params=params,
+                    bars_signal=bars_signal,
+                    bars_trail=bars_trail,
+                    holdout_start_ts=freeze_start_ts,
+                )
+                freeze_box["performance"] = freeze_perf
+                freeze_ok, freeze_reason = judge_holdout(
+                    float(train_net),
+                    float(freeze_perf.get("net_pnl") or 0),
+                    int(freeze_perf.get("trades") or 0),
+                )
+                freeze_reason = "最终半年：" + freeze_reason
+                freeze_box["reason"] = freeze_reason
+                record_freeze_attempt(
+                    path,
+                    key,
+                    extra={"engine": engine_name, "symbol": symbol, "accepted": bool(freeze_ok)},
+                )
+                mc_trades = list(freeze_trades or [])
+                if gate and not freeze_ok:
+                    accepted = False
+                reason = (reason + freeze_reason).strip()
+
+    if report is not None:
+        report("成交打乱")
+    capital = float((cfg.get("risk") or {}).get("capital") or 100_000)
+    ev = cfg.get("evaluation") if isinstance(cfg.get("evaluation"), dict) else {}
+    try:
+        mc_runs = int(ev.get("mc_runs") or DEFAULT_MC_RUNS)
+    except (TypeError, ValueError):
+        mc_runs = DEFAULT_MC_RUNS
+    mc_box = run_trade_monte_carlo(
+        trade_pnls(mc_trades),
+        capital=capital,
+        n_runs=mc_runs,
+        seed=42,
+    )
+    mc_ok, mc_reason = judge_monte_carlo(mc_box)
+    mc_box["reason"] = mc_reason
+    if (not mc_box.get("skipped")) and gate and not mc_ok:
+        accepted = False
+    if mc_reason:
+        reason = (reason + mc_reason).strip()
+    return accepted, reason, freeze_box, mc_box
+
+
 def _stamp(value: Any) -> str:
     """K 线时间写成界面上好读的日期。"""
     try:
@@ -1128,6 +1334,8 @@ class OptimizationResult:
     evaluation_ok: bool = True
     evaluation_reason: str = ""
     experiment: dict[str, Any] = field(default_factory=dict)
+    freeze: dict[str, Any] = field(default_factory=dict)
+    monte_carlo: dict[str, Any] = field(default_factory=dict)
     _experiment_data: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
@@ -1168,6 +1376,8 @@ class OptimizationResult:
             "evaluation_ok": self.evaluation_ok,
             "evaluation_reason": self.evaluation_reason,
             "experiment": self.experiment,
+            "freeze": self.freeze,
+            "monte_carlo": self.monte_carlo,
         }
 
 
@@ -1304,15 +1514,15 @@ def _apply_params(cfg: dict[str, Any], params: dict[str, Any], engine: str | Non
         box = st.setdefault(_ENGINE_PARAM_SECTION[engine], {})
         for k, v in params.items():
             # 长线箱体的周期写在公共项，不写进自己那一节，否则回测页改了也读不到。
-            if engine in ("swing_box", "swing_trend") and k == "timeframe":
-                fallback = "D" if engine == "swing_box" else "60"
+            if engine in ("swing_box", "swing_trend", "dual_donchian", "dual_fractal") and k == "timeframe":
+                fallback = "D" if engine in ("swing_box", "dual_donchian", "dual_fractal") else "60"
                 tf = str(v).strip() or fallback
                 st["timeframe"] = tf
                 if "trail_timeframe" not in params:
                     st["trail_timeframe"] = tf
                 continue
-            if engine in ("swing_box", "swing_trend") and k == "trail_timeframe":
-                fallback = "D" if engine == "swing_box" else "60"
+            if engine in ("swing_box", "swing_trend", "dual_donchian", "dual_fractal") and k == "trail_timeframe":
+                fallback = "D" if engine in ("swing_box", "dual_donchian", "dual_fractal") else "60"
                 st["trail_timeframe"] = str(v).strip() or st.get("timeframe") or fallback
                 continue
             if engine in ("ema_swing", "macd_swing") and k == "timeframe":
@@ -1732,6 +1942,9 @@ def check_params_on_holdout(
     if bars_signal is None or len(bars_signal) < 80:
         got = 0 if bars_signal is None else len(bars_signal)
         raise RuntimeError(f"复核用K线只有 {got} 根，分不出训练段和检验段。请改用「全部可用」时间段。")
+    full_signal, full_trail = bars_signal, bars_trail
+    bars_signal, bars_trail, freeze_meta = _prepare_searchable_bars(cfg, bars_signal, bars_trail)
+    search_end_date = str(freeze_meta.get("search_end") or end_date or "") or end_date
 
     cross_n = _cross_symbol_count(cross_symbols, symbol)
     total_steps = 2 + cross_n
@@ -1783,13 +1996,28 @@ def check_params_on_holdout(
             symbols=list(cross_symbols),
             skip_symbol=symbol,
             start_date=start_date,
-            end_date=end_date,
+            end_date=search_end_date,
             on_step=lambda i, n: _report(2 + i, f"多品种验收 {i}/{n}"),
         )
         cross_ok, cross_reason = judge_cross_symbols(train_net, cross_rows)
         if accepted and not cross_ok:
             accepted = False
             reason = cross_reason
+    accepted, reason, freeze_box, mc_box = _gate_freeze_and_monte_carlo(
+        cfg,
+        accepted=accepted,
+        reason=reason,
+        symbol=symbol,
+        engine_name=engine_name,
+        params=dict(params),
+        bars_signal=full_signal,
+        bars_trail=full_trail,
+        freeze_meta=freeze_meta,
+        train_net=train_net,
+        oos_trades=list(hold_trades or []),
+        gate=True,
+        report=lambda phase: _report(total_steps, phase),
+    )
     _report(total_steps, "复核完成")
     return {
         "accepted": bool(accepted),
@@ -1802,6 +2030,8 @@ def check_params_on_holdout(
         "train_end": _stamp(train_end_ts),
         "holdout_start": _stamp(holdout_start_ts),
         "hold_trades": len(hold_trades),
+        "freeze": freeze_box,
+        "monte_carlo": mc_box,
     }
 
 
@@ -1826,6 +2056,7 @@ class _SearchOutcome:
     walk_metrics: dict[str, Any] = field(default_factory=dict)
     actual_steps: int = 0
     total_steps: int = 0
+    hold_trades: list[Any] = field(default_factory=list)
 
 
 def _load_optimization_bars(
@@ -2113,6 +2344,7 @@ def _walk_forward_search(
         walk_metrics=walk_metrics,
         actual_steps=actual_steps,
         total_steps=total_steps,
+        hold_trades=list(all_oos_trades),
     )
 
 
@@ -2153,6 +2385,7 @@ def _once_cut_search(
     holdout_bars = 0
     train_end = ""
     holdout_start = ""
+    hold_trades_list: list[Any] = []
 
     cut = split_train_holdout(len(bars_signal), train_ratio)
     train_end_ts = bars_signal.index[cut - 1]
@@ -2204,7 +2437,7 @@ def _once_cut_search(
             bars_trail=train_trail,
             engine=engine_name,
         )
-        hold_perf, _hold_trades = _holdout_perf_for_params(
+        hold_perf, hold_trades_list = _holdout_perf_for_params(
             cfg,
             symbol=symbol,
             engine_name=engine_name,
@@ -2242,6 +2475,7 @@ def _once_cut_search(
         walk_metrics=walk_metrics,
         actual_steps=0,
         total_steps=total_steps,
+        hold_trades=hold_trades_list,
     )
 
 
@@ -2295,6 +2529,9 @@ def optimize_strategy(
         start_date=start_date,
         end_date=end_date,
     )
+    full_signal, full_trail = bars_signal, bars_trail
+    bars_signal, bars_trail, freeze_meta = _prepare_searchable_bars(cfg, bars_signal, bars_trail)
+    search_end_date = str(freeze_meta.get("search_end") or end_date or "") or end_date
 
     keys = list(grid.keys())
     values = [grid[k] for k in keys]
@@ -2389,7 +2626,7 @@ def optimize_strategy(
             symbols=list(cross_symbols),
             skip_symbol=symbol,
             start_date=start_date,
-            end_date=end_date,
+            end_date=search_end_date,
             on_step=lambda i, n: _report(
                 total_steps - cross_n + i, total_steps, f"多品种验收 {i}/{n}"
             ),
@@ -2418,7 +2655,7 @@ def optimize_strategy(
             engine_name=engine_name,
             param_keys=list(keys),
             start_date=start_date,
-            end_date=end_date,
+            end_date=search_end_date,
             thresholds=eval_th,
         )
         if ev_report.skipped:
@@ -2430,6 +2667,29 @@ def optimize_strategy(
             if eval_th.gate_on_optimize:
                 accepted = False
             reason = (reason + eval_reason).strip()
+
+    freeze_box: dict[str, Any] = {"enabled": bool(freeze_meta.get("enabled"))}
+    mc_box: dict[str, Any] = {}
+    if best_params:
+
+        def _anti_phase(phase: str) -> None:
+            _report(total_steps, total_steps, phase)
+
+        accepted, reason, freeze_box, mc_box = _gate_freeze_and_monte_carlo(
+            cfg,
+            accepted=accepted,
+            reason=reason,
+            symbol=symbol,
+            engine_name=engine_name,
+            params=best_params,
+            bars_signal=full_signal,
+            bars_trail=full_trail,
+            freeze_meta=freeze_meta,
+            train_net=float(train_perf.get("net_pnl") or 0),
+            oos_trades=list(outcome.hold_trades or []),
+            gate=True,
+            report=_anti_phase,
+        )
 
     experiment_details = {
         "symbol": symbol,
@@ -2444,6 +2704,8 @@ def optimize_strategy(
         "min_trades": int(min_trades),
         "grid": grid,
         "cross_symbols": list(cross_symbols or []),
+        "freeze_final_oos": bool(freeze_meta.get("enabled")),
+        "freeze_final_days": int(freeze_meta.get("days") or 0),
         "costs": {
             "slippage_ticks": (
                 best_result.params_snapshot.get("slippage_ticks") if best_result is not None else None
@@ -2490,7 +2752,9 @@ def optimize_strategy(
         oos_win_rate=float(walk_metrics.get("oos_win_rate") or 0),
         param_stability=str(walk_metrics.get("param_stability") or ""),
         experiment=new_experiment("optimization", cfg, details=experiment_details),
-        _experiment_data=snapshot_bars(signal=bars_signal, trail=bars_trail),
+        freeze=freeze_box,
+        monte_carlo=mc_box,
+        _experiment_data=snapshot_bars(signal=full_signal, trail=full_trail),
     )
     _report(total_steps, total_steps, "整理结果")
     return opt

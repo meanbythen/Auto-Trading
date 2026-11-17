@@ -94,9 +94,18 @@ def in_session_windows(
     return any(in_clock_window(start, end, now, grace_sec=grace_sec) for start, end in windows)
 
 
-# 贵金属夜盘收到次日凌晨。品种表没填时段时，白银/黄金用这一套。
-LATE_NIGHT_PRODUCTS = frozenset({"ag", "au"})
+# 贵金属、原油夜盘收到次日凌晨。品种表没填时段时用这一套。
+LATE_NIGHT_PRODUCTS = frozenset({"ag", "au", "sc", "lu"})
+# 沪铜等有色夜盘到 01:00。
+NIGHT_0100_PRODUCTS = frozenset("cu al zn pb ni sn ss".split())
+# 中金所：日盘 09:30～11:30、13:00～15:00，没有上午休息、没有夜盘。
+CFFEX_PRODUCTS = frozenset({"if", "ih", "ic", "im", "t", "tf", "ts", "tl"})
+# 生猪、鸡蛋、广期所工业硅等没有夜盘（股指国债走 CFFEX，不走这里的日盘骨架）。
+NO_NIGHT_PRODUCTS = frozenset(
+    {"lh", "jd", "fb", "bb", "rr", "si", "lc", "ps", "ap", "cj"}
+)
 _DAY_WINDOWS = (("09:00", "11:30"), ("13:30", "15:00"))
+_CFFEX_DAY_WINDOWS = (("09:30", "11:30"), ("13:00", "15:00"))
 
 
 def product_code(symbol: Any) -> str:
@@ -156,15 +165,30 @@ def format_session_text(sessions: list[list[str]] | None) -> str:
 
 
 def default_sessions_for_product(code: Any) -> list[list[str]]:
-    """品种没填时段时的出厂值。白银黄金夜盘到 02:30，其它到 23:00。"""
-    night = ["21:00", "02:30"] if product_code(code) in LATE_NIGHT_PRODUCTS else ["21:00", "23:00"]
-    return [[a, b] for a, b in _DAY_WINDOWS] + [night]
+    """品种没填时段时的出厂值。按夜盘组别分：无夜盘 / 23:00 / 01:00 / 02:30。"""
+    key = product_code(code)
+    if key in CFFEX_PRODUCTS:
+        return [[a, b] for a, b in _CFFEX_DAY_WINDOWS]
+    day = [[a, b] for a, b in _DAY_WINDOWS]
+    if key in NO_NIGHT_PRODUCTS:
+        return day
+    if key in LATE_NIGHT_PRODUCTS:
+        return day + [["21:00", "02:30"]]
+    if key in NIGHT_0100_PRODUCTS:
+        return day + [["21:00", "01:00"]]
+    return day + [["21:00", "23:00"]]
 
 
 def default_flatten_for_product(code: Any) -> list[str]:
-    """品种没填清仓时刻时的出厂值。白银黄金用凌晨 02:25，其它用 22:55。"""
-    night = "02:25" if product_code(code) in LATE_NIGHT_PRODUCTS else "22:55"
-    return ["14:55", night]
+    """品种没填清仓时刻时的出厂值。"""
+    key = product_code(code)
+    if key in NO_NIGHT_PRODUCTS or key in CFFEX_PRODUCTS:
+        return ["14:55"]
+    if key in LATE_NIGHT_PRODUCTS:
+        return ["14:55", "02:25"]
+    if key in NIGHT_0100_PRODUCTS:
+        return ["14:55", "00:55"]
+    return ["14:55", "22:55"]
 
 
 def sessions_for_symbol(cfg: dict[str, Any] | None, symbol: Any) -> list[list[str]]:
@@ -355,6 +379,229 @@ def session_tuples(
 ) -> list[tuple[dtime, dtime]]:
     """策略 in_entry_session 用的 (开始, 结束) 列表。"""
     return [(parse_hhmm(a), parse_hhmm(b)) for a, b in sessions_for_symbol(cfg, symbol)]
+
+
+# 中金所没有 10:15～10:30 休息；商品期货上午要拆成两段。
+_TEA_BREAK_START = dtime(10, 15)
+_TEA_BREAK_RESUME = dtime(10, 30)
+
+
+def has_commodity_tea_break(symbol: Any) -> bool:
+    """商品期货上午 10:15～10:30 休息；股指国债没有这段。"""
+    return product_code(symbol) not in CFFEX_PRODUCTS
+
+
+def split_tea_break(
+    sessions: Sequence[Sequence[Any]] | None,
+    *,
+    symbol: Any = "",
+) -> list[list[str]]:
+    """
+    把「09:00～11:30」拆成 09:00～10:15 和 10:30～11:30。
+
+    品种表通常写成一整段上午，但 10:15 之后到 10:30 是休市，
+    这段时间的 K 线不能拿来开仓。中金所不拆。没给品种时按商品拆，
+    因为回测默认品种都是商品。
+    """
+    rows: list[list[str]] = []
+    for row in sessions or []:
+        if not row or len(row) < 2:
+            continue
+        rows.append([str(row[0]).strip()[:5], str(row[1]).strip()[:5]])
+    if symbol and not has_commodity_tea_break(symbol):
+        return rows
+    out: list[list[str]] = []
+    for start_s, end_s in rows:
+        start, end = parse_hhmm(start_s), parse_hhmm(end_s)
+        covers_tea = start < _TEA_BREAK_START and end >= _TEA_BREAK_RESUME and start <= end
+        if covers_tea:
+            out.append([start_s, "10:15"])
+            out.append(["10:30", end_s])
+        else:
+            out.append([start_s, end_s])
+    return out
+
+
+def tradable_windows_for_symbol(
+    cfg: dict[str, Any] | None, symbol: Any
+) -> list[tuple[dtime, dtime]]:
+    """开仓/成交用的时段：品种表 + 商品上午休息拆段。"""
+    rows = split_tea_break(sessions_for_symbol(cfg, symbol), symbol=symbol)
+    return [(parse_hhmm(a), parse_hhmm(b)) for a, b in rows]
+
+
+def _stamp_to_naive(ts: Any) -> datetime | None:
+    """K 线时间收成不带时区的本地时间。"""
+    if ts is None:
+        return None
+    if isinstance(ts, datetime):
+        stamp = ts
+    else:
+        try:
+            stamp = pd_timestamp_to_datetime(ts)
+        except Exception:  # noqa: BLE001
+            return None
+    if stamp.tzinfo is not None:
+        stamp = stamp.replace(tzinfo=None)
+    return stamp.replace(second=0, microsecond=0)
+
+
+def pd_timestamp_to_datetime(ts: Any) -> datetime:
+    """pandas 时间戳转 datetime；没有 pandas 时走 fromisoformat。"""
+    try:
+        import pandas as pd
+
+        return pd.Timestamp(ts).to_pydatetime()
+    except Exception:  # noqa: BLE001
+        text = str(ts)
+        return datetime.fromisoformat(text.replace("Z", ""))
+
+
+def bar_close_in_windows(
+    stamp: datetime,
+    windows: Sequence[tuple[dtime, dtime]],
+) -> bool:
+    """
+    这根 K 线的结束时刻能不能当成真实行情。
+
+    右标签记的是「这段走完的时刻」：开盘那一刻还没走完一根，不算；
+    收盘那一刻是最后一根，算。所以用「开始 < 时刻 ≤ 结束」。
+    跨夜时段同样：21:00 开盘那根丢掉，02:30 收盘那根留下。
+    """
+    clock = stamp.time().replace(second=0, microsecond=0)
+    for start, end in windows:
+        if start <= end:
+            if start < clock <= end:
+                return True
+        elif clock > start or clock <= end:
+            return True
+    return False
+
+
+def _resolve_windows(
+    *,
+    symbol: Any = "",
+    cfg: dict[str, Any] | None = None,
+    windows: Sequence[tuple[dtime, dtime]] | None = None,
+) -> Sequence[tuple[dtime, dtime]] | None:
+    """没给品种也没给时段时返回 None，表示不过滤。"""
+    if windows is not None:
+        return windows
+    if not symbol and not cfg:
+        return None
+    return tradable_windows_for_symbol(cfg, symbol)
+
+
+def bar_stamp_tradable(
+    ts: Any,
+    *,
+    symbol: Any = "",
+    cfg: dict[str, Any] | None = None,
+    windows: Sequence[tuple[dtime, dtime]] | None = None,
+) -> bool:
+    """
+    这个结束时刻能不能当成一根已经走完的 K 线。
+
+    开盘那一刻还没走完一根（21:00），不算。午休 12:00 也不算。
+    没给品种、也没给时段时不过滤，方便测试用假 K 线。
+    """
+    resolved = _resolve_windows(symbol=symbol, cfg=cfg, windows=windows)
+    if resolved is None:
+        return True
+    stamp = _stamp_to_naive(ts)
+    if stamp is None:
+        return False
+    return bar_close_in_windows(stamp, resolved)
+
+
+def in_session_break(ts: Any, *, symbol: Any = "") -> bool:
+    """
+    是不是落在大家都知道的休市空档里。
+
+    商品：10:15～10:30 上午休息，11:30～13:30 午休。
+    中金所：只有 11:30～13:00 午休。
+    夜盘开盘 21:00 不是空档。配置里如果把日盘写成 09:00～15:00 一整段，
+    也不能把 21:00 当成休市丢掉。
+    """
+    stamp = _stamp_to_naive(ts)
+    if stamp is None:
+        return False
+    clock = stamp.time().replace(second=0, microsecond=0)
+    if has_commodity_tea_break(symbol):
+        if dtime(10, 15) < clock < dtime(10, 30):
+            return True
+        if dtime(11, 30) < clock < dtime(13, 30):
+            return True
+        return False
+    return dtime(11, 30) < clock < dtime(13, 0)
+
+
+def bar_stamp_fillable(
+    ts: Any,
+    *,
+    symbol: Any = "",
+    cfg: dict[str, Any] | None = None,
+    windows: Sequence[tuple[dtime, dtime]] | None = None,
+) -> bool:
+    """
+    这个时刻能不能当下一根开盘的成交时间。
+
+    午休、上午休息中间的整点不行。这段的开盘（10:30、13:30、21:00）可以。
+    生猪没有夜盘，21:00 不能成交。没给品种时不过滤。
+    """
+    if not symbol and not cfg and windows is None:
+        return True
+    if in_session_break(ts, symbol=symbol):
+        return False
+    stamp = _stamp_to_naive(ts)
+    if stamp is None:
+        return False
+    clock = stamp.time().replace(second=0, microsecond=0)
+    # 品种出厂时段的开盘（10:30、13:30、21:00）可以成交。
+    # 生猪没有夜盘，21:00 不会出现在这里。配置把日盘写成 09:00～15:00 时，
+    # 仍允许夜盘开盘成交，免得回测把燃油当晚 21:00 那根跳过。
+    for start, _end in tradable_windows_for_symbol(None, symbol):
+        if clock == start:
+            return True
+    resolved = _resolve_windows(symbol=symbol, cfg=cfg, windows=windows)
+    if resolved is None:
+        return True
+    for start, end in resolved:
+        if clock == start:
+            return True
+        if in_clock_window(start, end, stamp, grace_sec=0):
+            return True
+    return False
+
+
+def tradable_stamp_mask(
+    hours: Any,
+    minutes: Any,
+    windows: Sequence[tuple[dtime, dtime]],
+) -> Any:
+    """整列判断哪些右标签落在可交易时段里。hours/minutes 是 numpy 数组。"""
+    import numpy as np
+
+    total = np.asarray(hours, dtype=np.int64) * 60 + np.asarray(minutes, dtype=np.int64)
+    ok = np.zeros(len(total), dtype=bool)
+    for start, end in windows:
+        start_m = start.hour * 60 + start.minute
+        end_m = end.hour * 60 + end.minute
+        if start <= end:
+            ok |= (total > start_m) & (total <= end_m)
+        else:
+            ok |= (total > start_m) | (total <= end_m)
+    return ok
+
+
+def session_close_minutes(
+    windows: Sequence[tuple[dtime, dtime]],
+) -> tuple[int, ...]:
+    """各段结束时刻的分钟数，用来保留 11:30 这种不足整小时的收盘 K 线。"""
+    out: list[int] = []
+    for _start, end in windows:
+        out.append(end.hour * 60 + end.minute)
+    return tuple(out)
 
 
 def flatten_clocks_for_symbol(cfg: dict[str, Any] | None, symbol: Any) -> list[dtime]:

@@ -25,12 +25,19 @@ class PickerTabMixin:
         ctk.CTkLabel(box, text="开仓和止损限制", font=T.FONT_BODY, text_color=T.TEXT).pack(anchor="w", pady=(0, 4))
         ctk.CTkLabel(
             box,
-            text="手数、间隔、每天次数、每笔风险、收盘清仓开跑前跟实盘配置对齐。交叉测试仍按固定手数比组合（不看权益），保证各品种同一套开仓纪律。",
+            text="手数、间隔、每天次数、每笔风险、收盘清仓开跑前跟实盘配置对齐。开几手仍固定。账户权益可在本页改成准备投入的资金，只影响回撤%和通过/淘汰，不改实盘余额。点「按配置页重新填入」抄回当前余额。主力换月跟历史回测页。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=340,
             justify="left",
         ).pack(anchor="w", pady=(0, 6))
+        self._entry_row(
+            box,
+            "账户权益(元)",
+            self.pk_capital_var,
+            hint="可改成准备投入的资金；点「按配置页重新填入」抄回当前余额",
+            width=160,
+        )
         self._entry_row(
             box, "每笔风险%", self.pk_risk_pct_var, hint="跟配置页一致，开跑前对齐", width=160, readonly=True
         )
@@ -451,7 +458,7 @@ class PickerTabMixin:
 
 
     def _align_picker_trading_params_with_live(self) -> None:
-        """交叉测试：手数、风险、间隔、次数、收盘清仓跟实盘配置对齐，并刷新本页显示。"""
+        """交叉测试：手数、风险、间隔、次数、收盘清仓跟实盘配置对齐。账户权益不覆盖。"""
         if not hasattr(self, "pk_volume_var"):
             return
         self.pk_flatten_var.set(bool(self.flatten_at_close_var.get()))
@@ -462,21 +469,22 @@ class PickerTabMixin:
 
 
     def _fill_picker_from_config(self) -> None:
-        """把配置页当前的周期、行情、持仓手数、每笔风险和开仓次数抄到交叉测试页。不抄账户权益，也不写文件。"""
+        """把配置页当前的周期、行情、手数、风险、开仓次数和账户当前权益抄到交叉测试页。不写文件。"""
         self.pk_source_var.set(self.source_var.get())
         live_tf = self._period_code(self.tf_var, self.tf_custom_var)
         self._set_period_vars(live_tf, self.pk_tf_var, self.pk_tf_custom_var)
         self._set_period_vars(live_tf, self.pk_trail_var, self.pk_trail_custom_var)
+        self.pk_capital_var.set(self.capital_var.get())
         self._align_picker_trading_params_with_live()
         self._refresh_cross_lists(prefer_period=live_tf)
-        self._append_log(f"已按配置页填好交叉测试的周期、行情和开仓限制，行情 {self.pk_source_var.get()}")
+        self._append_log(f"已按配置页填好交叉测试的周期、行情、开仓限制和账户权益，行情 {self.pk_source_var.get()}")
 
 
     def _picker_settings(self) -> dict[str, Any]:
         """
         读交叉测试用的周期和开仓限制。
 
-        手数/风险/间隔/次数/收盘清仓强制跟实盘配置；日期仍用本页。数字填错就停下来。
+        手数/风险/间隔/次数/收盘清仓强制跟实盘配置；账户权益和日期用本页。数字填错就停下来。
         """
         self._align_picker_trading_params_with_live()
         preset = self.pk_range_var.get()
@@ -488,13 +496,13 @@ class PickerTabMixin:
         if end:
             self.pk_end_var.set(end)
         try:
-            # 与实盘配置页同一套数字，避免交叉测试页旧值各跑各的。
             volume = int(float(self.volume_var.get()))
             risk_pct = float(self.risk_pct_var.get())
             interval = int(float(self.min_interval_var.get()))
             max_orders = int(float(self.max_orders_var.get()))
+            capital = float(self.pk_capital_var.get())
         except ValueError as exc:
-            raise ValueError("配置页的每笔风险、持仓手数、开仓间隔和每天最多开仓要填数字") from exc
+            raise ValueError("交叉测试的账户权益，以及配置页的每笔风险、持仓手数、开仓间隔和每天最多开仓要填数字") from exc
         if volume < 1:
             raise ValueError("持仓手数至少是 1")
         if risk_pct < 0:
@@ -503,6 +511,8 @@ class PickerTabMixin:
             raise ValueError("开仓最小间隔不能是负数")
         if max_orders < 1:
             raise ValueError("每天最多开仓至少是 1")
+        if capital <= 0:
+            raise ValueError("账户权益要大于 0")
         periods = self._pk_checked_periods()
         tf = periods[0] if periods else self._period_code(self.tf_var, self.tf_custom_var)
         return {
@@ -516,6 +526,7 @@ class PickerTabMixin:
             "risk_per_trade_pct": risk_pct,
             "min_order_interval_sec": interval,
             "max_orders_per_day": max_orders,
+            "capital": capital,
             "data_source": self.pk_source_var.get(),
         }
 
@@ -753,6 +764,11 @@ class PickerTabMixin:
             messagebox.showerror("数字不对", str(exc))
             return
         cfg = self._clone_cfg()
+        bt = cfg.setdefault("backtest", {})
+        roll_var = getattr(self, "bt_rollover_var", None)
+        chain_var = getattr(self, "bt_rollover_chain_var", None)
+        bt["rollover_main"] = bool(roll_var.get()) if roll_var is not None else True
+        bt["chain_capital"] = bool(chain_var.get()) if chain_var is not None else False
         engine_names = [code for code, _label in engines]
         live_st = self.cfg.setdefault("strategy", {})
         live_st["cross_engines"] = list(engine_names)
@@ -766,7 +782,8 @@ class PickerTabMixin:
             f"每个组合 {settings['fixed_volume']} 手（跟实盘手数），"
             f"间隔 {settings['min_order_interval_sec']} 秒，每天最多 {settings['max_orders_per_day']} 次，"
             f"收盘清仓={'开' if settings.get('flatten_at_close') else '关'}，"
-            f"不看账户权益，行情 {self.pk_source_var.get()}"
+            f"主力换月={'开' if bt.get('rollover_main') else '关'}，"
+            f"评估本金 {settings.get('capital'):g} 元（本页账户权益），行情 {self.pk_source_var.get()}"
         )
         # 只用交叉测试页选中的这一家。配置页当时存的来源不参与这一轮。
         from src.data.quote_check import normalize_source

@@ -44,16 +44,20 @@ ENGINES_BY_STYLE: dict[str, tuple[tuple[str, str], ...]] = {
         ("trend_follow", "海龟突破"),
         ("multi_factor", "多因子 CTA 加权"),
         ("swing_trend", "长线趋势加减仓"),
+        ("dual_donchian", "双周期通道突破"),
+        ("dual_fractal", "双周期回调分型"),
     ),
     STYLE_BREAKOUT: (
         ("daily_body", "日内实体（开盘箱体收盘突破）"),
         ("bollinger", "布林突破"),
         ("trend_follow", "海龟突破"),
+        ("dual_donchian", "双周期通道突破"),
     ),
     STYLE_REVERSION: (),
     STYLE_SWING: (
         ("ema_swing", "均线波段"),
         ("swing_trend", "长线趋势加减仓"),
+        ("dual_fractal", "双周期回调分型"),
     ),
 }
 

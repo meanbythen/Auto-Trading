@@ -55,7 +55,8 @@ schedule:
 # ---------- 策略引擎（见文件顶部路线菜单） ----------
 strategy:
   # 切换策略：daily_body | trend_follow | supertrend |
-  # dual_ma | ema_swing | bollinger | sar_trend | multi_factor | swing_trend | swing_box |
+  # dual_ma | ema_swing | bollinger | sar_trend | multi_factor | swing_trend |
+  # dual_donchian | dual_fractal | swing_box |
   # rule_dsl（自己写的规则文件，见本文件底部 rule_dsl 小节）
   engine: "daily_body"
   # 信号周期：5 / 15 / 60 是分钟。日线写 D，周线写 W。自定义分钟直接写数字，如 120
@@ -77,6 +78,8 @@ strategy:
     - sar_trend
     - multi_factor
     - swing_trend
+    - dual_donchian
+    - dual_fractal
     - swing_box
   flatten_times:
     - "14:55"
@@ -377,6 +380,35 @@ strategy:
     filter_adx_flat: 20
     filter_atr_low_pct: 0.2
 
+  # 双周期通道突破（engine=dual_donchian）。
+  # 大周期通道+ADX 定方向；小周期唐奇安突破。进出跟 timeframe，止损跟 trail_timeframe。
+  dual_donchian:
+    trend_timeframe: "D"
+    entry_bars: 55
+    exit_bars: 20
+    htf_donchian: 55
+    adx_period: 14
+    adx_min: 22
+    atr_period: 14
+    atr_mult: 2.5
+    flatten_at_close: false
+
+  # 双周期回调分型（engine=dual_fractal）。
+  # trend_mode: ema=大周期指数均线；donchian=大周期通道。小周期强分型+DIF 背离。
+  dual_fractal:
+    trend_timeframe: "D"
+    trend_mode: "ema"
+    trend_ema: 20
+    htf_donchian: 55
+    adx_period: 14
+    adx_min: 22
+    macd_fast: 12
+    macd_slow: 26
+    macd_signal: 9
+    atr_period: 14
+    atr_mult: 2.8
+    flatten_at_close: false
+
   # 长线箱体突破（engine=swing_box）。收盘走出箱子才顺着做。
   # 信号周期、止损周期跟上面的 timeframe / trail_timeframe。没填时默认日线。
   # 默认不收盘清仓。手数仍用公共每笔风险%。
@@ -412,9 +444,9 @@ strategy:
     use_market_filter: false
 
 data:
-  source: "akshare"
-  # 行情来源。akshare 是新浪，eastmoney 是东方财富，tq 是天勤。界面下拉里选，一次只用一家。
-  # 三家的K线分开存放：新浪用原合约名，东方财富加 @eastmoney，天勤加 @tq（如 fu2701@tq）。
+  source: "tq"
+  # 行情来源。tq 是天勤（主源），akshare 是新浪（备源）。界面下拉里选，一次只用一家。
+  # 两家的K线分开存放：新浪用原合约名，天勤加 @tq（如 fu2701@tq）。同花顺图只给回测，加 @ths。
   cache_dir: "data/klines"
   # 每次下载都会追加进 data/klines/market.sqlite。新浪不再提供的旧K线留在库里，回测按日期从库里取。
   min_bars: 80
@@ -484,6 +516,9 @@ backtest:
   optimize_mode: "一次切断"
   optimize_holdout_pct: 30
   optimize_walk_steps: 3
+  # 最后半年只验收、不搜参数。看过一次就不能再用同一段当最终验收。
+  freeze_final_oos: true
+  freeze_final_days: 180
 
 # 策略评估门槛（回测/优化共用）。缺项按程序默认值处理。
 evaluation:
@@ -508,6 +543,7 @@ evaluation:
   perturbation_step_pct: 0.1
   perturbation_pf_ratio: 0.8
   perturbation_pf_min: 1.1
+  mc_runs: 500
 
 # ---------- 执行通道（见文件顶部路线菜单） ----------
 trade:

@@ -769,7 +769,7 @@ def _stale_market_bars():
         {"open": close, "high": close + 1, "low": close - 1, "close": close, "volume": 10}
     )
     bars.attrs["market_health"] = {
-        "source": "eastmoney",
+        "source": "tq",
         "status": "stale",
         "from_cache": True,
         "stale": True,
@@ -810,7 +810,7 @@ def test_stale_open_is_blocked_with_health_alert_and_throttled_event(tmp_path) -
     assert sum(row["event"] == "market_health_warning" for row in events) == 1
     assert alert.call_count == 1
     blocked = next(row for row in events if row["event"] == "stale_block_open")
-    assert blocked["market_health"]["source"] == "eastmoney"
+    assert blocked["market_health"]["source"] == "tq"
     assert blocked["signal_bar_age_minutes"] >= 90
     health_rows = [
         json.loads(line)
@@ -823,7 +823,7 @@ def test_stale_open_is_blocked_with_health_alert_and_throttled_event(tmp_path) -
     assert "cache_stale" in health_rows[-1]["issues"]
     snap = bot.status_snapshot()["market_health"]["fu2701|5"]
     assert snap["signal_bar_time"] == str(bars.index[-1])
-    assert decision.meta["market_health"]["source"] == "eastmoney"
+    assert decision.meta["market_health"]["source"] == "tq"
 
 
 def test_stale_market_does_not_block_close_protection(tmp_path) -> None:
@@ -857,7 +857,7 @@ def test_order_intent_contains_market_health_evidence(tmp_path) -> None:
     """委托落盘能追到信号 K 线、行情来源、年龄和下载耗时。"""
     bot = _intent_bot(tmp_path / "order_intent.json")
     health = {
-        "source": "eastmoney",
+        "source": "tq",
         "signal_bar_time": "2026-11-05 09:05:00",
         "signal_bar_age_minutes": 2.5,
         "download_ms": 125.0,

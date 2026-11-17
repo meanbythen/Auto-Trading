@@ -101,6 +101,14 @@ def test_settlement_click_only_hits_the_named_button() -> None:
 
     assert window_title_is_settlement("确认结算单") is True
     assert window_title_is_settlement("同花顺期货通") is False
+    from src.login.ths_login import settlement_search_host
+
+    # 本程序标题里有「期货」，不能走进 Tk 窗口去点结算单。
+    assert settlement_search_host("Auto-Trading 45.5.0  ·  期货自动交易台", "TkTopLevel") is False
+    assert settlement_search_host("期货自动交易台", "TkTopLevel") is False
+    assert settlement_search_host("同花顺期货通", "") is True
+    assert settlement_search_host("确认结算单", "") is True
+    assert settlement_search_host("华泰期货_CTP主席-20318052", "") is True
     point = settlement_click_point(200, 120, 980, 760)
     assert point is not None
     assert 200 < point[0] < 980

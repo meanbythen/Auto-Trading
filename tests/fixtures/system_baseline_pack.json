@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "note": "P0.3 冻结对照。不要把 GUI 假定成交写成柜台真实成交。",
+  "cases": [
+    {
+      "case_id": "empty_aligned",
+      "symbol": "fu2701",
+      "engine": "ema_swing",
+      "trade_date": "2026-11-10",
+      "replay_opens": 0,
+      "event_orders": 0,
+      "book_fills": 0,
+      "event_codes": [],
+      "fill_kinds": [],
+      "categories": ["matched"],
+      "alignment": "none"
+    },
+    {
+      "case_id": "gui_assumed",
+      "symbol": "fu2701",
+      "engine": "ema_swing",
+      "trade_date": "2026-11-11",
+      "replay_opens": 1,
+      "event_orders": 1,
+      "book_fills": 1,
+      "event_codes": ["assumed_fill"],
+      "fill_kinds": ["assumed_fill"],
+      "categories": ["assumed_fill"],
+      "alignment": "matched"
+    },
+    {
+      "case_id": "catch_up_and_risk",
+      "symbol": "c2701",
+      "engine": "ema_swing",
+      "trade_date": "2026-11-12",
+      "replay_opens": 1,
+      "event_orders": 0,
+      "book_fills": 0,
+      "event_codes": ["catch_up_open", "risk_block"],
+      "fill_kinds": [],
+      "categories": ["catch_up", "risk_block"],
+      "alignment": "signal_only"
+    }
+  ]
+}

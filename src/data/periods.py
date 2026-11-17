@@ -14,12 +14,67 @@ K 线周期。
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import pandas as pd
+
+
+# 程序里统一的 K 线列。各家下载之后都收成这一张表，避免换源时列名、时区对不上。
+OHLC_COLUMNS = ("open", "high", "low", "close", "volume")
+
+
+def canonicalize_ohlc(
+    frame: pd.DataFrame | None,
+    *,
+    period: str | None = None,
+) -> pd.DataFrame | None:
+    """
+    把任意一家刚下来的表收成同一口径。
+
+    - 时间索引：不带时区的北京时间，列名 datetime，精确到秒。
+    - 分钟、小时：右标签（这段结束时刻），例如 09:00–09:05 记成 09:05。
+    - 日线：交易日 00:00（不再加一天）。
+    - 列：open / high / low / close，有成交量就留 volume，有持仓量就留 oi。
+
+    这里不改开高低收的数字，只整理格式。脏时间戳仍交给 aligned_bars 丢掉。
+    """
+    if frame is None or len(frame) == 0:
+        return frame
+    out = unique_ohlc_columns(frame)
+    if out is None or len(out) == 0:
+        return out
+    if not isinstance(out.index, pd.DatetimeIndex):
+        out = out.copy()
+        out.index = pd.to_datetime(out.index)
+    index = pd.DatetimeIndex(out.index)
+    if index.tz is not None:
+        index = index.tz_convert("Asia/Shanghai").tz_localize(None)
+    index = index.floor("s")
+    code = canonical_period(period) if period else ""
+    if code == "D":
+        index = index.normalize()
+    out = out.copy()
+    out.index = index
+    out.index.name = "datetime"
+    rename = {}
+    cols = {str(name).lower(): name for name in out.columns}
+    for need in (*OHLC_COLUMNS, "oi"):
+        if need in cols and cols[need] != need:
+            rename[cols[need]] = need
+    if rename:
+        out = out.rename(columns=rename)
+    keep = [name for name in (*OHLC_COLUMNS, "oi") if name in out.columns]
+    if "close" not in keep:
+        return out.sort_index()
+    out = out[keep]
+    for name in keep:
+        out[name] = pd.to_numeric(out[name], errors="coerce")
+    out = out.dropna(subset=["close"])
+    out = out[~out.index.duplicated(keep="last")].sort_index()
+    return out
 
 
 def unique_ohlc_columns(frame: pd.DataFrame | None) -> pd.DataFrame | None:
@@ -91,13 +146,15 @@ PERIOD_LABELS = {
 PERIOD_MENU = list(PERIOD_LABELS.values()) + ["自定义"]
 
 # 国内商品常见开盘（用于判断「这一段刚开盘，分钟可能不满」）
-_SESSION_OPEN_MINUTES = (9 * 60, 13 * 60 + 30, 21 * 60)
+# 10:30 是上午休息后的开盘，不是上一根的收盘。
+_SESSION_OPEN_MINUTES = (9 * 60, 9 * 60 + 30, 10 * 60 + 30, 13 * 60, 13 * 60 + 30, 21 * 60)
 # 国内商品常见收盘（用于判断「这一段要收盘，最后一根可能不足整周期」）
 _SESSION_CLOSE_MINUTES = (
     10 * 60 + 15,
     11 * 60 + 30,
     15 * 60,
     23 * 60,
+    1 * 60,
     2 * 60 + 30,
 )
 
@@ -273,6 +330,211 @@ def resample_ohlc(df: pd.DataFrame | None, period: str) -> pd.DataFrame | None:
     return out
 
 
+def trading_segments_for_symbol(symbol: Any = "") -> tuple[tuple[dtime, dtime], ...]:
+    """
+    1 分钟哪些时刻算在盘里。
+
+    商品上午拆成 09:00～10:15、10:30～11:30，午休、夜盘结束到次日开盘都断开。
+    夜盘组别跟品种走：无夜盘 / 23:00 / 01:00 / 02:30；中金所没有上午休息。
+    """
+    from src.utils.session_clock import (
+        default_sessions_for_product,
+        parse_hhmm,
+        split_tea_break,
+    )
+
+    sessions = split_tea_break(default_sessions_for_product(symbol), symbol=symbol)
+    return tuple((parse_hhmm(a), parse_hhmm(b)) for a, b in sessions if a and b)
+
+
+def _clock_in_segments(stamp: datetime, segments: tuple[tuple[dtime, dtime], ...]) -> bool:
+    """右标签 1 分钟：开盘那一分钟不算，收盘那一分钟算。"""
+    hm = stamp.hour * 60 + stamp.minute
+    for start, end in segments:
+        start_m = start.hour * 60 + start.minute
+        end_m = end.hour * 60 + end.minute
+        if start <= end:
+            if start_m < hm <= end_m:
+                return True
+        elif hm > start_m or hm <= end_m:
+            return True
+    return False
+
+
+def _session_kind(stamp: datetime) -> str:
+    """日盘 / 夜盘。夜盘可跨零点。"""
+    hour = stamp.hour
+    if hour >= 20 or hour < 8:
+        return "night"
+    return "day"
+
+
+def _emit_bucket(rows: list[pd.Series], columns: list[str]) -> dict[str, Any]:
+    """一桶 1 分钟收成一根：开=第一根开，收=最后一根收，高最高，低最低。"""
+    frame = pd.DataFrame(rows)
+    out: dict[str, Any] = {
+        "open": float(frame["open"].iloc[0]),
+        "high": float(frame["high"].max()),
+        "low": float(frame["low"].min()),
+        "close": float(frame["close"].iloc[-1]),
+        "minute_count": int(len(frame)),
+    }
+    if "volume" in columns:
+        out["volume"] = float(pd.to_numeric(frame["volume"], errors="coerce").fillna(0).sum())
+    if "oi" in columns:
+        oi = pd.to_numeric(frame["oi"], errors="coerce")
+        out["oi"] = float(oi.iloc[-1]) if len(oi) and pd.notna(oi.iloc[-1]) else None
+    return out
+
+
+def _segment_for_stamp(
+    stamp: datetime,
+    segments: tuple[tuple[dtime, dtime], ...],
+) -> tuple[dtime, dtime] | None:
+    """这根 1 分钟落在哪一段。开盘那一分钟（09:00/10:30/13:30/21:00）并进这一段第一根。"""
+    hm = stamp.hour * 60 + stamp.minute
+    for start, end in segments:
+        start_m = start.hour * 60 + start.minute
+        if hm == start_m:
+            return start, end
+        if _clock_in_segments(stamp, ((start, end),)):
+            return start, end
+    return None
+
+
+def _segment_end_at(stamp: datetime, start: dtime, end: dtime) -> datetime:
+    """这段真正收盘的墙上时间。夜盘跨零点时，凌晨看的是当天结束钟点。"""
+    if start <= end:
+        return datetime.combine(stamp.date(), end)
+    if stamp.time() >= start:
+        return datetime.combine(stamp.date() + timedelta(days=1), end)
+    return datetime.combine(stamp.date(), end)
+
+
+def _next_clock_close(stamp: datetime, step: int) -> datetime:
+    """下一根墙上整点格子：5/15/30 看分钟，60 看整点。"""
+    t = stamp.replace(second=0, microsecond=0)
+    hm = t.hour * 60 + t.minute
+    rem = hm % step
+    if rem == 0:
+        return t
+    return t + timedelta(minutes=step - rem)
+
+
+def _bar_close_for(
+    stamp: datetime,
+    step: int,
+    start: dtime,
+    end: dtime,
+) -> datetime:
+    """
+    这根 1 分钟该收到哪一根 K 上。
+
+    先看墙上整点，再和这段收盘取较早的那个。
+    这样 10:00～10:15 不会并进 11:00，11:00～11:30 也不会并进下午。
+    """
+    clock = _next_clock_close(stamp, step)
+    return min(clock, _segment_end_at(stamp, start, end))
+
+
+def minute_in_session(stamp: datetime, symbol: Any = "") -> bool:
+    """这根 1 分钟（含开盘那一分钟）是不是在交易时段里。"""
+    naive = stamp.replace(second=0, microsecond=0)
+    if getattr(naive, "tzinfo", None) is not None:
+        naive = naive.replace(tzinfo=None)
+    return _segment_for_stamp(naive, trading_segments_for_symbol(symbol)) is not None
+
+
+def session_close_times(
+    day: datetime | date,
+    step: int,
+    *,
+    symbol: Any = "",
+    include_night: bool = True,
+) -> list[datetime]:
+    """
+    这一天按交易时段应该出现的 K 线结束时刻。
+
+    和拼 K 同一套：段内墙上时钟，段尾截断。休市不生成。
+    夜盘跨零点时，02:30 落在次日凌晨。
+    """
+    if isinstance(day, datetime):
+        day = day.date()
+    step = max(int(step), 1)
+    segments = list(trading_segments_for_symbol(symbol))
+    if not include_night:
+        segments = [(start, end) for start, end in segments if start <= end and start.hour < 16]
+    closes: list[datetime] = []
+    for start, end in segments:
+        if start <= end:
+            begin = datetime.combine(day, start)
+            finish = datetime.combine(day, end)
+        else:
+            begin = datetime.combine(day, start)
+            finish = datetime.combine(day + timedelta(days=1), end)
+        cursor = begin
+        while cursor < finish:
+            nxt = _next_clock_close(cursor + timedelta(minutes=1), step)
+            if nxt > finish:
+                nxt = finish
+            if nxt <= cursor:
+                break
+            closes.append(nxt)
+            cursor = nxt
+    return closes
+
+
+def bars_from_session_clock(
+    minutes: pd.DataFrame,
+    step: int,
+    *,
+    symbol: str = "",
+) -> pd.DataFrame:
+    """
+    按「每一段交易时段内部的自然时钟」收线，休市断开。
+
+    商品日盘 60 分钟：10:00、10:15（短）、11:00（短）、11:30（短）、14:00（短）、15:00。
+    没有 12:00、13:00，也不会把上午最后几分钟并进下午那根。
+    时间戳是结束时刻（右标签）。09:00、10:30、13:30、21:00 是开盘，不是收线。
+    """
+    step = max(int(step), 1)
+    segments = trading_segments_for_symbol(symbol)
+    data = minutes.sort_index()
+    columns = [name for name in ("open", "high", "low", "close", "volume", "oi") if name in data.columns]
+    buckets: dict[datetime, list[pd.Series]] = {}
+    order: list[datetime] = []
+
+    for ts, row in data.iterrows():
+        stamp = pd.Timestamp(ts).to_pydatetime()
+        if getattr(stamp, "tzinfo", None) is not None:
+            stamp = stamp.replace(tzinfo=None)
+        stamp = stamp.replace(second=0, microsecond=0)
+        seg = _segment_for_stamp(stamp, segments)
+        if seg is None:
+            continue
+        close_at = _bar_close_for(stamp, step, seg[0], seg[1])
+        if close_at not in buckets:
+            buckets[close_at] = []
+            order.append(close_at)
+        buckets[close_at].append(row)
+
+    if not order:
+        return pd.DataFrame(columns=list(dict.fromkeys(columns + ["minute_count"])))
+    records = [_emit_bucket(buckets[stamp], columns) for stamp in order]
+    out = pd.DataFrame(records, index=pd.DatetimeIndex(order, name="datetime"))
+    return out.sort_index()
+
+
+def bars_from_trading_minutes(
+    minutes: pd.DataFrame,
+    step: int,
+    *,
+    symbol: str = "",
+) -> pd.DataFrame:
+    """旧名字：以前按交易分钟凑满 60 根，会跨午休。现在改走时段内时钟。"""
+    return bars_from_session_clock(minutes, step, symbol=symbol)
+
+
 def _min_minutes_for_bar(step: int) -> int:
     """
     一根 K 至少要有多少根 1 分钟才算可用。
@@ -333,13 +595,19 @@ def is_session_open_stamp(ts: Any, opens: tuple[int, ...]) -> bool:
     return (stamp.hour * 60 + stamp.minute) in opens
 
 
-def bars_from_minutes(minutes: pd.DataFrame | None, period: str) -> pd.DataFrame | None:
+def bars_from_minutes(
+    minutes: pd.DataFrame | None,
+    period: str,
+    *,
+    symbol: str = "",
+) -> pd.DataFrame | None:
     """
     用 1 分钟拼出更长的 K 线。
 
-    时间戳用这一段的结束时刻（右标签），与同花顺主图一致：
+    时间戳用这一段的结束时刻（右标签）：
     15 分钟的 21:15 = 约 21:00～21:15；5 分钟的 11:15 = 11:10～11:15。
-    新浪直接下的同档时间戳常和这套不一致，开仓必须以 1 分钟拼出来的为准。
+    5/15/30/60 都按交易时段内的自然时钟收，大休市断开，不把 10:15～10:30、
+    11:30～13:30 并进同一根。60 分钟日盘是 10:00、10:15、11:00、11:30、14:00、15:00。
     最后一段分钟还没齐也先留着，扫描时当未收盘。
     开盘第一根允许略缺几分钟（夜盘常见），避免整根被丢掉。
     """
@@ -348,6 +616,8 @@ def bars_from_minutes(minutes: pd.DataFrame | None, period: str) -> pd.DataFrame
     step = int(canonical_period(period))
     if step <= 1:
         return minutes
+    if step >= 5:
+        return bars_from_session_clock(minutes, step, symbol=symbol)
     data = minutes.sort_index()
     # 右闭右标签：与 resample_ohlc、同花顺结束时刻一致
     grouped = data.resample(f"{step}min", label="right", closed="right")
@@ -377,57 +647,29 @@ def bars_from_minutes(minutes: pd.DataFrame | None, period: str) -> pd.DataFrame
     return kept
 
 
-def fix_gap_spanning_bars(
-    bars: pd.DataFrame | None, *, gap_ratio: float = 0.002
-) -> pd.DataFrame | None:
+def _drop_clock_hour_native_60(native: pd.DataFrame, persist: pd.DataFrame) -> pd.DataFrame:
     """
-    修掉跨休市第一根K线里被拼进来的上一段收盘价。
+    同一天已经用 1 分钟拼出时段内时钟 K 线时，删掉对不上的天勤整点。
 
-    新浪的分钟接口在休市后的第一根（09:05、13:35、21:05）有时会把上一段最后一笔
-    塞进 high/low：跳空低开时 high 正好压在上一根收盘，跳空高开时 low 正好压在
-    上一根收盘。这个价位本段并没有成交（比如今天 fu2701 的 09:05 最高价是昨晚收盘
-    4486，而今天开盘只有 4179），会让突破、ATR、止损全部失真。
-
-    只在这根开盘相对上一根明显跳空（默认 0.2%）时处理，普通K线不动。
-    取回本段自己的价格区间：低开时 high 收到 open/close 较高者，高开时 low 抬到较低者。
+    例如拼出了 10:15、11:30，就要拿掉午休里的 12:00、13:00，
+    也拿掉旧的 11:15、14:15。这一天 1 分钟不够、拼不出来时，先留着原生。
     """
-    if bars is None or len(bars) < 2:
-        return bars
-    out = unique_ohlc_columns(bars)
-    if out is None:
-        return bars
-    need = {"open", "high", "low", "close"}
-    if not need.issubset(set(out.columns)):
-        return out
-    prev_close = ohlc_series(out, "close").shift(1)
-    open_px = ohlc_series(out, "open")
-    high_px = ohlc_series(out, "high")
-    low_px = ohlc_series(out, "low")
-    close_px = ohlc_series(out, "close")
-    body_high = open_px.where(open_px > close_px, close_px)
-    body_low = open_px.where(open_px < close_px, close_px)
-
-    gap = (open_px - prev_close).abs()
-    moved = gap >= (prev_close.abs() * gap_ratio)
-    tol = (prev_close.abs() * 1e-4).clip(lower=1e-6)
-    down = moved & (open_px < prev_close) & (high_px <= prev_close + tol) & (high_px > body_high)
-    up = moved & (open_px > prev_close) & (low_px >= prev_close - tol) & (low_px < body_low)
-
-    def _flag(mask: Any) -> pd.Series:
-        arr = np.asarray(mask, dtype=bool)
-        if arr.ndim > 1:
-            arr = arr.reshape(len(out), -1)[:, -1]
-        arr = arr.reshape(-1)[: len(out)]
-        return pd.Series(arr, index=out.index)
-
-    down_flag = _flag(down)
-    up_flag = _flag(up)
-    # 必须先收成一列 True/False。多列时 .any() 会变成一排数字，不能写进 if。
-    if bool(down_flag.to_numpy().any()):
-        out.loc[down_flag, "high"] = body_high[down_flag]
-    if bool(up_flag.to_numpy().any()):
-        out.loc[up_flag, "low"] = body_low[up_flag]
-    return out
+    if native is None or persist is None or len(native) == 0 or len(persist) == 0:
+        return native
+    persist_days = pd.DatetimeIndex(persist.index).normalize()
+    native_days = pd.DatetimeIndex(native.index).normalize()
+    drop = np.zeros(len(native), dtype=bool)
+    native_hm = (native.index.hour * 60 + native.index.minute).to_numpy(dtype=np.int64)
+    for day in persist_days.unique():
+        built = persist.loc[persist_days == day]
+        times = {int(h) * 60 + int(m) for h, m in zip(built.index.hour, built.index.minute)}
+        if not times:
+            continue
+        same = np.asarray(native_days == day)
+        drop |= same & ~np.isin(native_hm, np.fromiter(times, dtype=np.int64, count=len(times)))
+    if not drop.any():
+        return native
+    return native.loc[~drop]
 
 
 def overlay_minute_bars(
@@ -444,18 +686,9 @@ def overlay_minute_bars(
     if built is None or len(built) == 0 or "minute_count" not in getattr(built, "columns", []):
         return native, pd.DatetimeIndex([])
     step = int(step)
-    min_ok = _min_minutes_for_bar(step)
-    # 可落库：分钟够，或开盘/收盘边且达到放宽门槛
     counts = built["minute_count"].to_numpy(dtype=np.int64, copy=False)
-    persist_mask = counts >= step
-    if min_ok < step:
-        persist_mask = persist_mask | (
-            (counts >= min_ok) & _session_open_edge_mask(built.index, step)
-        )
-    # 收盘边的半桶也要落库，否则本地库存会比行情商少这一根
-    persist_mask = persist_mask | (
-        (counts >= 1) & _session_close_edge_mask(built.index, step)
-    )
+    # 时段内时钟会收出 10:15、11:00、11:30、14:00 这种短 K，只要有分钟就落库。
+    persist_mask = counts >= 1
     persist = built.loc[persist_mask].drop(columns=["minute_count"], errors="ignore")
     visible = built.drop(columns=["minute_count"], errors="ignore")
     if persist is None or len(persist) == 0:
@@ -475,6 +708,9 @@ def overlay_minute_bars(
         return visible, persist.index
 
     out = native.copy()
+    if step >= 60:
+        # 有拼好的时段内 60 分钟时，当天对不上的天勤整点（含午休 12:00）要拿掉。
+        out = _drop_clock_hour_native_60(out, persist)
     # 按时间戳逐根替换：只丢掉拼图里确实有的原生K线。
     # 原来按 [min,max] 整段删，区间内某天缺 1 分钟数据时该天原生 K 线会被误删且不回填。
     drop_mask = out.index.isin(persist.index)

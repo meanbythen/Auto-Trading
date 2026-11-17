@@ -14,7 +14,7 @@ from typing import Any
 
 from src.data.bar_store import BarStore, RawBarStore
 from src.data.periods import cache_tag, canonical_period, csv_skip_marker, period_label
-from src.data.quote_check import normalize_source, product_code, source_label, storage_symbol
+from src.data.quote_check import normalize_source, product_code, storage_symbol, stored_source_label
 
 
 LATEST_NAME = "K线库存.xlsx"
@@ -24,7 +24,7 @@ def split_stored_symbol(stored: str) -> tuple[str, str]:
     """
     库存名拆成合约和来源。
 
-    fu2701 → 新浪；fu2701@eastmoney → 东方财富；fu2701@tq → 天勤；fu2701@ths → 同花顺图。
+    fu2701 → 新浪；fu2701@tq → 天勤；fu2701@ths → 同花顺图。残留的 fu2701@eastmoney 标成已停用。
     """
     text = str(stored or "").strip()
     if text.endswith("@eastmoney"):
@@ -73,7 +73,7 @@ def _row(
     span = _span_days(ts_from, ts_to)
     return {
         "哪一份": layer,
-        "数据源": source_label(src),
+        "数据源": stored_source_label(src),
         "品种": product_code(contract) or contract,
         "合约": contract,
         "周期": period_label(period),
@@ -240,7 +240,7 @@ def _ingest_row(item: dict[str, Any]) -> dict[str, Any]:
     expected = int(item.get("expected_n") or 0)
     return {
         "读取时间": item.get("created_at") or "",
-        "数据源": source_label(str(item.get("source") or from_name)),
+        "数据源": stored_source_label(str(item.get("source") or from_name)),
         "合约": contract,
         "周期": period_label(str(item.get("period") or "")),
         "请求时段": _span(item.get("requested_from"), item.get("requested_to")),
@@ -264,7 +264,7 @@ def write_inventory_excel(path: Path, book: dict[str, Any]) -> None:
         help_ws,
         [
             ("这是什么", "电脑里已经存下的 K 线总账。只读本地库，不拉网、不下单。"),
-            ("清洗后", "开仓和回测看这一份。东方财富带 @eastmoney，天勤带 @tq，同花顺图带 @ths。"),
+            ("清洗后", "开仓和回测看这一份。天勤带 @tq，同花顺图带 @ths，新浪不带后缀。"),
             ("接口原样", "刚从网上或图上读下来、还没清洗的那一份。"),
             ("读取记录", "每次从同花顺图读一批就记一行：请求时段、实读范围、根数、新增和缺口。"),
             ("怎么看", "「总览」看一共有多少；「明细」可按数据源、合约、周期筛选。"),

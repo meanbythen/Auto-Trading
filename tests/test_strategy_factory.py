@@ -62,6 +62,8 @@ def test_list_engines_contains_core() -> None:
     assert "float_hold" in names
     assert "daily_body_expand" not in names
     assert "swing_box" in names
+    assert "dual_donchian" in names
+    assert "dual_fractal" in names
     assert "liquidity_exhaustion" not in names
     assert "morning_box_a" not in names
     assert "trend_follow" in names

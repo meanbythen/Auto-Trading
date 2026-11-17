@@ -32,6 +32,15 @@ def test_old_2300_config_is_not_overnight() -> None:
     assert in_trading_session(sessions, datetime(2026, 11, 10, 22, 10)) is True
 
 
+def test_lh_default_sessions_have_no_night() -> None:
+    """生猪没有夜盘，默认时段不应出现 21:00。"""
+    from src.utils.session_clock import default_sessions_for_product, sessions_for_symbol
+
+    sessions = default_sessions_for_product("lh")
+    assert sessions == [["09:00", "11:30"], ["13:30", "15:00"]]
+    assert sessions_for_symbol({}, "lh2701") == sessions
+
+
 def test_ag_uses_late_night_even_without_table_row() -> None:
     """品种表没填时，白银默认收到 02:30，燃油默认到 23:00。"""
     from src.utils.session_clock import in_trading_sessions, sessions_for_symbol
@@ -108,6 +117,26 @@ def test_near_session_close_uses_real_close_not_lunch() -> None:
     assert near_session_close(datetime(2026, 11, 13, 11, 25), sessions, minutes=10) is False
     assert near_session_close(datetime(2026, 11, 13, 22, 51), sessions, minutes=10) is True
     assert near_session_close(datetime(2026, 11, 13, 22, 40), sessions, minutes=10) is False
+
+
+def test_bar_stamp_skips_lunch_and_tea_break() -> None:
+    """生猪午休 12:00 不能成交；11:30 收盘那根可以；10:20 上午休息不能。"""
+    from src.utils.session_clock import bar_stamp_tradable
+
+    assert bar_stamp_tradable(datetime(2026, 1, 5, 11, 0), symbol="lh2701") is True
+    assert bar_stamp_tradable(datetime(2026, 1, 5, 11, 30), symbol="lh2701") is True
+    assert bar_stamp_tradable(datetime(2026, 1, 5, 12, 0), symbol="lh2701") is False
+    assert bar_stamp_tradable(datetime(2026, 1, 5, 13, 0), symbol="lh2701") is False
+    assert bar_stamp_tradable(datetime(2026, 1, 5, 14, 0), symbol="lh2701") is True
+    assert bar_stamp_tradable(datetime(2026, 1, 5, 10, 15), symbol="lh2701") is True
+    assert bar_stamp_tradable(datetime(2026, 1, 5, 10, 20), symbol="lh2701") is False
+    assert bar_stamp_tradable(datetime(2026, 1, 5, 10, 20), symbol="ic0") is True
+    from src.utils.session_clock import bar_stamp_fillable
+
+    assert bar_stamp_fillable(datetime(2026, 1, 5, 12, 0), symbol="lh2701") is False
+    assert bar_stamp_fillable(datetime(2026, 1, 5, 13, 30), symbol="lh2701") is True
+    assert bar_stamp_fillable(datetime(2026, 1, 5, 21, 0), symbol="lh2701") is False
+    assert bar_stamp_fillable(datetime(2026, 1, 5, 21, 0), symbol="fu2701") is True
 
 
 def test_near_session_close_overnight_uses_next_morning() -> None:

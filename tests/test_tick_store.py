@@ -59,6 +59,31 @@ def test_split_instrument() -> None:
         split_instrument("fu2701")
 
 
+def test_nonzero_nanoseconds_do_not_warn() -> None:
+    """天勤时间带纳秒时，转换不能每条刷 UserWarning。"""
+    import warnings
+
+    ns = int(pd.Timestamp("2026-11-16 01:01:00.123456789", tz="UTC").value)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error", UserWarning)
+        moment = vnpy_store._shanghai(ns)
+    assert moment.microsecond == 123456
+    assert moment.replace(tzinfo=None) == datetime(2026, 11, 16, 9, 1, 0, 123456)
+
+
+def test_tqsdk_nanosecond_utc_becomes_beijing() -> None:
+    """天勤 tick 时间是 UTC 纳秒，入库应按北京时间，不能整段丢掉。"""
+    from vnpy.trader.constant import Exchange
+
+    ns = int(pd.Timestamp("2026-11-16 01:01:00", tz="UTC").value)
+    tick = vnpy_store.to_tick_data(
+        {"datetime": ns, "last_price": 3100.0, "volume": 1, "open_interest": 1},
+        "fu2701",
+        Exchange.SHFE,
+    )
+    assert tick.datetime.replace(tzinfo=None) == datetime(2026, 11, 16, 9, 1, 0)
+
+
 def test_frame_to_ticks_keeps_beijing_time() -> None:
     ticks = ticks_from_frame(_frame(), instrument="SHFE.fu2701")
     assert len(ticks) == 2

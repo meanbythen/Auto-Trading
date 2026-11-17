@@ -96,6 +96,72 @@ def test_prepare_screen_cfg_fixes_lots_and_clears_margin_without_touching_origin
     assert cfg["risk"]["contracts"]["bu"]["margin"] == 7794
 
 
+def test_aligned_backtest_runner_follows_rollover_switch(monkeypatch) -> None:
+    """历史回测勾了主力换月，交叉测试默认也要分段，不能只测当前合约。"""
+    from src.screen.picker import aligned_backtest_runner
+
+    seen: dict[str, str] = {}
+
+    def fake_roll(cfg, **kwargs):
+        seen["path"] = "roll"
+        return "rolled"
+
+    def fake_plain(cfg, **kwargs):
+        seen["path"] = "plain"
+        return "plain"
+
+    monkeypatch.setattr("src.backtest.rollover.run_backtest_rollover", fake_roll)
+    monkeypatch.setattr("src.backtest.engine.run_backtest", fake_plain)
+    runner = aligned_backtest_runner()
+    assert runner({"backtest": {"rollover_main": True}}, symbol="fu2701") == "rolled"
+    assert seen["path"] == "roll"
+    assert runner({"backtest": {"rollover_main": False}}, symbol="fu2701") == "plain"
+    assert seen["path"] == "plain"
+
+
+def test_prepare_screen_cfg_keeps_account_capital_for_evaluation() -> None:
+    """交叉测试固定手数，但评估本金必须仍是账户权益，不能换成十亿把回撤冲没。"""
+    cfg = {
+        "strategy": {"engine": "daily_body", "symbols": ["bu2612"]},
+        "trade": {"volume": 2},
+        "risk": {"capital": 93100, "margin_per_lot": 5000},
+    }
+    out, volume = prepare_screen_cfg(
+        cfg,
+        {
+            "fixed_volume": 1,
+            "fair_compare": True,
+            "ignore_equity": True,
+            "timeframe": "5",
+        },
+    )
+    assert volume == 1
+    assert out["risk"]["capital"] == 93100
+    assert out["risk"]["margin_per_lot"] == 0
+
+
+def test_prepare_screen_cfg_uses_page_capital_when_given() -> None:
+    """交叉测试页填了测试本金时，回撤评估用这个数，不用配置页余额。"""
+    cfg = {
+        "strategy": {"engine": "daily_body", "symbols": ["bu2612"]},
+        "trade": {"volume": 2},
+        "risk": {"capital": 32790, "margin_per_lot": 5000},
+    }
+    out, volume = prepare_screen_cfg(
+        cfg,
+        settings={
+            "fixed_volume": 1,
+            "fair_compare": True,
+            "ignore_equity": True,
+            "capital": 100000,
+            "timeframe": "5",
+        },
+    )
+    assert volume == 1
+    assert out["risk"]["capital"] == 100000
+    assert cfg["risk"]["capital"] == 32790
+
+
 def test_screen_keeps_only_symbols_that_beat_baseline_on_two_metrics() -> None:
     class Perf:
         def __init__(self, trades, win_rate, profit_factor, max_drawdown, net_pnl=0):
@@ -192,28 +258,28 @@ def test_baseline_from_report_reads_saved_backtest() -> None:
 
 
 def test_baseline_remembers_the_quote_source() -> None:
-    """回测结果里写了东方财富时，基准也带着这个来源，方便品种优选下拉框跟着变。"""
+    """回测结果里写了天勤时，基准也带着这个来源，方便品种优选下拉框跟着变。"""
     base = baseline_from_report(
         {
             "symbol": "bu0",
             "performance": {"trades": 4, "win_rate": 0.5, "profit_factor": 1.1, "max_drawdown": 100},
-            "params_snapshot": {"fixed_volume": 1, "data_source": "eastmoney"},
+            "params_snapshot": {"fixed_volume": 1, "data_source": "tq"},
         }
     )
-    assert base["data_source"] == "eastmoney"
+    assert base["data_source"] == "tq"
 
 
 def test_prepare_screen_cfg_keeps_the_quote_source() -> None:
     """品种优选改手数和保证金时，不把已经选好的行情来源换掉。"""
     cfg = {
-        "data": {"source": "eastmoney"},
+        "data": {"source": "tq"},
         "strategy": {"engine": "daily_body", "daily_body": {"eth_minutes": 20}},
         "trade": {"volume": 1},
         "risk": {"margin_per_lot": 0, "contracts": {}},
     }
     out, _volume = prepare_screen_cfg(cfg, {"fixed_volume": 1, "engine": "daily_body"})
-    assert out["data"]["source"] == "eastmoney"
-    assert cfg["data"]["source"] == "eastmoney"
+    assert out["data"]["source"] == "tq"
+    assert cfg["data"]["source"] == "tq"
 
 
 def test_return_rate_uses_the_largest_margin_of_one_position() -> None:
@@ -558,8 +624,10 @@ def test_strategy_compare_keeps_one_symbol_and_ranks_each_engine() -> None:
     assert "daily_body_expand" not in engines
     assert "swing_box" in engines
     assert "float_hold" in engines
-    assert len(engines) == len(set(engines)) == 11
-    assert [item[0] for item in seen] == ["rb2701"] * 11
+    from src.strategy.factory import CROSS_TEST_ENGINE_ORDER
+
+    assert len(engines) == len(set(engines)) == len(CROSS_TEST_ENGINE_ORDER)
+    assert [item[0] for item in seen] == ["rb2701"] * len(CROSS_TEST_ENGINE_ORDER)
     assert [item[1] for item in seen] == engines
     shown = list_rows(result)
     assert shown[0]["symbol"] == "日内实体"
@@ -669,7 +737,7 @@ def test_cross_keeps_only_the_top_quarter_of_profitable_combos() -> None:
         assert cfg["risk"]["sizing_mode"] == "fixed"
         assert cfg["risk"]["margin_per_lot"] == 0
         assert cfg["risk"]["contracts"]["rb"]["margin"] == 0
-        assert cfg["risk"]["capital"] >= 1_000_000_000
+        assert cfg["risk"]["capital"] == 20148
         assert cfg["risk"]["max_daily_loss"] > 10_000_000
         assert cfg["risk"]["risk_per_trade_pct"] == 20
         assert cfg["risk"]["min_order_interval_sec"] == 60

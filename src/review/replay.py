@@ -281,6 +281,8 @@ def _walk(
         "src.strategy.macd_swing",
         "src.strategy.swing_trend",
         "src.strategy.swing_box",
+        "src.strategy.dual_donchian",
+        "src.strategy.dual_fractal",
     )
     for mod in modules:
         logger.disable(mod)

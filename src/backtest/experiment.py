@@ -110,7 +110,7 @@ def _code_identity() -> dict[str, Any]:
             check=False,
         )
         if commit.returncode == 0:
-            identity["git_commit"] = commit.stdout.strip()
+            identity["git_commit"] = (commit.stdout or "").strip()
         dirty = subprocess.run(
             ["git", "status", "--porcelain", "--untracked-files=no"],
             cwd=root,
@@ -120,7 +120,7 @@ def _code_identity() -> dict[str, Any]:
             check=False,
         )
         if dirty.returncode == 0:
-            identity["git_dirty"] = bool(dirty.stdout.strip())
+            identity["git_dirty"] = bool((dirty.stdout or "").strip())
     except (OSError, subprocess.SubprocessError):
         pass
     return identity

@@ -35,7 +35,8 @@ EXCHANGE_BY_PRODUCT = {
 }
 
 # 各交易所开盘时刻（分钟数）。K 线是右标签（结束时刻），正好落在开盘上的不可能存在。
-COMMODITY_OPEN_MINUTES = (9 * 60, 13 * 60 + 30, 21 * 60)  # 商品：09:00 / 13:30 / 21:00
+# 商品开盘（右标签不可能落在这里）：早盘、上午休息后、午盘、夜盘。
+COMMODITY_OPEN_MINUTES = (9 * 60, 10 * 60 + 30, 13 * 60 + 30, 21 * 60)
 CFFEX_OPEN_MINUTES = (9 * 60 + 30, 13 * 60)  # 中金所：09:30 / 13:00，没有夜盘
 
 
@@ -355,11 +356,16 @@ def frame_from_klines(raw: Any, seconds: int) -> pd.DataFrame:
     if int(seconds) >= _DAY_SECONDS:
         frame.index = beijing.normalize()
     else:
-        frame.index = beijing + pd.Timedelta(seconds=int(seconds), unit="s")
+        frame.index = beijing + pd.Timedelta(seconds=int(seconds))
     frame.index.name = "datetime"
     frame = frame[~frame.index.duplicated(keep="last")].sort_index()
     frame = frame.dropna(subset=["open", "high", "low", "close"])
-    return frame
+    from src.data.periods import canonicalize_ohlc
+
+    # 和新浪、同花顺图走同一套：无时区北京时间、秒级、列名统一。
+    period = "D" if int(seconds) >= _DAY_SECONDS else None
+    out = canonicalize_ohlc(frame, period=period)
+    return out if out is not None else frame
 
 
 def _filled_close_count(klines: Any) -> int | None:

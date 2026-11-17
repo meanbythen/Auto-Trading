@@ -33,9 +33,9 @@ from src.data.periods import (
     bars_from_minutes,
     cache_tag,
     canonical_period,
+    canonicalize_ohlc,
     csv_skip_marker,
     drop_forming_bar,
-    fix_gap_spanning_bars,
     minute_base,
     overlay_minute_bars,
     period_label,
@@ -44,6 +44,12 @@ from src.data.periods import (
 )
 from src.data.tq_source import session_open_minutes
 from src.utils import load_secrets
+
+
+def _rebuildable_minute_period(period: str) -> bool:
+    """5 分钟及以上的分钟周期，都可以用 1 分钟按交易时段重拼。"""
+    code = canonical_period(period)
+    return str(code).isdigit() and int(code) >= 5
 
 # 实盘扫描和回测会同时来拉同一份行情。排队拉，避免两路请求缠在一起后其中一路永远不返回。
 _FETCH_LOCK = threading.Lock()
@@ -123,13 +129,12 @@ class KlineProvider:
         self.store = BarStore(self.cache_dir / "market.sqlite")
         # 接口原样另存一份，清洗后的仍在 market.sqlite。出了问题能对照网上原来长什么样。
         self.raw_store = RawBarStore(self.cache_dir / "raw.sqlite")
-        from src.data.quote_check import normalize_source
+        from src.data.quote_check import DEFAULT_FALLBACK, DEFAULT_SOURCE, normalize_fallback, normalize_source
 
-        # akshare 是新浪。eastmoney 是东方财富。tq 是天勤。ths 是同花顺图（只给回测）。
-        # tick 是本地 tick 合成 K 线（只读、不联网，只给回测）。
-        self.source = normalize_source(data_cfg.get("source", "akshare"))
-        # 天勤挂了以后可以退到哪一家。默认回新浪；回退数据按备用源自己的库存名保存。
-        self.fallback_source = normalize_source(data_cfg.get("fallback_source", "akshare"))
+        # 主源天勤，备源新浪。ths 是同花顺图（只给回测）。tick 是本地 tick 合成（只给回测）。
+        self.source = normalize_source(data_cfg.get("source", DEFAULT_SOURCE))
+        # 天勤挂了以后只退到新浪；回退数据按新浪库存名保存，不写进 @tq。
+        self.fallback_source = normalize_fallback(data_cfg.get("fallback_source", DEFAULT_FALLBACK))
         self.fallback_allow_entry = bool(data_cfg.get("fallback_allow_entry", True))
         tick_cfg = data_cfg.get("tick") or {}
         self.tick_bar_store = root / tick_cfg.get("bar_store", "data/klines/tick_bars.sqlite")
@@ -276,7 +281,7 @@ class KlineProvider:
         return s.upper()
 
     def _stored_symbol(self, symbol: str) -> str:
-        """本地库存名。东方财富和新建浪分开，避免两家写进同一根时间。"""
+        """本地库存名。天勤、新浪、同花顺图分开，避免两家写进同一根时间。"""
         from src.data.quote_check import storage_symbol
 
         return storage_symbol(symbol, self.source)
@@ -285,7 +290,7 @@ class KlineProvider:
         """
         最新成交价（1 分钟粒度）。取不到返回 0。
 
-        必须问当前选中的那一家：选天勤就问天勤，选东方财富就问东方财富。
+        必须问当前选中的那一家：选天勤就问天勤，选新浪就问新浪。
         否则开仓滑点闸门会拿另一家的价格去比，选天勤时等于没闸门。
         """
         try:
@@ -295,8 +300,6 @@ class KlineProvider:
                 frame = BarStore(self.tick_bar_store).load(self._stored_symbol(symbol), "1", limit=1)
             elif self.source == "tq":
                 frame = self._fetch_tq(symbol, "1", limit=5)
-            elif self.source == "eastmoney":
-                frame = self._fetch_eastmoney(symbol, "1", limit=5)
             else:
                 frame = self._recent_minutes(self._to_sina_symbol(symbol))
             if frame is None or len(frame) == 0:
@@ -337,14 +340,14 @@ class KlineProvider:
         if self.source == "ths" and not keep_history:
             raise RuntimeError(
                 "同花顺图只能用于历史回测。读图要抢窗口、动键盘，实盘扫描和下单会卡住。"
-                "请到历史回测页选「同花顺图」。配置页请继续用新浪、东方财富或天勤。"
+                "请到历史回测页选「同花顺图」。配置页请继续用天勤或新浪。"
             )
         logger.info(
             "拉取K线 symbol={} sina={} period={} source={} max_bars={}",
             symbol,
             sina_code,
             period_label(period),
-            {"eastmoney": "东方财富", "tq": "天勤", "ths": "同花顺图"}.get(self.source, "新浪"),
+            {"tq": "天勤", "ths": "同花顺图", "tick": "tick合成"}.get(self.source, "新浪"),
             "全部库存" if keep_history else limit,
         )
 
@@ -372,7 +375,7 @@ class KlineProvider:
                     local.index[0],
                     local.index[-1],
                 )
-                out = fix_gap_spanning_bars(local)
+                out = local
                 out.attrs["from_cache"] = True
                 return out
             raise RuntimeError(
@@ -390,12 +393,18 @@ class KlineProvider:
                 local.index[0],
                 local.index[-1],
             )
-            if self.source in {"tq", "ths"}:
-                # 天勤和同花顺图已经是右标签，不再拿新浪的1分钟来重拼。
+            if self.source == "ths":
+                # 同花顺图按图上的时间戳用，不再拿别家 1 分钟来重拼。
                 local.attrs["from_cache"] = True
                 return local
+            if self.source == "tq":
+                # 天勤 60 分钟常是墙上整点。本地有同一家的 1 分钟时，按交易时段重拼。
+                rebuilt = self._rebuild_from_local_minutes(symbol, period, local)
+                out = rebuilt if rebuilt is not None else local
+                out.attrs["from_cache"] = True
+                return out
             fixed = self._rebuild_with_minutes(symbol, sina_code, period, local)
-            out = fix_gap_spanning_bars(fixed) if fixed is not None else fix_gap_spanning_bars(local)
+            out = fixed if fixed is not None else local
             out.attrs["from_cache"] = True
             return out
 
@@ -405,17 +414,7 @@ class KlineProvider:
             fresh = self._load_csv(symbol, period)
         else:
             try:
-                if self.source == "eastmoney":
-                    fresh = self._fetch_eastmoney(symbol, period, limit=1200 if keep_history else 200)
-                    self._save_vendor_raw(symbol, period, fresh)
-                    # 东方财富直接下的 5/15/30/60 时间戳也可能和同花顺不一致；同样用 1 分钟右标签重拼。
-                    if period in {"5", "15", "30", "60"} and fresh is not None and len(fresh) > 0:
-                        rebuilt = self._rebuild_frame_with_minutes(
-                            sina_code, period, fresh, symbol_hint=symbol
-                        )
-                        if rebuilt is not None:
-                            fresh = rebuilt
-                elif self.source == "tq":
+                if self.source == "tq":
                     # 回测要长历史：往大要，天勤服务端按它的上限（免费账号实测约 10000 根）
                     # 截断，给多少存多少。这些K线会存进本地库，下次区间落在已有数据里就不再重下。
                     # 实盘仍只要最近一段。
@@ -427,17 +426,16 @@ class KlineProvider:
                 download_error = str(e)
                 if local is not None and len(local) > 0:
                     logger.warning("行情下载失败，先用刚才存下的K线: {}", e)
-                elif self.source == "eastmoney":
-                    logger.warning("东方财富这次没连上，电脑里还没有它的K线。下一轮再试。")
                 else:
                     logger.warning("行情下载失败: {}，改用本地K线库", e)
 
-        if fresh is not None and len(fresh) > 0:
-            # 跨休市的第一根常被接口拼进上一段收盘价，先修掉再入库，避免把假高低点存下来。
-            fresh = fix_gap_spanning_bars(fresh)
         if fresh is not None and len(fresh) > 0 and self.source != "csv":
             full = self._archive_bars(symbol, period, fresh, local=local, full_history=keep_history)
             full = self._replace_rebuilt_bars(symbol, period, full, fresh)
+            if self.source == "tq":
+                rebuilt = self._rebuild_from_local_minutes(symbol, period, full)
+                if rebuilt is not None:
+                    full = rebuilt
         else:
             full = local if local is not None and len(local) > 0 else self._load_history(
                 symbol, period, limit=None if keep_history else limit
@@ -451,8 +449,6 @@ class KlineProvider:
                     full = rebuilt
 
         if full is not None and len(full) > 0:
-            # 拼图（1分钟合成）也会带上同样的假影线，返回前按上一根收盘修一次。
-            full = fix_gap_spanning_bars(full)
             if self.source == "csv" or fresh is not None and len(fresh) > 0:
                 return full if keep_history else self._clip(full, limit)
             out = full if keep_history else self._clip(full, limit)
@@ -472,11 +468,6 @@ class KlineProvider:
             )
             return out
 
-        if self.source == "eastmoney":
-            raise RuntimeError(
-                f"东方财富这次没有拿到 {symbol} 的{period_label(period)}K线。"
-                "这一轮先不判断开仓。不会拿新浪的K线来顶替，下一轮会再试。"
-            )
         if self.source == "tq":
             fallback = self._try_fallback(
                 symbol,
@@ -590,7 +581,7 @@ class KlineProvider:
         """
         接口刚下来的K线另存一份。失败不影响开平仓。
 
-        存的是还没对齐时间、还没用 1 分钟重拼、还没修跨休市影线的表。
+        存的是还没对齐时间、还没用 1 分钟重拼的表。开高低收保持接口原样。
         """
         if frame is None or len(frame) == 0 or self.source in {"csv", "demo"}:
             return
@@ -620,7 +611,10 @@ class KlineProvider:
         stored_name = self._stored_symbol(symbol)
         opens = session_open_minutes(symbol)
         stored = aligned_bars(
-            self.store.load(stored_name, period, limit=limit), period, session_opens=opens
+            self.store.load(stored_name, period, limit=limit),
+            period,
+            session_opens=opens,
+            symbol=symbol,
         )
         raw_count = self.store.count(stored_name, period)
         # 只有把整库都读进来时才做对齐修复；只读尾部时不能拿尾部根数去和全库比，否则会误删历史。
@@ -637,7 +631,10 @@ class KlineProvider:
         csv_bars: pd.DataFrame | None = None
         try:
             csv_bars = aligned_bars(
-                self._load_cache(stored_name, period), period, session_opens=opens
+                self._load_cache(stored_name, period),
+                period,
+                session_opens=opens,
+                symbol=symbol,
             )
             if limit is not None and csv_bars is not None and len(csv_bars) > limit:
                 csv_bars = csv_bars.tail(limit)
@@ -687,7 +684,9 @@ class KlineProvider:
         """
         if local is None:
             local = self._prepare_local(symbol, period)
-        pieces = aligned_bars(fresh, period, session_opens=session_open_minutes(symbol))
+        pieces = aligned_bars(
+            fresh, period, session_opens=session_open_minutes(symbol), symbol=symbol
+        )
         before = 0 if local is None else len(local)
         merged = merge_local_and_download(local, pieces, refresh_last=True)
         if merged is None or len(merged) == 0:
@@ -775,9 +774,9 @@ class KlineProvider:
             df = resample_ohlc(df, period)
         # 先把接口原样存下来，再拿 1 分钟重拼。开仓仍看拼好的那一份。
         self._save_vendor_raw(symbol_hint or sina_code, period, df)
-        # 5、15、30、60 分钟改用 1 分钟来拼。时间戳与同花顺右标签对齐；夜盘第一根一并补上。
+        # 5、15、30、60 分钟改用 1 分钟按交易时段内时钟来拼，休市断开。
         # symbol_hint 要用配置里的合约名（如 fu2701），才能对上本地 1 分钟库存；不要用新浪大写码。
-        if period not in {"5", "15", "30", "60"}:
+        if not _rebuildable_minute_period(period):
             return df
         rebuilt = self._rebuild_frame_with_minutes(
             sina_code, period, df, symbol_hint=symbol_hint or sina_code
@@ -845,22 +844,20 @@ class KlineProvider:
         """把 frame 里能被 1 分钟盖住的时段，换成右标签、可含夜盘首根的版本。"""
         if frame is None or len(frame) == 0:
             return frame
-        if period not in {"5", "15", "30", "60"}:
+        if not _rebuildable_minute_period(period):
             return frame
         symbol = symbol_hint or sina_code
         try:
             minutes = self._minutes_for_rebuild(symbol, sina_code)
             if minutes is None or len(minutes) < 3:
                 return frame
-            built = bars_from_minutes(minutes, period)
+            built = bars_from_minutes(minutes, period, symbol=symbol)
             merged, complete = overlay_minute_bars(frame, built, int(period))
         except Exception as exc:  # noqa: BLE001
             logger.warning("1分钟没能拼成{}，这一轮仍用原K线: {}", period_label(period), exc)
             return frame
         if merged is None:
             return frame
-        # 1分钟拼出来的第一根同样会带上上一段收盘价，这里也修一次再写回库存。
-        merged = fix_gap_spanning_bars(merged)
         try:
             # 只记时间字符串。不要塞 DatetimeIndex：拼表时 pandas 会拿两段时间比相不相等，直接报错。
             merged.attrs["rebuilt_from_minutes"] = tuple(
@@ -869,6 +866,26 @@ class KlineProvider:
         except Exception:  # noqa: BLE001
             pass
         return merged
+
+    def _rebuild_from_local_minutes(
+        self,
+        symbol: str,
+        period: str,
+        frame: pd.DataFrame | None,
+    ) -> pd.DataFrame | None:
+        """只用本地这家来源的 1 分钟重拼，不混新浪。"""
+        if frame is None or len(frame) == 0 or not _rebuildable_minute_period(period):
+            return frame
+        minutes = self._local_minutes(symbol)
+        if minutes is None or len(minutes) < 3:
+            return frame
+        try:
+            built = bars_from_minutes(minutes, period, symbol=symbol)
+            merged, _complete = overlay_minute_bars(frame, built, int(canonical_period(period)))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("本地1分钟没能拼成{}，仍用原K线: {}", period_label(period), exc)
+            return frame
+        return merged if merged is not None else frame
 
     def _rebuild_with_minutes(
         self,
@@ -929,7 +946,7 @@ class KlineProvider:
         if replaced <= 0 and len(updated) == len(full):
             return updated
         logger.info(
-            "{} {} 有 {} 根改用 1 分钟拼出来的K线（右标签，对齐同花顺；含夜盘首根补齐）。开仓看这一版。",
+            "{} {} 有 {} 根改用 1 分钟拼出来的K线（右标签，按交易时段收线）。开仓看这一版。",
             symbol,
             period_label(period),
             replaced,
@@ -1026,7 +1043,6 @@ class KlineProvider:
         from src.data.quote_check import storage_symbol
 
         require_timestamps(fresh)
-        fresh = fix_gap_spanning_bars(fresh)
         self._save_vendor_raw(symbol, period, fresh)
         local = self._prepare_local(symbol, period, limit=None)
         before = 0 if local is None else len(local)
@@ -1129,24 +1145,6 @@ class KlineProvider:
             password=getattr(self, "tq_password", ""),
         )
 
-    def _fetch_eastmoney(self, symbol: str, period: str, *, limit: int = 200) -> pd.DataFrame:
-        """
-        拉东方财富这一家。
-
-        5、15、30、60 分钟直接用它给出的 K 线，不再用 1 分钟重拼。
-        自定义分钟先拉能整除的那一档，再合成。和新建浪分开存。
-        实盘只要最近一段。回测才多要一些，要太多时对方更容易把连接掐断。
-        """
-        from src.data.quote_check import fetch_eastmoney_frame
-
-        period = canonical_period(period)
-        with _FETCH_LOCK:
-            if period in {"1", "5", "15", "30", "60", "D", "W"}:
-                return self._normalize_ohlc(fetch_eastmoney_frame(symbol, period, limit=limit))
-            base = minute_base(period)
-            raw = self._normalize_ohlc(fetch_eastmoney_frame(symbol, base, limit=limit))
-        return resample_ohlc(raw, period)
-
     def _sina_minutes(self, sina_code: str, period: str) -> pd.DataFrame:
         """1、5、15、30、60 分钟。period 用新浪要的数字，例如 5。"""
         url = "https://stock2.finance.sina.com.cn/futures/api/jsonp.php/=/InnerFuturesNewService.getFewMinLine"
@@ -1161,7 +1159,7 @@ class KlineProvider:
         return self._sina_json_table(url, {"symbol": sina_code, "type": "2021_04_12"})
 
     @staticmethod
-    def _normalize_ohlc(raw: Any) -> pd.DataFrame:
+    def _normalize_ohlc(raw: Any, period: str | None = None) -> pd.DataFrame:
         """日线和分钟线的列名不一样，这里收成同一张表：时间索引 + 开高低收量。"""
         df = pd.DataFrame(raw)
         if "datetime" in df.columns:
@@ -1170,18 +1168,10 @@ class KlineProvider:
         elif "date" in df.columns:
             df["date"] = pd.to_datetime(df["date"])
             df = df.set_index("date")
-        cols = {c.lower(): c for c in df.columns}
-        rename = {}
-        for need in ("open", "high", "low", "close", "volume"):
-            if need in cols:
-                rename[cols[need]] = need
-        df = df.rename(columns=rename)
-        keep = [c for c in ("open", "high", "low", "close", "volume") if c in df.columns]
-        df = df[keep]
-        # 单字母列和英文列同时存在时，rename 后会留下两列 close，后面 if 收盘价会报错。
-        df = df.loc[:, ~df.columns.duplicated(keep="last")]
-        df = df.apply(pd.to_numeric, errors="coerce").dropna(subset=["close"])
-        return df.sort_index()
+        out = canonicalize_ohlc(df, period=period)
+        if out is None or len(out) == 0:
+            raise RuntimeError("K线整理后是空的")
+        return out
 
     def _cache_path(self, symbol: str, period: str) -> Path:
         safe = symbol.replace("/", "_")
@@ -1225,7 +1215,8 @@ class KlineProvider:
         df[time_col] = pd.to_datetime(df[time_col])
         df = df.set_index(time_col)
         df.columns = [c.lower() for c in df.columns]
-        return df.sort_index()
+        out = canonicalize_ohlc(df)
+        return out if out is not None else df.sort_index()
 
     def _demo_bars(self, symbol: str, period: str, n: int | None = None) -> pd.DataFrame:
         """

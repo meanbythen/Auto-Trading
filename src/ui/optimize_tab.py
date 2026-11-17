@@ -124,9 +124,17 @@ class OptimizeTabMixin:
             hint="仅滚动前进用，默认3。段数越多越久",
             width=100,
         )
+        self._pick_switch_row(box, "冻结最后半年", self.opt_freeze_var)
+        self._entry_row(
+            box,
+            "冻结天数",
+            self.opt_freeze_days_var,
+            hint="默认180天。这段只验收一次，搜索碰不到；看过就不能再当验收",
+            width=100,
+        )
         ctk.CTkLabel(
             box,
-            text="一次切断：按比例切一刀。滚动前进：把检验段拆成多段，走一步再验一步。优化结束后，其它关注品种会用同一组参数再跑一遍（不再重搜），成绩会列在结果里。开仓限制与保证金开跑前跟实盘配置/品种表对齐。",
+            text="一次切断：按比例切一刀。滚动前进：把检验段拆成多段，走一步再验一步。打开「冻结最后半年」时，最后这段永远不参与挑参数；过关后再验收一次，看过就不能用同一段再调参。优化结束后还会把检验成交打乱，分不清规则还是运气时不写入。其它关注品种会用同一组参数再跑一遍（不再重搜）。开仓限制与保证金开跑前跟实盘配置/品种表对齐。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=320,
@@ -457,7 +465,7 @@ class OptimizeTabMixin:
         if not symbol or symbol == "（还没有）":
             messagebox.showwarning("还没有合约", "请先到配置页的关注品种里添加要优化的合约。")
             return
-        # 开仓限制、保证金、收盘清仓跟实盘一致（与历史回测同一套对齐逻辑）。
+        # 开仓限制、保证金、收盘清仓跟实盘一致；账户权益用回测/优化页填的测试资金。
         self._align_backtest_trading_params_with_live()
         cfg = self._clone_cfg()
         try:
@@ -502,6 +510,13 @@ class OptimizeTabMixin:
             walk_steps = max(1, int(float(self.opt_walk_steps_var.get() or 3)))
         except ValueError:
             walk_steps = 3
+        try:
+            freeze_days = min(730, max(30, int(float(self.opt_freeze_days_var.get() or 180))))
+        except ValueError:
+            freeze_days = 180
+        bt_run = cfg.setdefault("backtest", {})
+        bt_run["freeze_final_oos"] = bool(self.opt_freeze_var.get())
+        bt_run["freeze_final_days"] = freeze_days
         depth = self.opt_depth_var.get().strip() or "标准"
         mode = self.opt_mode_var.get().strip() or "一次切断"
         from src.backtest.optimizer import describe_run_switches
@@ -534,7 +549,9 @@ class OptimizeTabMixin:
         job_name = "模拟重跑优化（只出报告）" if evolve_only else "开始策略优化"
         self._append_log(
             f"{job_name}… engine={engine} depth={depth} mode={mode} "
-            f"检验比例={holdout_pct}% symbol={symbol} "
+            f"检验比例={holdout_pct}% "
+            f"冻结={'开'+str(freeze_days)+'天' if self.opt_freeze_var.get() else '关'} "
+            f"symbol={symbol} "
             f"行情={self.opt_source_var.get()} "
             f"限制={'开' if limit_snap['apply_limits'] else '关'} "
             f"trials<={max_trials} 区间={start or '起'}~{end or '止'}"
@@ -765,9 +782,15 @@ class OptimizeTabMixin:
                             f"覆盖{cover:.0f}"
                         )
                 from src.backtest.evaluation import format_evaluation_lines
+                from src.backtest.frozen_oos import format_freeze_lines
+                from src.backtest.monte_carlo import format_monte_carlo_lines
 
                 lines.extend(
                     [
+                        "",
+                        *format_freeze_lines(getattr(result, "freeze", None)),
+                        "",
+                        *format_monte_carlo_lines(getattr(result, "monte_carlo", None)),
                         *(
                             format_evaluation_lines(result.evaluation, title="策略评估")
                             if result.evaluation
@@ -1019,6 +1042,14 @@ class OptimizeTabMixin:
         self._opt_progress_at = 0.0
         self._show_opt_progress(0, 1, f"复核第 {idx} 组", force=True)
         cfg = self._clone_cfg()
+        bt_run = cfg.setdefault("backtest", {})
+        bt_run["freeze_final_oos"] = bool(self.opt_freeze_var.get())
+        try:
+            bt_run["freeze_final_days"] = min(
+                730, max(30, int(float(self.opt_freeze_days_var.get() or 180)))
+            )
+        except (TypeError, ValueError):
+            bt_run["freeze_final_days"] = 180
 
         def _run() -> None:
             try:
@@ -1338,6 +1369,8 @@ class OptimizeTabMixin:
                 "macd_swing": "ema_swing",
                 "swing_trend": "swing_trend",
                 "swing_box": "swing_box",
+                "dual_donchian": "dual_donchian",
+                "dual_fractal": "dual_fractal",
             }.get(engine, engine)
             shown = (new_cfg.get("strategy") or {}).get(section)
             if hasattr(self, "opt_result_box"):

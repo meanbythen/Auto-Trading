@@ -128,7 +128,8 @@ def test_thread_collects_flushes_and_stops(tmp_path) -> None:
     assert api.closed is True
 
     overview = tick_overview(database=tmp_path / "data/ticks/vnpy_data.db")
-    assert overview[0]["count"] == 2
+    # 连上时写当前这一笔，之后 wait_update 再写两笔。
+    assert overview[0]["count"] == 3
     status = read_status(tmp_path / "data/ticks/recorder_status.json")
     assert status["state"] == "stopped"
     assert status["symbols"] == ["SHFE.fu2701"]

@@ -16,7 +16,7 @@ class FillModel:
     """
     回测成交近似。
 
-    - on_next_open：信号在当根收盘后才确认，按下一根开盘成交（跨休市也按下一根开盘）。
+    - on_next_open：信号在当根收盘后才确认，按下一根开盘成交（跨休市跳到真正开盘的那根，不在午休整点成交）。
     - slippage_ticks：成交价按买卖方向各让几跳，模拟挂单排队和盘口差价。
     - price_tick：一跳多少钱，默认取交易配置里的 price_tick。
     """
@@ -73,7 +73,7 @@ class FillModel:
 
     def describe(self) -> str:
         """回测结果里说明这次是怎么成交的。"""
-        parts = ["信号确认后按下一根开盘成交（跨休市也按下一根开盘）" if self.on_next_open else "成交按策略价，未给则当根收盘"]
+        parts = ["信号确认后按下一根开盘成交（休市整点会跳到重新开盘）" if self.on_next_open else "成交按策略价，未给则当根收盘"]
         if self.slip > 0:
             parts.append(f"滑点 {self.slippage_ticks:g} 跳（每跳 {self.price_tick:g}）")
         else:

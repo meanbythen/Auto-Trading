@@ -439,6 +439,8 @@ def test_box_stop_exits_without_waiting_for_the_close() -> None:
     decision = strategy.evaluate("bu2612", crash, now=datetime(2026, 10, 23, 10, 15))
     assert decision.action == StrategyAction.CLOSE
     assert "打破开盘箱体" in decision.reason
+    assert "止损" in decision.reason
+    assert (decision.meta or {}).get("structure_stop") is True
     strategy.on_filled("bu2612", StrategyAction.CLOSE, opened.stop_price, 1)
     # 止损后、截止前，反向突破第二段箱体可以再开一次（日盘上限两次）。
     again = strategy.evaluate("bu2612", crash, now=datetime(2026, 10, 23, 10, 15))

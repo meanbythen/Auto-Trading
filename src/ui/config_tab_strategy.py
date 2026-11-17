@@ -65,7 +65,7 @@ def build_strategy_section(
     app._option_row(left, "行情数据源", app.source_var, list(SOURCE_LABELS), width=160)
     ctk.CTkLabel(
         left,
-        text="只拉选中的这一家。开仓前不再另问一家。同花顺图不在这里：读图会抢鼠标，只给历史回测。",
+        text="主源天勤，备源新浪。只拉选中的这一家。同花顺图不在这里：读图会抢鼠标，只给历史回测。",
         font=T.FONT_SMALL,
         text_color=T.TEXT_DIM,
         wraplength=420,
@@ -95,7 +95,7 @@ def build_strategy_section(
         except Exception:  # noqa: BLE001
             pass
     try:
-        # 换成天勤才去查主力；换走新浪/东财立刻停掉天勤登录提示。
+        # 换成天勤才去查主力；换走新浪立刻停掉天勤登录提示。
         app.source_var.trace_add("write", lambda *_: app._refresh_main_contract_hint())
     except Exception:  # noqa: BLE001
         pass
@@ -850,6 +850,48 @@ def build_strategy_section(
         "swing_trend",
         "大周期没趋势时加减仓没意义。默认关，需要再开。",
     )
+
+    dd_box = detail_panel(
+        app,
+        "dual_donchian",
+        "双周期通道突破",
+        "大周期通道+ADX 定方向，小周期唐奇安突破。进出跟左边信号周期，止损跟左边止损周期。",
+    )
+    app._option_row(dd_box, "大周期", app.dd_htf_var, list(app._htf_menu), width=160)
+    note_block(
+        dd_box,
+        "大周期只回答允许多还是空。小周期收盘冲出前 N 根高点才做多、跌破低点才做空。\n"
+        "想用资料里的周线+日线：左边信号周期选日线，这里大周期选周线。",
+        pady=(0, 4),
+    )
+    param_entry(app, dd_box, "进场通道根数", app.dd_entry_var, hint="小周期前多少根高低点，默认 55")
+    param_entry(app, dd_box, "离场通道根数", app.dd_exit_var, hint="更短的一段，默认 20")
+    param_entry(app, dd_box, "大周期ADX下限", app.dd_adx_min_var, hint="低于它当震荡，不开。默认 22")
+    param_entry(app, dd_box, "止损ATR倍数", app.dd_atr_mult_var, hint="开仓价外面几倍波动，默认 2.5")
+
+    df_box = detail_panel(
+        app,
+        "dual_fractal",
+        "双周期回调分型",
+        "大周期定方向，小周期等回调里的强分型，并要 DIF 不创新低/新高。均线用指数平均。",
+    )
+    app._option_row(df_box, "大周期", app.df_htf_var, list(app._htf_menu), width=160)
+    app._option_row(
+        df_box,
+        "大周期怎么定方向",
+        app.df_mode_var,
+        list(app._fractal_mode_labels.values()),
+        width=160,
+    )
+    note_block(
+        df_box,
+        "指数均线：收盘在大周期 EMA 上方只做多。通道突破：收盘冲出大周期通道才给方向。\n"
+        "小周期必须同时出现强分型和 DIF 背离才开仓。没有做缠论中枢递归。",
+        pady=(0, 4),
+    )
+    param_entry(app, df_box, "大周期均线根数", app.df_ema_var, hint="选指数均线时用，默认 20")
+    param_entry(app, df_box, "大周期ADX下限", app.df_adx_min_var, hint="低于它当震荡，不开。默认 22")
+    param_entry(app, df_box, "止损ATR倍数", app.df_atr_mult_var, hint="开仓价外面几倍波动，默认 2.8")
 
     sbox = detail_panel(
         app,

@@ -531,6 +531,46 @@ class ConfigCollectMixin:
         self._write_trend_filter_vars(boll_box, "bollinger")
         self._write_trend_filter_vars(sar_box, "sar_trend")
         self._write_trend_filter_vars(swing_box, "swing_trend")
+        from src.strategy.dual_cycle import parse_fractal_mode, parse_htf
+
+        dd_box = st.setdefault("dual_donchian", {})
+        dd_box["trend_timeframe"] = parse_htf(str(self.dd_htf_var.get() or "日线"), "D")
+        try:
+            dd_box["entry_bars"] = max(5, int(self.dd_entry_var.get()))
+        except ValueError:
+            dd_box["entry_bars"] = 55
+        try:
+            dd_box["exit_bars"] = max(2, int(self.dd_exit_var.get()))
+        except ValueError:
+            dd_box["exit_bars"] = 20
+        if dd_box["exit_bars"] >= dd_box["entry_bars"]:
+            dd_box["exit_bars"] = max(2, dd_box["entry_bars"] // 2)
+        dd_box["htf_donchian"] = dd_box["entry_bars"]
+        try:
+            dd_box["adx_min"] = max(0.0, float(self.dd_adx_min_var.get()))
+        except ValueError:
+            dd_box["adx_min"] = 22.0
+        try:
+            dd_box["atr_mult"] = max(0.1, float(self.dd_atr_mult_var.get()))
+        except ValueError:
+            dd_box["atr_mult"] = 2.5
+        dd_box.setdefault("flatten_at_close", False)
+        df_box = st.setdefault("dual_fractal", {})
+        df_box["trend_timeframe"] = parse_htf(str(self.df_htf_var.get() or "日线"), "D")
+        df_box["trend_mode"] = parse_fractal_mode(str(self.df_mode_var.get() or "指数均线"))
+        try:
+            df_box["trend_ema"] = max(2, int(self.df_ema_var.get()))
+        except ValueError:
+            df_box["trend_ema"] = 20
+        try:
+            df_box["adx_min"] = max(0.0, float(self.df_adx_min_var.get()))
+        except ValueError:
+            df_box["adx_min"] = 22.0
+        try:
+            df_box["atr_mult"] = max(0.1, float(self.df_atr_mult_var.get()))
+        except ValueError:
+            df_box["atr_mult"] = 2.8
+        df_box.setdefault("flatten_at_close", False)
         sbox = st.setdefault("swing_box", {})
         try:
             sbox["lookback"] = max(20, int(self.sbox_lookback_var.get()))
@@ -586,6 +626,11 @@ class ConfigCollectMixin:
             bt["optimize_walk_steps"] = min(10, max(1, int(float(self.opt_walk_steps_var.get() or 3))))
         except (TypeError, ValueError):
             bt["optimize_walk_steps"] = 3
+        bt["freeze_final_oos"] = bool(self.opt_freeze_var.get())
+        try:
+            bt["freeze_final_days"] = min(730, max(30, int(float(self.opt_freeze_days_var.get() or 180))))
+        except (TypeError, ValueError):
+            bt["freeze_final_days"] = 180
         try:
             bt["max_trials"] = max(5, int(float(self.opt_trials_var.get() or 80)))
         except (TypeError, ValueError):

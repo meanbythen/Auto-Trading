@@ -538,8 +538,8 @@ class DailyBodyStrategy(StrategyBase):
         edge = "下沿" if pos.side == "long" else "上沿"
         verb = "收盘跌破" if pos.side == "long" else "收盘站上"
         if self.stop_mode == STOP_MODE_CLOSE:
-            return f"{verb}开盘箱体{edge} {stop:.2f}"
-        return f"打破开盘箱体{edge} {stop:.2f}"
+            return f"收盘确认止损，{verb}开盘箱体{edge} {stop:.2f}"
+        return f"触及止损，打破开盘箱体{edge} {stop:.2f}"
 
     def _open_stop_text(
         self, side: str, box_low: float, box_high: float, tick_pad: float
@@ -998,6 +998,7 @@ class DailyBodyStrategy(StrategyBase):
                     f"{hit_text}，方向作废，先出来，不再拿到收盘",
                     entry_price=None,
                     stop_price=stop,
+                    meta={"structure_stop": True},
                 )
             if self.is_flatten_time(now):
                 return StrategyDecision(

@@ -29,7 +29,11 @@ _LOCK = threading.RLock()
 _DB: Any = None
 _DB_PATH = ""
 
-_INSTALL_HINT = "tick 入库需要 vnpy 与 vnpy_sqlite，请执行 pip install vnpy vnpy_sqlite"
+_INSTALL_HINT = (
+    "还没装 tick 入库组件。请先关掉本程序，在项目目录执行 "
+    ".venv\\Scripts\\python -m pip install vnpy vnpy_sqlite "
+    "装完再打开。"
+)
 
 # 天勤只给一档盘口，也不给成交额、涨跌停。缺的字段填 0，不能少列。
 _TICK_COLUMNS = (
@@ -110,12 +114,47 @@ def split_instrument(instrument: str) -> tuple[str, Any]:
     return symbol.strip(), exchange
 
 
+def _as_pydatetime(stamp: pd.Timestamp) -> datetime:
+    """
+    pandas 时间可以到纳秒，Python datetime 只能到微秒。
+    先收到微秒再转换，避免每条 tick 刷「Discarding nonzero nanoseconds」。
+    """
+    if int(getattr(stamp, "nanosecond", 0) or 0) != 0:
+        stamp = stamp.floor("us")
+    return stamp.to_pydatetime()
+
+
 def _shanghai(moment: Any) -> datetime:
-    """只给北京时间打 Asia/Shanghai 标签，不改数值。"""
+    """
+    收成带上海时区的时间。
+
+    天勤 tick 的 datetime 经常是 UTC 纳秒整数（和 K 线同一套）；已经是北京时间的
+    字符串/不带时区 datetime 只贴时区、不加 8 小时，避免把测试和清洗后的数据再挪一次。
+    """
+    if moment is None:
+        raise TypeError("tick 时间是空的")
+    number = None
+    if isinstance(moment, bool):
+        raise TypeError(f"tick 时间看不懂：{moment!r}")
+    if isinstance(moment, (int, float)):
+        number = int(moment)
+    else:
+        try:
+            import numpy as np
+
+            if isinstance(moment, np.integer):
+                number = int(moment)
+        except ImportError:
+            pass
+    if number is not None and number > 10**15:
+        stamp = pd.Timestamp(number, unit="ns", tz="UTC").tz_convert(TZ)
+        return _as_pydatetime(stamp)
     if isinstance(moment, str):
         moment = pd.Timestamp(moment)
     if isinstance(moment, pd.Timestamp):
-        moment = moment.to_pydatetime()
+        moment = _as_pydatetime(moment)
+    if type(moment).__name__ == "datetime64":
+        moment = _as_pydatetime(pd.Timestamp(moment))
     if not isinstance(moment, datetime):
         raise TypeError(f"tick 时间看不懂：{moment!r}")
     if moment.tzinfo is None:
@@ -272,7 +311,10 @@ def load_tick_frame(
 
 
 def tick_overview(*, database: str | Path) -> list[dict[str, Any]]:
-    """库里每个合约有多少条 tick、从哪到哪。"""
+    """库里每个合约有多少条 tick、从哪到哪。还没有库文件时当作空库存。"""
+    path = Path(database)
+    if not path.exists():
+        return []
     db = _database(database)
     out: list[dict[str, Any]] = []
     for item in db.get_tick_overview():

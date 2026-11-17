@@ -6,7 +6,7 @@
 信息框可能在主图左侧或右侧。这里读框里的开高低收，不点买卖。
 
 实盘不能用这一路：每根都要抢窗口、动键盘，会挡住下单、拖慢扫描。
-读到的数据单独存成 @ths，不盖新浪 / 东财 / 天勤。
+读到的数据单独存成 @ths，不盖新浪 / 天勤。
 """
 
 from __future__ import annotations
@@ -226,7 +226,12 @@ def bars_from_tooltips(rows: list[dict[str, Any]]) -> pd.DataFrame:
     frame = frame.set_index("datetime").sort_index()
     frame = frame[~frame.index.duplicated(keep="last")]
     keep = [c for c in cols if c in frame.columns]
-    return frame[keep]
+    frame = frame[keep]
+    from src.data.periods import canonicalize_ohlc
+
+    # 信息框顶部时间已经是右标签。再走统一口径，避免带时区或列名和天勤、新浪不一致。
+    out = canonicalize_ohlc(frame)
+    return out if out is not None else frame
 
 
 def walk_tooltips(

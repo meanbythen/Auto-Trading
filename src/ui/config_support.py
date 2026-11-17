@@ -951,7 +951,7 @@ class ConfigSupportMixin:
 
         交割月按合约代码的年月本地就能算，不联网。主力合约向天勤的主连要。
         查询放在后台线程；换合约后旧结果直接丢掉。
-        只有行情来源选「天勤」才登录天勤；选新浪/东方财富时不连。
+        只有行情来源选「天勤」才登录天勤；选新浪时不连。
         """
         label = getattr(self, "main_contract_hint", None)
         if label is None:

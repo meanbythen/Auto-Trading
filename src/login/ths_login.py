@@ -510,6 +510,43 @@ def window_title_is_settlement(title: str) -> bool:
     return "确认结算单" in str(title or "")
 
 
+def settlement_search_host(name: str, class_name: str = "") -> bool:
+    """
+    这个窗口值不值得进去找「确认结算单」按钮。
+
+    本程序标题是「期货自动交易台」，里面也有「期货」两个字，不能当成同花顺。
+    Tk 窗口的控件树不稳定，走进去会报 COM 错，启动常驻会中断。
+    """
+    title = str(name or "")
+    cls = str(class_name or "")
+    if "Auto-Trading" in title:
+        return False
+    if cls in {"TkTopLevel", "TkChild"}:
+        return False
+    if window_title_is_settlement(title):
+        return True
+    return "同花顺" in title or "期货通" in title or "CTP主席" in title
+
+
+def _walk_ui(host: Any, max_depth: int) -> list[tuple[Any, int]]:
+    """
+    走一遍窗口里的控件。中途 COM 报错就停，已经读到的还留着。
+
+    同花顺控件树偶发 GetNextSiblingControl 失败，不能把整次准备打停。
+    """
+    import uiautomation as auto
+
+    found: list[tuple[Any, int]] = []
+    if host is None:
+        return found
+    try:
+        for ctrl, depth in auto.WalkControl(host, maxDepth=max_depth):
+            found.append((ctrl, depth))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("读窗口控件中断，跳过这个窗口剩余部分: {}", exc)
+    return found
+
+
 def settlement_click_point(left: int, top: int, right: int, bottom: int) -> tuple[int, int] | None:
     """
     结算单窗口里找不到按钮时，点窗口内部靠下居中的位置。
@@ -590,10 +627,8 @@ def pick_settlement_button(controls: list[tuple[Any, ...]]) -> int | None:
 
 def _window_rows(window: Any) -> list[tuple[str, str, int, int, int, Any]]:
     """读窗口里的控件。每一项带上控件上沿和控件本身，方便选中后再点击。"""
-    import uiautomation as auto
-
     found: list[tuple[str, str, int, int, int, Any]] = []
-    for ctrl, _depth in auto.WalkControl(window, maxDepth=8):
+    for ctrl, _depth in _walk_ui(window, 8):
         rect = getattr(ctrl, "BoundingRectangle", None)
         if rect is None:
             continue
@@ -653,20 +688,21 @@ def _find_settlement_windows() -> list[Any]:
         logger.warning("按窗口标题找确认结算单失败: {}", exc)
 
     root = auto.GetRootControl()
-    for ctrl, depth in auto.WalkControl(root, maxDepth=2):
+    for ctrl, depth in _walk_ui(root, 2):
         if depth < 1:
             continue
         name = str(getattr(ctrl, "Name", "") or "")
         kind = str(getattr(ctrl, "ControlTypeName", "") or "")
         if window_title_is_settlement(name) and kind in {"WindowControl", "PaneControl"}:
             _add(ctrl)
-    for ctrl, depth in auto.WalkControl(root, maxDepth=1):
+    for ctrl, depth in _walk_ui(root, 1):
         if depth < 1:
             continue
         name = str(getattr(ctrl, "Name", "") or "")
-        if "同花顺" not in name and "期货通" not in name:
+        cls = str(getattr(ctrl, "ClassName", "") or "")
+        if not settlement_search_host(name, cls):
             continue
-        for child, _child_depth in auto.WalkControl(ctrl, maxDepth=8):
+        for child, _child_depth in _walk_ui(ctrl, 8):
             child_name = str(getattr(child, "Name", "") or "")
             child_kind = str(getattr(child, "ControlTypeName", "") or "")
             if not window_title_is_settlement(child_name):
@@ -777,22 +813,28 @@ def _find_settlement_buttons() -> list[Any]:
 
         hwnd = int(ctypes.windll.user32.GetForegroundWindow() or 0)
         if hwnd:
-            roots.append(auto.ControlFromHandle(hwnd))
+            front = auto.ControlFromHandle(hwnd)
+            name = str(getattr(front, "Name", "") or "")
+            cls = str(getattr(front, "ClassName", "") or "")
+            # 点「启动常驻」时最前的是本程序，走进 Tk 控件树会 COM 报错。
+            if settlement_search_host(name, cls):
+                roots.append(front)
     except Exception:  # noqa: BLE001
         pass
     root = auto.GetRootControl()
-    for ctrl, depth in auto.WalkControl(root, maxDepth=1):
+    for ctrl, depth in _walk_ui(root, 1):
         if depth < 1:
             continue
         name = str(getattr(ctrl, "Name", "") or "")
-        if "同花顺" not in name and "期货" not in name and "结算单" not in name:
+        cls = str(getattr(ctrl, "ClassName", "") or "")
+        if not settlement_search_host(name, cls):
             continue
         roots.append(ctrl)
     for host in roots:
         if host is None:
             continue
         _take(host)
-        for child, _depth in auto.WalkControl(host, maxDepth=10):
+        for child, _depth in _walk_ui(host, 10):
             _take(child)
     return found
 
@@ -836,8 +878,12 @@ def _look_and_click_settlement() -> str:
     返回 absent（没有）、clicked（点过并且窗口已经关掉）、stuck（窗口还在）。
     窗口还在时不能去改对手价，否则会点在结算单上。
     """
-    buttons = _find_settlement_buttons()
-    windows = _find_settlement_windows()
+    try:
+        buttons = _find_settlement_buttons()
+        windows = _find_settlement_windows()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("查找确认结算单时读窗口失败，当作没有这个窗口: {}", exc)
+        return "absent"
     if not buttons and not windows:
         return "absent"
     clicked = False

@@ -13,7 +13,7 @@ from typing import Any
 
 import pandas as pd
 
-from src.backtest.exit_policy import next_open_price
+from src.backtest.exit_policy import next_open_price, next_tradable_bar_index
 from src.data.periods import canonical_period, last_ohlc_price
 from src.utils.trading_day import futures_trading_day
 
@@ -59,6 +59,7 @@ class BarView:
     now: datetime
     px: float
     next_open: float | None
+    next_index: int | None
     trail: pd.DataFrame | None
     trend: pd.DataFrame | None
     is_last: bool
@@ -83,6 +84,8 @@ class BarCursor:
         start: int = 0,
         end: int | None = None,
         fill_next_open: bool = True,
+        symbol: str = "",
+        cfg: dict[str, Any] | None = None,
     ) -> None:
         self.signal = signal
         self.trail = trail
@@ -92,6 +95,8 @@ class BarCursor:
         self.start = max(0, int(start))
         self.end = len(signal) if end is None else min(int(end), len(signal))
         self.fill_next_open = fill_next_open
+        self.symbol = str(symbol or "")
+        self.cfg = cfg
 
     def __len__(self) -> int:
         return max(0, self.end - self.start)
@@ -113,7 +118,20 @@ class BarCursor:
         if self.trail is not None and len(self.trail) > 0:
             trail_df = self.trail[self.trail.index <= last_ts]
         trend_df = _trend_frame_for_signal(self.trend, last_ts, self.trend_timeframe)
-        next_open = next_open_price(self.signal, i, self.timeframe) if self.fill_next_open else None
+        next_open: float | None = None
+        next_index: int | None = None
+        if self.fill_next_open:
+            next_open = next_open_price(
+                self.signal, i, self.timeframe, symbol=self.symbol, cfg=self.cfg
+            )
+            if next_open is not None:
+                code = canonical_period(self.timeframe)
+                if code in ("D", "W"):
+                    next_index = i + 1 if i + 1 < len(self.signal) else None
+                else:
+                    next_index = next_tradable_bar_index(
+                        self.signal, i, symbol=self.symbol, cfg=self.cfg
+                    )
 
         return BarView(
             index=i,
@@ -121,6 +139,7 @@ class BarCursor:
             now=_ts_to_dt(last_ts),
             px=float(px),
             next_open=next_open,
+            next_index=next_index,
             trail=trail_df,
             trend=trend_df,
             is_last=i >= self.end - 1,

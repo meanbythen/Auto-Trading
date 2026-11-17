@@ -145,6 +145,8 @@ class BacktestConfigMixin:
 
         self.bt_sizing_var.set(self.sizing_mode_var.get())
         self.bt_capital_var.set(self.capital_var.get())
+        if hasattr(self, "pk_capital_var"):
+            self.pk_capital_var.set(self.capital_var.get())
         self.bt_risk_pct_var.set(self.risk_pct_var.get())
         self.bt_margin_usage_pct_var.set(self.margin_usage_pct_var.get())
         self.bt_volume_var.set(self.volume_var.get())
@@ -362,13 +364,13 @@ class BacktestConfigMixin:
         """
         仓位、风险、保证金、收盘清仓与实盘配置对齐，并刷新回测页显示。
 
-        策略引擎 / 周期 / 品种仍可由回测页单独选，方便对比；真正影响手数和保证金的数字跟实盘走。
+        策略引擎 / 周期 / 品种仍可由回测页单独选。账户权益不在这里覆盖：
+        测试页可以填准备投入的资金，只有点「按配置页重新填入」才抄回当前余额。
         """
         if not hasattr(self, "bt_capital_var"):
             return
         risk = self.cfg.get("risk") or {}
         self.bt_sizing_var.set(self.sizing_mode_var.get() or "risk_pct")
-        self.bt_capital_var.set(self.capital_var.get())
         self.bt_risk_pct_var.set(self.risk_pct_var.get())
         self.bt_margin_usage_pct_var.set(self.margin_usage_pct_var.get())
         self.bt_volume_var.set(self.volume_var.get())
@@ -386,6 +388,7 @@ class BacktestConfigMixin:
         把实盘配置里的开仓限制写进这一次回测/优化副本（保证金优先品种表）。
 
         不写磁盘。回测页「启用限制」关掉时仍固定 1 手，便于只看信号。
+        账户权益读本页填的数（准备投入的资金），其它手数规则仍跟配置页。
         symbol：算哪一个合约的表内保证金；空则用历史回测页当前品种。
         """
         self._align_backtest_trading_params_with_live()
@@ -396,11 +399,14 @@ class BacktestConfigMixin:
         if not risk["apply_limits"]:
             trade["volume"] = 1
             risk["sizing_mode"] = "fixed"
+            try:
+                risk["capital"] = float(self.bt_capital_var.get())
+            except (TypeError, ValueError):
+                pass
             return
         try:
-            # 一律读配置页（实盘）数字，避免回测/优化页旧值跟实盘不一致。
             risk["sizing_mode"] = self.sizing_mode_var.get() or "risk_pct"
-            risk["capital"] = float(self.capital_var.get())
+            risk["capital"] = float(self.bt_capital_var.get())
             risk["risk_per_trade_pct"] = float(self.risk_pct_var.get())
             risk["margin_usage_pct"] = max(0.0, float(self.margin_usage_pct_var.get() or 0))
             trade["volume"] = int(float(self.volume_var.get()))
@@ -411,12 +417,12 @@ class BacktestConfigMixin:
             risk["max_orders_per_day"] = max(1, int(float(self.max_orders_var.get())))
             generic_margin = max(0.0, float(self.margin_var.get() or 0))
         except ValueError as e:
-            raise ValueError("配置页的权益、风险和手数要填数字") from e
+            raise ValueError("回测页的账户权益、以及配置页的风险和手数要填数字") from e
         code = (symbol or self.bt_symbol_var.get() or "").strip()
         # 有保证金比例时按每笔开仓价现算，不要绑死一个金额把比例清掉。
         risk["margin_per_lot"] = generic_margin
         logger.info(
-            "开仓限制已按实盘对齐 | 权益={:g} 风险%={} 模式={} 品种={} 兜底保证金{:g}",
+            "开仓限制已写入本次回测 | 测试权益={:g} 风险%={} 模式={} 品种={} 兜底保证金{:g}",
             risk["capital"],
             risk["risk_per_trade_pct"],
             risk["sizing_mode"],
@@ -429,7 +435,7 @@ class BacktestConfigMixin:
         """把回测页的选项收成一份可跑的回测配置。参数不对时弹窗并返回 None。"""
         from tkinter import messagebox
 
-        # 先对齐开仓限制，再克隆，保证副本里就是实盘数字。
+        # 先对齐手数规则（账户权益不覆盖），再克隆成这一次回测副本。
         self._align_backtest_trading_params_with_live()
         cfg = self._clone_cfg()
         try:

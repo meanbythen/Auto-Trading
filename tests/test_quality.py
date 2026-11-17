@@ -119,18 +119,18 @@ def _put_source(raw: RawBarStore, clean: BarStore, src: str, symbol: str, df: pd
 
 
 def test_three_sources_side_by_side_close_spread(tmp_path) -> None:
-    """三家同一时刻并排：东财收盘贵 2 点时，报告能写出差几跳、大约几元。"""
+    """三家同一时刻并排：同花顺图收盘贵 2 点时，报告能写出差几跳、大约几元。"""
     kline_dir = tmp_path / "data" / "klines"
     kline_dir.mkdir(parents=True)
     raw = RawBarStore(kline_dir / "raw.sqlite")
     clean = BarStore(kline_dir / "market.sqlite")
     times = [f"2026-10-16 09:{minute:02d}:00" for minute in range(10, 40, 5)]
     sina = _frame([(t, 100.0) for t in times])
-    em = _frame([(t, 100.0) for t in times])
+    ths = _frame([(t, 100.0) for t in times])
     tq = _frame([(t, 100.0) for t in times])
-    em.loc[pd.Timestamp(times[1]), "close"] = 102.0
+    ths.loc[pd.Timestamp(times[1]), "close"] = 102.0
     _put_source(raw, clean, "akshare", "fu2701", sina)
-    _put_source(raw, clean, "eastmoney", "fu2701", em)
+    _put_source(raw, clean, "ths", "fu2701", ths)
     _put_source(raw, clean, "tq", "fu2701", tq)
     cfg = {
         "trade": {"ctp": {"price_tick": 1}},
@@ -150,13 +150,13 @@ def test_three_sources_side_by_side_close_spread(tmp_path) -> None:
     assert "清洗同刻" in wb.sheetnames
     assert "两两对照" in wb.sheetnames
     headers = [cell.value for cell in wb["清洗同刻"][1]]
-    assert "东方财富收" in headers
+    assert "天勤收" in headers
     assert "同花顺图收" in headers
     assert "收盘最大差跳" in headers
-    # 东财那根贵 2 点，应出现在问题K线里，能按跳数筛。
+    # 同花顺图那根贵 2 点，应出现在问题K线里，能按跳数筛。
     closes = []
     head = [cell.value for cell in wb["问题K线"][1]]
-    close_idx = head.index("东方财富收")
+    close_idx = head.index("同花顺图收")
     tick_idx = head.index("收盘最大差跳")
     for row in wb["问题K线"].iter_rows(min_row=2, values_only=True):
         closes.append(row[close_idx])
@@ -165,8 +165,8 @@ def test_three_sources_side_by_side_close_spread(tmp_path) -> None:
     assert 102.0 in closes
 
 
-def test_four_sources_overlap_counts_ths(tmp_path) -> None:
-    """同花顺图也进对照。三家已齐、第四家缺一根时，至少三家同一时刻仍能数出来。"""
+def test_three_sources_overlap_counts_ths(tmp_path) -> None:
+    """同花顺图也进对照。天勤新浪已齐、同花顺图缺一根时，至少两家同一时刻仍能数出来。"""
     kline_dir = tmp_path / "data" / "klines"
     kline_dir.mkdir(parents=True)
     raw = RawBarStore(kline_dir / "raw.sqlite")
@@ -175,13 +175,12 @@ def test_four_sources_overlap_counts_ths(tmp_path) -> None:
     base = _frame([(t, 100.0) for t in times])
     ths = _frame([(t, 100.0) for t in times[:-1]])
     _put_source(raw, clean, "akshare", "fu2701", base)
-    _put_source(raw, clean, "eastmoney", "fu2701", base)
     _put_source(raw, clean, "tq", "fu2701", base)
     _put_source(raw, clean, "ths", "fu2701", ths)
     book = inspect_quote_book(tmp_path, "fu2701", "5")
-    assert book.clean_cmp["n_sources"] == 4
-    assert book.clean_cmp["overlap3"] >= len(times) - 1
-    assert book.clean_cmp["overlap4"] == len(times) - 1
+    assert book.clean_cmp["n_sources"] == 3
+    assert book.clean_cmp["overlap3"] == len(times) - 1
+    assert book.clean_cmp["overlap2"] == 1
 
 
 def test_book_asks_to_download_when_only_one_source(tmp_path) -> None:
@@ -205,7 +204,7 @@ def test_market_health_summary_groups_latency_by_symbol_source_and_hour(tmp_path
     base = {
         "symbol": "fu2701",
         "period": "5",
-        "source": "eastmoney",
+        "source": "tq",
         "received_at": "2026-11-16T09:00:01+08:00",
         "scan_gap_sec": 30.0,
     }

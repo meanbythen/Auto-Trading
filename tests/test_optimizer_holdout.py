@@ -1012,6 +1012,7 @@ def test_optimization_evaluation_gate_and_training_snapshot(
         "trade": {"executor": "sim"},
         "risk": {"risk_per_trade_pct": 0.01},
         "evaluation": {"enabled": True, "gate_on_optimize": gate_on_optimize},
+        "backtest": {"freeze_final_oos": False},
     }
     original = copy.deepcopy(cfg)
     result = optimize_strategy(
@@ -1107,6 +1108,7 @@ def test_optimize_walk_mode_keeps_rolling_search(monkeypatch) -> None:
                 "trend_follow": {"entry_bars": 36},
             },
             "risk": {"capital": 100_000},
+            "backtest": {"freeze_final_oos": False},
         },
         symbol="fu2701",
         grid={"entry_bars": [48]},

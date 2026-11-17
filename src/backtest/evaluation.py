@@ -921,6 +921,19 @@ def evaluate_perf(
     )
 
 
+def mark_stress_not_run(report: EvaluationReport, *, reason: str) -> EvaluationReport:
+    """交叉测试等场景不跑压力项时，在报告里标明跳过，避免被当成已经过关。"""
+    if report.skipped:
+        return report
+    existing = {c.key for c in report.checks}
+    if "slippage" not in existing:
+        report.add_check(_skip_check("slippage", "滑点压力", reason))
+    if "perturbation" not in existing:
+        report.add_check(_skip_check("perturbation", "参数扰动", reason))
+    # 跳过项不参与结论。不要 recompute：测试/外部可能只写了 conclusion、还没填检查项。
+    return report
+
+
 def apply_stress(
     report: EvaluationReport,
     *,

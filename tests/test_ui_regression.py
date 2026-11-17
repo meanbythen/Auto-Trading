@@ -386,7 +386,7 @@ def test_backtest_source_hint_margin_trace_and_opt_sync(real_app, monkeypatch) -
     notices = []
     monkeypatch.setattr(messagebox, "showinfo", lambda *args: notices.append(args))
     real_app._set_watch_codes(["bu2612", "bu2613"], select="bu2612", save=False)
-    real_app.source_var.set("东方财富")
+    real_app.source_var.set("天勤")
     real_app.bt_source_var.set("同花顺图")
     assert "只给历史回测" in real_app.bt_source_hint.cget("text")
     real_app.bt_source_var.set("新浪")
@@ -413,14 +413,14 @@ def test_backtest_source_hint_margin_trace_and_opt_sync(real_app, monkeypatch) -
     assert real_app._period_code(real_app.opt_trail_var, real_app.opt_trail_custom_var) == "D"
     assert real_app.opt_start_var.get() == "2026-01-02"
     assert real_app.opt_end_var.get() == "2026-02-03"
-    assert real_app.opt_source_var.get() == "东方财富"
+    assert real_app.opt_source_var.get() == "天勤"
     assert notices
 
 
 def test_config_mapping_save_and_reload_round_trip(real_app) -> None:
     real_app._set_watch_codes(["bu2612", "rb2610"], select="bu2612", save=False)
     real_app.engine_var.set("daily_body")
-    real_app.source_var.set("东方财富")
+    real_app.source_var.set("天勤")
     real_app._set_period_vars("60", real_app.tf_var, real_app.tf_custom_var)
     real_app._set_period_vars("D", real_app.trail_var, real_app.trail_custom_var)
     real_app.flatten_at_close_var.set(False)
@@ -456,7 +456,7 @@ def test_config_mapping_save_and_reload_round_trip(real_app) -> None:
     assert cfg["strategy"]["symbols"] == list(real_app._watch_symbols)
     assert "bu2612" in cfg["strategy"]["symbols"]
     assert cfg["strategy"]["flatten_at_close"] is False
-    assert cfg["data"]["source"] == "eastmoney"
+    assert cfg["data"]["source"] == "tq"
     assert cfg["trade"]["volume"] == 3
     assert cfg["risk"]["capital"] == 234567
     assert cfg["risk"]["risk_per_trade_pct"] == 1.25
@@ -477,7 +477,7 @@ def test_config_mapping_save_and_reload_round_trip(real_app) -> None:
     real_app.volume_var.set("9")
     real_app._reload_values_only()
     assert real_app.engine_var.get() == "daily_body"
-    assert real_app.source_var.get() == "东方财富"
+    assert real_app.source_var.get() == "天勤"
     assert real_app._period_code(real_app.tf_var, real_app.tf_custom_var) == "60"
     assert real_app._period_code(real_app.trail_var, real_app.trail_custom_var) == "D"
     assert real_app.flatten_at_close_var.get() is False
@@ -493,7 +493,7 @@ def test_config_mapping_save_and_reload_round_trip(real_app) -> None:
 def test_copy_risk_to_backtest_full_does_not_save(real_app) -> None:
     real_app._set_watch_codes(["bu2612"], select="bu2612", save=False)
     real_app.engine_var.set("daily_body")
-    real_app.source_var.set("东方财富")
+    real_app.source_var.set("天勤")
     real_app._set_period_vars("60", real_app.tf_var, real_app.tf_custom_var)
     real_app._set_period_vars("D", real_app.trail_var, real_app.trail_custom_var)
     real_app.flatten_at_close_var.set(False)
@@ -517,8 +517,8 @@ def test_copy_risk_to_backtest_full_does_not_save(real_app) -> None:
     assert real_app.rv_symbol_var.get() == "bu2612"
     assert real_app._period_code(real_app.bt_tf_var, real_app.bt_tf_custom_var) == "60"
     assert real_app._period_code(real_app.bt_trail_var, real_app.bt_trail_custom_var) == "D"
-    assert real_app.bt_source_var.get() == "东方财富"
-    assert real_app.opt_source_var.get() == "东方财富"
+    assert real_app.bt_source_var.get() == "天勤"
+    assert real_app.opt_source_var.get() == "天勤"
     assert real_app.bt_flatten_var.get() is False
     assert real_app.bt_sizing_var.get() == "fixed"
     assert real_app.bt_capital_var.get() == "246800"
@@ -537,7 +537,7 @@ def test_prepare_backtest_run_clones_and_normalizes_without_live_leak(real_app) 
     real_app.engine_var.set("multi_factor")
     real_app.source_var.set("新浪")
     real_app.bt_engine_var.set("daily_body")
-    real_app.bt_source_var.set("东方财富")
+    real_app.bt_source_var.set("天勤")
     real_app.bt_symbol_var.set("bu2612")
     real_app._set_period_vars("30", real_app.bt_tf_var, real_app.bt_tf_custom_var)
     real_app._set_period_vars("60", real_app.bt_trail_var, real_app.bt_trail_custom_var)
@@ -557,7 +557,7 @@ def test_prepare_backtest_run_clones_and_normalizes_without_live_leak(real_app) 
     assert end == "2026-02-03"
     assert cfg["strategy"]["engine"] == "daily_body"
     assert cfg["strategy"]["symbols"] == ["bu2612"]
-    assert cfg["data"]["source"] == "eastmoney"
+    assert cfg["data"]["source"] == "tq"
     assert cfg["risk"]["apply_limits"] is False
     assert cfg["risk"]["sizing_mode"] == "fixed"
     assert cfg["trade"]["volume"] == 1
@@ -570,9 +570,33 @@ def test_prepare_backtest_run_clones_and_normalizes_without_live_leak(real_app) 
     assert real_app.cfg["strategy"]["symbols"] == live_symbols
 
 
+def test_prepare_backtest_uses_page_capital_not_live(real_app) -> None:
+    """历史回测用本页填的测试资金开仓，不改配置页账户余额。"""
+    real_app._set_watch_codes(["bu2612"], select="bu2612", save=False)
+    real_app.capital_var.set("32790")
+    real_app.bt_capital_var.set("100000")
+    real_app.bt_engine_var.set("daily_body")
+    real_app.bt_source_var.set("天勤")
+    real_app.bt_symbol_var.set("bu2612")
+    real_app.bt_limits_on_var.set(True)
+    real_app.bt_range_var.set("自定义")
+    real_app.bt_start_var.set("2026-01-02")
+    real_app.bt_end_var.set("2026-02-03")
+    config_path = real_app.root_dir / "config" / "config.yaml"
+    before = config_path.read_bytes()
+
+    prepared = real_app._prepare_backtest_run()
+
+    assert prepared is not None
+    cfg, _symbol, _start, _end = prepared
+    assert cfg["risk"]["capital"] == 100000
+    assert real_app.capital_var.get() == "32790"
+    assert config_path.read_bytes() == before
+
+
 @pytest.mark.parametrize(
     ("bt_source", "expected_source"),
-    [("东方财富", "eastmoney"), ("同花顺图", "akshare")],
+    [("天勤", "tq"), ("同花顺图", "akshare")],
 )
 def test_write_backtest_to_config_page_preserves_live_only_values(real_app, monkeypatch, bt_source, expected_source) -> None:
     real_app._set_watch_codes(["bu2612"], select="bu2612", save=False)

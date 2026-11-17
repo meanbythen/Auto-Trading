@@ -21,11 +21,21 @@ from typing import Any
 
 from loguru import logger
 
-from src.data.tick.vnpy_store import save_ticks, split_instrument, to_tick_data
+from src.data.tick.vnpy_store import VnpyUnavailable, save_ticks, split_instrument, to_tick_data
 from src.data.tq_source import main_contract, tq_symbol
 from src.utils import load_secrets
 
 _BACKOFF = (5.0, 10.0, 30.0, 60.0)
+
+
+class TickConfigError(RuntimeError):
+    """配置写错了，重连也没用，应直接停采集。"""
+
+
+def _watch_symbols(cfg: dict[str, Any]) -> list[str]:
+    """配置页关注品种。tick.symbols 空时用这份，和说明书一致。"""
+    strategy = cfg.get("strategy") or {}
+    return [str(item).strip() for item in (strategy.get("symbols") or []) if str(item).strip()]
 
 
 def tick_settings(cfg: dict[str, Any]) -> dict[str, Any]:
@@ -35,9 +45,12 @@ def tick_settings(cfg: dict[str, Any]) -> dict[str, Any]:
     tick_cfg = data_cfg.get("tick", {}) or {}
     tq_cfg = data_cfg.get("tq", {}) or {}
     secrets = load_secrets()
+    symbols = [str(item).strip() for item in (tick_cfg.get("symbols") or []) if str(item).strip()]
+    if not symbols:
+        symbols = _watch_symbols(cfg)
     return {
         "root": root,
-        "symbols": [str(item) for item in (tick_cfg.get("symbols") or [])],
+        "symbols": symbols,
         "resolve_main": bool(tick_cfg.get("resolve_main", True)),
         "flush_seconds": float(tick_cfg.get("flush_seconds", 5)),
         "batch_size": int(tick_cfg.get("batch_size", 2000)),
@@ -174,6 +187,12 @@ class TickRecorder:
         while not self._stop.is_set():
             try:
                 self._session()
+            except (TickConfigError, VnpyUnavailable) as exc:
+                # 没装库、没填合约：再连也一样，停住让界面把原因显示出来。
+                self._error = str(exc)
+                self._state = "stopped"
+                logger.error("tick 采集停住：{}", exc)
+                break
             except Exception as exc:  # noqa: BLE001
                 if self._stop.is_set():
                     break
@@ -193,6 +212,10 @@ class TickRecorder:
         return min(max(self.reconnect_seconds, step), self.max_backoff_seconds)
 
     def _session(self) -> None:
+        if not self.symbols_in:
+            raise TickConfigError(
+                "没有要采集的合约：请在配置页填关注品种，或在 data.tick.symbols 里写真实合约"
+            )
         client = self._api_factory() if self._api_factory else self._default_api()
         self._api = client
         try:
@@ -202,19 +225,18 @@ class TickRecorder:
             self._state = "running"
             self._connected_at = datetime.now().isoformat(timespec="seconds")
             logger.info("tick 采集已连接：{}", ", ".join(self._symbols))
+            for instrument, serial in serials.items():
+                self._append_serial(instrument, serial)
+            self.flush()
             self._write_status("running")
 
             last_flush = time.monotonic()
+            last_status = last_flush
             refreshed = date.today()
             while not self._stop.is_set():
                 _wait_update(client)
                 for instrument, serial in list(serials.items()):
-                    try:
-                        changed = bool(client.is_changed(serial))
-                    except Exception:  # noqa: BLE001
-                        changed = True
-                    if changed:
-                        self._append_serial(instrument, serial)
+                    self._append_serial(instrument, serial)
 
                 now = time.monotonic()
                 with self._buffer_lock:
@@ -222,6 +244,9 @@ class TickRecorder:
                 if buffered and (buffered >= self.batch_size or now - last_flush >= self.flush_seconds):
                     self.flush()
                     last_flush = now
+                if now - last_status >= 2:
+                    self._write_status(self._state)
+                    last_status = now
 
                 if date.today() != refreshed:
                     refreshed = date.today()
@@ -231,7 +256,7 @@ class TickRecorder:
 
     def _default_api(self) -> Any:
         if not self.user or not self.password:
-            raise RuntimeError(
+            raise TickConfigError(
                 "天勤需要账号和密码：请填 data.tq.user，密码放 config/secrets.local.yaml 的 tq_password"
             )
         from tqsdk import TqApi, TqAuth
@@ -249,7 +274,9 @@ class TickRecorder:
         """品种代码解析成当前主力真实合约；具体合约原样订阅。"""
         raw_list = self.symbols_in
         if not raw_list:
-            raise RuntimeError("data.tick.symbols 是空的：请填写品种或真实合约后再启动 tick 采集")
+            raise TickConfigError(
+                "没有要采集的合约：请在配置页填关注品种，或在 data.tick.symbols 里写真实合约"
+            )
         out: list[str] = []
         for raw in raw_list:
             text = str(raw).strip()
@@ -303,7 +330,7 @@ class TickRecorder:
         try:
             tick = to_tick_data(row, symbol, exchange)
         except Exception as exc:  # noqa: BLE001
-            logger.debug("tick 数据转换失败（{}）：{}", instrument, exc)
+            logger.warning("tick 数据转换失败（{}）：{}", instrument, exc)
             return
         today = date.today()
         if today != self._today:

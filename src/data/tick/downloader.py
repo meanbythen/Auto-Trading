@@ -25,7 +25,7 @@ from src.data.tick.clean import clean_tick_frame
 from src.data.tick.recorder import tick_settings
 from src.data.tick.synthesize import synthesize_symbol
 from src.data.tick.vnpy_store import save_ticks, ticks_from_frame
-from src.data.tq_source import config_symbol_from_tq
+from src.data.tq_source import config_symbol_from_tq, tq_symbol
 
 _PERMISSION_HINT = "需要天勤专业版或试用权限才能下载历史 tick"
 
@@ -47,6 +47,32 @@ class DownloadChunk:
     @property
     def key(self) -> str:
         return f"{self.contract}|{self.start.isoformat()}|{self.end.isoformat()}"
+
+
+def main_cont_from_symbol(symbol: str) -> str:
+    """fu2701 / fu → KQ.m@SHFE.fu，给历史主力查询用。"""
+    instrument = tq_symbol(symbol)
+    if instrument.startswith("KQ.m@"):
+        return instrument
+    exchange, code = instrument.split(".", 1)
+    product = "".join(ch for ch in code if ch.isalpha())
+    return f"KQ.m@{exchange}.{product}"
+
+
+def main_cont_list_from_symbols(symbols: list[str]) -> list[str]:
+    """关注品种收成不重复的天勤主连代码。"""
+    out: list[str] = []
+    for raw in symbols:
+        text = str(raw).strip()
+        if not text:
+            continue
+        try:
+            key = main_cont_from_symbol(text)
+        except ValueError:
+            continue
+        if key not in out:
+            out.append(key)
+    return out
 
 
 def download_settings(cfg: dict[str, Any]) -> dict[str, Any]:

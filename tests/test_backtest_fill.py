@@ -16,6 +16,7 @@ from src.backtest.engine import (
     _trend_frame_for_signal,
     run_backtest,
 )
+from src.backtest.exit_policy import is_stop_exit_reason
 from src.strategy.trend_base import TrendStrategyBase
 from src.strategy.types import PositionState, StrategyAction, StrategyDecision
 
@@ -33,6 +34,15 @@ def _frame(rows: list[tuple[str, float, float, float]]) -> pd.DataFrame:
         },
         index=index,
     )
+
+
+def test_box_stop_reason_counts_as_explicit_stop() -> None:
+    """打破开盘箱体就是结构止损，不能当成普通离场去用下一根开盘价。"""
+    reason = "触及止损，打破开盘箱体上沿 4346.00，方向作废，先出来，不再拿到收盘"
+    assert is_stop_exit_reason(reason, {}) is True
+    assert is_stop_exit_reason("打破开盘箱体上沿 4346.00，方向作废", {}) is True
+    assert is_stop_exit_reason("收到这段收盘，日内方向拿到这里", {}) is False
+    assert is_stop_exit_reason("顺着日内方向拿着空单", {"structure_stop": True}) is True
 
 
 def test_next_open_spans_session_break_and_returns_next_bar_open() -> None:
@@ -55,6 +65,20 @@ def test_next_open_spans_session_break_and_returns_next_bar_open() -> None:
         ]
     )
     assert _next_open_price(gap, 0, "5") == 102
+
+
+def test_next_open_skips_lunch_clock_bar_for_hog() -> None:
+    """生猪 60 分钟 11:00 信号不能在 12:00 成交，要等到下午重新开盘。"""
+    bars = _frame(
+        [
+            ("2026-01-05 11:00", 13000, 13010, 12990),
+            ("2026-01-05 12:00", 13020, 13030, 13010),
+            ("2026-01-05 13:00", 13040, 13050, 13030),
+            ("2026-01-05 14:00", 13080, 13090, 13070),
+        ]
+    )
+    assert _next_open_price(bars, 0, "60") == 13020
+    assert _next_open_price(bars, 0, "60", symbol="lh2701") == 13080
 
 
 def test_fill_model_reads_config_and_defaults_to_one_tick() -> None:
@@ -153,8 +177,13 @@ def test_daily_trend_bars_use_the_futures_trading_day() -> None:
 
 def test_entry_fills_at_next_open_when_enabled() -> None:
     """开启「下一根开盘」后，开仓价就是下一根开盘价，不再用信号当根的策略价。"""
+    from datetime import date as date_cls
+
+    from src.backtest.engine import session_bar_times
+
     closes = [90.0 if i % 2 == 0 else 110.0 for i in range(40)] + [130.0, 131.0, 132.0]
-    idx = [datetime(2026, 10, 16, 9, 0) + timedelta(minutes=5 * i) for i in range(len(closes))]
+    # 用交易时段时间，避免 09:00 起连续 5 分钟一直走到午休里。
+    idx = session_bar_times(date_cls(2026, 10, 16), 5, include_night=False)[: len(closes)]
     bars = pd.DataFrame(
         {
             "open": closes,

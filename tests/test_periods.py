@@ -1,6 +1,6 @@
 """周期写法：分钟、日线、周线、自定义分钟，要收成同一种代码。"""
 
-from datetime import datetime
+from datetime import date, datetime
 
 import pandas as pd
 
@@ -9,11 +9,12 @@ from src.data.periods import (
     bars_from_minutes,
     canonical_period,
     drop_forming_bar,
-    fix_gap_spanning_bars,
     minute_base,
     overlay_minute_bars,
     resample_ohlc,
+    session_close_times,
     ui_parts,
+    unique_ohlc_columns,
 )
 
 
@@ -45,54 +46,6 @@ def test_session_open_edge_mask_flags_only_opening_bars() -> None:
         True,
         False,
     ]
-
-
-def test_fix_gap_spanning_bar_removes_last_session_high() -> None:
-    """跳空低开时，第一根K线的高点常被接口塞成上一段收盘价，要收回本段区间。"""
-    bars = pd.DataFrame(
-        [
-            # 11-04 夜盘最后一根：收盘 4486
-            {"open": 4489, "high": 4491, "low": 4481, "close": 4486, "volume": 1200},
-            # 11-05 跳空低开 4179，接口把昨晚收盘 4486 当成高点；低点 4105 是本段的
-            {"open": 4179, "high": 4486, "low": 4105, "close": 4163, "volume": 79776},
-        ],
-        index=pd.to_datetime(["2026-11-04 23:00:00", "2026-11-05 09:05:00"]),
-    )
-    fixed = fix_gap_spanning_bars(bars)
-    assert fixed is not None
-    assert float(fixed["high"].iloc[1]) == 4179  # max(open, close)，不再含 4486
-    assert float(fixed["low"].iloc[1]) == 4105  # 真实低点保留
-    # 夜盘那根不跳空，保持原样
-    assert float(fixed["high"].iloc[0]) == 4491
-
-
-def test_fix_gap_spanning_bar_raises_low_on_gap_up() -> None:
-    """跳空高开时反过来：低点被塞成上一段收盘价，要抬回本段区间。"""
-    bars = pd.DataFrame(
-        [
-            {"open": 4100, "high": 4110, "low": 4090, "close": 4105, "volume": 900},
-            {"open": 4300, "high": 4330, "low": 4105, "close": 4310, "volume": 5000},
-        ],
-        index=pd.to_datetime(["2026-11-05 15:00:00", "2026-11-05 21:05:00"]),
-    )
-    fixed = fix_gap_spanning_bars(bars)
-    assert fixed is not None
-    assert float(fixed["low"].iloc[1]) == 4300  # min(open, close)
-    assert float(fixed["high"].iloc[1]) == 4330
-
-
-def test_fix_gap_spanning_bar_leaves_normal_bars_alone() -> None:
-    """没有跳空、或者高点高于上一根收盘（确实打回去了）时不动。"""
-    bars = pd.DataFrame(
-        [
-            {"open": 100, "high": 101, "low": 99, "close": 100, "volume": 10},
-            {"open": 105, "high": 110, "low": 104, "close": 108, "volume": 12},
-        ],
-        index=pd.to_datetime(["2026-11-05 09:05:00", "2026-11-05 09:10:00"]),
-    )
-    fixed = fix_gap_spanning_bars(bars)
-    assert fixed is not None
-    assert float(fixed["high"].iloc[1]) == 110
 
 
 def test_daily_weekly_and_custom_minutes() -> None:
@@ -194,6 +147,178 @@ def test_custom_minutes_can_be_built_from_finer_bars() -> None:
     assert float(out["close"].iloc[0]) == 2.5
 
 
+def _session_minutes(day: str, segments: list[tuple[str, str]]) -> pd.DataFrame:
+    """按交易时段生成 1 分钟，跳过休息。"""
+    from datetime import timedelta
+
+    stamps: list[pd.Timestamp] = []
+    for start_s, end_s in segments:
+        start = pd.Timestamp(f"{day} {start_s}")
+        end = pd.Timestamp(f"{day} {end_s}")
+        t = start + timedelta(minutes=1)
+        while t <= end:
+            stamps.append(t)
+            t += timedelta(minutes=1)
+    n = len(stamps)
+    return pd.DataFrame(
+        {
+            "open": list(range(n)),
+            "high": list(range(n)),
+            "low": list(range(n)),
+            "close": list(range(n)),
+            "volume": [1.0] * n,
+        },
+        index=pd.DatetimeIndex(stamps),
+    )
+
+
+def test_sixty_minute_bars_follow_session_clock() -> None:
+    """商品 60 分钟日盘按时段内整点收，休市断开，没有 12:00、11:15、14:15。"""
+    minutes = _session_minutes(
+        "2026-10-27",
+        [("09:00", "10:15"), ("10:30", "11:30"), ("13:30", "15:00")],
+    )
+    built = bars_from_minutes(minutes, "60", symbol="lh2701")
+    assert list(built.index.strftime("%H:%M")) == [
+        "10:00",
+        "10:15",
+        "11:00",
+        "11:30",
+        "14:00",
+        "15:00",
+    ]
+    assert int(built.loc[pd.Timestamp("2026-10-27 10:00")]["minute_count"]) == 60
+    assert int(built.loc[pd.Timestamp("2026-10-27 10:15")]["minute_count"]) == 15
+    assert int(built.loc[pd.Timestamp("2026-10-27 11:00")]["minute_count"]) == 30
+    assert int(built.loc[pd.Timestamp("2026-10-27 11:30")]["minute_count"]) == 30
+    assert int(built.loc[pd.Timestamp("2026-10-27 14:00")]["minute_count"]) == 30
+    assert int(built.loc[pd.Timestamp("2026-10-27 15:00")]["minute_count"]) == 60
+
+    native = pd.DataFrame(
+        {
+            "open": [1.0, 2.0, 3.0, 4.0],
+            "high": [1.0, 2.0, 3.0, 4.0],
+            "low": [1.0, 2.0, 3.0, 4.0],
+            "close": [1.0, 2.0, 3.0, 4.0],
+            "volume": [1.0, 1.0, 1.0, 1.0],
+        },
+        index=pd.to_datetime(
+            [
+                "2026-10-27 11:00:00",
+                "2026-10-27 12:00:00",
+                "2026-10-27 13:00:00",
+                "2026-10-27 14:00:00",
+            ]
+        ),
+    )
+    merged, _complete = overlay_minute_bars(native, built, 60)
+    assert list(merged.index.strftime("%H:%M")) == [
+        "10:00",
+        "10:15",
+        "11:00",
+        "11:30",
+        "14:00",
+        "15:00",
+    ]
+
+
+def test_thirty_minute_bars_do_not_span_tea_or_lunch() -> None:
+    """30 分钟在 10:15、11:30 截断；10:30、13:30 是开盘不是收线。"""
+    minutes = _session_minutes(
+        "2026-10-27",
+        [("09:00", "10:15"), ("10:30", "11:30"), ("13:30", "15:00")],
+    )
+    built = bars_from_minutes(minutes, "30", symbol="lh2701")
+    assert list(built.index.strftime("%H:%M")) == [
+        "09:30",
+        "10:00",
+        "10:15",
+        "11:00",
+        "11:30",
+        "14:00",
+        "14:30",
+        "15:00",
+    ]
+
+
+def test_hog_sixty_has_no_night_bars() -> None:
+    """生猪没有夜盘，21 点那根 1 分钟不能拼进 60 分钟。"""
+    day = _session_minutes(
+        "2026-10-27",
+        [("09:00", "10:15"), ("10:30", "11:30"), ("13:30", "15:00")],
+    )
+    night = _session_minutes("2026-10-26", [("21:00", "23:00")])
+    minutes = pd.concat([night, day]).sort_index()
+    built = bars_from_minutes(minutes, "60", symbol="lh2701")
+    hours = set(built.index.strftime("%H:%M"))
+    assert "22:00" not in hours
+    assert "23:00" not in hours
+
+
+def test_silver_sixty_keeps_0230_stub() -> None:
+    """黄金白银夜盘 02:00～02:30 是一根不足 60 分钟的短 K。"""
+    minutes = _session_minutes("2026-10-27", [("21:00", "23:59")])
+    extra = _session_minutes("2026-10-28", [("00:00", "02:30")])
+    built = bars_from_minutes(pd.concat([minutes, extra]), "60", symbol="ag2702")
+    times = list(built.index.strftime("%Y-%m-%d %H:%M"))
+    assert "2026-10-27 22:00" in times
+    assert "2026-10-28 02:00" in times
+    assert "2026-10-28 02:30" in times
+    assert int(built.loc[pd.Timestamp("2026-10-28 02:30")]["minute_count"]) == 30
+
+
+def test_five_and_ten_minute_follow_clock_with_gaps() -> None:
+    """5/10 分钟按墙上时钟收，休市没有 K；10 分钟在 10:15 收一根短 K。"""
+    minutes = _session_minutes(
+        "2026-10-27",
+        [("09:00", "10:15"), ("10:30", "11:30"), ("13:30", "15:00")],
+    )
+    five = bars_from_minutes(minutes, "5", symbol="lh2701")
+    times5 = set(five.index.strftime("%H:%M"))
+    assert "10:15" in times5
+    assert "10:20" not in times5
+    assert "10:25" not in times5
+    assert "10:30" not in times5
+    assert "10:35" in times5
+    assert "12:00" not in times5
+    ten = bars_from_minutes(minutes, "10", symbol="lh2701")
+    times10 = list(ten.index.strftime("%H:%M"))
+    assert "10:10" in times10
+    assert "10:15" in times10
+    assert "10:20" not in times10
+    assert int(ten.loc[pd.Timestamp("2026-10-27 10:15")]["minute_count"]) == 5
+
+
+def test_daily_bar_groups_night_into_next_day_session() -> None:
+    """有夜盘：26 日 21:00～27 日 15:00 合成 27 日这一根；午休分钟不并进去。"""
+    from src.data.tick.synthesize import minutes_to_daily
+
+    night = _session_minutes("2026-10-26", [("21:00", "23:00")])
+    day = _session_minutes(
+        "2026-10-27",
+        [("09:00", "10:15"), ("10:30", "11:30"), ("13:30", "15:00")],
+    )
+    lunch = pd.DataFrame(
+        {"open": [9.0], "high": [9.0], "low": [9.0], "close": [9.0], "volume": [99.0]},
+        index=pd.to_datetime(["2026-10-27 12:00"]),
+    )
+    daily = minutes_to_daily(pd.concat([night, day, lunch]), symbol="fu2701")
+    assert list(daily.index) == [pd.Timestamp("2026-10-27")]
+    assert float(daily["open"].iloc[0]) == float(night["open"].iloc[0])
+    assert float(daily["close"].iloc[0]) == float(day["close"].iloc[-1])
+    assert float(daily["volume"].iloc[0]) == float(night["volume"].sum() + day["volume"].sum())
+
+    hog = minutes_to_daily(pd.concat([night, day]), symbol="lh2701")
+    assert float(hog["open"].iloc[0]) == float(day["open"].iloc[0])
+
+
+def test_session_close_times_sixty_matches_clock_bars() -> None:
+    """缺口检查用的应收时刻，要和拼出来的 60 分钟一致。"""
+    day = date(2026, 10, 27)
+    times = [stamp.strftime("%H:%M") for stamp in session_close_times(day, 60, include_night=False)]
+    assert times == ["10:00", "10:15", "11:00", "11:30", "14:00", "15:00"]
+
+
 def test_drop_forming_keeps_complete_afternoon_bar_after_lunch() -> None:
     """
     午休后只有上午收盘 + 13:35 已收盘时，不能再盲删最后一根。
@@ -240,8 +365,8 @@ def test_drop_forming_still_drops_current_incomplete_bucket() -> None:
     assert str(kept.index[-1]) == "2026-10-27 13:35:00"
 
 
-def test_fix_gap_with_duplicate_close_column_does_not_crash() -> None:
-    """同一张表有两列 close 时，不能再报 array ambiguous。"""
+def test_duplicate_close_column_keeps_last() -> None:
+    """同一张表有两列 close 时只留最后一列，开高低收不再改写。"""
     bars = pd.DataFrame(
         [
             {"open": 4489, "high": 4491, "low": 4481, "close": 4486, "volume": 1200},
@@ -251,7 +376,7 @@ def test_fix_gap_with_duplicate_close_column_does_not_crash() -> None:
     )
     bars = pd.concat([bars, bars[["close"]]], axis=1)
     assert bars.columns.duplicated().any()
-    fixed = fix_gap_spanning_bars(bars)
-    assert fixed is not None
-    assert not fixed.columns.duplicated().any()
-    assert float(fixed["high"].iloc[1]) == 4179
+    cleaned = unique_ohlc_columns(bars)
+    assert cleaned is not None
+    assert not cleaned.columns.duplicated().any()
+    assert float(cleaned["high"].iloc[1]) == 4486

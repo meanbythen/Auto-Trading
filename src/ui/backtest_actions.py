@@ -14,6 +14,21 @@ import sys
 import threading
 
 
+def _source_line(snap: dict) -> str:
+    """结果里写明这一把用的哪家行情，避免和内存缓存串库。"""
+    from src.data.quote_check import source_label
+
+    code = str(snap.get("data_source") or "")
+    label = source_label(code)
+    if label in {"天勤"}:
+        return f"{label}（本地库存名带 @tq，不和新浪混）"
+    if label in {"同花顺图"}:
+        return f"{label}（本地库存名带 @ths）"
+    if label in {"tick合成"}:
+        return f"{label}（本地库存名带 @tick）"
+    return f"{label}（本地库存名不带后缀）"
+
+
 class BacktestActionsMixin:
     """Methods mixed into AutoTradingApp; UI state remains on the app instance."""
 
@@ -81,6 +96,7 @@ class BacktestActionsMixin:
             if snap.get("flatten_at_close", True)
             else "收盘清仓  关（可留过收盘；区间最后一根仍会按收盘价结算未平的仓）",
             f"周期      信号{period_label(result.timeframe)} / 止损{period_label(result.trail_timeframe)}",
+            f"行情来源  {_source_line(snap)}",
             self._format_limit_lines(snap),
             f"你选的区间  {snap.get('start_date') or '不限'} ~ {snap.get('end_date') or '到最新'}",
             f"行情能给的  {str(snap.get('available_from', ''))[:16]}  →  {str(snap.get('available_to', ''))[:16]}",
@@ -497,6 +513,45 @@ class BacktestActionsMixin:
         # 写 Excel 可能要几秒：放后台线程，弹窗和日志都回主线程再碰控件。
         threading.Thread(target=_run, daemon=True).start()
 
+
+    def _on_minute_review(self) -> None:
+        """对最近一次历史回测的成交做 1 分钟止损复核，不另找开仓。"""
+        from src.backtest.minute_review import (
+            format_minute_review,
+            load_one_minute_bars,
+            review_trades_on_minutes,
+            trades_from_backtest_file,
+        )
+
+        report_path = self.root_dir / "data" / "backtest_last.json"
+        trades = trades_from_backtest_file(report_path)
+        if not trades:
+            messagebox.showwarning("还没有回测成交", "请先点「开始历史回测」，有成交后再做 1 分钟复核。")
+            return
+        symbol = str(trades[0].symbol or self.bt_symbol_var.get() or "")
+        start = min((str(item.entry_time)[:10] for item in trades if item.entry_time), default="")
+        end = max((str(item.exit_time)[:10] for item in trades if item.exit_time), default="")
+        cfg = self._clone_cfg()
+        box = getattr(self, "bt_result_box", None)
+        self._append_log(f"开始 1 分钟复核 {symbol} {len(trades)} 笔")
+        if box is not None:
+            self._set_result_text(box, "正在用 1 分钟复核上一回测的止损…\n")
+
+        def work() -> None:
+            try:
+                minutes = load_one_minute_bars(cfg, symbol, start=start or None, end=end or None)
+                report = review_trades_on_minutes(trades, minutes)
+                text = format_minute_review(report)
+                if box is not None:
+                    self._post_to_main(lambda t=text: self._set_result_text(box, t))
+                self._post_to_main(lambda: self._append_log(
+                    f"1 分钟复核完成：更早止损 {report.earlier_stops}/{report.trades}"
+                ))
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("1 分钟复核失败")
+                self._post_to_main(lambda m=str(exc): messagebox.showerror("1 分钟复核失败", m))
+
+        threading.Thread(target=work, name="MinuteReview", daemon=True).start()
 
     def _on_plot_factor_decay(self) -> None:
         """按资料第二节的思路画衰减图：只读已有成交，不改开平仓。"""

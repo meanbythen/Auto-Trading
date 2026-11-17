@@ -97,7 +97,8 @@ def expected_bar_times(
                 if day.weekday() == 4:
                     stamps.append(datetime.combine(day, time(15, 0)))
             elif code == "D":
-                stamps.append(datetime.combine(day, time(15, 0)))
+                # 程序里日线时间戳是交易日 00:00，不是 15:00。
+                stamps.append(datetime.combine(day, time(0, 0)))
             else:
                 for stamp in _session_times(day, max(1, int(code))):
                     if first <= stamp <= last:

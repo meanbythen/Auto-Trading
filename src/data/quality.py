@@ -25,7 +25,7 @@ from src.data.tq_source import session_open_minutes
 
 LATEST_NAME = "行情质量.xlsx"
 # 并排对照这几家。csv / 演示数据不参加。同花顺图只在回测页拉过才有库存。
-COMPARE_SOURCES = ("akshare", "eastmoney", "tq", "ths")
+COMPARE_SOURCES = ("tq", "akshare", "ths")
 _STATUS_CN = {"ok": "能用", "watch": "该看一眼", "empty": "还没数据"}
 
 
@@ -416,7 +416,7 @@ def _compare_layer(
         only_name = source_label(next(iter(ready)))
         result["message"] = (
             f"{layer}：本地只有「{only_name}」。"
-            "请到历史回测页换另外几家来源各跑一次（新浪/东财/天勤可常驻拉；同花顺图只在回测页读图），再点检查。"
+            "请到历史回测页换另外几家来源各跑一次（天勤/新浪可常驻拉；同花顺图只在回测页读图），再点检查。"
         )
         return result
 
@@ -744,7 +744,7 @@ def inspect_quote_book(
         status = "empty"
         message = (
             f"还没有 {symbol} 的{period_label(period)}库存。"
-            "请到历史回测页换新浪、东方财富、天勤各跑一次（或常驻拉一次）；"
+            "请到历史回测页换天勤、新浪各跑一次（或常驻拉一次）；"
             "同花顺图请在回测页选好后读图。"
         )
     elif n_clean < 2:
@@ -840,7 +840,7 @@ def format_quality_text(report: QualityReport) -> str:
 def format_quality_book_text(book: QuoteQualityBook) -> str:
     """三家并排的一整页。先写清洗后（开仓看这份），再写各家脏不脏、原样对照。"""
     lines = [
-        f"行情质量  {book.symbol}  {period_label(book.period)}  新浪 / 东方财富 / 天勤 / 同花顺图 并排",
+        f"行情质量  {book.symbol}  {period_label(book.period)}  天勤 / 新浪 / 同花顺图 并排",
         f"检查时间  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
         f"结论  {_STATUS_CN.get(book.status, book.status)}",
         f"每跳 {book.tick:g}，乘数 {book.multiplier:g}（用来把价差说成跳数和大约几元）",
@@ -872,7 +872,7 @@ def format_quality_book_text(book: QuoteQualityBook) -> str:
     lines.extend(_format_layer(book.raw_cmp))
     lines.append("")
     lines.append("原样库：data/klines/raw.sqlite")
-    lines.append("清洗库：data/klines/market.sqlite（东方财富带 @eastmoney，天勤带 @tq，同花顺图带 @ths）")
+    lines.append("清洗库：data/klines/market.sqlite（天勤带 @tq，同花顺图带 @ths，新浪不带后缀）")
     lines.append("这一页只检查，不下单，也不改开平仓。")
     return "\n".join(lines) + "\n"
 

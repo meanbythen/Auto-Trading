@@ -37,6 +37,8 @@ from .params import DEFAULT_ENGINE, ENGINE_SECTION_DEFAULTS, StrategyParams
 from .rule_dsl import RuleConfigError, RuleStrategy, rule_engine_stem
 from .sar_trend import SarTrendStrategy
 from .supertrend import SuperTrendStrategy
+from .dual_donchian import DualDonchianStrategy
+from .dual_fractal import DualFractalStrategy
 from .swing_box import SwingBoxStrategy
 from .swing_trend import SwingTrendStrategy
 from .trend_follow import TrendFollowStrategy
@@ -210,6 +212,8 @@ ENGINE_LABELS: dict[str, str] = {
     "multi_factor": "多因子CTA（加权打分）",
     "swing_trend": "长线趋势加减仓",
     "swing_box": "长线箱体突破",
+    "dual_donchian": "双周期通道突破",
+    "dual_fractal": "双周期回调分型",
     "rule_dsl": "自定义规则（DSL）",
 }
 
@@ -229,6 +233,8 @@ CROSS_TEST_ENGINE_ORDER: list[str] = [
     "multi_factor",
     "swing_trend",
     "swing_box",
+    "dual_donchian",
+    "dual_fractal",
 ]
 
 # 每个引擎盘前审计时该套哪种公共行情过滤。None = 不接公共过滤器。
@@ -253,6 +259,8 @@ ENGINE_AUDIT_MODES: dict[str, MarketFilterMode | None] = {
     "cta": "trend",         # 别名
     "swing_trend": "trend",
     "swing_box": None,  # 箱子和 ADX 写在策略里
+    "dual_donchian": None,  # ADX 写在大周期自己里
+    "dual_fractal": None,
     "rule_dsl": None,  # 过滤条件写在用户规则文件里
 }
 
@@ -289,6 +297,10 @@ REGISTRY: dict[str, StrategyFactory] = {
     "swing_trend": SwingTrendStrategy,
     # 震荡箱子收盘突破后顺着拿趋势（信号/止损周期跟配置页）
     "swing_box": SwingBoxStrategy,
+    # 大周期通道+ADX 定方向，小周期唐奇安突破（周期可改）
+    "dual_donchian": DualDonchianStrategy,
+    # 大周期均线或通道定方向，小周期强分型+DIF 背离（周期可改）
+    "dual_fractal": DualFractalStrategy,
     # 用户自己写的指标条件组合（rules/*.yaml），不写代码就能加策略
     "rule_dsl": RuleStrategy,
 }

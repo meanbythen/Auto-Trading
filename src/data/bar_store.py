@@ -177,6 +177,7 @@ def aligned_bars(
     period: str,
     *,
     session_opens: tuple[int, ...] | None = None,
+    symbol: str | None = None,
 ) -> pd.DataFrame | None:
     """
     只留下能当成真实行情的K线，并按时间留在调用方的库里。
@@ -189,7 +190,12 @@ def aligned_bars(
     是早期左标签版本留下的，一并丢掉，免得被当成上一段收盘。开盘时刻按品种给
     （商品 09:00/13:30/21:00，中金所 09:30/13:00）：中金所 13:30 是正常收盘时刻，
     不能按商品那套丢掉。session_opens 不传就不做这一项。
+
+    休市当中的整点（商品 12:00、13:00，以及 10:16～10:29）不留给均线。
+    一根 K 线跨过大休市后，实盘那个时点根本下不了单。
     """
+    from src.utils.session_clock import has_commodity_tea_break
+
     cleaned = _as_bars(frame)
     if cleaned is None:
         return None
@@ -203,11 +209,34 @@ def aligned_bars(
             (index.second == 0)
             & (index.microsecond == 0)
             & (index.nanosecond == 0)
-            & (((index.hour * 60 + index.minute) % step) == 0)
         )
+        hm = index.hour * 60 + index.minute
+        on_step = (hm % step) == 0
+        if step >= 60:
+            # 时段收盘的短 K：10:15、11:30、02:30。不再保留跨午休的 11:15/14:15。
+            stub_60 = np.isin(
+                hm,
+                (
+                    10 * 60 + 15,
+                    11 * 60 + 30,
+                    2 * 60 + 30,
+                ),
+            )
+            mask &= on_step | stub_60
+        else:
+            mask &= on_step
         if session_opens:
             opens = np.asarray(index.hour * 60 + index.minute)
             mask &= ~np.isin(opens, np.asarray(session_opens))
+        if symbol:
+            clock_hm = np.asarray(index.hour * 60 + index.minute)
+            if has_commodity_tea_break(symbol):
+                in_break = ((clock_hm > 10 * 60 + 15) & (clock_hm < 10 * 60 + 30)) | (
+                    (clock_hm > 11 * 60 + 30) & (clock_hm < 13 * 60 + 30)
+                )
+            else:
+                in_break = (clock_hm > 11 * 60 + 30) & (clock_hm < 13 * 60)
+            mask &= ~in_break
     prices = cleaned[["open", "high", "low", "close"]].to_numpy(dtype=float)
     rounded = np.round(prices, 3)
     # 三位以内的小数是真实报价；空格子和更长的一串随机小数都不留着算 SAR。
@@ -657,7 +686,7 @@ class RawBarStore:
     接口刚下来、还没做对齐/去脏/重拼之前的K线。
 
     和清洗库分开一个文件，出了问题能对照「网上原来长什么样」。
-    只整理列名和数字，不丢掉对不齐的时间戳，也不修跨休市影线。
+    只整理列名和数字，不丢掉对不齐的时间戳，也不改开高低收。
     """
 
     def __init__(self, path: Path) -> None:

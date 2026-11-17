@@ -104,6 +104,25 @@ class ReviewTabMixin:
         ).pack(fill="x", padx=4, pady=(4, 8))
         ctk.CTkButton(
             left,
+            text="保存当天基线",
+            height=34,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_save_baseline,
+        ).pack(fill="x", padx=4, pady=(0, 4))
+        ctk.CTkLabel(
+            left,
+            text="把这一天「策略会不会开、程序有没有下单、账本有没有记」收成一份对照。以后改策略可以拿同一天重跑，看出信号笔数有没有变。不是买卖点。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w", padx=4, pady=(0, 8))
+        ctk.CTkButton(
+            left,
             text="按配置页重新填入",
             height=34,
             fg_color=T.BG_ELEVATED,
@@ -242,4 +261,66 @@ class ReviewTabMixin:
                 self._post_to_main(lambda m=err: messagebox.showerror("复盘失败", m))
 
         threading.Thread(target=_run, daemon=True).start()
+
+    def _on_save_baseline(self) -> None:
+        """把当天复盘对照写成可重跑的基线文件。"""
+        from datetime import date
+        from tkinter import messagebox
+
+        from src.review.replay import ENGINE_BY_LABEL, engine_from_label
+        from src.review.system_baseline import CATEGORY_LABELS, load_pack, save_current_baseline
+
+        raw_day = self.rv_date_var.get().strip()
+        try:
+            trade_date = date.fromisoformat(raw_day)
+        except ValueError:
+            messagebox.showerror("日期不对", "请按 YYYY-MM-DD 填写，例如 2026-10-14。")
+            return
+        symbol = self.rv_symbol_var.get().strip()
+        if not symbol or symbol == "（还没有）":
+            messagebox.showwarning("还没有合约", "请先到配置页的关注品种里添加要复盘的合约。")
+            return
+        label = self.rv_engine_var.get().strip()
+        engine = ENGINE_BY_LABEL.get(label) if label in ENGINE_BY_LABEL else engine_from_label(label)
+        scope = self.rv_scope_var.get().strip() or "前夜盘+日盘"
+        cfg = self._clone_cfg()
+        st = cfg.setdefault("strategy", {})
+        st["timeframe"] = self._period_code(self.rv_tf_var, self.rv_tf_custom_var)
+        st["trail_timeframe"] = self._period_code(self.rv_trail_var, self.rv_trail_custom_var)
+        st["symbols"] = [symbol]
+        if engine:
+            st["engine"] = engine
+        self._append_log(f"开始保存基线 {symbol} {raw_day}")
+        self._set_result_text(self.rv_result_box, "正在保存当天基线…\n会再对照一次策略重放、事件和账本。\n")
+
+        def work() -> None:
+            try:
+                path = save_current_baseline(
+                    cfg,
+                    symbol=symbol,
+                    trade_date=trade_date,
+                    scope=scope,
+                    engine=engine,
+                    root=self.root_dir,
+                )
+                pack = load_pack(path)
+                case = (pack.get("cases") or [{}])[0]
+                cats = [
+                    CATEGORY_LABELS.get(str(code), str(code))
+                    for code in (case.get("categories") or [])
+                ]
+                text = (
+                    f"已保存当天基线：{path}\n"
+                    f"合约 {case.get('symbol')}  策略 {case.get('engine') or '只看盘面'}  {case.get('trade_date')}\n"
+                    f"重放开仓 {case.get('replay_opens')} 笔；事件 {case.get('event_orders')} 条；账本 {case.get('book_fills')} 笔。\n"
+                    f"分类：{'、'.join(cats) or '—'}\n"
+                    "这是对照样本，不是买卖建议。以后改策略可拿同一天重跑，看笔数有没有变。"
+                )
+                self._post_to_main(lambda t=text: self._set_result_text(self.rv_result_box, t))
+                self._post_to_main(lambda: self._append_log(f"基线已保存 {path}"))
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("保存基线失败")
+                self._post_to_main(lambda m=str(exc): messagebox.showerror("保存基线失败", m))
+
+        threading.Thread(target=work, daemon=True).start()
 

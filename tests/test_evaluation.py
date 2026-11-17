@@ -11,6 +11,7 @@ from src.backtest.evaluation import (
     evaluate_backtest,
     evaluate_day,
     format_evaluation_lines,
+    mark_stress_not_run,
     max_consecutive_losses,
     verdict_text,
 )
@@ -195,6 +196,18 @@ def test_apply_stress_keeps_earlier_slippage_check() -> None:
     assert report.metrics["slippage_stress_ticks"] == 1.0
     assert report.metrics["slippage_net_pnl"] == 300.0
     assert report.metrics["slippage_trades"] == 5.0
+
+
+def test_mark_stress_not_run_does_not_change_pass_fail() -> None:
+    """交叉测试只标注没跑压力，不能把已经通过的结论改成淘汰。"""
+    trades = [_trade(40, i, adx=30) for i in range(1, 40)] + [_trade(-10, 40, adx=30)]
+    report = evaluate_backtest(_Result(trades, capital=100_000.0))
+    before = report.conclusion
+    mark_stress_not_run(report, reason="交叉测试不跑")
+    assert report.conclusion == before  # skip 不改写已经算好的通过/淘汰
+    keys = {item.key: item.status for item in report.checks}
+    assert keys["slippage"] == "skip"
+    assert keys["perturbation"] == "skip"
 
 
 def test_format_lines_accepts_serialized_dict() -> None:

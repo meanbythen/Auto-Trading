@@ -33,3 +33,7 @@ Desktop.ini
 # 编辑器
 .idea/
 .vscode/
+
+# 工具临时产物
+.trae/
+.trae-html-share-packages/

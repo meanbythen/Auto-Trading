@@ -128,8 +128,8 @@ MAIN_UNIVERSE: list[tuple[str, str, float, bool]] = [
 MIN_TRADES = 3
 # 交叉测试里，少于这么多笔不参加「较好」比较。和打分时「不满 5 笔直接垫底」是同一条线。
 MIN_COMPARE_TRADES = 5
-# 交叉测试共用的起始权益。只用来画权益曲线，不决定开几手。
-# 用同一个很大的数，回撤比例才不会被账户里那一两万放大，高保证金品种也不会被挡在外面。
+# 以前交叉测试把本金改成十亿，回撤比例几乎变成 0，评估会假「通过」。
+# 开几手仍固定；权益曲线和评估本金改回配置里的账户权益，和历史回测同一把尺子。
 CROSS_COMPARE_CAPITAL = 1_000_000_000.0
 
 
@@ -306,13 +306,21 @@ def prepare_screen_cfg(
         _attach_universe_contracts(risk)
         bind_run_margin(out, 0)
         if spec.get("ignore_equity"):
-            # 交叉测试不看账户权益。配置里按品种写的保证金也清掉，否则原油、国债这类仍会因钱不够开不出固定手数。
-            # 起始权益换成同一个大数，所有品种的回撤比例才放在同一把尺子上。
+            # 交叉测试不按权益算手数。保证金清掉，避免高保证金品种开不出固定手数。
+            # 本金优先用交叉测试页填的数，没有才用配置里的账户权益。
+            eval_capital = 0.0
+            try:
+                eval_capital = float(spec.get("capital") or risk.get("capital") or 0)
+            except (TypeError, ValueError):
+                eval_capital = 0.0
             for box in (risk.get("contracts") or {}).values():
                 if isinstance(box, dict):
                     box["margin"] = 0
                     box["margin_rate_pct"] = 0
-            risk["capital"] = CROSS_COMPARE_CAPITAL
+            if eval_capital > 0:
+                risk["capital"] = eval_capital
+            else:
+                risk.pop("capital", None)
             # 开几手仍是持仓手数。每笔风险记下来，但不拿它按权益重算手数。
             if "risk_per_trade_pct" in spec:
                 risk["risk_per_trade_pct"] = float(spec.get("risk_per_trade_pct") or 0)
@@ -645,7 +653,24 @@ def _fill_backtest_row(result: Any, row: dict[str, Any]) -> None:
     row["data_from"] = str(snap.get("data_from") or "")
     row["data_to"] = str(snap.get("data_to") or "")
     row["bars"] = int(getattr(result, "bars", 0) or 0)
+    _mark_picker_eval_no_stress(result)
     row.update(_evaluation_cells(result))
+
+
+def _mark_picker_eval_no_stress(result: Any) -> None:
+    """
+    交叉测试组合太多，不跑滑点加压和参数扰动。
+
+    在评估里标明「没跑」，避免表格上的「通过」被理解成已经过了历史回测页那两道压力。
+    结论本身仍只看已经算过的项（盈利因子、回撤、卡尔玛等）。
+    """
+    from src.backtest.evaluation import mark_stress_not_run
+
+    report = getattr(result, "evaluation", None)
+    if report is None:
+        return
+    mark_stress_not_run(report, reason="交叉测试不跑；请用历史回测页看这一项")
+    result.evaluation = report
 
 
 def _evaluation_cells(result: Any) -> dict[str, Any]:
@@ -726,6 +751,28 @@ def _run_cross_backtest(
     return result, volume
 
 
+def aligned_backtest_runner(cfg: dict[str, Any] | None = None) -> Callable[..., Any]:
+    """
+    交叉测试默认回测函数：换月开关和真实账户口径跟历史回测页同一套。
+
+    历史回测勾了「主力合约换月」，这里也按主力时段分段，不再只拿当前合约从年初测到尾。
+    测试传入自己的 runner 时不会走到这里。
+    """
+    del cfg
+
+    def _run(prepared: dict[str, Any], **kwargs: Any) -> Any:
+        from src.backtest.engine import run_backtest
+        from src.backtest.rollover import run_backtest_rollover
+
+        bt = prepared.get("backtest") if isinstance(prepared.get("backtest"), dict) else {}
+        kwargs.setdefault("chain_capital", bool(bt.get("chain_capital", False)))
+        if bool(bt.get("rollover_main", True)):
+            return run_backtest_rollover(prepared, **kwargs)
+        return run_backtest(prepared, **kwargs)
+
+    return _run
+
+
 def screen_strategies(
     cfg: dict[str, Any],
     symbol: str,
@@ -742,9 +789,7 @@ def screen_strategies(
     得分高的排前面。不改正在用的策略，也不拿这一轮去改配置。
     """
     if runner is None:
-        from src.backtest.engine import run_backtest
-
-        runner = run_backtest
+        runner = aligned_backtest_runner(cfg)
 
     contract = str(symbol or "").strip()
     if not contract or contract == "（还没有）":
@@ -881,9 +926,7 @@ def screen_cross(
     不改正在用的策略，也不写历史回测那份结果。
     """
     if runner is None:
-        from src.backtest.engine import run_backtest
-
-        runner = run_backtest
+        runner = aligned_backtest_runner(cfg)
 
     spec = dict(settings or {})
     # 不看账户权益，也不按风险百分比算手数。每个组合都用页面上的固定手数。

@@ -57,6 +57,20 @@ def test_next_open_is_next_bar_and_none_on_last() -> None:
     assert last.is_last is True
 
 
+def test_next_open_skips_lunch_when_symbol_given() -> None:
+    """有合约时，下一根若在午休，成交改到下午第一根。"""
+    bars = _frame(
+        ["2026-01-05 11:00", "2026-01-05 12:00", "2026-01-05 14:00"],
+        [13000.0, 13010.0, 13080.0],
+        [13000.0, 13020.0, 13080.0],
+    )
+    cursor = BarCursor(bars, timeframe="60", symbol="lh2701")
+    view = cursor.at(0)
+    assert view is not None
+    assert view.next_open == 13080.0
+    assert view.next_index == 2
+
+
 def test_next_open_disabled_gives_none() -> None:
     cursor = BarCursor(_bars(), timeframe="5", fill_next_open=False)
     view = cursor.at(0)

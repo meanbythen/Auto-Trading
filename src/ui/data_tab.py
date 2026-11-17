@@ -200,6 +200,17 @@ class DataTabMixin:
             text_color=T.TEXT,
             command=self._on_synth_tick_bars,
         ).pack(side="left")
+        ctk.CTkButton(
+            left,
+            text="下载历史 tick",
+            height=34,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_download_history_tick,
+        ).pack(fill="x", padx=4, pady=(0, 4))
         ctk.CTkLabel(
             left,
             textvariable=self.tick_inventory_var,
@@ -211,7 +222,8 @@ class DataTabMixin:
         ctk.CTkLabel(
             left,
             text=(
-                "免费账号盘中挂机即可攒 tick，落 data/ticks/vnpy_data.db。"
+                "合约名单空着时，自动用配置页的关注品种。"
+                "「启动 tick 采集」攒盘中实时；「下载历史 tick」需要天勤专业版/试用，免费账号会明确提示没权限。"
                 "合成后的 K 线单独存 tick_bars 库，回测数据源选「tick合成」，不覆盖天勤官方 K 线。"
             ),
             font=T.FONT_SMALL,
@@ -992,3 +1004,100 @@ class DataTabMixin:
                 self._tick_synth_busy = False
 
         threading.Thread(target=work, name="TickSynth", daemon=True).start()
+
+    def _on_download_history_tick(self) -> None:
+        """专业版历史 tick：弹窗选起止日期，后台下载入库。免费账号会得到没权限的说明。"""
+        from datetime import date, timedelta
+        from tkinter import messagebox
+
+        from src.data.tick.downloader import (
+            DownloadPermissionError,
+            download_settings,
+            main_cont_list_from_symbols,
+            run_download,
+        )
+        from src.ui.datetime_pickers import DateField
+
+        if getattr(self, "_tick_download_busy", False):
+            self._dm_write("历史 tick 还在下载，等这一轮结束再点")
+            return
+        recorder = getattr(self, "_tick_recorder", None)
+        if recorder is not None and recorder.running:
+            if not messagebox.askokcancel(
+                "下载历史 tick",
+                "实时采集还在跑，下载会再开一条天勤连接。免费账号可能被挤掉。建议先停采集再下。仍要继续？",
+            ):
+                return
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("下载历史 tick")
+        dialog.geometry("420x360")
+        dialog.transient(self)
+        dialog.grab_set()
+        ctk.CTkLabel(
+            dialog,
+            text="需要天勤专业版或试用权限。先选一小段日期验证，成功后再拉长区间。\n"
+            "合约用配置页关注品种转成主连。已下过的天会跳过，可断点续传。",
+            justify="left",
+            text_color=T.TEXT_DIM,
+            wraplength=380,
+        ).pack(anchor="w", padx=16, pady=(16, 10))
+        start_var = ctk.StringVar(value=(date.today() - timedelta(days=7)).isoformat())
+        end_var = ctk.StringVar(value=date.today().isoformat())
+        ctk.CTkLabel(dialog, text="开始日期").pack(anchor="w", padx=16)
+        DateField(dialog, start_var, allow_empty=False).frame.pack(anchor="w", padx=16, pady=(0, 8))
+        ctk.CTkLabel(dialog, text="结束日期").pack(anchor="w", padx=16)
+        DateField(dialog, end_var, allow_empty=False).frame.pack(anchor="w", padx=16, pady=(0, 8))
+        dry_var = ctk.BooleanVar(value=False)
+        ctk.CTkSwitch(dialog, text="只列计划，不真正下载", variable=dry_var).pack(anchor="w", padx=16, pady=(0, 12))
+
+        def _start() -> None:
+            settings = download_settings(self.cfg)
+            settings["enabled"] = True
+            settings["start"] = start_var.get().strip()
+            settings["end"] = end_var.get().strip()
+            mains = list(settings.get("main_cont_list") or [])
+            if not mains:
+                mains = main_cont_list_from_symbols(list(self._watch_symbols or []))
+            settings["main_cont_list"] = mains
+            if not mains:
+                messagebox.showwarning("还不能下载", "配置页还没有关注品种，也无法从配置读到主连名单。")
+                return
+            dry = bool(dry_var.get())
+            dialog.destroy()
+            self._tick_download_busy = True
+            self._dm_write(
+                f"{'只列计划' if dry else '开始下载'}历史 tick：{settings['start']} ~ {settings['end']} "
+                f"{'、'.join(mains)}"
+            )
+
+            def work() -> None:
+                try:
+                    summary = run_download(
+                        settings,
+                        dry_run=dry,
+                        on_progress=lambda text: logger.info("历史 tick {}", text),
+                    )
+                    logger.info("历史 tick 结束：{}", summary)
+                    self._post_to_main(
+                        lambda: self._dm_write(
+                            f"历史 tick 结束：计划 {summary.get('total', 0)} 块，"
+                            f"新下 {summary.get('downloaded', 0)}，跳过 {summary.get('skipped', 0)}，"
+                            f"失败 {summary.get('failed', 0)}"
+                        )
+                    )
+                    self._post_to_main(self._refresh_tick_card)
+                except DownloadPermissionError as exc:
+                    logger.warning("历史 tick 没有权限：{}", exc)
+                    self._post_to_main(lambda m=str(exc): messagebox.showerror("没有下载权限", m))
+                    self._post_to_main(lambda m=str(exc): self._dm_write(m))
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("历史 tick 下载失败")
+                    self._post_to_main(lambda m=str(exc): messagebox.showerror("下载失败", m))
+                    self._post_to_main(lambda m=str(exc): self._dm_write(f"历史 tick 失败：{m}"))
+                finally:
+                    self._tick_download_busy = False
+
+            threading.Thread(target=work, name="TickDownload", daemon=True).start()
+
+        ctk.CTkButton(dialog, text="开始", height=36, command=_start).pack(fill="x", padx=16, pady=(8, 16))

@@ -18,7 +18,14 @@ import pandas as pd
 from loguru import logger
 
 from src.data.bar_store import BarStore
-from src.data.periods import bars_from_minutes, canonical_period, drop_forming_bar, resample_ohlc
+from src.data.periods import (
+    bars_from_minutes,
+    canonical_period,
+    canonicalize_ohlc,
+    drop_forming_bar,
+    minute_in_session,
+    resample_ohlc,
+)
 from src.data.tick.clean import clean_tick_frame
 from src.data.tick.vnpy_store import load_tick_frame, split_instrument
 from src.data.tq_source import config_symbol_from_tq, tq_symbol
@@ -63,13 +70,29 @@ def ticks_to_minutes(ticks: pd.DataFrame | None) -> pd.DataFrame:
 
     out = out.dropna(subset=["close"])
     out.index.name = "datetime"
-    return out[["open", "high", "low", "close", "volume", "oi"]]
+    frame = out[["open", "high", "low", "close", "volume", "oi"]]
+    cleaned = canonicalize_ohlc(frame)
+    return cleaned if cleaned is not None else frame
 
 
-def minutes_to_daily(minutes: pd.DataFrame | None) -> pd.DataFrame:
-    """把 1 分钟按期货交易日聚成日线；夜盘归下一交易日，时间戳用交易日 00:00。"""
+def minutes_to_daily(minutes: pd.DataFrame | None, *, symbol: str = "") -> pd.DataFrame:
+    """
+    把 1 分钟按期货交易日聚成日线。
+
+    有夜盘：前一天 21:00 起到当天 15:00 收盘，合成一根。
+    无夜盘：当天日盘合成一根。时间戳是交易日 00:00。
+    休市里的 1 分钟不并进去。
+    """
     if minutes is None or len(minutes) == 0:
         return pd.DataFrame(columns=["open", "high", "low", "close", "volume", "oi"])
+    keep = [
+        stamp
+        for stamp in minutes.index
+        if minute_in_session(pd.Timestamp(stamp).to_pydatetime(), symbol)
+    ]
+    if not keep:
+        return pd.DataFrame(columns=["open", "high", "low", "close", "volume", "oi"])
+    minutes = minutes.loc[keep]
     days = pd.Index([futures_trading_day(stamp) for stamp in minutes.index], name="trading_day")
     grouped = minutes.groupby(days)
     out = pd.DataFrame(
@@ -91,6 +114,8 @@ def minutes_to_daily(minutes: pd.DataFrame | None) -> pd.DataFrame:
 def build_tick_bars(
     ticks: pd.DataFrame | None,
     periods: tuple[str, ...] | list[str] = DEFAULT_PERIODS,
+    *,
+    symbol: str = "",
 ) -> dict[str, pd.DataFrame]:
     """把一批 tick 合成各周期 K 线。只返回已经收盘的周期，最后一根形成中的不写库。"""
     minutes = ticks_to_minutes(ticks)
@@ -106,13 +131,13 @@ def build_tick_bars(
         if code == "1":
             frame = done
         elif code == "D":
-            daily = minutes_to_daily(done)
+            daily = minutes_to_daily(done, symbol=symbol)
             frame = daily
         elif code == "W":
-            daily = daily if daily is not None else minutes_to_daily(done)
+            daily = daily if daily is not None else minutes_to_daily(done, symbol=symbol)
             frame = resample_ohlc(daily, "W")
         else:
-            frame = bars_from_minutes(done, code)
+            frame = bars_from_minutes(done, code, symbol=symbol)
             frame = drop_forming_bar(frame) if frame is not None else None
         if frame is None or len(frame) == 0:
             continue
@@ -140,7 +165,7 @@ def synthesize_symbol(
     key = config_symbol_from_tq(instrument) or str(symbol)
     ticks = load_tick_frame(vn_symbol, exchange, start, end, database=database)
     cleaned, stats = clean_tick_frame(ticks)
-    bars = build_tick_bars(cleaned, periods)
+    bars = build_tick_bars(cleaned, periods, symbol=key)
     store = BarStore(Path(bar_store))
     written: dict[str, int] = {}
     for period, frame in bars.items():

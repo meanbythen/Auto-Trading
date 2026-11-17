@@ -17,6 +17,8 @@ from .factory import (
     sanitize_strategy_config,
 )
 from .supertrend import SuperTrendStrategy
+from .dual_donchian import DualDonchianStrategy
+from .dual_fractal import DualFractalStrategy
 from .swing_box import SwingBoxStrategy
 from .swing_trend import SwingTrendStrategy
 from .trend_follow import TrendFollowStrategy
@@ -42,6 +44,8 @@ __all__ = [
     "TrendFollowStrategy",
     "SwingTrendStrategy",
     "SwingBoxStrategy",
+    "DualDonchianStrategy",
+    "DualFractalStrategy",
     "StrategyAction",
     "StrategyDecision",
     "PositionState",

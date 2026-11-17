@@ -259,3 +259,44 @@ def test_backtest_archive_is_reproducible_and_does_not_change_live_config(tmp_pa
     assert data_file["rows"] == len(archived) > 0
     index = json.loads((tmp_path / "data" / "experiments" / "index.json").read_text(encoding="utf-8"))
     assert len(index["experiments"]) == 2
+
+
+def test_bars_cache_keeps_sources_apart() -> None:
+    """换行情来源必须重新拉K线，不能把天勤那份表当成新浪。"""
+    import pandas as pd
+
+    from src.backtest.engine import _fetch_bars_cached, clear_bars_cache
+
+    clear_bars_cache()
+
+    class _FakeProvider:
+        def __init__(self, source: str, close: float) -> None:
+            self.source = source
+            self.close = close
+            self.calls = 0
+
+        def fetch(self, symbol, period, max_bars, keep_history, start, end):
+            self.calls += 1
+            idx = pd.date_range("2026-01-05 09:05", periods=3, freq="5min")
+            return pd.DataFrame(
+                {
+                    "open": self.close,
+                    "high": self.close,
+                    "low": self.close,
+                    "close": self.close,
+                    "volume": 1,
+                },
+                index=idx,
+            )
+
+    tq = _FakeProvider("tq", 100.0)
+    sina = _FakeProvider("akshare", 200.0)
+    tq_bars = _fetch_bars_cached(tq, "fu2701", "5", max_bars=10, start="2026-01-01", end="")
+    sina_bars = _fetch_bars_cached(sina, "fu2701", "5", max_bars=10, start="2026-01-01", end="")
+    assert tq.calls == 1
+    assert sina.calls == 1
+    assert float(tq_bars["close"].iloc[0]) == 100.0
+    assert float(sina_bars["close"].iloc[0]) == 200.0
+    _fetch_bars_cached(tq, "fu2701", "5", max_bars=10, start="2026-01-01", end="")
+    assert tq.calls == 1
+    clear_bars_cache()

@@ -385,6 +385,28 @@ class ConfigVarsMixin:
         self.sbox_stop_atr_var = ctk.StringVar(value=str(sbox.get("stop_atr", 0.5)))
         self.sbox_trail_atr_var = ctk.StringVar(value=str(sbox.get("trail_atr", 2.0)))
         self.sbox_trail_h_var = ctk.StringVar(value=str(sbox.get("trail_start_h", 1.0)))
+        from src.strategy.dual_cycle import (
+            FRACTAL_MODE_LABELS,
+            HTF_MENU,
+            htf_label,
+            parse_fractal_mode,
+        )
+
+        dd_box = st.get("dual_donchian") or {}
+        self._htf_menu = list(HTF_MENU)
+        self.dd_htf_var = ctk.StringVar(value=htf_label(str(dd_box.get("trend_timeframe") or "D")))
+        self.dd_entry_var = ctk.StringVar(value=str(dd_box.get("entry_bars", 55)))
+        self.dd_exit_var = ctk.StringVar(value=str(dd_box.get("exit_bars", 20)))
+        self.dd_adx_min_var = ctk.StringVar(value=str(dd_box.get("adx_min", 22)))
+        self.dd_atr_mult_var = ctk.StringVar(value=str(dd_box.get("atr_mult", 2.5)))
+        df_box = st.get("dual_fractal") or {}
+        self._fractal_mode_labels = dict(FRACTAL_MODE_LABELS)
+        mode_code = parse_fractal_mode(str(df_box.get("trend_mode") or "ema"))
+        self.df_htf_var = ctk.StringVar(value=htf_label(str(df_box.get("trend_timeframe") or "D")))
+        self.df_mode_var = ctk.StringVar(value=self._fractal_mode_labels.get(mode_code, "指数均线"))
+        self.df_ema_var = ctk.StringVar(value=str(df_box.get("trend_ema", 20)))
+        self.df_adx_min_var = ctk.StringVar(value=str(df_box.get("adx_min", 22)))
+        self.df_atr_mult_var = ctk.StringVar(value=str(df_box.get("atr_mult", 2.8)))
         self.flatten_var = ctk.StringVar(
             value=",".join(str(x) for x in st.get("flatten_times", ["14:55", "22:55"]))
         )
@@ -466,6 +488,7 @@ class ConfigVarsMixin:
         self.ev_streak_var = ctk.StringVar(value=str(ev.get("max_consecutive_losses", 8)))
         # 回测页自己的资金限制，默认抄配置页，改这里不会写回实盘配置。
         self.bt_sizing_var = ctk.StringVar(value=str(risk.get("sizing_mode", "risk_pct")))
+        # 回测/优化页可手改，只当测试本金；保存配置仍用 capital_var（实盘余额）。
         self.bt_capital_var = ctk.StringVar(value=str(risk.get("capital", 14000)))
         self.bt_risk_pct_var = ctk.StringVar(value=str(risk.get("risk_per_trade_pct", 0.5)))
         self.bt_volume_var = ctk.StringVar(value=str(trade.get("volume", 1)))
@@ -530,6 +553,12 @@ class ConfigVarsMixin:
         self.opt_holdout_pct_var = ctk.StringVar(value=str(bt.get("optimize_holdout_pct", 30)))
         self.opt_mode_var = ctk.StringVar(value=str(bt.get("optimize_mode", "一次切断")))
         self.opt_walk_steps_var = ctk.StringVar(value=str(bt.get("optimize_walk_steps", 3)))
+        # 最终半年默认冻结：搜索碰不到，看过一次就不能再当验收。
+        freeze_on = bt.get("freeze_final_oos", True)
+        if isinstance(freeze_on, str):
+            freeze_on = freeze_on.strip() not in {"0", "false", "False", "否", "关"}
+        self.opt_freeze_var = ctk.BooleanVar(value=bool(freeze_on))
+        self.opt_freeze_days_var = ctk.StringVar(value=str(bt.get("freeze_final_days", 180)))
         # 写入第几组：1=训练最优；填其它编号会先按检验段重新复核再写。
         self.opt_write_index_var = ctk.StringVar(value="1")
         # 打开＝衰减重跑：搜完对照正在用的参数，默认不写配置。
@@ -1039,6 +1068,21 @@ class ConfigVarsMixin:
         self.sbox_stop_atr_var.set(str(sbox.get("stop_atr", 0.5)))
         self.sbox_trail_atr_var.set(str(sbox.get("trail_atr", 2.0)))
         self.sbox_trail_h_var.set(str(sbox.get("trail_start_h", 1.0)))
+        from src.strategy.dual_cycle import htf_label, parse_fractal_mode
+
+        dd_box = st.get("dual_donchian") or {}
+        self.dd_htf_var.set(htf_label(str(dd_box.get("trend_timeframe") or "D")))
+        self.dd_entry_var.set(str(dd_box.get("entry_bars", 55)))
+        self.dd_exit_var.set(str(dd_box.get("exit_bars", 20)))
+        self.dd_adx_min_var.set(str(dd_box.get("adx_min", 22)))
+        self.dd_atr_mult_var.set(str(dd_box.get("atr_mult", 2.5)))
+        df_box = st.get("dual_fractal") or {}
+        mode_code = parse_fractal_mode(str(df_box.get("trend_mode") or "ema"))
+        self.df_htf_var.set(htf_label(str(df_box.get("trend_timeframe") or "D")))
+        self.df_mode_var.set(self._fractal_mode_labels.get(mode_code, "指数均线"))
+        self.df_ema_var.set(str(df_box.get("trend_ema", 20)))
+        self.df_adx_min_var.set(str(df_box.get("adx_min", 22)))
+        self.df_atr_mult_var.set(str(df_box.get("atr_mult", 2.8)))
         self.flatten_var.set(",".join(str(x) for x in st.get("flatten_times", ["14:55", "22:55"])))
         self.flatten_at_close_var.set(bool(st.get("flatten_at_close", True)))
         rt = self.cfg.get("runtime") or {}

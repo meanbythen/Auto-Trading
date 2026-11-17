@@ -259,6 +259,25 @@ class BacktestTabMixin(BacktestConfigMixin, BacktestActionsMixin):
         ).pack(fill="x", padx=4, pady=(12, 6))
         ctk.CTkButton(
             left,
+            text="1 分钟复核",
+            height=34,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_minute_review,
+        ).pack(fill="x", padx=4, pady=(0, 4))
+        ctk.CTkLabel(
+            left,
+            text="用 1 分钟只检查上一回测已经开出的仓，止损会不会更早碰到。没有 1 分钟就标明「不是精确复盘」，不会在 1 分钟上另找开仓。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w", padx=4, pady=(0, 6))
+        ctk.CTkButton(
+            left,
             text="滑点灵敏度",
             height=34,
             fg_color=T.BG_ELEVATED,
@@ -314,25 +333,6 @@ class BacktestTabMixin(BacktestConfigMixin, BacktestActionsMixin):
             wraplength=360,
             justify="left",
         ).pack(anchor="w", padx=4, pady=(0, 6))
-        ctk.CTkLabel(
-            left,
-            text="K 线库的建立、补数、库存和删除已移到「数据管理」页。这里只负责跑回测。",
-            font=T.FONT_SMALL,
-            text_color=T.TEXT_DIM,
-            wraplength=360,
-            justify="left",
-        ).pack(anchor="w", padx=4, pady=(0, 4))
-        ctk.CTkButton(
-            left,
-            text="去「数据管理」页",
-            height=34,
-            fg_color=T.BG_ELEVATED,
-            hover_color=T.BORDER,
-            border_width=1,
-            border_color=T.BORDER,
-            text_color=T.TEXT,
-            command=lambda: self.tabs.set("数据管理"),
-        ).pack(fill="x", padx=4, pady=(0, 8))
         ctk.CTkButton(
             left,
             text="把条件同步到「策略优化」页",
@@ -391,7 +391,7 @@ class BacktestTabMixin(BacktestConfigMixin, BacktestActionsMixin):
         ).pack(anchor="w", pady=(0, 4))
         ctk.CTkLabel(
             box_risk,
-            text="开仓限制、保证金、收盘清仓与实盘配置一致：开跑前自动按配置页和品种表对齐。本页可改日期和「启用限制」；关掉限制后固定 1 手。点「按配置页重新填入」可连策略品种一起抄过来。",
+            text="开仓限制、保证金、收盘清仓开跑前跟配置页对齐。账户权益可在本页改成你准备拿来交易的资金，只影响回测和策略优化，不会改实盘余额。点「按配置页重新填入」会抄回账户当前权益。关掉「启用限制」后固定 1 手。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=340,
@@ -420,9 +420,8 @@ class BacktestTabMixin(BacktestConfigMixin, BacktestActionsMixin):
             box_risk,
             "账户权益(元)",
             self.bt_capital_var,
-            hint="跟配置页一致，开跑前自动对齐",
+            hint="可改成准备投入的资金；点「按配置页重新填入」抄回当前余额",
             width=160,
-            readonly=True,
         )
         self._entry_row(
             box_risk,

@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import copy
 from dataclasses import dataclass, field
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -22,7 +22,9 @@ from src.backtest.experiment import archive_report, new_experiment, research_dat
 from src.backtest.exit_policy import (
     carry_stop_price as _carry_stop_price,
     exit_fill_price as _exit_fill_price,
+    is_stop_exit_reason as _is_stop_exit_reason,
     next_open_price as _next_open_price,  # noqa: F401  旧调用方和测试仍从 engine 取这个名字
+    next_tradable_bar_index as _next_tradable_bar_index,  # noqa: F401
     position_stop as _position_stop,
     stop_breached as _stop_breached,  # noqa: F401  旧调用方和测试仍从 engine 取这个名字
 )
@@ -51,14 +53,27 @@ from src.utils.trading_day import EXCHANGE_HOLIDAYS, futures_trading_day
 if TYPE_CHECKING:
     from src.utils.holidays import HolidayCalendar
 
-# 同一进程内同一 (symbol, period, start, end) 的 K 线只拉一次。
+# 同一进程内同一 (来源, 合约, 周期, 起止) 的 K 线只拉一次。
+# 钥匙必须带来源：新浪和天勤是两套库存，不能把上一把天勤的表拿去当新浪。
 # stress 评估 / 参数扰动 / 多次回测同区间会反复用，避免每轮都读 DB+CSV+upsert。
-_BARS_CACHE: dict[tuple[str, str, str, str], pd.DataFrame] = {}
+_BARS_CACHE: dict[tuple[str, str, str, str, str], pd.DataFrame] = {}
 _MAX_BARS_CACHE = 64
 
 
-def _bars_cache_key(symbol: str, period: str, start: str | None, end: str | None) -> tuple[str, str, str, str]:
-    return (symbol, period, str(start or ""), str(end or ""))
+def _bars_cache_key(
+    symbol: str,
+    period: str,
+    start: str | None,
+    end: str | None,
+    source: str = "",
+) -> tuple[str, str, str, str, str]:
+    """缓存钥匙。来源放第一位，换下拉框必须重新拉。"""
+    return (str(source or ""), symbol, period, str(start or ""), str(end or ""))
+
+
+def clear_bars_cache() -> None:
+    """测试或换数据源排查时清空内存K线，避免上一把的表留在进程里。"""
+    _BARS_CACHE.clear()
 
 
 def _fetch_bars_cached(
@@ -71,10 +86,12 @@ def _fetch_bars_cached(
     end: str | None,
 ) -> pd.DataFrame:
     """带缓存的 provider.fetch。命中时秒级返回；miss 才走完整 I/O。"""
-    key = _bars_cache_key(symbol, period, start, end)
+    source = str(getattr(provider, "source", "") or "")
+    key = _bars_cache_key(symbol, period, start, end, source)
     cached = _BARS_CACHE.get(key)
     if cached is not None:
-        return cached
+        # 拷一份，避免回测后面删「还在走的那根」时改到缓存本体。
+        return cached.copy()
     bars = provider.fetch(
         symbol,
         period=period,
@@ -84,11 +101,11 @@ def _fetch_bars_cached(
         end=end,
     )
     if bars is not None and len(bars) > 0 and len(_BARS_CACHE) >= _MAX_BARS_CACHE:
-        # 简单 LRU：超过上限就清一半。bars 不会变（同区间同合约），所以不需要 TTL。
+        # 简单 LRU：超过上限就清一半。
         for k in list(_BARS_CACHE.keys())[: _MAX_BARS_CACHE // 2]:
             _BARS_CACHE.pop(k, None)
     if bars is not None and len(bars) > 0:
-        _BARS_CACHE[key] = bars
+        _BARS_CACHE[key] = bars.copy()
     return bars
 
 
@@ -193,14 +210,6 @@ def _make_trade_record(
     )
 
 
-# 国内期货白天三段加上夜盘。K线时间用该段收盘时刻，例如 5 分钟的第一根是 09:05。
-# 10:15–10:30、午休、白天到夜盘、过夜和周末都空在这些时段外面，不算数据断开。
-_SESSION_SEGMENTS: tuple[tuple[time, time], ...] = (
-    (time(9, 0), time(10, 15)),
-    (time(10, 30), time(11, 30)),
-    (time(13, 30), time(15, 0)),
-    (time(21, 0), time(23, 0)),
-)
 # 交易所休市的工作日由交易日历统一给出（src.utils.trading_day），这里不再单独维护一份。
 _CLOSED_WEEKDAYS = EXCHANGE_HOLIDAYS
 
@@ -226,18 +235,11 @@ def session_bar_times(
     """
     if day.weekday() >= 5 or _closed_day(day, calendar):
         return []
-    step = max(int(step_minutes), 1)
+    from src.data.periods import session_close_times
+
     # 第二天休市时，前一天晚上通常没有夜盘。没有夜盘不算数据断开。
-    night_closed = _closed_day(day + timedelta(days=1), calendar)
-    segments = _SESSION_SEGMENTS if include_night and not night_closed else _SESSION_SEGMENTS[:3]
-    closes: list[datetime] = []
-    for start, end in segments:
-        cursor = datetime.combine(day, start) + timedelta(minutes=step)
-        last = datetime.combine(day, end)
-        while cursor <= last:
-            closes.append(cursor)
-            cursor += timedelta(minutes=step)
-    return closes
+    night_ok = include_night and not _closed_day(day + timedelta(days=1), calendar)
+    return session_close_times(day, step_minutes, include_night=night_ok)
 
 
 def describe_bar_gaps(
@@ -605,6 +607,7 @@ class _BarContext:
     trail_df: pd.DataFrame | None
     trend_df: pd.DataFrame | None
     next_open: float | None
+    next_index: int | None
     stop_before: float
     decision: StrategyDecision
     meta: dict[str, Any]
@@ -793,6 +796,7 @@ def _decide_bar(run: _BacktestRun, i: int, view: Any) -> _BarContext:
     # 只用第 i 根（含）已收盘的数据做决策；开仓按下一根开盘成交（可配置关闭）。
     signal_df, now, px = view.signal, view.now, view.px
     trail_df, trend_df, next_open = view.trail, view.trend, view.next_open
+    next_index = getattr(view, "next_index", None)
     # evaluate 会更新尾随止损。止损判定和成交都用这根之前已知的止损，
     # 这根新算出来的止损只对下一根生效，避免用当根K线自己算出的线平自己。
     pos_before = strategy.positions.get(symbol)
@@ -896,6 +900,7 @@ def _decide_bar(run: _BacktestRun, i: int, view: Any) -> _BarContext:
         trail_df=trail_df,
         trend_df=trend_df,
         next_open=next_open,
+        next_index=next_index,
         stop_before=stop_before,
         decision=decision,
         meta=meta,
@@ -904,11 +909,18 @@ def _decide_bar(run: _BacktestRun, i: int, view: Any) -> _BarContext:
     )
 
 
+def _fill_bar_index(ctx: _BarContext) -> int | None:
+    """下一根开盘成交时实际用的那根；午休整点会往后跳。"""
+    if ctx.next_index is not None:
+        return int(ctx.next_index)
+    return ctx.i + 1
+
+
 def _execution_bar(run: _BacktestRun, ctx: _BarContext) -> Any:
     """这次成交用的是哪根K线：开了「下一根开盘」就取下一根，否则取信号这根。"""
     if run.fill.on_next_open and ctx.next_open is not None:
-        idx = ctx.i + 1
-        if 0 <= idx < len(run.bars_signal):
+        idx = _fill_bar_index(ctx)
+        if idx is not None and 0 <= idx < len(run.bars_signal):
             return run.bars_signal.iloc[idx]
     if ctx.signal_df is not None and len(ctx.signal_df):
         return ctx.signal_df.iloc[-1]
@@ -923,8 +935,9 @@ def _exit_fill_time(
     next_open: float | None,
 ) -> datetime:
     """成交时间跟实际采用的价格走：根内止损用当根，下一根开盘用下一根时间。"""
-    if not stop_filled and next_open is not None and ctx.i + 1 < len(run.bars_signal):
-        return _ts_to_dt(run.bars_signal.index[ctx.i + 1])
+    idx = _fill_bar_index(ctx)
+    if not stop_filled and next_open is not None and idx is not None and 0 <= idx < len(run.bars_signal):
+        return _ts_to_dt(run.bars_signal.index[idx])
     return ctx.now
 
 
@@ -1046,7 +1059,8 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
     # 不能再用策略内部价顶替，否则跳空时会报出当天根本没成交过的开仓价。
     if run.fill.on_next_open and next_open is not None:
         entry_ref = next_open
-        entry_ts = run.bars_signal.index[ctx.i + 1]
+        fill_i = _fill_bar_index(ctx)
+        entry_ts = run.bars_signal.index[fill_i if fill_i is not None else ctx.i + 1]
         # 下一根已经是收盘清仓时点：按开盘成交再按同一根收盘强平，
         # 实盘不会这样下单。换月移仓不算新开仓，照旧放行。
         flatten = getattr(strategy, "is_flatten_time", None)
@@ -1278,7 +1292,7 @@ def _close_position(run: _BacktestRun, ctx: _BarContext) -> bool:
     ambiguity: dict[str, Any] | None = None
     optimistic_px = signal_px
     optimistic_dt = signal_dt
-    explicit_stop = bool(meta.get("generic_stop")) or "止损" in str(decision.reason)
+    explicit_stop = _is_stop_exit_reason(decision.reason, meta)
     if stop_filled and not explicit_stop and abs(stop_px - signal_px) > 1e-9:
         # 主动离场和止损落在同一根时，OHLC 不能证明根内路径。
         # 不挑对收益更有利的解释：两种候选里取对持仓更差的价格及其对应时间。
@@ -1676,6 +1690,8 @@ def run_backtest(
         "src.strategy.daily_body",
         "src.strategy.swing_trend",
         "src.strategy.swing_box",
+        "src.strategy.dual_donchian",
+        "src.strategy.dual_fractal",
         "src.risk.sizing",
         "src.risk.guardian",
         "src.risk.dynamic",
@@ -1692,6 +1708,8 @@ def run_backtest(
             trend_timeframe=trend_tf,
             start=loop_start,
             fill_next_open=fill.on_next_open,
+            symbol=symbol,
+            cfg=cfg,
         )
         for i in cursor.indices():
             view = cursor.at(i)
@@ -1710,6 +1728,8 @@ def run_backtest(
             "src.strategy.daily_body",
             "src.strategy.swing_trend",
             "src.strategy.swing_box",
+            "src.strategy.dual_donchian",
+            "src.strategy.dual_fractal",
             "src.risk.sizing",
             "src.risk.guardian",
         ):
