@@ -471,6 +471,52 @@ def test_reconnect_checks_orders_before_ready() -> None:
     assert session.need_order_check is True
 
 
+def test_order_query_error_keeps_reconnect_protection(monkeypatch) -> None:
+    """今日委托查询失败必须连接失败并保持报单保护，成功重查后才恢复。"""
+    from types import SimpleNamespace
+
+    from src.trader.ctp_td import OpenctpClient, build_spi
+
+    client = OpenctpClient()
+    gateway = CtpGateway(_settings(), client)
+
+    def start(_settings, listener) -> None:
+        client.listener = listener
+        listener.on_connected()
+
+    monkeypatch.setattr(client, "start", start)
+    monkeypatch.setattr(client, "authenticate", lambda _settings: client.listener.on_auth(True, ""))
+    monkeypatch.setattr(
+        client,
+        "login",
+        lambda _settings: client.listener.on_login(True, 7, 8, "20261020", ""),
+    )
+    monkeypatch.setattr(client, "confirm", lambda _settings: client.listener.on_confirm(True, ""))
+    tdapi = SimpleNamespace(CThostFtdcTraderSpi=type("TraderSpi", (), {}))
+    spi = build_spi(tdapi, client)
+    error = SimpleNamespace(ErrorID=2, ErrorMsg="query rejected")
+    monkeypatch.setattr(
+        client,
+        "query_orders",
+        lambda _settings: spi.OnRspQryOrder(None, error, 1, True),
+    )
+
+    ok, message = gateway.connect()
+    assert ok is False
+    assert "今日委托查询失败" in message
+    assert gateway.session.need_order_check is True
+
+    gateway.client = client
+    monkeypatch.setattr(
+        client,
+        "query_orders",
+        lambda _settings: spi.OnRspQryOrder(None, None, 1, True),
+    )
+    ok, message = gateway.connect()
+    assert ok, message
+    assert gateway.session.need_order_check is False
+
+
 def test_login_chain_then_buy_open_is_a_real_fill() -> None:
     """认证、登录、确认结算单之后，买开收到成交回报才算全部成交。"""
     client = FakeClient()
@@ -687,6 +733,55 @@ def test_mismatch_stops_new_opens_until_books_match() -> None:
     ok, _note = trader.reconcile({"bu2612": 1})
     assert ok is True
     assert trader.blocks_new_opens() is False
+
+
+def test_query_errors_never_become_successful_reconcile_snapshot(monkeypatch) -> None:
+    """持仓/资金查询报错不能变成空快照，更不能进入自动对账修复。"""
+    from types import SimpleNamespace
+
+    from src.trader.ctp_td import OpenctpClient, build_spi
+
+    monkeypatch.setattr("src.trader.ctp_gateway.time.sleep", lambda _seconds: None)
+    client = OpenctpClient()
+    gateway = CtpGateway(_settings(), client)
+    client.listener = gateway
+    tdapi = SimpleNamespace(CThostFtdcTraderSpi=type("TraderSpi", (), {}))
+    spi = build_spi(tdapi, client)
+    error = SimpleNamespace(ErrorID=2, ErrorMsg="query rejected")
+    monkeypatch.setattr(
+        client,
+        "query_positions",
+        lambda _settings: spi.OnRspQryInvestorPosition(None, error, 1, True),
+    )
+    monkeypatch.setattr(
+        client,
+        "query_account",
+        lambda _settings: spi.OnRspQryTradingAccount(None, error, 2, True),
+    )
+    gateway.session.phase = "ready"
+    gateway.positions = {"bu2612": PositionView(long_today=1)}
+    gateway.positions_ready = True
+    gateway.account = {"balance": 100000.0, "available": 90000.0}
+    gateway.available = 90000.0
+
+    assert gateway.refresh() is False
+    assert gateway.positions["bu2612"].net == 1
+    assert gateway.positions_ready is False
+
+    # 持仓查成、资金查失败也同样不能让整轮 refresh 成功。
+    monkeypatch.setattr(
+        client,
+        "query_positions",
+        lambda _settings: spi.OnRspQryInvestorPosition(None, None, 1, True),
+    )
+    assert gateway.refresh() is False
+    assert gateway.account == {"balance": 100000.0, "available": 90000.0}
+
+    trader = CtpTrader({"dry_run": False}, gateway)
+    ok, _note = trader.reconcile({"bu2612": 1}, {"bu2612": 1})
+    assert ok is False
+    assert trader.last_report is not None
+    assert trader.last_report.queried is False
 
 
 def test_disconnect_then_reconnect_queries_orders_before_new_order() -> None:

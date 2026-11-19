@@ -283,6 +283,9 @@ class CtpGateway:
         self._instrument_error = ""
         self._waiters: dict[str, threading.Event] = {}
         self._pending_positions: dict[str, PositionView] = {}
+        self._position_query_error = ""
+        self._account_query_error = ""
+        self._order_query_error = ""
         self._started = False
         self._querying_positions = False
         self.activity = OrderActivity(
@@ -586,15 +589,20 @@ class CtpGateway:
             return False
         if not self._pos_event.wait(self.settings.login_timeout_sec):
             return False
+        if self._position_query_error:
+            return False
         # 柜台要求两次查询隔开一点，否则会把查资金挡掉。
         time.sleep(1.05)
         self._account_event.clear()
+        self._account_query_error = ""
         try:
             self.client.query_account(self.settings)
         except Exception as exc:  # noqa: BLE001
             logger.warning("查询资金失败: {}", exc)
             return False
-        return self._account_event.wait(self.settings.login_timeout_sec)
+        if not self._account_event.wait(self.settings.login_timeout_sec):
+            return False
+        return not self._account_query_error
 
     def close(self) -> None:
         """程序退出时释放接口。"""
@@ -686,6 +694,8 @@ class CtpGateway:
             return
         logger.info("结算单已确认，先查询今日委托")
         self.unknown_working = []
+        self._order_query_error = ""
+        self.session.last_error = ""
         try:
             self.client.query_orders(self.settings)
         except Exception as exc:  # noqa: BLE001
@@ -944,6 +954,8 @@ class CtpGateway:
         insert_time: str = "",
         hedge: str = "",
         remaining: int = 0,
+        *,
+        ok: bool = True,
     ) -> None:
         """
         重连或再登录后的报单查询。
@@ -953,6 +965,11 @@ class CtpGateway:
         """
         report = None
         with self._lock:
+            if not ok:
+                self._order_query_error = message or "柜台返回今日委托查询错误"
+                self.session.last_error = (
+                    f"今日委托查询失败：{self._order_query_error}，为保护持仓未允许报单"
+                )
             if order_ref:
                 self._note_ref(order_ref)
                 order = self.table.get(order_ref)
@@ -993,25 +1010,43 @@ class CtpGateway:
                     {"insert_time": insert_time, "hedge": hedge, "remaining": remaining},
                 )
             if is_last:
-                self.session.on_orders_checked()
-                counted = len(self.table.orders)
-                logger.info("今日委托已核对，共 {} 笔", counted)
-                # 顶栏「今日报单笔数」跟柜台今天的委托对齐，重启后不再显示 0。
-                self.activity.sync_from_broker_count(counted)
+                if self._order_query_error:
+                    # 查询失败不代表柜台没有挂单；保持 need_order_check，继续禁止报单。
+                    logger.error(self.session.last_error)
+                else:
+                    self.session.on_orders_checked()
+                    counted = len(self.table.orders)
+                    logger.info("今日委托已核对，共 {} 笔", counted)
+                    # 顶栏「今日报单笔数」跟柜台今天的委托对齐，重启后不再显示 0。
+                    self.activity.sync_from_broker_count(counted)
                 self._ready_event.set()
                 self._order_query_event.set()
         self._account_fill(report)
 
-    def on_position_row(self, row: dict[str, Any] | None, is_last: bool) -> None:
-        if row:
+    def on_position_row(
+        self,
+        row: dict[str, Any] | None,
+        is_last: bool,
+        *,
+        ok: bool = True,
+        message: str = "",
+    ) -> None:
+        if not ok:
+            self._position_query_error = message or "柜台返回持仓查询错误"
+            self.positions_ready = False
+        if not self._position_query_error and row:
             name = symbol_key(str(row.get("symbol") or ""))
             if name:
                 view = self._pending_positions.setdefault(name, PositionView())
                 absorb_position_row(view, row)
         if is_last:
-            self.positions = self._pending_positions
-            self._pending_positions = {}
-            self.positions_ready = True
+            if self._position_query_error:
+                # 错误响应不是一份空持仓；保留旧快照供展示，但不能拿去做对账修复。
+                self._pending_positions = {}
+            else:
+                self.positions = self._pending_positions
+                self._pending_positions = {}
+                self.positions_ready = True
             self._querying_positions = False
             self._pos_event.set()
 
@@ -1066,38 +1101,48 @@ class CtpGateway:
         if is_last:
             self._instrument_event.set()
 
-    def on_account(self, available: float | dict[str, Any] | None, is_last: bool) -> None:
+    def on_account(
+        self,
+        available: float | dict[str, Any] | None,
+        is_last: bool,
+        *,
+        ok: bool = True,
+        message: str = "",
+    ) -> None:
         """资金查询。新接口给一整行；旧测试只给可用金额，两种都认。"""
-        if isinstance(available, dict):
-            self.account = dict(available)
-            self.available = float(available.get("available") or 0)
-            balance = float(available.get("balance") or 0)
-            stamp = (round(self.available, 2), round(balance, 2))
-            # 查询每几十秒一次。数字没变、或只是几十元盯市跳动，不要刷屏。
-            last = getattr(self, "_last_logged_account", None)
-            last_at = float(getattr(self, "_last_account_log_at", 0) or 0)
-            now = time.monotonic()
-            jump = True
-            if isinstance(last, tuple) and len(last) >= 2:
-                jump = abs(stamp[1] - float(last[1])) >= 200.0 or abs(stamp[0] - float(last[0])) >= 200.0
-            if last is None or jump or now - last_at >= 180.0:
-                logger.info("柜台可用资金 {:.2f}，动态权益 {:.2f}", self.available, balance)
-                self._last_logged_account = stamp
-                self._last_account_log_at = now
-        elif available is not None:
-            self.available = float(available)
-            self.account["available"] = self.available
-            stamp = (round(self.available, 2),)
-            last = getattr(self, "_last_logged_account", None)
-            last_at = float(getattr(self, "_last_account_log_at", 0) or 0)
-            now = time.monotonic()
-            jump = True
-            if isinstance(last, tuple) and len(last) >= 1:
-                jump = abs(stamp[0] - float(last[0])) >= 200.0
-            if last is None or jump or now - last_at >= 180.0:
-                logger.info("柜台可用资金 {:.2f}", self.available)
-                self._last_logged_account = stamp
-                self._last_account_log_at = now
+        if not ok:
+            self._account_query_error = message or "柜台返回资金查询错误"
+        if not self._account_query_error:
+            if isinstance(available, dict):
+                self.account = dict(available)
+                self.available = float(available.get("available") or 0)
+                balance = float(available.get("balance") or 0)
+                stamp = (round(self.available, 2), round(balance, 2))
+                # 查询每几十秒一次。数字没变、或只是几十元盯市跳动，不要刷屏。
+                last = getattr(self, "_last_logged_account", None)
+                last_at = float(getattr(self, "_last_account_log_at", 0) or 0)
+                now = time.monotonic()
+                jump = True
+                if isinstance(last, tuple) and len(last) >= 2:
+                    jump = abs(stamp[1] - float(last[1])) >= 200.0 or abs(stamp[0] - float(last[0])) >= 200.0
+                if last is None or jump or now - last_at >= 180.0:
+                    logger.info("柜台可用资金 {:.2f}，动态权益 {:.2f}", self.available, balance)
+                    self._last_logged_account = stamp
+                    self._last_account_log_at = now
+            elif available is not None:
+                self.available = float(available)
+                self.account["available"] = self.available
+                stamp = (round(self.available, 2),)
+                last = getattr(self, "_last_logged_account", None)
+                last_at = float(getattr(self, "_last_account_log_at", 0) or 0)
+                now = time.monotonic()
+                jump = True
+                if isinstance(last, tuple) and len(last) >= 1:
+                    jump = abs(stamp[0] - float(last[0])) >= 200.0
+                if last is None or jump or now - last_at >= 180.0:
+                    logger.info("柜台可用资金 {:.2f}", self.available)
+                    self._last_logged_account = stamp
+                    self._last_account_log_at = now
         if is_last:
             self._account_event.set()
 
@@ -1192,6 +1237,7 @@ class CtpGateway:
 
     def _begin_position_query(self) -> None:
         self._pending_positions = {}
+        self._position_query_error = ""
         self._querying_positions = True
 
     def _note_ref(self, order_ref: str) -> None:

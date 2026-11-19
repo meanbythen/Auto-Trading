@@ -74,16 +74,6 @@ class DashboardMixin:
 
     def _mount_position_lot_buttons(self, card: ctk.CTkFrame) -> None:
         """程序持仓卡底下固定两颗按钮：平时灰，对账时变红。"""
-        self.pos_reconcile_hint = ctk.CTkLabel(
-            card,
-            text="认领=同步柜台，拒绝=不同步柜台",
-            font=T.FONT_SMALL,
-            text_color=T.TEXT_DIM,
-            wraplength=220,
-            justify="left",
-            anchor="w",
-        )
-        self.pos_reconcile_hint.pack(anchor="w", fill="x", padx=10, pady=(0, 4))
         row = ctk.CTkFrame(card, fg_color="transparent")
         row.pack(fill="x", padx=8, pady=(0, 8))
         kw = {
@@ -93,13 +83,13 @@ class DashboardMixin:
         }
         self.btn_claim_lots = ctk.CTkButton(
             row,
-            text="认领仓单",
+            text="同步柜台",
             command=self._on_claim_lots,
             **kw,
         )
         self.btn_reject_lots = ctk.CTkButton(
             row,
-            text="拒绝仓单",
+            text="不同步柜台",
             command=self._on_reject_lots,
             **kw,
         )
@@ -136,7 +126,7 @@ class DashboardMixin:
             self.card_symbols,
             self.card_position,
         )
-        for index, (card, label) in enumerate(zip(self._status_card_frames, labels)):
+        for card, label in zip(self._status_card_frames, labels):
             width = card.winfo_width()
             if width < 80:
                 continue
@@ -146,9 +136,6 @@ class DashboardMixin:
             current = int(label.cget("wraplength") or 0)
             if abs(current - wrap) > 4:
                 label.configure(wraplength=wrap)
-            hint = getattr(self, "pos_reconcile_hint", None)
-            if index == 5 and hint is not None:
-                hint.configure(wraplength=wrap)
 
 
     def _refresh_status_cards(self) -> None:

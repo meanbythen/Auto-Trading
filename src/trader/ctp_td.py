@@ -539,8 +539,10 @@ def build_spi(tdapi: Any, client: OpenctpClient) -> Any:
                     str(getattr(data, "CombHedgeFlag", "") or ""),
                     int(getattr(data, "VolumeTotal", 0) or 0),
                 )
-            elif last:
-                client.listener.on_query_order("", "", 0, "", True)
+            elif not ok or last:
+                client.listener.on_query_order(
+                    "", "", 0, "", bool(last), message=message, ok=ok
+                )
             if not ok and message:
                 logger.warning("查询报单: {}", message)
 
@@ -561,9 +563,9 @@ def build_spi(tdapi: Any, client: OpenctpClient) -> Any:
                     "use_margin": float(getattr(data, "UseMargin", 0) or 0),
                     "hedge": str(getattr(data, "HedgeFlag", "") or ""),
                 }
-            client.listener.on_position_row(row, bool(last))
+            client.listener.on_position_row(row, bool(last), ok=ok, message=message)
             if not ok and message:
-                logger.info("查询持仓: {}", message)
+                logger.warning("查询持仓: {}", message)
 
         def OnRspQryTradingAccount(self, data: Any, info: Any, _req: int, last: bool) -> None:
             ok, message = _rsp_ok(info)
@@ -591,7 +593,7 @@ def build_spi(tdapi: Any, client: OpenctpClient) -> Any:
                     "mortgage_out": float(getattr(data, "FundMortgageOut", 0) or 0),
                     "option_value": float(getattr(data, "SpecProductPositionProfit", 0) or 0),
                 }
-            client.listener.on_account(row, bool(last))
+            client.listener.on_account(row, bool(last), ok=ok, message=message)
             if not ok and message:
                 logger.warning("查询资金: {}", message)
 
