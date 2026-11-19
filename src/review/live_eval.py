@@ -137,7 +137,7 @@ def _backtest_verdict(root: Path) -> str:
 
 
 def _backtest_metric_text(root: Path) -> str:
-    """最近回测的 R 期望、卡尔玛和最大连亏，和历史回测页同一批指标。"""
+    """最近回测的收益期望、卡尔玛和最大连亏，和历史回测页同一批指标。"""
     evaluation = _load_backtest(root).get("evaluation") or {}
     if not isinstance(evaluation, dict):
         return ""
@@ -152,9 +152,11 @@ def _backtest_metric_text(root: Path) -> str:
         except (TypeError, ValueError):
             return None
 
-    r_value = _num("r_expectancy")
+    r_value = _num("expectancy")
+    if r_value is None:
+        r_value = _num("r_expectancy")
     if r_value is not None:
-        parts.append(f"R期望 {r_value:.3f}")
+        parts.append(f"收益期望 {r_value:.2f}")
     calmar = _num("calmar")
     if calmar is not None:
         parts.append(f"卡尔玛 {calmar:.2f}")

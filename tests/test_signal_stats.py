@@ -97,3 +97,16 @@ def test_night_close_goes_to_next_trading_day() -> None:
     assert report.account.closed == 1
     assert report.account.net_pnl == 100
     assert report.daily_pnl == {date(2026, 10, 7): 100}
+
+
+def test_ctp_calendar_follows_broker_equity_not_matched_closes() -> None:
+    """华泰账日历跟期货公司当日盈亏，配对平仓是 0 也不再显示 +0。"""
+    book = new_book(32743.76, version="48.2.1", started_at="2026-11-18 09:00:00")
+    book["funding"] = "ctp"
+    _trade(book, "开仓", "空", 3890, "2026-11-18 09:00:00", symbol="fu2701")
+    _trade(book, "平仓", "空", 3890, "2026-11-18 10:00:00", symbol="fu2701")
+    book["ctp_daily"] = {"2026-11-18": -44.0}
+    report = analyze_book(book, start=date(2026, 11, 18), end=date(2026, 11, 18))
+    assert report.daily_pnl == {date(2026, 11, 18): -44.0}
+    assert report.account.net_pnl == -44.0
+    assert report.symbols[0].stat.net_pnl == -44.0

@@ -71,7 +71,7 @@ class _Risk:
     def on_order_filled(self, side: str, volume: int, symbol: str = "") -> None:
         return None
 
-    def set_daily_pnl(self, value: float) -> None:
+    def set_daily_pnl(self, value: float, **_kw: object) -> None:
         self.daily_pnl = float(value)
 
     def update_pnl(self, delta: float) -> None:

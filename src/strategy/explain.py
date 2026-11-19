@@ -14,6 +14,9 @@ from loguru import logger
 from .indicators import detect_pinbar
 from .types import StrategyAction, StrategyDecision
 
+# 同一句话不要每 10 秒刷窗口；文件里每轮都记。键是合约。
+_last_brief: dict[str, str] = {}
+
 
 def _bar_shape(row: pd.Series) -> str:
     """把一根 OHLC 说成人话：阴阳、影线比例、是否像 Pin。"""
@@ -87,18 +90,21 @@ def log_scan_brief(
         signal_tf: 信号周期（仅用于日志文字）
     """
     if bars is None or len(bars) == 0:
-        logger.info("{} 扫描解说：暂无K线", symbol)
+        _emit_scan_brief(symbol, f"{symbol} 扫描解说：暂无K线")
         return
 
     last = bars.iloc[-1]
     ts = str(bars.index[-1])
     shape = _bar_shape(last)
     verdict = _entry_verdict(decision, _is_holding(strategy, symbol))
-    logger.info(
-        "{} 扫描解说 | 信号{}m 最新已收盘 {} | {} | {}",
+    _emit_scan_brief(
         symbol,
-        signal_tf,
-        ts,
-        shape,
-        verdict,
+        f"{symbol} 扫描解说 | 信号{signal_tf}m 最新已收盘 {ts} | {shape} | {verdict}",
     )
+
+
+def _emit_scan_brief(symbol: str, text: str) -> None:
+    """文件每轮都写；窗口只在这句话变了才出现（例如从观望变成开仓）。"""
+    changed = _last_brief.get(symbol) != text
+    _last_brief[symbol] = text
+    logger.bind(ui=changed).info(text)

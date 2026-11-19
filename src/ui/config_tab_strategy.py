@@ -6,7 +6,6 @@ from typing import TYPE_CHECKING
 
 import customtkinter as ctk
 
-from src.trader.factory import list_executors
 from src.ui import theme as T
 from src.ui.config_tab_controls import cta_param
 from src.ui.config_tab_controls import cta_switch
@@ -63,14 +62,6 @@ def build_strategy_section(
     app._strategy_detail_shell = right_shell
 
     app._option_row(left, "行情数据源", app.source_var, list(SOURCE_LABELS), width=160)
-    ctk.CTkLabel(
-        left,
-        text="主源天勤，备源新浪。只拉选中的这一家。同花顺图不在这里：读图会抢鼠标，只给历史回测。",
-        font=T.FONT_SMALL,
-        text_color=T.TEXT_DIM,
-        wraplength=420,
-        justify="left",
-    ).pack(anchor="w", pady=(0, 8))
     app.tq_hint_label = ctk.CTkLabel(
         left,
         text="",
@@ -101,17 +92,8 @@ def build_strategy_section(
         pass
     app._refresh_tq_hint()
     app.engine_menu = app._option_row(left, "策略引擎", app.engine_var, list(engine_choices), width=220)
-    ctk.CTkLabel(
-        left,
-        text=(
-            "右边整块是当前策略参数；换策略后右边跟着换。左侧下面是各策略共用设置。"
-            "「策略优化」会按深度从右边这块和左侧公共设置里挑参数。"
-        ),
-        font=T.FONT_SMALL,
-        text_color=T.TEXT_DIM,
-        wraplength=420,
-        justify="left",
-    ).pack(anchor="w", pady=(6, 0))
+    # 日常改合约最常用：紧挨策略引擎，不用滚到扫描间隔下面。
+    app._pack_watch_editor(left)
 
     app._strategy_detail_title = ctk.CTkLabel(
         right_shell,
@@ -276,175 +258,6 @@ def build_strategy_section(
         hint="默认 60，用来算 ATR 处于历史几分位",
     )
 
-    hold_box = detail_panel(
-        app,
-        "float_hold",
-        "日内浮盈飘单",
-        "等开盘噪音走完再定当天方向。止损和保本都按开盘前波动留宽度，否则拿到收盘。",
-    )
-    note_block(
-        hold_box,
-        "和日内实体分开。这套现在尽量简单：等观察窗口走完，"
-        "EMA60 在 EMA120 上面就做多、下面就做空，错了用较宽的止损认赔。"
-        "跳空、倾角、急破这些闸默认关掉，好让单边日能开到仓。"
-        "还可以改成「观察结束看昨日密集区」、箱子或 MACD。"
-        "手数仍用左边公共的凯利或每笔风险。",
-        pady=(0, 4),
-    )
-    app._option_row(
-        hold_box,
-        "方向选择器",
-        app.float_direction_var,
-        getattr(app, "_float_direction_labels", ["开盘箱体突破"]),
-        width=220,
-    )
-    app._option_row(
-        hold_box,
-        "MACD周期",
-        app.float_macd_tf_var,
-        getattr(app, "_float_macd_tf_labels", ["1分钟", "5分钟"]),
-        width=220,
-    )
-    app._option_row(
-        hold_box,
-        "MACD参数组合",
-        app.float_macd_combo_var,
-        getattr(app, "_float_macd_combo_labels", ["12 / 26 / 9（常用）"]),
-        width=220,
-    )
-
-    def _sync_macd_combo(*_args: object) -> None:
-        """下拉常见组合时，同步改下面三格数字。"""
-        from src.strategy.float_hold import parse_macd_combo
-
-        fast, slow, signal = parse_macd_combo(app.float_macd_combo_var.get())
-        app.float_macd_fast_var.set(str(fast))
-        app.float_macd_slow_var.set(str(slow))
-        app.float_macd_signal_var.set(str(signal))
-
-    if not getattr(app, "_float_macd_combo_traced", False):
-        app.float_macd_combo_var.trace_add("write", _sync_macd_combo)
-        app._float_macd_combo_traced = True
-    param_entry(
-        app,
-        hold_box,
-        "MACD快线",
-        app.float_macd_fast_var,
-        hint="出厂 12。选上面常见组合会改这里，也可手填",
-    )
-    param_entry(
-        app,
-        hold_box,
-        "MACD慢线",
-        app.float_macd_slow_var,
-        hint="出厂 26，须大于快线",
-    )
-    param_entry(
-        app,
-        hold_box,
-        "MACD平滑",
-        app.float_macd_signal_var,
-        hint="出厂 9，柱子用这一根平滑",
-    )
-    app._option_row(
-        hold_box,
-        "定向均线对",
-        app.float_ema_pair_var,
-        getattr(app, "_float_ema_pair_labels", ["EMA5 / EMA20"]),
-        width=220,
-    )
-    switch_row(
-        app,
-        hold_box,
-        "大方向过滤",
-        app.float_trend_align_var,
-        hint="只给箱子/MACD 用。默认方向已经顺着 EMA60/120，不必再开。出厂关",
-    )
-    param_entry(
-        app,
-        hold_box,
-        "最小倾角(度)",
-        app.float_trend_slope_var,
-        hint="出厂 0=只看均线谁在上面。填大了会很少开仓",
-    )
-    param_entry(
-        app,
-        hold_box,
-        "斜率回看根数",
-        app.float_trend_lookback_var,
-        hint="看 EMA60、EMA120 自己往回几根，比均线现在和当时差多少。不是 K 线实体的斜。出厂 5",
-    )
-    param_entry(
-        app,
-        hold_box,
-        "观察几分钟再定方向",
-        app.float_eth_var,
-        hint="对「观察结束顺大方向」、昨日密集区和箱子有效。MACD循环不等。出厂 60",
-    )
-    param_entry(
-        app,
-        hold_box,
-        "密集区最宽点数",
-        app.float_cluster_width_var,
-        hint="上一交易日被反复摸到的窄价格带，最高减最低不超过这么多。出厂 10。只给「昨日密集区」用",
-    )
-    param_entry(
-        app,
-        hold_box,
-        "日盘开仓截止",
-        app.float_day_cutoff_var,
-        hint="过了这个钟点就停止开日盘新仓。出厂 14:45，好让观察结束后还能开",
-    )
-    param_entry(
-        app,
-        hold_box,
-        "夜盘开仓截止",
-        app.float_night_cutoff_var,
-        hint="过了这个钟点就停止开夜盘新仓。出厂 22:50",
-    )
-    param_entry(
-        app,
-        hold_box,
-        "止损几倍开盘前ATR",
-        app.float_stop_atr_var,
-        hint="从进场价往回留这么多倍开盘前波动。出厂 1.5。尺子不含今天早盘",
-    )
-    param_entry(
-        app,
-        hold_box,
-        "跳空超过几倍ATR不开",
-        app.float_skip_gap_var,
-        hint="缺口太大整段不做。出厂关（0）",
-    )
-    param_entry(
-        app,
-        hold_box,
-        "跳空超过几倍ATR只顺向",
-        app.float_gap_align_var,
-        hint="缺口够大时，高开只做多、低开只做空。出厂关（0）",
-    )
-    param_entry(
-        app,
-        hold_box,
-        "箱体超过几倍ATR不开",
-        app.float_max_box_var,
-        hint="箱子太宽不开。出厂关（0），默认方向不用箱子",
-    )
-    param_entry(
-        app,
-        hold_box,
-        "急破超过几倍ATR不追",
-        app.float_max_chase_var,
-        hint="收盘离破位太远就等回抽。出厂关（0），默认方向不用箱子",
-    )
-    param_entry(
-        app,
-        hold_box,
-        "浮盈几倍ATR后保本",
-        app.float_be_atr_var,
-        hint="收盘浮盈达到开盘前波动的这么多倍，止损提到开仓价。出厂 2，0=不做保本",
-    )
-
     trend_box = detail_panel(
         app,
         "trend_follow",
@@ -548,7 +361,7 @@ def build_strategy_section(
         "多空分界线、止损、倾角出厂都是 120，可以分开填。"
         "空仓时日盘/夜盘收盘前若干分钟不再开（出厂 30，可改；午休不算）。"
         "仓位、信号周期都用配置页公共项。这套适合更大级别：建议信号和止损都用 15 分钟，5 分钟容易被影线扫止损。"
-        "主力连续换月时，旧仓还在会在新主力同方向移过去。"
+        "主力连续换月时，旧仓在段末平掉，新主力按策略重新开，不沿用上一手方向。"
         "任何合约都不进入自己的交割月：交割月前一个月的日盘收盘必须平仓，之后改下一手。",
         pady=(0, 4),
     )
@@ -961,101 +774,11 @@ def build_strategy_section(
     # 共用设置挂在左侧列里，跟「选策略」连成一条；右侧多高也不会把这里顶下去。
     ctk.CTkLabel(
         left,
-        text="—— 各策略共用的下单与仓位设置 ——",
+        text="—— 各策略共用的开仓、时段与仓位 ——",
         font=T.FONT_SMALL,
         text_color=T.TEXT_DIM,
         anchor="w",
     ).pack(anchor="w", pady=(12, 4))
-    app._option_row(left, "执行通道", app.exec_var, list_executors(), width=220)
-    app._option_row(
-        left,
-        "CTP操作账",
-        app.ctp_kind_var,
-        getattr(app, "ctp_kind_choices", ["仿真账号", "真实账号"]),
-        width=220,
-    )
-    ctk.CTkLabel(
-        left,
-        text="仿真=仿真账号+仿真前置。真实=上面的资金账号+实盘前置。账号不用填两遍。",
-        font=T.FONT_SMALL,
-        text_color=T.TEXT_DIM,
-        wraplength=420,
-        justify="left",
-    ).pack(anchor="w", pady=(0, 4))
-    app._option_row(
-        left,
-        "券商档案",
-        app.ctp_profile_var,
-        getattr(app, "ctp_profile_choices", ["default"]),
-        width=220,
-    )
-    ctk.CTkLabel(
-        left,
-        text="换期货公司只改档案，不改代码。没有 ctp_profiles 时这里显示 default，按下面的旧字段运行。",
-        font=T.FONT_SMALL,
-        text_color=T.TEXT_DIM,
-        wraplength=420,
-        justify="left",
-    ).pack(anchor="w", pady=(0, 4))
-    ctk.CTkLabel(
-        left,
-        textvariable=app.ctp_profile_note_var,
-        font=T.FONT_SMALL,
-        text_color=T.WARN,
-        wraplength=420,
-        justify="left",
-    ).pack(anchor="w", pady=(0, 4))
-    app._entry_row(
-        left,
-        "档案交易前置",
-        app.ctp_profile_td_var,
-        hint="当前档案的交易地址，例如 tcp://主机:端口",
-        width=160,
-    )
-    app._entry_row(
-        left,
-        "档案行情前置",
-        app.ctp_profile_md_var,
-        hint="行情地址必须单独填，程序不再按交易端口推断行情端口",
-        width=160,
-    )
-    app._entry_row(
-        left,
-        "档案BrokerID",
-        app.ctp_profile_broker_var,
-        hint="柜台给的 BrokerID，例如 8080 / 9999",
-        width=160,
-    )
-    app._entry_row(
-        left,
-        "档案资金账号",
-        app.ctp_profile_user_var,
-        hint="仿真档案填仿真账号；真实档案留空时沿用上面的资金账号",
-        width=160,
-    )
-    app._entry_row(
-        left,
-        "档案密码变量",
-        app.ctp_profile_pwd_env_var,
-        hint="环境变量名，默认 CTP_PASSWORD；真实档案默认 CTP_LIVE_PASSWORD",
-        width=160,
-    )
-    app._entry_row(
-        left,
-        "档案认证码变量",
-        app.ctp_profile_auth_env_var,
-        hint="环境变量名，默认 CTP_AUTH_CODE；该柜台不需要认证码时留空",
-        width=160,
-    )
-    ctk.CTkButton(
-        left,
-        text="测试交易前置连通",
-        width=160,
-        command=app._test_ctp_front,
-        fg_color=T.ACCENT,
-        hover_color=T.ACCENT_HOVER,
-        text_color=T.TEXT,
-    ).pack(anchor="w", pady=(2, 8))
     app._entry_row(
         left,
         "开仓滑点上限(×ATR)",
@@ -1079,16 +802,6 @@ def build_strategy_section(
         list(SCOPE_LABELS.values()),
         width=200,
     )
-    ctk.CTkLabel(
-        left,
-        text="全时段 / 只做日盘 / 只做夜盘：只决定能不能开新仓，已经拿着的仓仍按止损和收盘清仓走。"
-        "夜日连续（跳空小）：只建议隔夜跳空不大的品种用。日内实体会把夜盘拿到日盘 14:55，"
-        "跳空大时最大回撤会明显变大。燃油这类常大幅跳空的，继续用全时段，让夜盘自己清仓。",
-        font=T.FONT_SMALL,
-        text_color=T.TEXT_DIM,
-        wraplength=420,
-        justify="left",
-    ).pack(anchor="w", pady=(0, 6))
     app._entry_row(
         left,
         "扫描间隔秒",
@@ -1096,7 +809,6 @@ def build_strategy_section(
         hint="一轮扫描之间隔多久，5~600 秒；止损发现快慢跟着它",
         width=160,
     )
-    app._pack_watch_editor(left)
     app._option_row(left, "仓位模式", app.sizing_mode_var, ["risk_pct", "fixed"], width=220)
     app._entry_row(
         left,
@@ -1149,7 +861,7 @@ def build_strategy_section(
     ).pack(side="left")
     ctk.CTkLabel(
         flat_row,
-        text="开=到点强平；关=仓可以留过午盘、夜盘和周末，只靠止损。周五临收仍不开新仓",
+        text="开=到清仓时刻强平（除非策略写死关闭）；关=仓可以留过清仓时刻，只靠止损",
         font=T.FONT_SMALL,
         text_color=T.TEXT_DIM,
         wraplength=280,

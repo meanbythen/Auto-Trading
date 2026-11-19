@@ -144,7 +144,7 @@ class AccountTabMixin:
         ).pack(fill="x", padx=4, pady=(0, 8))
         self.ac_ths_manual = ctk.CTkButton(
             left,
-            text="手工单录入",
+            text="手工单（只改程序账本）",
             height=36,
             fg_color=T.BG_ELEVATED,
             hover_color=T.BORDER,
@@ -153,16 +153,7 @@ class AccountTabMixin:
             text_color=T.ACCENT,
             command=self._on_manual_trade,
         )
-        self.ac_ths_manual.pack(fill="x", padx=4, pady=(0, 4))
-        self.ac_ths_manual_note = ctk.CTkLabel(
-            left,
-            text="手动在交易软件上开仓/平仓后，在这里录入。品种、价格、手数 + 买多/卖空/平仓。只改程序的账，不会去点交易软件。",
-            font=T.FONT_SMALL,
-            text_color=T.TEXT_DIM,
-            wraplength=390,
-            justify="left",
-        )
-        self.ac_ths_manual_note.pack(anchor="w", padx=4, pady=(0, 8))
+        self.ac_ths_manual.pack(fill="x", padx=4, pady=(0, 8))
         self._sync_account_mode()
 
         right = ctk.CTkFrame(tab, fg_color=T.BG_ELEVATED, corner_radius=12)
@@ -249,9 +240,12 @@ class AccountTabMixin:
         self.ac_calendar = tk.Canvas(scroll, height=210, bg=T.BG, highlightthickness=0, bd=0)
         self.ac_calendar.pack(fill="x", pady=(4, 8))
 
-        ctk.CTkLabel(scroll, text="资金变动记录", font=T.FONT_BODY, text_color=T.TEXT).pack(anchor="w")
+        self.ac_ledger_title = ctk.CTkLabel(
+            scroll, text="资金变动记录", font=T.FONT_BODY, text_color=T.TEXT
+        )
+        self.ac_ledger_title.pack(anchor="w")
         self.ac_result_box = ctk.CTkTextbox(
-            scroll, height=220, font=T.FONT_MONO, fg_color=T.BG, text_color=T.TEXT, corner_radius=10, wrap="word"
+            scroll, height=280, font=T.FONT_MONO, fg_color=T.BG, text_color=T.TEXT, corner_radius=10, wrap="word"
         )
         self.ac_result_box.pack(fill="x", pady=(4, 8))
         self._refresh_signal_view()
@@ -273,8 +267,6 @@ class AccountTabMixin:
             ths_card.pack_forget()
             if hasattr(self, "ac_ths_manual"):
                 self.ac_ths_manual.pack_forget()
-            if hasattr(self, "ac_ths_manual_note"):
-                self.ac_ths_manual_note.pack_forget()
             if refresh is not None:
                 ctp_card.pack(fill="x", pady=(0, 4), before=refresh)
             else:
@@ -286,9 +278,7 @@ class AccountTabMixin:
             else:
                 ths_card.pack(fill="x", pady=(0, 4))
             if hasattr(self, "ac_ths_manual"):
-                self.ac_ths_manual.pack(fill="x", padx=4, pady=(0, 4))
-            if hasattr(self, "ac_ths_manual_note"):
-                self.ac_ths_manual_note.pack(anchor="w", padx=4, pady=(0, 8))
+                self.ac_ths_manual.pack(fill="x", padx=4, pady=(0, 8))
 
 
     def _paint_ctp_fund_panel(self, book) -> None:
@@ -345,6 +335,26 @@ class AccountTabMixin:
                 finally:
                     self._account_switch_busy = busy
 
+
+    def _apply_ctp_book_align(self, note: str) -> None:
+        """配置页切仿真/真实后，账户分析下拉框跟到同一本账。"""
+        if not note:
+            return
+        from src.account.workspace import display_label, load_active_id
+
+        if hasattr(self, "ac_account_var"):
+            busy = bool(getattr(self, "_account_switch_busy", False))
+            self._account_switch_busy = True
+            try:
+                self.ac_account_var.set(display_label(load_active_id(self.root_dir), self.root_dir))
+            finally:
+                self._account_switch_busy = busy
+        self._signal_book_mtime = 0.0
+        if hasattr(self, "_refresh_signal_view"):
+            self._refresh_signal_view()
+        if hasattr(self, "_refresh_status_cards"):
+            self._refresh_status_cards()
+        self._append_log(note)
 
     def _on_account_switch(self, choice: str) -> None:
         """
@@ -972,6 +982,8 @@ class AccountTabMixin:
             from src.account.workspace import is_ctp_book
 
             if is_ctp_book(info["id"]):
+                if hasattr(self, "ac_ledger_title"):
+                    self.ac_ledger_title.configure(text="柜台资金与程序成交")
                 empty = (
                     f"「{info['label']}」还没有期货公司资金回报。\n"
                     "请先打开交易台，用这一本账对应的账号登录，点「刷新持仓」或左边「从柜台刷新资金」。\n"
@@ -979,6 +991,8 @@ class AccountTabMixin:
                     "GUI 点单请换到 GUI实盘账 或 GUI模拟账。"
                 )
             else:
+                if hasattr(self, "ac_ledger_title"):
+                    self.ac_ledger_title.configure(text="资金变动记录")
                 empty = (
                     f"「{info['label']}」还没有开始记账。\n"
                     "程序按信号真正开仓或平仓后会自动记在这里。\n"
@@ -1001,10 +1015,20 @@ class AccountTabMixin:
             initial = float(book.get("initial_capital") or 0)
             self.ac_capital_var.set(str(int(initial)) if initial == int(initial) else f"{initial:.2f}")
         if str(book.get("funding") or "") == "ctp":
-            from src.account.signal_book import describe_ctp_funds
+            from src.account.signal_book import describe_ctp_funds, repair_ctp_daily, save_book
 
+            # 结算后空壳快照会把日历盖成 0；打开本页时按历史纠正并写回。
+            if repair_ctp_daily(book):
+                try:
+                    save_book(self.root_dir, book)
+                except Exception:  # noqa: BLE001
+                    pass
+            if hasattr(self, "ac_ledger_title"):
+                self.ac_ledger_title.configure(text="柜台资金与程序成交")
             self._set_result_text(self.ac_result_box, describe_ctp_funds(book))
         else:
+            if hasattr(self, "ac_ledger_title"):
+                self.ac_ledger_title.configure(text="资金变动记录")
             self._set_result_text(self.ac_result_box, describe(book, multiplier_map(self.cfg)))
         self._paint_ctp_fund_panel(book)
         self._sync_account_mode()

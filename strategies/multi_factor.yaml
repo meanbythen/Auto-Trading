@@ -12,6 +12,7 @@ principle:
   - SAR 开不开关在本策略个性配置里；关掉后权重摊给剩下三个因子
   - 因子分数差太大（默认 0.7）视为打架，不开新仓
   - 出场：总分反向穿越阈值，或 2 倍 ATR 只往有利方向收的跟踪止损
+  - 收盘清仓听配置页「收盘清仓」总开关，不再写死每天平仓。隔夜跳空不大的品种可把总开关关掉
   - 本策略行情过滤：ADX / ATR 分位 / 因子分歧写在本小节 cta_filter，带总开关；弱趋势要更高总分并打成仓位
   - 不走页面底下那张公共行情过滤，避免拦两次
 
@@ -32,7 +33,7 @@ defaults:
   bias_ma: 60
   trend_timeframe: D
   weights: {ma: 0.30, turtle: 0.25, boll: 0.25, sar: 0.20}
-  flatten_at_close: true
+  flatten_at_close: true  # 实际听总开关；保存时会跟交易配置对齐
   cta_filter:
     enabled: true
     use_adx: true

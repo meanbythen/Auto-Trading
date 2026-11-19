@@ -69,7 +69,6 @@ strategy:
   # 交叉测试要跑的策略。不写就用程序里的每一套。正在用的策略仍是上面的 engine。
   cross_engines:
     - daily_body
-    - float_hold
     - trend_follow
     - supertrend
     - dual_ma
@@ -81,6 +80,10 @@ strategy:
     - dual_donchian
     - dual_fractal
     - swing_box
+  # 交叉测试勾选的周期：5 / 15 / 30 / 60 分钟，日线 D，周线 W。
+  # 不写时界面按当前信号周期勾一档。点开始交叉测试时会把勾选写回这里。
+  cross_periods:
+    - "5"
   flatten_times:
     - "14:55"
     - "22:55"
@@ -220,7 +223,7 @@ strategy:
     boll_dev: 2.0
     atr_period: 14
     atr_stop_mult: 1.5
-    flatten_at_close: true
+    flatten_at_close: true  # 布林听上面的总开关；保存时会把这一项改成和总开关一样
     filter_enabled: false
     filter_adx_period: 14
     filter_atr_period: 14
@@ -236,7 +239,7 @@ strategy:
     af_max: 0.2
     ma_filter: 20
     atr_period: 14
-    flatten_at_close: true
+    flatten_at_close: true  # SAR 听上面的总开关；保存时会把这一项改成和总开关一样
     filter_enabled: false
     filter_adx_period: 14
     filter_atr_period: 14
@@ -267,7 +270,7 @@ strategy:
       turtle: 0.25
       boll: 0.25
       sar: 0.20
-    flatten_at_close: true
+    flatten_at_close: true  # 多因子听上面的总开关；保存时会把这一项改成和总开关一样
     # 本策略自己的行情闸门，不走页面底下那张公共过滤。
     cta_filter:
       enabled: true
@@ -308,44 +311,6 @@ strategy:
     night_cutoff: "22:15"
     # 本策略自带的箱体突破过滤：ADX 过高（强单边）不开，不拦波动压缩。关了这一层就不看。
     filter_enabled: true
-    filter_adx_period: 14
-    filter_atr_period: 14
-    filter_lookback: 60
-    filter_adx_upper: 30
-    filter_atr_high_pct: 0.8
-
-  # 日内浮盈飘单（engine=float_hold 时生效）。和日内实体分开。
-  # 默认等开盘观察结束，顺着 EMA60/120 开仓；止损放宽，少过滤。
-  float_hold:
-    direction: eth_trend
-    macd_timeframe: "5"
-    macd_fast: 12
-    macd_slow: 26
-    macd_signal: 9
-    # 优化按「12/26/9」「5/20」这种整串改参数时会写回这两项，和上面的分项等价。
-    macd_combo: "12/26/9"
-    dir_ema_pair: "5/20"
-    dir_ema_fast: 5
-    dir_ema_slow: 20
-    trend_align_enabled: false
-    trend_align_fast: 60
-    trend_align_slow: 120
-    trend_slope_lookback: 5
-    trend_slope_min_deg: 0
-    cluster_max_width: 10
-    eth_minutes: 60
-    eth_minutes2: 0
-    stop_atr_mult: 1.5
-    be_atr_mult: 2.0
-    skip_gap_atr_mult: 0
-    max_box_atr_mult: 0
-    max_chase_atr_mult: 0
-    gap_align_atr_mult: 0
-    ema_period: 0
-    ema_buffer_ticks: 2
-    day_cutoff: "14:45"
-    night_cutoff: "22:50"
-    filter_enabled: false
     filter_adx_period: 14
     filter_atr_period: 14
     filter_lookback: 60
@@ -505,6 +470,8 @@ backtest:
   # 成交近似：信号下一根开盘价成交；滑点按买卖方向各让几跳。
   fill_on_next_open: true
   slippage_ticks: 1.0
+  # 打开后回测开仓再套挂机的过期K和追价上限。默认关，不改原来的回测成绩。
+  mirror_live_gates: false
   # 涨跌停/流动性近似（默认关闭，打开后会改变回测结果）：
   #   block_limit_locked: 成交这根最高=最低（一字板）时不开仓，平仓顺延到下一根。
   #   max_volume_pct: 单根新开仓手数不超过该根成交量的比例，0=不限。
@@ -529,7 +496,7 @@ evaluation:
   gate_on_optimize: true
   stress_min_trades: 30
   profit_factor_min: 1.3
-  r_expect_min: 0.12
+  r_expect_min: 0.12          # 最低收益期望（界面名）；低于它只给观察
   calmar_min: 1.0
   max_drawdown_pct: 0.15
   profit_cover_min: 0
@@ -586,11 +553,10 @@ trade:
       huatai_sim:
         label: 华泰仿真
         kind: sim
-        td_front: ""
-        # 行情前置必须单独填，程序不再按交易端口推断行情端口。
-        md_front: ""
-        broker_id: ""
-        user_id: ""
+        td_front: "tcp://59.36.3.115:27226"
+        md_front: "tcp://59.36.3.115:27236"
+        broker_id: "8080"
+        user_id: "28077"
         password_env: "CTP_PASSWORD"
         auth_code_env: "CTP_AUTH_CODE"
       simnow:
@@ -606,8 +572,15 @@ trade:
       huatai_live:
         label: 华泰真实
         kind: live
-        td_front: ""
-        md_front: ""
+        # 可写多台。连接时全部登记，断线由柜台在列表里换。完整对照见 docs/华泰期货ctp主席新地址.md
+        td_front:
+          - "tcp://220.196.208.129:41206"
+          - "tcp://220.196.208.130:41206"
+          - "tcp://120.86.122.66:41206"
+        md_front:
+          - "tcp://220.196.208.129:41214"
+          - "tcp://220.196.208.130:41214"
+          - "tcp://120.86.122.66:41214"
         broker_id: "8080"
         user_id: ""
         password_env: "CTP_LIVE_PASSWORD"
@@ -616,7 +589,7 @@ trade:
     # 旧写法（trade.ctp.sim / live、顶层 td_front/md_front/broker_id/user_id）已删除，
     # 程序只读 ctp_profiles。仿真与实盘用同一套字段，换柜台时改档案里的前置和 kind 即可。
     # 认证码不要写在这个文件里。放到环境变量 CTP_AUTH_CODE，或 config/secrets.local.yaml 的 ctp_auth_code
-    # 仿真密码写 secrets.local.yaml 的 ctp_password。真实通道默认用同一份交易密码；若不同再写 ctp_live_password。
+    # 仿真密码写 secrets.local.yaml 的 ctp_password（界面「账号」页可填）。真实通道默认用同一份交易密码；若不同再写 ctp_live_password。
     auth_code_env: "CTP_AUTH_CODE"
   gui:
     # 期货通默认无确认弹窗。0=点完买卖就结束，不要按回车。

@@ -77,6 +77,16 @@ def test_create_via_factory() -> None:
     assert isinstance(create_strategy(cfg), DualMaStrategy)
 
 
+def test_trail_timeframe_follows_public_stop_period() -> None:
+    """止损周期跟左边公共项，不再抄成信号周期。"""
+    cfg = _cfg()
+    cfg["strategy"]["timeframe"] = "15"
+    cfg["strategy"]["trail_timeframe"] = "5"
+    s = DualMaStrategy(cfg)
+    assert s.timeframe == "15"
+    assert s.trail_timeframe == "5"
+
+
 def test_flatten_follows_global_switch() -> None:
     on = _cfg()
     on["strategy"]["flatten_at_close"] = True

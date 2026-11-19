@@ -57,10 +57,12 @@ class CtpTrader(TraderBase):
         self.last_report: ReconcileReport | None = None
         # 最近一次柜台资金查询的完整数字，给常驻同步账号、可用、保证金、当日盈亏。
         self.last_broker_snapshot: dict[str, Any] | None = None
+        fronts = getattr(self.settings, "td_fronts", ()) or (self.settings.td_front,)
         logger.info(
-            "CTP 通道已准备。操作账={} 账号={} 前置={} AppID={}，平今平昨品种={}",
+            "CTP 通道已准备。操作账={} 账号={} 前置{}台 第一台={} AppID={}，平今平昨品种={}",
             "真实" if self.settings.account_kind == "live" else "仿真",
             self.settings.user_id,
+            len([item for item in fronts if item]),
             self.settings.td_front,
             self.settings.app_id,
             ",".join(self.settings.close_split),
@@ -171,7 +173,12 @@ class CtpTrader(TraderBase):
             self._last_note = "；".join(diffs) + f"。可用资金 {money}。持仓对不上，停止开新仓"
             if extra_text:
                 self._last_note = self._last_note + "。" + extra_text
-            logger.warning("柜台持仓不一致: {}", self._last_note)
+            prev = getattr(self, "last_report", None)
+            same = bool(prev is not None and list(getattr(prev, "diffs", []) or []) == list(diffs))
+            if same:
+                logger.debug("柜台持仓仍不一致: {}", self._last_note)
+            else:
+                logger.warning("柜台持仓不一致: {}", self._last_note)
         else:
             self._last_note = f"持仓一致。可用资金 {money}"
             if extra_text:
@@ -221,7 +228,7 @@ class CtpTrader(TraderBase):
             self.last_broker_equity = value
 
     def fetch_account_snapshot(self) -> tuple[bool, str]:
-        """向柜台查一遍持仓和可用资金，给仿真窗口对照无限易。"""
+        """向柜台查一遍持仓和可用资金，给交易台对照。"""
         if not self.gateway.session.ready:
             return False, "还没登录，不能查持仓"
         ok = self.gateway.refresh()
@@ -231,7 +238,7 @@ class CtpTrader(TraderBase):
         extra = self._sync_signal_book()
         if extra:
             text = text + " " + extra
-        logger.info("仿真持仓查询：{}", text)
+        logger.info("柜台持仓查询：{}", text)
         return True, text
 
     def _sync_signal_book(self) -> str:
@@ -279,7 +286,7 @@ class CtpTrader(TraderBase):
             text = "今天还没有成交。"
         else:
             text = f"今天成交 {len(rows)} 笔（窗口成交表会列出明细）"
-        logger.info("仿真成交查询：{}", text)
+        logger.info("柜台成交查询：{}", text)
         return True, text
 
     def cancel_ref(self, order_ref: str) -> OrderResult:

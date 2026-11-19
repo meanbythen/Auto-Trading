@@ -60,6 +60,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--tick-download", action="store_true", help="专业版历史 tick 批量下载")
     parser.add_argument("--dry-run", action="store_true", help="配合 --tick-download：只列计划不下载")
+    parser.add_argument(
+        "--tick-inventory",
+        action="store_true",
+        help="写出本地 tick 库存 Excel（连续时段统计，不含逐笔）",
+    )
     return parser.parse_args()
 
 

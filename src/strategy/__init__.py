@@ -1,7 +1,6 @@
 # 策略子包：注册表工厂 + 已实现策略 + 公共类型
 from .base import StrategyBase
 from .daily_body import DailyBodyStrategy
-from .float_hold import FloatHoldStrategy
 from .dual_ma import DualMaStrategy
 from .macd_swing import MacdSwingStrategy
 from .factory import (
@@ -37,7 +36,6 @@ __all__ = [
     "list_engines",
     "sanitize_strategy_config",
     "DailyBodyStrategy",
-    "FloatHoldStrategy",
     "SuperTrendStrategy",
     "DualMaStrategy",
     "MacdSwingStrategy",

@@ -14,7 +14,8 @@ from src.utils import load_config, save_config
 
 TAB_NAMES = [
     "运行",
-    "配置",
+    "账号",
+    "交易配置",
     "策略编辑器",
     "历史回测",
     "数据管理",
@@ -594,6 +595,88 @@ def test_prepare_backtest_uses_page_capital_not_live(real_app) -> None:
     assert config_path.read_bytes() == before
 
 
+def test_prepare_backtest_keeps_page_flatten_switch(real_app) -> None:
+    """回测页关掉收盘清仓后点开始，不能被交易配置再打开。"""
+    real_app._set_watch_codes(["bu2612"], select="bu2612", save=False)
+    real_app.flatten_at_close_var.set(True)
+    real_app.bt_flatten_var.set(False)
+    real_app.engine_var.set("multi_factor")
+    real_app.source_var.set("新浪")
+    real_app.bt_engine_var.set("daily_body")
+    real_app.bt_source_var.set("天勤")
+    real_app.bt_symbol_var.set("bu2612")
+    real_app._set_period_vars("30", real_app.bt_tf_var, real_app.bt_tf_custom_var)
+    real_app._set_period_vars("60", real_app.bt_trail_var, real_app.bt_trail_custom_var)
+    real_app.bt_capital_var.set("100000")
+    real_app.capital_var.set("32790")
+    real_app.bt_range_var.set("自定义")
+    real_app.bt_start_var.set("2026-01-02")
+    real_app.bt_end_var.set("2026-02-03")
+
+    prepared = real_app._prepare_backtest_run()
+
+    assert prepared is not None
+    cfg, _symbol, _start, _end = prepared
+    assert real_app.bt_flatten_var.get() is False
+    assert cfg["strategy"]["flatten_at_close"] is False
+    assert real_app.flatten_at_close_var.get() is True
+    assert real_app.bt_engine_var.get() == "daily_body"
+    assert real_app.bt_source_var.get() == "天勤"
+    assert real_app._period_code(real_app.bt_tf_var, real_app.bt_tf_custom_var) == "30"
+    assert real_app._period_code(real_app.bt_trail_var, real_app.bt_trail_custom_var) == "60"
+    assert real_app.bt_capital_var.get() == "100000"
+    assert cfg["strategy"]["engine"] == "daily_body"
+    assert cfg["data"]["source"] == "tq"
+
+
+def test_picker_settings_keeps_page_values(real_app) -> None:
+    """交叉测试点开始不能把本页收盘清仓、手数改回交易配置。"""
+    real_app.flatten_at_close_var.set(True)
+    real_app.volume_var.set("1")
+    real_app.risk_pct_var.set("2")
+    real_app.min_interval_var.set("60")
+    real_app.max_orders_var.set("5")
+    real_app.capital_var.set("1000")
+    real_app.pk_flatten_var.set(False)
+    real_app.pk_volume_var.set("9")
+    real_app.pk_risk_pct_var.set("1.5")
+    real_app.pk_interval_var.set("10")
+    real_app.pk_max_orders_var.set("8")
+    real_app.pk_capital_var.set("50000")
+    real_app.pk_range_var.set("自定义")
+    real_app.pk_start_var.set("2026-01-02")
+    real_app.pk_end_var.set("2026-02-03")
+    real_app.pk_source_var.set("天勤")
+
+    settings = real_app._picker_settings()
+
+    assert real_app.pk_flatten_var.get() is False
+    assert real_app.pk_volume_var.get() == "9"
+    assert real_app.pk_capital_var.get() == "50000"
+    assert settings["flatten_at_close"] is False
+    assert settings["fixed_volume"] == 9
+    assert settings["risk_per_trade_pct"] == 1.5
+    assert settings["min_order_interval_sec"] == 10
+    assert settings["max_orders_per_day"] == 8
+    assert settings["capital"] == 50000
+
+
+def test_copy_risk_without_button_does_not_touch_backtest_page(real_app) -> None:
+    """没点「按配置页重新填入」时，重新加载那条抄写路径不能改回测页。"""
+    real_app.bt_flatten_var.set(False)
+    real_app.bt_engine_var.set("ema_swing")
+    real_app.bt_capital_var.set("88888")
+    real_app.flatten_at_close_var.set(True)
+    real_app.engine_var.set("daily_body")
+    real_app.capital_var.set("1000")
+
+    real_app._copy_risk_to_backtest()
+
+    assert real_app.bt_flatten_var.get() is False
+    assert real_app.bt_engine_var.get() == "ema_swing"
+    assert real_app.bt_capital_var.get() == "88888"
+
+
 @pytest.mark.parametrize(
     ("bt_source", "expected_source"),
     [("天勤", "tq"), ("同花顺图", "akshare")],
@@ -645,7 +728,7 @@ def test_write_backtest_to_config_page_preserves_live_only_values(real_app, monk
     assert "apply_limits" not in saved["risk"]
     assert saved.get("backtest", {}).get("start_date") != "2030-01-02"
     assert saved.get("backtest", {}).get("end_date") != "2030-02-03"
-    assert real_app.tabs.get() == "配置"
+    assert real_app.tabs.get() == "交易配置"
 
 
 def test_backtest_validation_failure_does_not_start_thread(real_app, monkeypatch) -> None:

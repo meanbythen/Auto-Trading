@@ -56,6 +56,16 @@ def _steady_up() -> list[float]:
     return [80 + i * 0.6 for i in range(180)]
 
 
+def test_trail_timeframe_follows_public_stop_period() -> None:
+    """止损周期跟左边公共项，不再抄成信号周期。"""
+    cfg = _cfg()
+    cfg["strategy"]["timeframe"] = "15"
+    cfg["strategy"]["trail_timeframe"] = "5"
+    s = MacdSwingStrategy(cfg)
+    assert s.timeframe == "15"
+    assert s.trail_timeframe == "5"
+
+
 def test_parse_sig_triple() -> None:
     assert parse_sig_triple("EMA5 / 10 / 30") == (5, 10, 30)
     assert parse_sig_triple("5/10/20") == (5, 10, 20)

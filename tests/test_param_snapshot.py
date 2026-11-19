@@ -128,6 +128,43 @@ def test_writing_daily_body_keeps_the_flatten_switch_used_to_score() -> None:
     assert st["daily_body"]["initial_atr_mult"] == 1.0
 
 
+def test_writing_multi_factor_keeps_the_flatten_switch_used_to_score() -> None:
+    """多因子优化结果要把打分时的收盘清仓写回总开关和自己那一节。"""
+    cfg = {
+        "strategy": {
+            "engine": "daily_body",
+            "flatten_at_close": True,
+            "multi_factor": {"threshold": 0.6, "flatten_at_close": True},
+        }
+    }
+    updated = apply_run_switches(
+        cfg,
+        "multi_factor",
+        flatten_at_close=False,
+    )
+    st = updated["strategy"]
+    assert st["engine"] == "daily_body"
+    assert st["flatten_at_close"] is False
+    assert st["multi_factor"]["flatten_at_close"] is False
+    assert st["multi_factor"]["threshold"] == 0.6
+
+
+def test_writing_bollinger_keeps_the_flatten_switch_used_to_score() -> None:
+    """布林优化结果要把打分时的收盘清仓写回总开关和自己那一节。"""
+    cfg = {
+        "strategy": {
+            "engine": "daily_body",
+            "flatten_at_close": True,
+            "bollinger": {"boll_window": 20, "flatten_at_close": True},
+        }
+    }
+    updated = apply_run_switches(cfg, "bollinger", flatten_at_close=False)
+    st = updated["strategy"]
+    assert st["flatten_at_close"] is False
+    assert st["bollinger"]["flatten_at_close"] is False
+    assert st["bollinger"]["boll_window"] == 20
+
+
 def test_writing_trend_does_not_touch_the_shared_flatten_switch() -> None:
     """趋势跟随打分时不听总开关，写入时也不能把总开关改掉。"""
     cfg = {"strategy": {"engine": "daily_body", "flatten_at_close": True, "trend_follow": {"entry_bars": 36}}}

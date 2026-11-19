@@ -261,6 +261,24 @@ def ctp_kind_label(value: Any) -> str:
     return CTP_KIND_LABELS[normalize_ctp_kind(value)]
 
 
+def foreign_report_notice(account_kind: Any) -> str:
+    """
+    柜台推来、但本程序这次登录没发过的委托/成交。
+
+    实盘常见：手机同花顺、另一台电脑、登录前已有的单。
+    仿真才可能是公用账号上别人的单。两套话不能混用。
+    """
+    if normalize_ctp_kind(account_kind) == CTP_KIND_LIVE:
+        return (
+            "收到本程序没发过的柜台回报（常见：手机同花顺、其他终端，或登录前已有的单）。"
+            "那些单不会记进本程序账本，后面同类回报不再逐条显示。"
+        )
+    return (
+        "仿真账号上还有不是这次登录发出的回报（公用仿真可能是别人的单）。"
+        "那些单不会记进本程序账本，后面不再逐条显示。"
+    )
+
+
 def overlay_ctp_profile(
     ctp: dict[str, Any] | None,
     kind: Any = None,
@@ -282,6 +300,21 @@ def overlay_ctp_profile(
     if account_password:
         acc["resolved_password"] = account_password
     return resolve_ctp_profile(ctp, acc, kind=kind)
+
+
+def explain_ctp_reject(message: str, *, account_kind: str = "", user_id: str = "") -> str:
+    """把柜台拒单补一句人能看懂的原因。原句保留在前面。"""
+    text = str(message or "").strip() or "拒单"
+    if "席位未连接" not in text:
+        return text
+    if normalize_ctp_kind(account_kind) == CTP_KIND_SIM:
+        who = str(user_id or "").strip() or "仿真账号"
+        return (
+            f"{text}。现在连的是仿真账号 {who}，仿真席位夜里常常没挂上交易所，"
+            "不是配置页那个资金账号在下单。要测真实资金：交易台「操作账」改成「真实账号」，"
+            "再点连接登录（会换成资金账号和联通实盘前置）。"
+        )
+    return f"{text}。真实席位暂时没挂上交易所，请稍后再下，或换备用前置后重新登录。"
 
 
 def test_front_blocks_live_account(kind: Any, user_id: str, live_user_id: str) -> str:
@@ -313,6 +346,16 @@ class OrderActivity:
         """记一笔撤单请求，并在达到阈值时附上警示。只提醒，不拦住下一笔。"""
         self.cancels += 1
         return self.describe(kind="撤单")
+
+    def sync_from_broker_count(self, broker_orders: int) -> None:
+        """
+        用柜台今日委托笔数把本机计数补齐。
+
+        重启后内存从 0 开始，柜台仍有今天的单。取较大值，避免刷新委托时把已经加上的本机报单冲掉。
+        """
+        n = max(0, int(broker_orders or 0))
+        if n > self.orders:
+            self.orders = n
 
     def describe(self, kind: str | None = None) -> str:
         """窗口和日志共用的笔数说明。到了阈值只写「请停止」，不会禁止再报。"""

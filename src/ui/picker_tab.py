@@ -25,7 +25,7 @@ class PickerTabMixin:
         ctk.CTkLabel(box, text="开仓和止损限制", font=T.FONT_BODY, text_color=T.TEXT).pack(anchor="w", pady=(0, 4))
         ctk.CTkLabel(
             box,
-            text="手数、间隔、每天次数、每笔风险、收盘清仓开跑前跟实盘配置对齐。开几手仍固定。账户权益可在本页改成准备投入的资金，只影响回撤%和通过/淘汰，不改实盘余额。点「按配置页重新填入」抄回当前余额。主力换月跟历史回测页。",
+            text="账户权益、收盘清仓以本页为准，点开始不会被交易配置改回去。手数、间隔、每天次数、每笔风险跟本页显示的数字；要跟交易配置一样，点「按配置页重新填入」。开几手仍固定。主力换月跟历史回测页。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=340,
@@ -39,13 +39,13 @@ class PickerTabMixin:
             width=160,
         )
         self._entry_row(
-            box, "每笔风险%", self.pk_risk_pct_var, hint="跟配置页一致，开跑前对齐", width=160, readonly=True
+            box, "每笔风险%", self.pk_risk_pct_var, hint="本页显示值；点「按配置页重新填入」才从交易配置抄来", width=160, readonly=True
         )
         self._entry_row(
-            box, "持仓手数", self.pk_volume_var, hint="跟配置页一致；各组合同手数", width=160, readonly=True
+            box, "持仓手数", self.pk_volume_var, hint="本页显示值；各组合同手数", width=160, readonly=True
         )
-        self._entry_row(box, "开仓最小间隔秒", self.pk_interval_var, hint="跟配置页一致", width=160, readonly=True)
-        self._entry_row(box, "每天最多开仓", self.pk_max_orders_var, hint="跟配置页一致", width=160, readonly=True)
+        self._entry_row(box, "开仓最小间隔秒", self.pk_interval_var, hint="本页显示值", width=160, readonly=True)
+        self._entry_row(box, "每天最多开仓", self.pk_max_orders_var, hint="本页显示值", width=160, readonly=True)
         ctk.CTkButton(
             box,
             text="按配置页重新填入",
@@ -92,7 +92,16 @@ class PickerTabMixin:
             wraplength=340,
             justify="left",
         ).pack(anchor="w", pady=(4, 6))
-        self.pk_engine_list = self._pack_cross_check_group(lists, "参与策略", "engine")
+        self.pk_engine_list = self._pack_cross_check_group(lists, "参与策略", "engine", height=200)
+        self.pk_engine_hint = ctk.CTkLabel(
+            lists,
+            text="",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=340,
+            justify="left",
+        )
+        self.pk_engine_hint.pack(anchor="w", pady=(0, 6))
         self.pk_symbol_list = self._pack_cross_check_group(lists, "品种合约", "symbol")
         self.pk_period_list = self._pack_cross_check_group(lists, "周期（信号和止损相同）", "period")
         self.pk_combo_label = ctk.CTkLabel(
@@ -131,7 +140,7 @@ class PickerTabMixin:
         self._pick_switch_row(box, "收盘清仓", self.pk_flatten_var)
         ctk.CTkLabel(
             box,
-            text="每个组合都用上面勾选的周期（信号=止损），以及下面的开仓限制。趋势跟随不听收盘清仓。",
+            text="每个组合都用上面勾选的周期（信号=止损），以及下面的开仓限制。点开始就按本页收盘清仓，不会被交易配置改回去。趋势跟随、SuperTrend、均线波段仍用它们自己的设置。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=340,
@@ -218,7 +227,7 @@ class PickerTabMixin:
         # 列顺序和导出「交叉测试」表一致：盈亏比后是收益期望；净盈亏后是盈利覆盖；交易频率后是笔数、每笔。
         # 「当下行情」只在这里显示（这一轮跑的时候现算），不写进导出表。
         self._pick_col_widths = (
-            108, 132, 64, 48, 64, 56, 72, 64, 72, 56, 64, 72, 72, 64, 120, 40, 72,
+            108, 132, 64, 48, 64, 56, 72, 72, 56, 64, 72, 72, 64, 120, 40, 72,
             176, 88, 88, 40, 72, 72, 48, 96, 180, 96, 52, 64,
         )
         self._pick_headers = [
@@ -229,7 +238,6 @@ class PickerTabMixin:
             "盈利因子",
             "盈亏比",
             "收益期望",
-            "R期望",
             "最大回撤",
             "卡尔玛",
             "最大连亏",
@@ -373,7 +381,6 @@ class PickerTabMixin:
                     item.get("profit_factor") or "—",
                     item.get("payoff") or "—",
                     item.get("expectancy") or "—",
-                    item.get("r_expectancy") or "—",
                     item.get("max_drawdown") or "—",
                     item.get("calmar") or "—",
                     item.get("loss_streak") or "—",
@@ -458,10 +465,9 @@ class PickerTabMixin:
 
 
     def _align_picker_trading_params_with_live(self) -> None:
-        """交叉测试：手数、风险、间隔、次数、收盘清仓跟实盘配置对齐。账户权益不覆盖。"""
+        """只给「按配置页重新填入」用：把交易配置的手数、风险、间隔、次数抄到本页。"""
         if not hasattr(self, "pk_volume_var"):
             return
-        self.pk_flatten_var.set(bool(self.flatten_at_close_var.get()))
         self.pk_risk_pct_var.set(self.risk_pct_var.get())
         self.pk_volume_var.set(self.volume_var.get())
         self.pk_interval_var.set(self.min_interval_var.get())
@@ -475,6 +481,7 @@ class PickerTabMixin:
         self._set_period_vars(live_tf, self.pk_tf_var, self.pk_tf_custom_var)
         self._set_period_vars(live_tf, self.pk_trail_var, self.pk_trail_custom_var)
         self.pk_capital_var.set(self.capital_var.get())
+        self.pk_flatten_var.set(bool(self.flatten_at_close_var.get()))
         self._align_picker_trading_params_with_live()
         self._refresh_cross_lists(prefer_period=live_tf)
         self._append_log(f"已按配置页填好交叉测试的周期、行情、开仓限制和账户权益，行情 {self.pk_source_var.get()}")
@@ -484,9 +491,9 @@ class PickerTabMixin:
         """
         读交叉测试用的周期和开仓限制。
 
-        手数/风险/间隔/次数/收盘清仓强制跟实盘配置；账户权益和日期用本页。数字填错就停下来。
+        收盘清仓、手数、风险、间隔、次数、账户权益都听本页，不回头改格子。
+        要跟交易配置一样，请点「按配置页重新填入」。数字填错就停下来。
         """
-        self._align_picker_trading_params_with_live()
         preset = self.pk_range_var.get()
         start, end = self._resolve_date_range(preset, self.pk_start_var.get(), self.pk_end_var.get())
         if preset == "全部可用" and (start or end):
@@ -496,13 +503,13 @@ class PickerTabMixin:
         if end:
             self.pk_end_var.set(end)
         try:
-            volume = int(float(self.volume_var.get()))
-            risk_pct = float(self.risk_pct_var.get())
-            interval = int(float(self.min_interval_var.get()))
-            max_orders = int(float(self.max_orders_var.get()))
+            volume = int(float(self.pk_volume_var.get()))
+            risk_pct = float(self.pk_risk_pct_var.get())
+            interval = int(float(self.pk_interval_var.get()))
+            max_orders = int(float(self.pk_max_orders_var.get()))
             capital = float(self.pk_capital_var.get())
         except ValueError as exc:
-            raise ValueError("交叉测试的账户权益，以及配置页的每笔风险、持仓手数、开仓间隔和每天最多开仓要填数字") from exc
+            raise ValueError("交叉测试的账户权益、每笔风险、持仓手数、开仓间隔和每天最多开仓要填数字") from exc
         if volume < 1:
             raise ValueError("持仓手数至少是 1")
         if risk_pct < 0:
@@ -520,7 +527,7 @@ class PickerTabMixin:
             "trail_timeframe": tf,
             "start_date": start or "",
             "end_date": end or "",
-            "flatten_at_close": bool(self.flatten_at_close_var.get()),
+            "flatten_at_close": bool(self.pk_flatten_var.get()),
             "has_flatten": True,
             "fixed_volume": volume,
             "risk_per_trade_pct": risk_pct,
@@ -869,7 +876,13 @@ class PickerTabMixin:
         self._append_log("将在当前组合测完后停止")
 
 
-    def _pack_cross_check_group(self, parent: ctk.CTkFrame, title: str, kind: str) -> ctk.CTkScrollableFrame:
+    def _pack_cross_check_group(
+        self,
+        parent: ctk.CTkFrame,
+        title: str,
+        kind: str,
+        height: int = 108,
+    ) -> ctk.CTkScrollableFrame:
         """交叉测试左边一组可复选名单：标题、全选/全不选、可滚动勾选。"""
         ctk.CTkLabel(parent, text=title, font=T.FONT_SMALL, text_color=T.TEXT_DIM).pack(anchor="w")
         btns = ctk.CTkFrame(parent, fg_color="transparent")
@@ -898,7 +911,7 @@ class PickerTabMixin:
             text_color=T.TEXT,
             command=lambda k=kind: self._pk_check_all(k, False),
         ).pack(side="left")
-        box = ctk.CTkScrollableFrame(parent, height=108, fg_color=T.BG, corner_radius=8)
+        box = ctk.CTkScrollableFrame(parent, height=height, fg_color=T.BG, corner_radius=8)
         box.pack(fill="x", pady=(0, 8))
         return box
 
@@ -950,6 +963,10 @@ class PickerTabMixin:
                 text_color=T.TEXT,
                 command=self._update_pk_combo_count,
             ).pack(anchor="w", padx=4, pady=1)
+        try:
+            frame._parent_canvas.yview_moveto(0)
+        except Exception:
+            pass
 
 
     def _pk_checked_engines(self) -> list[str]:
@@ -988,7 +1005,7 @@ class PickerTabMixin:
         """
         刷新交叉测试左边三份可复选名单。
 
-        策略按程序里有的全部列出，勾选跟配置里的 cross_engines。
+        策略按当前程序能交叉测试的全部列出（含自定义规则），勾选跟配置里的 cross_engines。
         合约跟当前关注品种。周期勾选跟配置里的 cross_periods，没有就勾当前信号周期。
         """
         engine_box = getattr(self, "pk_engine_list", None)
@@ -996,20 +1013,29 @@ class PickerTabMixin:
         period_box = getattr(self, "pk_period_list", None)
         if engine_box is None or symbol_box is None or period_box is None:
             return
-        from src.screen.picker import CROSS_PERIODS, SCREEN_STRATEGIES, contracts_for_cross
+        from src.screen.picker import CROSS_PERIODS, contracts_for_cross, listed_cross_engines
 
         st = self.cfg.get("strategy") or {}
         raw_engines = st.get("cross_engines")
         engine_checked: set[str] = set()
         if isinstance(raw_engines, list) and raw_engines:
             engine_checked = {str(x).strip() for x in raw_engines if str(x).strip()}
+        engine_items = listed_cross_engines()
         self._fill_check_frame(
             engine_box,
             self._pk_engine_vars,
-            list(SCREEN_STRATEGIES),
+            engine_items,
             engine_checked,
             default_all=not engine_checked,
         )
+        hint = getattr(self, "pk_engine_hint", None)
+        if hint is not None:
+            hint.configure(
+                text=(
+                    f"共 {len(engine_items)} 套，跟当前程序能用的策略走，可滚动。"
+                    "已删的不会再出现。以损定开、凯利突破参数太多，交叉测试不测这两套。"
+                )
+            )
 
         contracts = contracts_for_cross(self._watch_symbols)
         symbol_items = [(code, name) for code, name, _mult, _thin in contracts]

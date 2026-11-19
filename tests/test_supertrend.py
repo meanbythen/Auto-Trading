@@ -80,3 +80,13 @@ def test_opens_on_flip_and_can_hold() -> None:
         elif d.action == StrategyAction.CLOSE:
             strat.on_filled("bu2612", d.action, float(part["close"].iloc[-1]), 1)
     assert saw_open
+
+
+def test_trail_timeframe_follows_public_stop_period() -> None:
+    """止损周期跟左边公共项，不再抄成信号周期。"""
+    cfg = _cfg()
+    cfg["strategy"]["timeframe"] = "15"
+    cfg["strategy"]["trail_timeframe"] = "5"
+    s = SuperTrendStrategy(cfg)
+    assert s.timeframe == "15"
+    assert s.trail_timeframe == "5"

@@ -75,7 +75,7 @@ def test_engine_names_match() -> None:
 
 def test_daily_body_is_range_mode() -> None:
     assert ENGINE_AUDIT_MODES["daily_body"] == "range"
-    assert ENGINE_AUDIT_MODES["float_hold"] is None
+    assert "float_hold" not in ENGINE_AUDIT_MODES
     assert "daily_body_expand" not in ENGINE_AUDIT_MODES
 
 
@@ -94,7 +94,6 @@ def test_trend_engines_use_trend_mode() -> None:
 
 def test_swing_box_skips_public_filter() -> None:
     assert ENGINE_AUDIT_MODES["swing_box"] is None
-    assert ENGINE_AUDIT_MODES["float_hold"] is None
     assert ENGINE_AUDIT_MODES["ema_swing"] is None
     assert ENGINE_AUDIT_MODES["macd_swing"] is None
     assert "jesse_casper" not in ENGINE_AUDIT_MODES

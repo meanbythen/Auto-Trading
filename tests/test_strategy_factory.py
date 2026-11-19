@@ -2,7 +2,6 @@
 
 from src.strategy.base import StrategyBase
 from src.strategy.daily_body import DailyBodyStrategy
-from src.strategy.float_hold import FloatHoldStrategy
 from src.strategy.swing_box import SwingBoxStrategy
 from src.strategy.factory import DEFAULT_ENGINE, create_strategy, list_engines
 from src.trader.factory import create_trader, list_executors
@@ -59,7 +58,7 @@ def test_engine_metadata_comes_from_one_registry() -> None:
 def test_list_engines_contains_core() -> None:
     names = list_engines()
     assert "daily_body" in names
-    assert "float_hold" in names
+    assert "float_hold" not in names
     assert "daily_body_expand" not in names
     assert "swing_box" in names
     assert "dual_donchian" in names
@@ -200,12 +199,42 @@ def test_create_daily_body() -> None:
     assert type(strategy) is DailyBodyStrategy
 
 
-def test_create_float_hold() -> None:
-    """日内浮盈飘单是单独一套，不会改掉日内实体。"""
-    strategy = create_strategy(_cfg("float_hold"))
-    assert isinstance(strategy, FloatHoldStrategy)
-    assert type(strategy) is not DailyBodyStrategy
-    assert strategy.SIGNAL_NAME == "float_hold"
+def test_removed_float_hold_falls_back() -> None:
+    """日内浮盈飘单已删除：旧配置写这个名字时回退到日内实体。"""
+    s = create_strategy(_cfg("float_hold"))
+    assert isinstance(s, DailyBodyStrategy)
+
+
+def test_cross_engine_choices_follows_live_registry() -> None:
+    """交叉测试名单跟当前注册表走：已删的没有，新内置会排在后面，跳过的两套不测。"""
+    from src.strategy.factory import (
+        CROSS_TEST_ENGINE_ORDER,
+        CROSS_TEST_SKIP_ENGINES,
+        PRIMARY_ENGINES,
+        REGISTRY,
+        cross_engine_choices,
+    )
+    from src.strategy.rule_dsl import RULE_ENGINE_PREFIX
+
+    items = cross_engine_choices()
+    codes = [code for code, _label in items]
+    assert codes == list(dict.fromkeys(codes))
+    assert "float_hold" not in codes
+    assert "liq_stop" not in codes
+    assert "kelly_break" not in codes
+    assert "daily_body" in codes
+    builtins = [code for code in codes if not str(code).startswith(RULE_ENGINE_PREFIX)]
+    expected = [code for code in CROSS_TEST_ENGINE_ORDER if code in REGISTRY]
+    extra = [
+        code
+        for code in PRIMARY_ENGINES
+        if code not in expected
+        and code not in CROSS_TEST_SKIP_ENGINES
+        and code != "rule_dsl"
+    ]
+    assert builtins == expected + extra
+    for code in CROSS_TEST_SKIP_ENGINES:
+        assert code not in codes
 
 
 def test_create_swing_box() -> None:
@@ -285,7 +314,6 @@ def test_all_strategies_read_the_shared_stop_mode() -> None:
     """止损触发方式是 strategy 根上的公共设置，每套策略都照它判断。"""
     engines = (
         "daily_body",
-        "float_hold",
         "trend_follow",
         "supertrend",
         "dual_ma",
@@ -305,7 +333,6 @@ def test_all_strategies_share_the_public_bar_state_contract() -> None:
     """所有引擎都有同一套信号去重和开仓 K 线公开接口。"""
     engines = (
         "daily_body",
-        "float_hold",
         "trend_follow",
         "supertrend",
         "dual_ma",
@@ -321,6 +348,9 @@ def test_all_strategies_share_the_public_bar_state_contract() -> None:
         assert isinstance(strategy, StrategyBase), engine
         assert strategy.get_signaled_bar("bu") == "", engine
         assert strategy.get_last_entry_bar("bu") == "", engine
+        strategy.note_flat_wait_next_bar("bu", "bar-flat")
+        assert strategy.get_signaled_bar("bu") == "bar-flat", engine
+        assert strategy.get_last_entry_bar("bu") == "bar-flat", engine
 
 
 def test_public_bar_state_methods_cover_release_snapshot_and_restore() -> None:
@@ -383,7 +413,7 @@ def test_sanitize_strategy_config_drops_dead_and_fills_defaults() -> None:
     assert "initial_atr_mult" not in st["daily_body"]
     assert "reverse_atr_mult" not in st["daily_body"]
     assert "supertrend" in st and "multiplier" in st["supertrend"]
-    assert st["float_hold"]["direction"] == "eth_trend"
+    assert "float_hold" not in st
     assert "morning_box_a" not in st
     assert "liquidity_exhaustion" not in st["cross_engines"]
     assert "morning_box_a" not in st["cross_engines"]

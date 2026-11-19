@@ -27,7 +27,7 @@ defaults:
   flatten_at_close: false
 
 notes:
-  - 和「日内浮盈飘单」里的 MACD 循环方向选择器不是同一套
+  - 不用 MACD 柱子，也不看 DIF/DEA
   - 旧引擎名 macd_swing 仍打开这一套
   - 建议 15 分钟及以上；5 分钟下影线容易碰到止损均线
   - 主力连续换月：旧仓还在则次日在新主力同方向移仓；交割月不再交易旧合约

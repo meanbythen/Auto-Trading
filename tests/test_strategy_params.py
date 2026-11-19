@@ -67,7 +67,7 @@ def test_find_duplicate_keys_flags_same_level() -> None:
     text = """
 strategy:
   engine: daily_body
-  engine: float_hold
+  engine: dual_ma
 trade:
   ctp:
     broker_id: ""
@@ -81,6 +81,16 @@ def test_find_duplicate_keys_ignores_broken_yaml() -> None:
 
 def test_example_config_has_no_duplicate_keys() -> None:
     assert find_duplicate_keys(EXAMPLE.read_text(encoding="utf-8")) == []
+
+
+def test_example_includes_cross_periods() -> None:
+    """交叉测试会把勾选周期写进 strategy.cross_periods，示例里必须有这一项，否则启动误报废弃。"""
+    import yaml
+
+    data = yaml.safe_load(EXAMPLE.read_text(encoding="utf-8")) or {}
+    assert "cross_periods" in (data.get("strategy") or {})
+    unknown, _missing = diff_config_keys({"strategy": {"cross_periods": ["5"]}}, data)
+    assert "strategy.cross_periods" not in unknown
 
 
 def test_diff_config_keys_skips_runtime_and_dynamic_sections() -> None:

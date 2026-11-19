@@ -8,6 +8,7 @@ from src.trader.go_live import (
     STAGE_DESK_LIVE,
     STAGE_DESK_SIM,
     allows_strategy_orders,
+    apply_account_kind_to_cfg,
     apply_stage_to_cfg,
     current_stage_from_cfg,
     empty_state,
@@ -28,17 +29,71 @@ def test_desk_stage_blocks_strategy_orders() -> None:
     assert allows_strategy_orders(STAGE_AUTO_LIVE) is True
 
 
-def test_apply_stage_keeps_same_ctp_and_only_auto_sets_executor() -> None:
+def test_apply_stage_does_not_overwrite_gui_executor() -> None:
+    """上线走到③④也不能把同花顺通道改成 CTP。"""
     cfg = {"trade": {"executor": "gui", "ctp": {"account_kind": "sim"}}}
     apply_stage_to_cfg(cfg, STAGE_DESK_LIVE)
     assert cfg["trade"]["executor"] == "gui"
     assert cfg["trade"]["ctp"]["account_kind"] == "live"
     apply_stage_to_cfg(cfg, STAGE_AUTO_SIM)
-    assert cfg["trade"]["executor"] == "ctp"
+    assert cfg["trade"]["executor"] == "gui"
     assert cfg["trade"]["ctp"]["account_kind"] == "sim"
+    cfg_ctp = {"trade": {"executor": "ctp", "ctp": {"account_kind": "sim"}}}
+    apply_stage_to_cfg(cfg_ctp, STAGE_AUTO_LIVE)
+    assert cfg_ctp["trade"]["executor"] == "ctp"
+    trader = create_trader(cfg_ctp)
+    assert isinstance(trader, CtpTrader)
+    assert trader.settings.account_kind == "live"
+
+
+def test_strategy_block_skips_gui_channel() -> None:
+    """同花顺点单不受 CTP 上线四步拦截。"""
+    cfg = {"trade": {"go_live": {"stage": STAGE_DESK_SIM}, "executor": "gui"}}
+    assert strategy_order_block_reason(cfg) == ""
+
+
+def test_config_kind_switch_keeps_auto_or_desk_and_picks_sim_profile() -> None:
+    """配置页切仿真/真实只换接口：策略自动仍自动，手工仍手工；仿真用 28077。"""
+    from src.trader.go_live import pair_stage_with_kind
+
+    assert pair_stage_with_kind(STAGE_AUTO_LIVE, "sim") == STAGE_AUTO_SIM
+    assert pair_stage_with_kind(STAGE_AUTO_SIM, "live") == STAGE_AUTO_LIVE
+    assert pair_stage_with_kind(STAGE_DESK_LIVE, "sim") == STAGE_DESK_SIM
+    cfg = {
+        "trade": {
+            "executor": "ctp",
+            "go_live": {"stage": STAGE_AUTO_LIVE},
+            "ctp": {
+                "account_kind": "live",
+                "ctp_profile": "huatai_live",
+                "ctp_profiles": {
+                    "huatai_sim": {
+                        "kind": "sim",
+                        "td_front": "tcp://59.36.3.115:27226",
+                        "md_front": "tcp://59.36.3.115:27236",
+                        "broker_id": "8080",
+                        "user_id": "28077",
+                    },
+                    "huatai_live": {
+                        "kind": "live",
+                        "td_front": "tcp://220.196.208.129:41206",
+                        "md_front": "tcp://220.196.208.129:41214",
+                        "broker_id": "8080",
+                        "user_id": "20318052",
+                    },
+                },
+            },
+        }
+    }
+    apply_account_kind_to_cfg(cfg, "sim")
+    assert cfg["trade"]["go_live"]["stage"] == STAGE_AUTO_SIM
+    assert cfg["trade"]["ctp"]["account_kind"] == "sim"
+    assert cfg["trade"]["ctp"]["ctp_profile"] == "huatai_sim"
     trader = create_trader(cfg)
     assert isinstance(trader, CtpTrader)
     assert trader.settings.account_kind == "sim"
+    assert trader.settings.user_id == "28077"
+    assert "59.36.3.115" in trader.settings.td_front
 
 
 def test_cannot_skip_to_live_auto_without_sim_auto() -> None:
@@ -78,7 +133,7 @@ def test_strategy_block_reason_reads_cfg() -> None:
     cfg = {"trade": {"go_live": {"stage": STAGE_DESK_SIM}, "executor": "ctp"}}
     text = strategy_order_block_reason(cfg)
     assert "交易台" in text
-    cfg = apply_stage_to_cfg({"trade": {}}, STAGE_AUTO_SIM)
+    cfg = apply_stage_to_cfg({"trade": {"executor": "ctp"}}, STAGE_AUTO_SIM)
     assert strategy_order_block_reason(cfg) == ""
     assert current_stage_from_cfg(cfg) == STAGE_AUTO_SIM
 

@@ -167,39 +167,6 @@ FACTORY_DEFAULT_SNAPSHOT: dict[str, Any] = {
         "filter_adx_upper": 30.0,
         "filter_atr_high_pct": 0.8,
     },
-    "float_hold": {
-        "eth_minutes": 60,
-        "eth_minutes2": 0,
-        "stop_atr_mult": 1.5,
-        "be_atr_mult": 2.0,
-        "skip_gap_atr_mult": 0.0,
-        "max_box_atr_mult": 0.0,
-        "max_chase_atr_mult": 0.0,
-        "direction": "eth_trend",
-        "macd_timeframe": "5",
-        "macd_fast": 12,
-        "macd_slow": 26,
-        "macd_signal": 9,
-        "dir_ema_fast": 5,
-        "dir_ema_slow": 20,
-        "trend_align_enabled": False,
-        "trend_align_fast": 60,
-        "trend_align_slow": 120,
-        "trend_slope_lookback": 5,
-        "trend_slope_min_deg": 0.0,
-        "cluster_max_width": 10,
-        "gap_align_atr_mult": 0.0,
-        "ema_period": 0,
-        "ema_buffer_ticks": 2,
-        "day_cutoff": "14:45",
-        "night_cutoff": "22:50",
-        "filter_enabled": False,
-        "filter_adx_period": 14,
-        "filter_atr_period": 14,
-        "filter_lookback": 60,
-        "filter_adx_upper": 30.0,
-        "filter_atr_high_pct": 0.8,
-    },
     "swing_trend": {
         "scale": "D_60",
         "signal_timeframe": "60",
@@ -289,7 +256,6 @@ _ENGINE_SECTION = {
     "multi": "multi_factor",
     "cta": "multi_factor",
     "daily_body": "daily_body",
-    "float_hold": "float_hold",
     "swing_trend": "swing_trend",
     "swing_box": "swing_box",
     "dual_donchian": "dual_donchian",
@@ -454,7 +420,6 @@ def extract_strategy_snapshot(cfg: dict[str, Any]) -> dict[str, Any]:
         "sar_trend": st.get("sar_trend") or {},
         "multi_factor": st.get("multi_factor") or {},
         "daily_body": st.get("daily_body") or {},
-        "float_hold": st.get("float_hold") or {},
         "swing_trend": st.get("swing_trend") or {},
         "swing_box": st.get("swing_box") or {},
         "dual_donchian": st.get("dual_donchian") or {},
@@ -504,8 +469,6 @@ def apply_snapshot_to_config(cfg: dict[str, Any], snap: dict[str, Any]) -> dict[
         st["multi_factor"] = copy.deepcopy(snap["multi_factor"])
     if snap.get("daily_body") is not None:
         st["daily_body"] = copy.deepcopy(snap["daily_body"])
-    if snap.get("float_hold") is not None:
-        st["float_hold"] = copy.deepcopy(snap["float_hold"])
     if snap.get("swing_trend") is not None:
         st["swing_trend"] = copy.deepcopy(snap["swing_trend"])
     if snap.get("swing_box") is not None:
@@ -543,12 +506,11 @@ def apply_engine_snapshot(cfg: dict[str, Any], snap: dict[str, Any], engine: str
     # 收盘清仓是总开关。只有听这个开关的策略回溯时才把它带回去，趋势跟随不碰。
     if section in (
         "daily_body",
-        "float_hold",
         "dual_ma",
     ) and (snap or {}).get("flatten_at_close") is not None:
         st["flatten_at_close"] = bool(snap.get("flatten_at_close"))
-    # 止损触发方式是全策略公共设置；日内实体 / 浮盈飘单把它当优化参数，回溯这一套时一并带回。
-    if section in ("daily_body", "float_hold") and (snap or {}).get("stop_mode") is not None:
+    # 止损触发方式是全策略公共设置；日内实体把它当优化参数，回溯这一套时一并带回。
+    if section == "daily_body" and (snap or {}).get("stop_mode") is not None:
         st["stop_mode"] = snap["stop_mode"]
     # 通用止损是公共设置：回溯任何一套策略时都按快照恢复，保证结果可复现。
     if (snap or {}).get("generic_stop"):

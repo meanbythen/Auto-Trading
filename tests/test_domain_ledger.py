@@ -25,6 +25,27 @@ def _write_book(tmp_path: Path, payload: Any) -> Path:
     return path
 
 
+def test_read_book_file_retries_permission_denied(tmp_path: Path, monkeypatch) -> None:
+    """Windows 正在换文件时会暂时 Permission denied，多试几次应能读到。"""
+    path = _write_book(tmp_path, {"initial_capital": 12.5})
+    hits = {"n": 0}
+    real = Path.read_text
+
+    def flaky(self: Path, *args: object, **kwargs: object) -> str:
+        if self.resolve() == path.resolve():
+            hits["n"] += 1
+            if hits["n"] < 3:
+                raise PermissionError(13, "Permission denied")
+        return real(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky)
+    monkeypatch.setattr("src.domain.ledger.time.sleep", lambda _s: None)
+    book = read_book_file(path)
+    assert book is not None
+    assert book["initial_capital"] == 12.5
+    assert hits["n"] == 3
+
+
 def test_read_book_file_missing_broken_and_non_dict(tmp_path: Path) -> None:
     assert read_book_file(tmp_path / "nope.json") is None
 

@@ -61,6 +61,11 @@ _api_key: tuple[str, str] | None = None
 # 天勤免费账号单档 K 线上限；超过会被服务端静默截断且 while filled<size 恒成立等满 15 秒。
 # 夹取到上限就好，要更多请自己日线合成。
 _TQ_MAX_SIZE = 10_000
+# 分批下发时 close 连续几次没增加，就当作更早的历史没有了，不必空等到 15 秒。
+_HISTORY_STALL_WAITS = 3
+# (天勤合约, 周期秒数) → 已经确认填不满时的根数。下一轮不要再空等、也不要再刷同一条告警。
+_HISTORY_SHORT: dict[tuple[str, int], int] = {}
+_HISTORY_SHORT_WARNED: set[tuple[str, int, int, int]] = set()
 
 
 def period_seconds(period: str) -> int:
@@ -272,11 +277,18 @@ def instrument_specs(
         }
 
 
+def _clear_history_short() -> None:
+    """清掉「历史不够 200 根」的记忆。断线重连或测试开始时用。"""
+    _HISTORY_SHORT.clear()
+    _HISTORY_SHORT_WARNED.clear()
+
+
 def reset_api() -> None:
     """断线或换账号后丢掉旧连接，下次重新登录。"""
     global _api, _api_key
     with _LOCK:
         api, _api, _api_key = _api, None, None
+        _clear_history_short()
     if api is None:
         return
 
@@ -425,21 +437,41 @@ def fetch_frame(
         try:
             klines = client.get_kline_serial(code, seconds, data_length=size)
             # 等服务端把历史填满再转换：服务端分批下发，只等一次可能拿到半截数据。
-            # 填满到请求根数就提前走；更早的历史没有了时填不满，最多等 15 秒。
+            # 填满到请求根数就提前走；close 连续几次不增加，当作更早没有了，不必空等 15 秒。
             filled = _filled_close_count(klines)
+            hist_key = (code, seconds)
             if filled is None:
                 _wait_update(client, time.time() + 3)
             else:
-                deadline = time.time() + 15
-                while filled < size and time.time() < deadline:
-                    _wait_update(client, min(time.time() + 1, deadline))
-                    filled = _filled_close_count(klines) or filled
+                known_short = _HISTORY_SHORT.get(hist_key)
+                already_at_ceiling = (
+                    known_short is not None and filled >= known_short and filled < size
+                )
+                if not already_at_ceiling:
+                    deadline = time.time() + 15
+                    stalled = 0
+                    while filled < size and time.time() < deadline:
+                        prev = filled
+                        _wait_update(client, min(time.time() + 1, deadline))
+                        filled = _filled_close_count(klines) or filled
+                        if filled <= prev:
+                            stalled += 1
+                            if stalled >= _HISTORY_STALL_WAITS:
+                                break
+                        else:
+                            stalled = 0
                 if filled < size:
-                    logger.warning(
-                        "天勤K线只填满 {}/{} 根，按现有数据继续（更早的历史可能没有了）",
-                        filled,
-                        size,
-                    )
+                    _HISTORY_SHORT[hist_key] = filled
+                    warn_key = (code, seconds, filled, size)
+                    if warn_key not in _HISTORY_SHORT_WARNED:
+                        _HISTORY_SHORT_WARNED.add(warn_key)
+                        logger.warning(
+                            "天勤K线只填满 {}/{} 根，按现有数据继续（更早的历史可能没有了）",
+                            filled,
+                            size,
+                        )
+                else:
+                    _HISTORY_SHORT.pop(hist_key, None)
         except Exception:
             # 连接断了就丢掉，下一轮重新登录，不要拿着死连接一直重试。
             if api is None:

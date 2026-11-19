@@ -23,11 +23,6 @@ from .market_state import (
 )
 from .bollinger_break import BollingerBreakStrategy
 from .daily_body import DailyBodyStrategy
-from .float_hold import (
-    FloatHoldStrategy,
-    normalize_direction_key,
-    normalize_macd_timeframe,
-)
 from .kelly_break import KellyBreakStrategy
 from .liq_stop import LiquidityStopStrategy
 from .dual_ma import DualMaStrategy
@@ -64,6 +59,8 @@ class StrategyLike(Protocol):
     def get_last_entry_bars(self) -> dict[str, str]: ...
 
     def restore_last_entry_bars(self, bars: dict[str, Any] | None) -> None: ...
+
+    def note_flat_wait_next_bar(self, symbol: str, bar_id: Any = "") -> None: ...
 
     def evaluate(
         self,
@@ -142,6 +139,8 @@ _REMOVED_ENGINES = {
     "vote",
     # 27.0.0 删掉日内实体·扩张（日内实体不动）
     "daily_body_expand",
+    # 47.0.0 删掉日内浮盈飘单（和日内实体、双均线、均线波段重复，实测难开仓且难盈利）
+    "float_hold",
 }
 
 # 配置根上已不再使用的键（旧 Pin/SAR 细则）。保存时清掉，避免误导。
@@ -176,6 +175,7 @@ _OBSOLETE_STRATEGY_SECTIONS = {
     "multi_hybrid",
     "multi_vote",
     "daily_body_expand",
+    "float_hold",
 }
 
 _ENGINE_ALIASES = {
@@ -200,7 +200,6 @@ REMOVED_ENGINES: set[str] = set(_REMOVED_ENGINES)
 # 策略中文名（配置页 / 参数表 / 导出用）。别名不单列，统一走 ENGINE_ALIASES 换算。
 ENGINE_LABELS: dict[str, str] = {
     "daily_body": "日内实体（主推）",
-    "float_hold": "日内浮盈飘单",
     "trend_follow": "趋势跟随",
     "supertrend": "SuperTrend趋势",
     "dual_ma": "双均线趋势",
@@ -220,10 +219,9 @@ ENGINE_LABELS: dict[str, str] = {
 # 选股交叉测试名单里的短名：同一策略不重复标「主推」。
 ENGINE_SHORT_LABELS: dict[str, str] = {**ENGINE_LABELS, "daily_body": "日内实体"}
 
-# 交叉测试可选的策略与顺序。以损定开、凯利突破参数维度太高，暂不参与交叉测试。
+# 交叉测试可选内置策略的显示顺序。真正名单由 cross_engine_choices() 现算。
 CROSS_TEST_ENGINE_ORDER: list[str] = [
     "daily_body",
-    "float_hold",
     "trend_follow",
     "supertrend",
     "dual_ma",
@@ -237,11 +235,13 @@ CROSS_TEST_ENGINE_ORDER: list[str] = [
     "dual_fractal",
 ]
 
+# 配置页能选，但交叉测试不测：参数格子太大，一轮组合会爆。
+CROSS_TEST_SKIP_ENGINES: frozenset[str] = frozenset({"liq_stop", "kelly_break"})
+
 # 每个引擎盘前审计时该套哪种公共行情过滤。None = 不接公共过滤器。
 # 和引擎名、中文名放在同一处，新增策略只改这个文件。
 ENGINE_AUDIT_MODES: dict[str, MarketFilterMode | None] = {
     "daily_body": "range",
-    "float_hold": None,  # 过滤默认关；方向交给方向选择器，默认开盘箱体 + 跳空顺向
     "trend_follow": "trend",
     "supertrend": "trend",
     "st": "trend",          # 别名
@@ -269,8 +269,6 @@ ENGINE_AUDIT_MODES: dict[str, MarketFilterMode | None] = {
 REGISTRY: dict[str, StrategyFactory] = {
     # 主推：开盘箱体收盘突破 + 极值/ATR 止损
     "daily_body": DailyBodyStrategy,
-    # 等开盘噪音走完再定方向，突破沿止损，浮盈保本后拿到收盘
-    "float_hold": FloatHoldStrategy,
     # 经典结构趋势
     "trend_follow": TrendFollowStrategy,
     "supertrend": SuperTrendStrategy,
@@ -412,15 +410,6 @@ def sanitize_strategy_config(cfg: dict[str, Any]) -> dict[str, Any]:
         if "slope_ema" not in ema_box:
             ema_box["slope_ema"] = ema_box.get("stop_ema", 120)
 
-    hold = st.get("float_hold")
-    if isinstance(hold, dict):
-        _migrate_daily_body_atr_gates(hold)
-        # 止损/保本已改成 ATR 宽度，旧的跳数和「几倍风险」不再读。
-        hold.pop("stop_extra_ticks", None)
-        hold.pop("be_r_mult", None)
-        hold["direction"] = normalize_direction_key(hold.get("direction"))
-        hold["macd_timeframe"] = normalize_macd_timeframe(hold.get("macd_timeframe"))
-
     # 止损触发方式已从日内实体挪到 strategy 根，全策略共用；旧配置写在 daily_body 里，迁上来。
     legacy_stop_mode = body.pop("stop_mode", None)
     if legacy_stop_mode is not None and "stop_mode" not in st:
@@ -468,7 +457,9 @@ def sanitize_strategy_config(cfg: dict[str, Any]) -> dict[str, Any]:
         engine = DEFAULT_ENGINE
     st["engine"] = engine
 
-    # 交叉测试名单：丢掉已删名字。写过哪些就留哪些，空名单才填全部。
+    # 交叉测试勾选：丢掉已删名字和现在测不了的名字。写过哪些就留哪些，空名单才填内置全部。
+    # 不把没勾过的新策略自动勾上，避免一轮组数突然变多。界面仍会列出新策略，让人自己勾。
+    allowed = {code for code, _label in cross_engine_choices()}
     raw_cross = st.get("cross_engines")
     cleaned_cross: list[str] = []
     seen: set[str] = set()
@@ -476,14 +467,14 @@ def sanitize_strategy_config(cfg: dict[str, Any]) -> dict[str, Any]:
         for item in raw_cross:
             name = str(item).strip().lower()
             name = _ENGINE_ALIASES.get(name, name)
-            if name in _REMOVED_ENGINES or name not in CROSS_TEST_ENGINE_ORDER:
+            if name in _REMOVED_ENGINES or name not in allowed:
                 continue
             if name in seen:
                 continue
             seen.add(name)
             cleaned_cross.append(name)
     if not cleaned_cross:
-        cleaned_cross = list(CROSS_TEST_ENGINE_ORDER)
+        cleaned_cross = [code for code, _label in cross_engine_choices() if not rule_engine_stem(code)]
     st["cross_engines"] = cleaned_cross
     return cfg
 
@@ -520,8 +511,36 @@ def engine_label_map(*, short: bool = False) -> dict[str, str]:
 
 
 def cross_engine_choices() -> list[tuple[str, str]]:
-    """交叉测试可选策略（代号, 中文名），顺序固定。"""
-    return [(code, ENGINE_SHORT_LABELS[code]) for code in CROSS_TEST_ENGINE_ORDER]
+    """交叉测试当前可选策略（代号, 中文名）。
+
+    每次现算，不拍死一份名单：注册表里还在的正式引擎会列出，已经删掉的立刻没了。
+    策略编辑器里的自定义规则也会跟上。以损定开、凯利突破不参加交叉测试。
+    """
+    from .rule_dsl import list_rule_files, rule_engine_code
+
+    skip = set(CROSS_TEST_SKIP_ENGINES) | {"rule_dsl"} | set(_ENGINE_ALIASES) | set(_REMOVED_ENGINES)
+    seen: set[str] = set()
+    out: list[tuple[str, str]] = []
+
+    def _add(code: str, label: str | None = None) -> None:
+        # 同一套策略只出现一次；别名、已删、明确跳过的都不进名单。
+        if not code or code in seen or code in skip:
+            return
+        seen.add(code)
+        out.append((code, label or ENGINE_SHORT_LABELS.get(code, code)))
+
+    for code in CROSS_TEST_ENGINE_ORDER:
+        if code in REGISTRY:
+            _add(code)
+    for code in PRIMARY_ENGINES:
+        _add(code)
+    for info in list_rule_files():
+        stem = str(info.get("stem") or "").strip()
+        if not stem:
+            continue
+        title = str(info.get("name") or stem).strip() or stem
+        _add(rule_engine_code(stem), f"自定义：{title}")
+    return out
 
 
 def list_engines() -> list[str]:

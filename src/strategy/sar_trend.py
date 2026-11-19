@@ -26,6 +26,7 @@ class SarTrendStrategy(TrendStrategyBase):
 
     def __init__(self, cfg: dict[str, Any]) -> None:
         super().__init__(cfg)
+        # 收盘清仓、信号/止损周期都在 TrendStrategyBase 里跟公共配置，这里只读 SAR 参数。
         self.af_start = float(self.box.get("af_start", 0.02) or 0.02)
         self.af_step = float(self.box.get("af_step", 0.02) or 0.02)
         self.af_max = float(self.box.get("af_max", 0.2) or 0.2)

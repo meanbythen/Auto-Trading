@@ -26,6 +26,7 @@ class BollingerBreakStrategy(TrendStrategyBase):
 
     def __init__(self, cfg: dict[str, Any]) -> None:
         super().__init__(cfg)
+        # 收盘清仓、信号/止损周期都在 TrendStrategyBase 里跟公共配置，这里只读轨道参数。
         self.boll_window = max(10, int(self.box.get("boll_window", 20) or 20))
         self.boll_dev = float(self.box.get("boll_dev", 2.0) or 2.0)
         if self.boll_dev <= 0:

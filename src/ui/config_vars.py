@@ -70,12 +70,16 @@ class ConfigVarsMixin:
         self.go_live_choices = list(STAGE_LABELS.values())
         self.go_live_var = ctk.StringVar(value=stage_label(stage_now))
         self.go_live_hint_var = ctk.StringVar(value=stage_hint(stage_now))
-        from src.trader.go_live import allows_strategy_orders, apply_stage_to_cfg, account_kind_for_stage
+        from src.trader.go_live import apply_stage_to_cfg, account_kind_for_stage
 
         apply_stage_to_cfg(self.cfg, stage_now)
-        if allows_strategy_orders(stage_now):
-            self.exec_var.set("ctp")
+        # 执行通道跟「账号」页所选，上线阶段不再强行改成 ctp。
         self.ctp_kind_var.set(ctp_kind_label(account_kind_for_stage(stage_now)))
+        self._ctp_kind_syncing = False
+        try:
+            self.ctp_kind_var.trace_add("write", self._on_ctp_kind_changed)
+        except Exception:  # noqa: BLE001
+            pass
         from src.data.quote_check import source_label
 
         quote_label = source_label((self.cfg.get("data") or {}).get("source"))
@@ -183,75 +187,6 @@ class ConfigVarsMixin:
         self.body_day_cutoff_var = ctk.StringVar(value=str(body_box.get("day_cutoff", "10:30")))
         self.body_night_cutoff_var = ctk.StringVar(value=str(body_box.get("night_cutoff", "22:15")))
         self.body_eth2_var = ctk.StringVar(value=str(body_box.get("eth_minutes2", 30)))
-        hold_box = st.get("float_hold") or {}
-        from src.strategy.float_hold import (
-            DIRECTION_LABELS,
-            EMA_PAIR_LABELS,
-            MACD_COMBO_LABELS,
-            MACD_TF_LABELS,
-            direction_label,
-            ema_pair_label,
-            macd_combo_label,
-            macd_timeframe_label,
-        )
-
-        self.float_direction_var = ctk.StringVar(
-            value=direction_label(hold_box.get("direction"))
-        )
-        self._float_direction_labels = list(DIRECTION_LABELS.values())
-        self.float_macd_tf_var = ctk.StringVar(
-            value=macd_timeframe_label(hold_box.get("macd_timeframe", "5"))
-        )
-        self._float_macd_tf_labels = list(MACD_TF_LABELS.values())
-        self.float_macd_combo_var = ctk.StringVar(
-            value=macd_combo_label(
-                hold_box.get("macd_combo")
-                or f"{hold_box.get('macd_fast', 12)}/{hold_box.get('macd_slow', 26)}/{hold_box.get('macd_signal', 9)}"
-            )
-        )
-        self._float_macd_combo_labels = list(MACD_COMBO_LABELS)
-        self.float_macd_fast_var = ctk.StringVar(value=str(hold_box.get("macd_fast", 12)))
-        self.float_macd_slow_var = ctk.StringVar(value=str(hold_box.get("macd_slow", 26)))
-        self.float_macd_signal_var = ctk.StringVar(value=str(hold_box.get("macd_signal", 9)))
-        self.float_ema_pair_var = ctk.StringVar(
-            value=ema_pair_label(
-                hold_box.get("dir_ema_fast", 5), hold_box.get("dir_ema_slow", 20)
-            )
-        )
-        self._float_ema_pair_labels = list(EMA_PAIR_LABELS)
-        self.float_trend_align_var = ctk.BooleanVar(
-            value=bool(hold_box.get("trend_align_enabled", False))
-        )
-        self.float_trend_slope_var = ctk.StringVar(
-            value=str(hold_box.get("trend_slope_min_deg", 0))
-        )
-        self.float_trend_lookback_var = ctk.StringVar(
-            value=str(hold_box.get("trend_slope_lookback", 5))
-        )
-        self.float_eth_var = ctk.StringVar(value=str(hold_box.get("eth_minutes", 60)))
-        self.float_cluster_width_var = ctk.StringVar(
-            value=str(hold_box.get("cluster_max_width", 10))
-        )
-        self.float_stop_atr_var = ctk.StringVar(
-            value=format_atr_mult(hold_box.get("stop_atr_mult"), 1.5)
-        )
-        self.float_skip_gap_var = ctk.StringVar(
-            value=format_atr_mult(hold_box.get("skip_gap_atr_mult"), 0.0)
-        )
-        self.float_max_box_var = ctk.StringVar(
-            value=format_atr_mult(hold_box.get("max_box_atr_mult"), 0.0)
-        )
-        self.float_max_chase_var = ctk.StringVar(
-            value=format_atr_mult(hold_box.get("max_chase_atr_mult"), 0.0)
-        )
-        self.float_gap_align_var = ctk.StringVar(
-            value=format_atr_mult(hold_box.get("gap_align_atr_mult"), 0.0)
-        )
-        self.float_be_atr_var = ctk.StringVar(
-            value=format_atr_mult(hold_box.get("be_atr_mult"), 2.0)
-        )
-        self.float_day_cutoff_var = ctk.StringVar(value=str(hold_box.get("day_cutoff", "14:45")))
-        self.float_night_cutoff_var = ctk.StringVar(value=str(hold_box.get("night_cutoff", "22:50")))
         from src.strategy.market_state import range_params_for_daily_body
 
         body_rp = range_params_for_daily_body(self.cfg)
@@ -410,7 +345,7 @@ class ConfigVarsMixin:
         self.flatten_var = ctk.StringVar(
             value=",".join(str(x) for x in st.get("flatten_times", ["14:55", "22:55"]))
         )
-        # 默认开：到点强平。关掉后仓可以留过收盘，用来对比隔夜表现。
+        # 默认开：到清仓时刻强平。关掉后仓可以留过清仓时刻，用来对比隔夜表现。
         self.flatten_at_close_var = ctk.BooleanVar(value=bool(st.get("flatten_at_close", True)))
         # 收盘后关机（默认关；有夜盘会等到夜盘结束）
         rt = self.cfg.get("runtime") or {}
@@ -421,6 +356,12 @@ class ConfigVarsMixin:
         self.user_var = ctk.StringVar(value=str(acc.get("user_id", "")))
         self.pwd_env_var = ctk.StringVar(value=str(acc.get("password_env", "FUTURES_PASSWORD")))
         self.password_var = ctk.StringVar(value=str(secrets.get("password", "") or acc.get("resolved_password", "")))
+        # 仿真号码写仿真档案；仿真密码和认证码只进密钥文件。
+        from src.trader.ctp_profile import sim_profile_user_id
+
+        self.ctp_sim_user_var = ctk.StringVar(value=sim_profile_user_id(ctp_box))
+        self.ctp_sim_password_var = ctk.StringVar(value=str(secrets.get("ctp_password", "") or ""))
+        self.ctp_auth_code_var = ctk.StringVar(value=str(secrets.get("ctp_auth_code", "") or ""))
         # 天勤行情要单独登录。账号写进 config.yaml 的 data.tq.user，密码写进 secrets.local.yaml。
         tq_cfg = (self.cfg.get("data") or {}).get("tq") or {}
         self.tq_user_var = ctk.StringVar(value=str(tq_cfg.get("user") or secrets.get("tq_user", "") or ""))
@@ -474,7 +415,9 @@ class ConfigVarsMixin:
         # 成交近似：下一根开盘成交与滑点跳数，只影响回测。配置页和历史回测页共用这一组。
         self.bt_fill_next_open_var = ctk.BooleanVar(value=bool(bt.get("fill_on_next_open", True)))
         self.bt_slippage_var = ctk.StringVar(value=str(bt.get("slippage_ticks", 1)))
-        # 策略评估门槛。配置页改这里，回测/优化/交叉测试共用。
+        # 实盘镜像闸门只影响回测对照，默认关，不改原来的回测成绩。
+        self.bt_mirror_gates_var = ctk.BooleanVar(value=bool(bt.get("mirror_live_gates", False)))
+        # 策略评估门槛。历史回测页改这里，回测/优化/交叉测试共用；保存交易配置会写盘。
         ev = self.cfg.get("evaluation") if isinstance(self.cfg.get("evaluation"), dict) else {}
         self.ev_enabled_var = ctk.BooleanVar(value=bool(ev.get("enabled", True)))
         self.ev_stress_var = ctk.BooleanVar(value=bool(ev.get("stress_on_backtest", True)))
@@ -612,6 +555,11 @@ class ConfigVarsMixin:
         from src.account.workspace import display_label, load_active_id
 
         self.ac_account_var = ctk.StringVar(value=display_label(load_active_id(self.root_dir), self.root_dir))
+        from src.account.ctp_sync import align_active_book_to_ctp
+
+        boot_note = align_active_book_to_ctp(self.root_dir, self.cfg, running=False)
+        if boot_note:
+            self.ac_account_var.set(display_label(load_active_id(self.root_dir), self.root_dir))
 
         # 规律候选：只扫统计关系，不下单。日期默认跟回测页同一套，改这里不会改回测。
         self.rs_source_var = ctk.StringVar(value=quote_label)
@@ -803,14 +751,51 @@ class ConfigVarsMixin:
             self._ctp_profile_syncing = True
             self.ctp_profile_var.set(name)
             self._ctp_profile_syncing = False
+        from src.trader.ctp_fronts import collect_fronts, format_fronts_ui
+
         resolved = resolve_ctp_profile(ctp_box, account, name=name)
-        self.ctp_profile_td_var.set(str(resolved.get("td_front") or ""))
-        self.ctp_profile_md_var.set(str(resolved.get("md_front") or ""))
+        self.ctp_profile_td_var.set(
+            format_fronts_ui(collect_fronts(resolved.get("td_front"), resolved.get("td_fronts")))
+        )
+        self.ctp_profile_md_var.set(
+            format_fronts_ui(collect_fronts(resolved.get("md_front"), resolved.get("md_fronts")))
+        )
         self.ctp_profile_broker_var.set(str(resolved.get("broker_id") or ""))
         self.ctp_profile_user_var.set(str(resolved.get("user_id") or ""))
         self.ctp_profile_pwd_env_var.set(str(resolved.get("password_env") or "CTP_PASSWORD"))
         self.ctp_profile_auth_env_var.set(str(resolved.get("auth_code_env") or ""))
         self.ctp_profile_note_var.set("；".join(profile_validation_notes(ctp_box, account)))
+
+    def _on_ctp_kind_changed(self, *_args: object) -> None:
+        """配置页切仿真/真实，和交易台一样只换账号和前置。"""
+        if getattr(self, "_ctp_kind_syncing", False):
+            return
+        from src.trader.ctp_logic import normalize_ctp_kind
+        from src.trader.ctp_profile import profile_name_for_kind
+        from src.trader.go_live import apply_stage_to_cfg, pair_stage_with_kind, stage_hint, stage_label
+
+        kind = normalize_ctp_kind(self.ctp_kind_var.get())
+        stage = pair_stage_with_kind(self.go_live_var.get(), kind)
+        apply_stage_to_cfg(self.cfg, stage)
+        self._ctp_kind_syncing = True
+        try:
+            self.go_live_var.set(stage_label(stage))
+            self.go_live_hint_var.set(stage_hint(stage))
+            ctp_box = (self.cfg.get("trade") or {}).get("ctp") or {}
+            name = profile_name_for_kind(ctp_box, kind)
+            if name:
+                self._ctp_profile_syncing = True
+                self.ctp_profile_var.set(name)
+                self._ctp_profile_syncing = False
+            self._fill_ctp_profile_vars()
+        finally:
+            self._ctp_kind_syncing = False
+        running = bool(getattr(getattr(self, "worker", None), "running", False))
+        from src.account.ctp_sync import align_active_book_to_ctp
+
+        self._apply_ctp_book_align(
+            align_active_book_to_ctp(self.root_dir, self.cfg, running=running)
+        )
 
     def _on_ctp_profile_changed(self, *_args: object) -> None:
         """下拉换档案时，把下面几个输入框换成那一份档案的值。"""
@@ -835,7 +820,9 @@ class ConfigVarsMixin:
         ctp_box = trade.get("ctp") or {}
         from src.trader.ctp_profile import selected_profile_name
 
+        self._ctp_kind_syncing = True
         self.ctp_kind_var.set(ctp_kind_label(ctp_box.get("account_kind")))
+        self._ctp_kind_syncing = False
         self._ctp_profile_syncing = True
         self.ctp_profile_var.set(selected_profile_name(ctp_box))
         self._ctp_profile_syncing = False
@@ -856,6 +843,11 @@ class ConfigVarsMixin:
         self.tq_password_var.set(
             str(secrets.get("tq_password", "") or tq_cfg.get("password", "") or "")
         )
+        from src.trader.ctp_profile import sim_profile_user_id
+
+        self.ctp_sim_user_var.set(sim_profile_user_id(ctp_box))
+        self.ctp_sim_password_var.set(str(secrets.get("ctp_password", "") or ""))
+        self.ctp_auth_code_var.set(str(secrets.get("ctp_auth_code", "") or ""))
         self._refresh_tq_hint()
         self.dry_var.set(bool(self.cfg.get("dry_run", True)))
         self._set_period_vars(str(st.get("timeframe", "15")), self.tf_var, self.tf_custom_var)
@@ -873,8 +865,6 @@ class ConfigVarsMixin:
 
         self.margin_usage_pct_var.set(str(risk.get("margin_usage_pct", DEFAULT_MARGIN_USAGE_PCT)))
         self.margin_var.set(str(risk.get("margin_per_lot", 0) or 0))
-        if hasattr(self, "bt_margin_usage_pct_var"):
-            self.bt_margin_usage_pct_var.set(self.margin_usage_pct_var.get())
         from src.risk.universe_table import DEFAULT_REL_PATH, summarize_universe
 
         self.margin_table_path_var.set(
@@ -907,41 +897,6 @@ class ConfigVarsMixin:
         self.body_day_cutoff_var.set(str(body_box.get("day_cutoff", "10:30")))
         self.body_night_cutoff_var.set(str(body_box.get("night_cutoff", "22:15")))
         self.body_eth2_var.set(str(body_box.get("eth_minutes2", 30)))
-        hold_box = st.get("float_hold") or {}
-        from src.strategy.float_hold import (
-            direction_label,
-            ema_pair_label,
-            macd_combo_label,
-            macd_timeframe_label,
-        )
-
-        self.float_direction_var.set(direction_label(hold_box.get("direction")))
-        self.float_macd_tf_var.set(macd_timeframe_label(hold_box.get("macd_timeframe", "5")))
-        self.float_macd_fast_var.set(str(hold_box.get("macd_fast", 12)))
-        self.float_macd_slow_var.set(str(hold_box.get("macd_slow", 26)))
-        self.float_macd_signal_var.set(str(hold_box.get("macd_signal", 9)))
-        self.float_macd_combo_var.set(
-            macd_combo_label(
-                hold_box.get("macd_combo")
-                or f"{hold_box.get('macd_fast', 12)}/{hold_box.get('macd_slow', 26)}/{hold_box.get('macd_signal', 9)}"
-            )
-        )
-        self.float_ema_pair_var.set(
-            ema_pair_label(hold_box.get("dir_ema_fast", 5), hold_box.get("dir_ema_slow", 20))
-        )
-        self.float_trend_align_var.set(bool(hold_box.get("trend_align_enabled", False)))
-        self.float_trend_slope_var.set(str(hold_box.get("trend_slope_min_deg", 0)))
-        self.float_trend_lookback_var.set(str(hold_box.get("trend_slope_lookback", 5)))
-        self.float_eth_var.set(str(hold_box.get("eth_minutes", 60)))
-        self.float_cluster_width_var.set(str(hold_box.get("cluster_max_width", 10)))
-        self.float_stop_atr_var.set(format_atr_mult(hold_box.get("stop_atr_mult"), 1.5))
-        self.float_skip_gap_var.set(format_atr_mult(hold_box.get("skip_gap_atr_mult"), 0.0))
-        self.float_max_box_var.set(format_atr_mult(hold_box.get("max_box_atr_mult"), 0.0))
-        self.float_max_chase_var.set(format_atr_mult(hold_box.get("max_chase_atr_mult"), 0.0))
-        self.float_gap_align_var.set(format_atr_mult(hold_box.get("gap_align_atr_mult"), 0.0))
-        self.float_be_atr_var.set(format_atr_mult(hold_box.get("be_atr_mult"), 2.0))
-        self.float_day_cutoff_var.set(str(hold_box.get("day_cutoff", "14:45")))
-        self.float_night_cutoff_var.set(str(hold_box.get("night_cutoff", "22:50")))
         from src.strategy.market_state import range_params_for_daily_body
 
         body_rp = range_params_for_daily_body(self.cfg)
@@ -1092,6 +1047,11 @@ class ConfigVarsMixin:
         self.user_var.set(str(acc.get("user_id", "")))
         self.pwd_env_var.set(str(acc.get("password_env", "FUTURES_PASSWORD")))
         self.password_var.set(str(secrets.get("password", "") or ""))
+        from src.trader.ctp_profile import sim_profile_user_id as _sim_uid
+
+        self.ctp_sim_user_var.set(_sim_uid(ctp_box))
+        self.ctp_sim_password_var.set(str(secrets.get("ctp_password", "") or ""))
+        self.ctp_auth_code_var.set(str(secrets.get("ctp_auth_code", "") or ""))
         self.captcha_var.set(str(acc.get("captcha_mode", "pause")))
         self.auto_login_var.set(not bool(acc.get("skip_auto_login", True)))
         self.app_path_var.set(str(app.get("path", "")))
@@ -1125,4 +1085,3 @@ class ConfigVarsMixin:
         self.kelly_win_var.set(win_rate_pct_display(_kr))
         self.kelly_payoff_var.set("" if _kp is None else f"{_kp:g}")
         self._refresh_kelly_status()
-        self._copy_risk_to_backtest()

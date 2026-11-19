@@ -122,6 +122,41 @@ class WidgetsMixin:
         custom_var.set(custom)
 
 
+    def _password_row(
+        self,
+        parent: ctk.CTkFrame,
+        label: str,
+        var: ctk.StringVar,
+        show_var: ctk.BooleanVar,
+        *,
+        width: int = 280,
+    ) -> ctk.CTkEntry:
+        """一行带星号的密码框，旁边有「显示」开关。留空保存时不覆盖已有密码。"""
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(fill="x", pady=6)
+        ctk.CTkLabel(
+            row, text=label, font=T.FONT_BODY, text_color=T.TEXT_DIM, width=130, anchor="w"
+        ).pack(side="left")
+        entry = ctk.CTkEntry(
+            row,
+            textvariable=var,
+            show="*",
+            width=width,
+            fg_color=T.BG_ELEVATED,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+        )
+        entry.pack(side="left", padx=(0, 8))
+
+        def _toggle() -> None:
+            entry.configure(show="" if show_var.get() else "*")
+
+        ctk.CTkSwitch(
+            row, text="显示", variable=show_var, width=60,
+            progress_color=T.ACCENT, command=_toggle,
+        ).pack(side="left")
+        return entry
+
     def _entry_row(
         self,
         parent: ctk.CTkFrame,

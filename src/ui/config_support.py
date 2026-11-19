@@ -29,6 +29,12 @@ class ConfigSupportMixin:
 
         build_config_tab(self, tab, ENGINE_CHOICES)
 
+    def _build_credentials_tab(self, tab: ctk.CTkFrame) -> None:
+        """账号页：仿真/真实/天勤的号码和密码。"""
+        from src.ui.credentials_tab import build_credentials_tab
+
+        build_credentials_tab(self, tab)
+
     def _build_rule_editor_tab(self, tab: ctk.CTkFrame) -> None:
         """「策略编辑器」页签，界面在 src/ui/rule_editor_page.py。"""
         from src.ui.rule_editor_page import build_rule_editor_tab
@@ -85,26 +91,35 @@ class ConfigSupportMixin:
         ).pack(side="left", padx=(8, 0))
         ctk.CTkLabel(
             parent,
-            text="下拉是当前启用的合约。添加/移出会同步进「品种与合约」总表。保证金、乘数、手续费、交易时段、清仓时刻请在总表里改；同品种必须填成一样。",
+            text="下拉是当前启用的合约。添加/移出会同步进「品种与合约」总表",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=520,
             justify="left",
         ).pack(anchor="w", pady=(0, 6))
-        # 当前合约不是主力时，在这里亮一行黄底提示。平时高度压到 1 像素，不占地方。
+        # 黄条边线画在控件最外一圈。贴着父容器 pack 时，左右/上下会被裁掉半根线。
+        # 外面先留 2 像素空隙，边线画在内层框上，整圈才能看见。
+        self.main_contract_hint_shell = ctk.CTkFrame(parent, fg_color="transparent")
+        self.main_contract_hint_shell.pack(fill="x", pady=(0, 4))
+        self.main_contract_hint_box = ctk.CTkFrame(
+            self.main_contract_hint_shell,
+            fg_color="transparent",
+            corner_radius=8,
+            border_width=0,
+        )
+        self.main_contract_hint_box.pack(fill="x", padx=2, pady=2)
         self.main_contract_hint = ctk.CTkLabel(
-            parent,
+            self.main_contract_hint_box,
             text="",
             font=T.FONT_BODY,
             text_color=T.TEXT_DIM,
             fg_color="transparent",
-            corner_radius=8,
             height=1,
             anchor="w",
             justify="left",
-            wraplength=520,
+            wraplength=500,
         )
-        self.main_contract_hint.pack(fill="x", pady=(0, 4))
+        self.main_contract_hint.pack(fill="x", padx=0, pady=0)
 
 
     def _refresh_strategy_param_panel(self, *_args: object) -> None:
@@ -253,47 +268,51 @@ class ConfigSupportMixin:
             label.configure(text="", text_color=T.TEXT_DIM)
             return
         label.configure(
-            text="天勤免费接口：分钟、小时、日线可直接拉；周线用日线合成。多因子的日线方向也能用。账号密码填在上面「账号与登录」。",
+            text="天勤免费接口：分钟、小时、日线可直接拉；周线用日线合成",
             text_color=T.TEXT_DIM,
         )
 
 
     def _test_ctp_front(self) -> None:
-        """只测交易前置的 IP 端口通不通，不做认证登录。"""
-        from src.trader.ctp_gateway import probe_front_tcp
+        """只测交易前置的 IP 端口通不通，不做认证登录。多台会逐台测。"""
+        from src.trader.ctp_fronts import probe_front_list, split_fronts
 
         front = str(self.ctp_profile_td_var.get() or "").strip()
-        if not front:
+        fronts = split_fronts(front)
+        if not fronts:
             self._append_log("测试前置连通：还没有填「档案交易前置」")
             return
-        result = probe_front_tcp(front)
-        if result is None:
-            self._append_log(f"测试前置连通：地址格式看不懂 {front}，应写成 tcp://主机:端口")
-        elif result:
-            self._append_log(f"测试前置连通：端口可连 {front}（端口通不等于登录成功）")
-        else:
-            self._append_log(f"测试前置连通：连不上 {front}，请检查网络、端口和 VPN")
+        rows = probe_front_list(fronts)
+        ok_count = sum(1 for _addr, ok in rows if ok is True)
+        for addr, result in rows:
+            if result is None:
+                self._append_log(f"测试前置连通：地址格式看不懂 {addr}，应写成 tcp://主机:端口")
+            elif result:
+                self._append_log(f"测试前置连通：端口可连 {addr}")
+            else:
+                self._append_log(f"测试前置连通：连不上 {addr}")
+        self._append_log(
+            f"测试前置连通：{ok_count}/{len(rows)} 台端口可连。"
+            "连接时会把全部登记给柜台，断线由柜台换下一台；端口通不等于登录成功。"
+        )
 
     def _on_save(self) -> None:
-        # 记下配置页和回测页各自的信号/止损周期，保存后把「还跟着配置页」的那项一起换掉。
-        old_st = self.cfg.get("strategy") or {}
-        old_tf = str(old_st.get("timeframe") or "")
-        old_trail = str(old_st.get("trail_timeframe") or "")
         try:
             old_limit = float((self.cfg.get("risk") or {}).get("max_daily_loss") or 0)
         except (TypeError, ValueError):
             old_limit = 0.0
-        cur_tf = self._period_code(self.bt_tf_var, self.bt_tf_custom_var)
-        cur_trail = self._period_code(self.bt_trail_var, self.bt_trail_custom_var)
         # 保存前用最新余额填上账户权益。这个数不能在配置页手改。
         self._pull_signal_balance()
         # 扫描间隔夹到 5~600 秒，并把夹过的值显示回输入框，避免界面和配置对不上。
         self.scan_var.set(str(self._scan_interval_value()))
         cfg = self._merge_disk_gui_coords(self._apply_ui_to_cfg())
         path = save_config(cfg)
-        self._sync_bt_periods_after_save(old_tf, old_trail, cur_tf, cur_trail, cfg)
         self._status = "已保存"
         self._append_log(f"配置已保存: {path}")
+        from src.account.ctp_sync import align_active_book_to_ctp
+
+        running = bool(getattr(self.worker, "running", False))
+        self._apply_ctp_book_align(align_active_book_to_ctp(self.root_dir, cfg, running=running))
         # 常驻正在跑时，把新间隔推给它：主循环每轮都读这个属性，不用重启就能生效。
         bot = getattr(self.worker, "bot", None)
         if bot is not None and bool(getattr(bot, "is_running", False)):
@@ -323,7 +342,12 @@ class ConfigSupportMixin:
                 prune_stale_halt_alerts(self.root_dir, new_limit)
             except OSError as exc:
                 logger.debug("旧限额熔断告警没清掉: {}", exc)
-        if self.password_var.get():
+        if (
+            self.password_var.get()
+            or self.tq_password_var.get()
+            or self.ctp_sim_password_var.get()
+            or self.ctp_auth_code_var.get()
+        ):
             self._append_log("密码已写入 config/secrets.local.yaml（本地私密）")
         try:
             from src.ui.config_presets import add_preset
@@ -376,7 +400,7 @@ class ConfigSupportMixin:
         label = self.cfg_preset_var.get()
         vid = (self._cfg_preset_ids or {}).get(label)
         if not vid:
-            messagebox.showwarning("还没有存档", "请先点「保存全部配置」，再来一键应用。")
+            messagebox.showwarning("还没有存档", "请先点「保存交易配置」，再来一键应用。")
             return
         if self.worker.running:
             messagebox.showwarning(
@@ -642,16 +666,7 @@ class ConfigSupportMixin:
             text_color=T.ACCENT_ON,
             command=self._refresh_universe_from_tq,
         ).pack(side="left", padx=(8, 0))
-        self.margin_table_summary = ctk.CTkLabel(
-            parent,
-            text="",
-            font=T.FONT_SMALL,
-            text_color=T.TEXT_DIM,
-            wraplength=420,
-            justify="left",
-            anchor="w",
-        )
-        self.margin_table_summary.pack(anchor="w", pady=(0, 4))
+        # 说明文字已去掉；仍同步一次关注名单与保证金摘要（回测页会用）。
         self._refresh_margin_table_summary()
 
 
@@ -680,8 +695,7 @@ class ConfigSupportMixin:
                 def _on_done() -> None:
                     total = len(rows)
                     enabled = sum(1 for r in rows if r.get("enabled", True))
-                    if hasattr(self, "margin_table_summary"):
-                        self._reload_margin_table(silent=True)
+                    self._reload_margin_table(silent=True)
                     messagebox.showinfo(
                         "主力合约刷新完成",
                         f"天勤主力查询 {total} 个品种全部成功。\n"
@@ -704,7 +718,7 @@ class ConfigSupportMixin:
                         "刷新失败",
                         f"{fail_text}\n\n"
                         "可能原因：天勤 tqsdk 未安装（pip install tqsdk），"
-                        "或账号密码没填（配置页 → 账号与登录 → 天勤行情账号/密码）。",
+                        "或账号密码没填（「账号」页 → 天勤行情账号/密码）。",
                     )
 
                 self._post_to_main(_on_fail)
@@ -718,27 +732,18 @@ class ConfigSupportMixin:
 
 
     def _refresh_margin_table_summary(self) -> None:
-        """刷新总表说明文字；并刷新上方关注下拉（不罗列全部合约）。"""
+        """同步保证金摘要到回测页用的变量，并刷新上方关注下拉（界面不再显示说明文字）。"""
         from src.risk.margin_table import summarize_contracts
 
         symbols = list((self.cfg.get("strategy") or {}).get("symbols") or [])
         contracts = (self.cfg.get("risk") or {}).get("contracts") or {}
-        # 回测页抄「当前品种保证金」仍用摘要字符串，只是界面下方不再展示长名单。
+        # 回测页抄「当前品种保证金」仍用摘要字符串，界面不再展示这段说明。
         self.margin_map_var.set(summarize_contracts(contracts))
         if symbols and symbols != list(self._watch_symbols):
             try:
                 self._set_watch_codes(symbols, select=symbols[0], save=False)
             except Exception:  # noqa: BLE001
                 pass
-        text = (
-            "改表后请先关掉 Excel，再点「重新读取」。保证金比例填 23 表示 23%。"
-            "每手数量就是合约乘数。同品种比例/每手数量/手续费必须相同。"
-            "刷新全市场主力能自动填每手数量；比例天勤拿不到，请对照期货公司或交易台合约页手填。"
-        )
-        try:
-            self.margin_table_summary.configure(text=text)
-        except Exception:  # noqa: BLE001
-            pass
 
 
     def _reload_margin_table(self, *, silent: bool = False) -> bool:
@@ -768,7 +773,7 @@ class ConfigSupportMixin:
                     messagebox.showwarning(
                         "已读取，未写回文件",
                         "表格已读进程序，但 config.yaml 没写成功。\n"
-                        "请再点一次「保存全部配置」。\n\n"
+                        "请再点一次「保存交易配置」。\n\n"
                         f"{save_exc}",
                     )
                     return True
@@ -910,29 +915,64 @@ class ConfigSupportMixin:
         return ""
 
 
+    def _hint_label_height(self, text: str, wrap: int = 500) -> int:
+        """按字数估黄条文字高度，避免写死 48 像素把第三行和底边裁掉。"""
+        if not text:
+            return 1
+        per_line = max(8, wrap // 13)
+        lines = 0
+        for part in str(text).replace("\r", "").split("\n"):
+            lines += max(1, (len(part) + per_line - 1) // per_line)
+        return max(40, lines * 22)
+
     def _set_main_contract_hint(self, text: str, *, warn: bool = False) -> None:
         """写关注品种下面那行提示。空文本时把高度压到 1 像素。"""
         label = getattr(self, "main_contract_hint", None)
+        box = getattr(self, "main_contract_hint_box", None)
         if label is None:
             return
+        wrap = 500
         if not text:
+            if box is not None:
+                box.configure(fg_color="transparent", border_width=0)
+                box.pack_configure(padx=0, pady=0)
             label.configure(
-                text="", fg_color="transparent", text_color=T.TEXT_DIM, height=1, border_width=0
+                text="", fg_color="transparent", text_color=T.TEXT_DIM, height=1
             )
-        elif warn:
+            label.pack_configure(padx=0, pady=0)
+            return
+        if warn:
+            if box is not None:
+                # 边线画在内层框，外层已留空隙，不会再被裁成半根。
+                box.configure(
+                    fg_color="#3A2A12",
+                    corner_radius=8,
+                    border_width=1,
+                    border_color=T.WARN,
+                )
+                box.pack_configure(padx=2, pady=2)
             label.configure(
                 text=text,
-                fg_color="#3A2A12",
+                fg_color="transparent",
                 text_color=T.WARN,
-                height=48,
-                corner_radius=8,
-                border_width=1,
-                border_color=T.WARN,
+                height=self._hint_label_height(text, wrap),
+                wraplength=wrap,
+                justify="left",
+                anchor="w",
             )
-        else:
-            label.configure(
-                text=text, fg_color="transparent", text_color=T.TEXT_DIM, height=40, border_width=0
-            )
+            label.pack_configure(padx=12, pady=8)
+            return
+        if box is not None:
+            box.configure(fg_color="transparent", border_width=0)
+            box.pack_configure(padx=2, pady=2)
+        label.configure(
+            text=text,
+            fg_color="transparent",
+            text_color=T.TEXT_DIM,
+            height=self._hint_label_height(text, wrap),
+            wraplength=wrap,
+        )
+        label.pack_configure(padx=4, pady=2)
 
 
     def _delivery_hint_for(self, code: str) -> tuple[str, bool]:
@@ -1154,6 +1194,7 @@ class ConfigSupportMixin:
             self.engine_menu.configure(values=list(ENGINE_CHOICES))
         except Exception:  # noqa: BLE001
             pass
+        self._refresh_cross_lists()
         self._refresh_rule_editor(select_stem=stem)
         self.rule_status_var.set(
             f"已保存：{stem}.yaml（{rule.name}）。要在运行/回测里用它，"
@@ -1280,6 +1321,7 @@ class ConfigSupportMixin:
             self.engine_menu.configure(values=list(ENGINE_CHOICES))
         except Exception:  # noqa: BLE001
             pass
+        self._refresh_cross_lists()
         # 删的是当前引擎就回退到日内实体，避免界面引用已删除的策略。
         if rule_engine_stem(self.engine_var.get()) == stem:
             self.engine_var.set("daily_body")
@@ -1322,6 +1364,7 @@ class ConfigSupportMixin:
             self.engine_menu.configure(values=list(ENGINE_CHOICES))
         except Exception:  # noqa: BLE001
             pass
+        self._refresh_cross_lists()
         # 当前引擎指向旧名字时切到新名字。
         if rule_engine_stem(self.engine_var.get()) == old:
             self.engine_var.set(rule_engine_code(new))

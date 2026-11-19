@@ -97,6 +97,68 @@ EXEC_LABELS = {
 }
 
 
+def _short_ctp_error(text: str) -> str:
+    """把柜台报错收成卡片能放下的一句，不把整段日志塞进状态栏。"""
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    if "认证码" in raw:
+        return "密钥没读到"
+    if "交易密码" in raw:
+        return "缺交易密码"
+    if "资金账号" in raw:
+        return "缺资金账号"
+    if "前置" in raw:
+        return "缺交易前置"
+    if len(raw) > 16:
+        return raw[:16] + "…"
+    return raw
+
+
+def format_exec_card(
+    executor: str,
+    *,
+    running: bool = False,
+    daily_pnl: float | None = None,
+    dry_run: bool = True,
+    ctp_ready: bool = False,
+    ctp_user: str = "",
+    ctp_kind: str = "",
+    ctp_error: str = "",
+) -> str:
+    """
+    状态栏「执行通道」卡片文字。
+
+    通道名不够：CTP 常驻连没连上必须一眼能看出来。
+    交易台是点「连接登录」才连；常驻是点「启动常驻」后自己连同一套柜台。
+    """
+    name = EXEC_LABELS.get(executor, executor)
+    pnl_txt = ""
+    if running and daily_pnl is not None:
+        pnl_txt = f"今日{daily_pnl:+.0f}元"
+    if str(executor or "").strip().lower() != "ctp":
+        if pnl_txt:
+            return f"{name} · {pnl_txt}"
+        return name
+    kind = str(ctp_kind or "").strip().lower()
+    kind_txt = "真实" if kind in {"live", "real", "prod", "真实", "真实账号"} else "仿真"
+    if not running:
+        return "CTP 柜台\n未挂机"
+    if dry_run:
+        lines = ["CTP 模拟", "不连柜台"]
+        if pnl_txt:
+            lines.append(pnl_txt)
+        return "\n".join(lines)
+    if ctp_ready:
+        who = f"{kind_txt} {ctp_user}".strip() if str(ctp_user).strip() else kind_txt
+        lines = ["CTP 已连接", who]
+        if pnl_txt:
+            lines.append(pnl_txt)
+        return "\n".join(lines)
+    err = _short_ctp_error(ctp_error) or "未登录"
+    return f"CTP 未连接\n{err}"
+
+
 def _clock_text(value: object, default: str) -> str:
     """保存钟点参数：能读成 HH:MM 就规整成两位，读不出来就用默认值。"""
     try:

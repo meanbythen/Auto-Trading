@@ -81,6 +81,34 @@ def _bot() -> TradingBot:
     return bot
 
 
+def test_close_books_when_broker_already_empty() -> None:
+    """手机把仓平了以后，程序只补记账，不再向柜台报平仓。"""
+    from src.strategy.types import PositionState
+    from src.trader.ctp_logic import PositionView
+
+    bot = _bot()
+    bot.trader.capabilities = DEFAULT_CAPABILITIES["ctp"]
+    bot.trader.gateway = type("G", (), {"positions": {"fu2701": PositionView()}})()
+    bot.strategy.positions["fu2701"] = PositionState(
+        side="short", volume=1, entry_price=3892.0, symbol="fu2701"
+    )
+    booked: list[tuple[str, float, str]] = []
+
+    def _book(symbol: str, exit_price: float, reason: str = "") -> tuple[dict, float]:
+        booked.append((symbol, float(exit_price), reason))
+        return {"symbol": symbol}, 0.0
+
+    bot._manual_close_locked = _book  # type: ignore[assignment]
+    bot.kline = type("_K", (), {"latest_price": lambda self, symbol: 3890.0})()
+    bot._frozen_symbols = set()
+
+    ok = bot._execute(StrategyDecision(StrategyAction.CLOSE, "fu2701", "止损离场"))
+
+    assert ok is True
+    assert booked == [("fu2701", 3890.0, "柜台已无持仓（可能已在别处平掉），补记平仓")]
+    assert bot.trader.close_calls == []  # type: ignore[attr-defined]
+
+
 def test_close_without_position_does_not_order() -> None:
     bot = _bot()
 
@@ -331,8 +359,17 @@ def test_runtime_leftover_intent_blocks_next_order(tmp_path) -> None:
     assert json.loads(intent.read_text(encoding="utf-8"))["symbol"] == "bu2612"
 
 
+def test_ctp_opponent_limit_uses_ask_bid_not_stop() -> None:
+    """买平看卖一，卖平看买一；止损价不能当成限价。"""
+    from src.scheduler.order_executor import ctp_opponent_limit
+
+    assert ctp_opponent_limit(is_buy=True, last=3893, ask=3894, tick=1, extra_ticks=2) == 3896.0
+    assert ctp_opponent_limit(is_buy=False, last=3893, bid=3892, tick=1, extra_ticks=2) == 3890.0
+    assert ctp_opponent_limit(is_buy=True, last=3893, ask=3883, upper=3900, tick=1, extra_ticks=2) == 3885.0
+
+
 def test_ctp_close_price_adds_protective_ticks() -> None:
-    """CTP 平仓不能拿已收线收盘价原样挂限价，要往对手价方向让几跳。"""
+    """CTP 平仓按对手价方向让几跳，不拿止损价挂单。"""
     import pandas as pd
 
     bot = _intent_bot(Path("unused-order-intent.json"))
@@ -343,8 +380,15 @@ def test_ctp_close_price_adds_protective_ticks() -> None:
     }
     bot.strategy.timeframe = "5"  # type: ignore[attr-defined]
     bot.kline = type(  # type: ignore[assignment]
-        "_K", (), {"fetch": lambda self, symbol, period: pd.DataFrame({"close": [4569.0]})}
+        "_K",
+        (),
+        {
+            "fetch": lambda self, symbol, period: pd.DataFrame({"close": [4569.0]}),
+            "latest_price": lambda self, symbol: 4569.0,
+        },
     )()
+    bot.trader = type("_T", (), {"gateway": None})()  # type: ignore[assignment]
+    bot._close_chase_ticks = {}
 
     bot._position_for = lambda symbol: type("_P", (), {"side": "long"})()  # type: ignore[assignment]
     long_price = bot._ctp_limit_price(
@@ -353,11 +397,56 @@ def test_ctp_close_price_adds_protective_ticks() -> None:
 
     bot._position_for = lambda symbol: type("_P", (), {"side": "short"})()  # type: ignore[assignment]
     short_price = bot._ctp_limit_price(
-        StrategyDecision(StrategyAction.CLOSE, "bu2612", "止损", stop_price=4600)
+        StrategyDecision(StrategyAction.CLOSE, "bu2612", "止损", stop_price=3882)
     )
 
     assert long_price == 4567.0
     assert short_price == 4571.0
+
+
+def test_ctp_close_chase_caps_at_eight_ticks() -> None:
+    """平仓未成交可以多让几跳，最多 8 跳，避免一路追到涨跌停。"""
+    import pandas as pd
+
+    bot = _intent_bot(Path("unused-order-intent.json"))
+    bot.cfg = {
+        "dry_run": False,
+        "trade": {"executor": "ctp", "price_tick": 1, "ctp_close_protect_ticks": 2},
+        "risk": {},
+    }
+    bot.strategy.timeframe = "5"  # type: ignore[attr-defined]
+    bot.kline = type(  # type: ignore[assignment]
+        "_K",
+        (),
+        {
+            "fetch": lambda self, symbol, period: pd.DataFrame({"close": [4569.0]}),
+            "latest_price": lambda self, symbol: 4569.0,
+        },
+    )()
+    bot.trader = type("_T", (), {"gateway": None})()  # type: ignore[assignment]
+    bot._close_chase_ticks = {"bu2612": 40}
+    bot._position_for = lambda symbol: type("_P", (), {"side": "long"})()  # type: ignore[assignment]
+    price = bot._ctp_limit_price(
+        StrategyDecision(StrategyAction.CLOSE, "bu2612", "止损", stop_price=4500)
+    )
+    assert price == 4561.0
+
+
+def test_ctp_open_slip_blocked_after_opponent_price() -> None:
+    """CTP 开仓对手价比信号价追太远就放弃；平仓不走这道闸。"""
+    bot = _intent_bot(Path("unused-order-intent.json"))
+    bot.cfg = {"trade": {"max_entry_slip_atr": 0, "max_entry_slip_points": 2}}
+    bot.strategy.timeframe = "15"  # type: ignore[attr-defined]
+    bot.kline = type("_K", (), {"fetch": lambda self, symbol, period: None})()  # type: ignore[assignment]
+    bot._record_event = lambda *args, **kwargs: None  # type: ignore[assignment]
+    open_d = StrategyDecision(
+        StrategyAction.BUY_OPEN, "fu2701", "测", entry_price=3890.0
+    )
+    assert bot._ctp_open_slip_blocked(open_d, 3895.0) is True
+    assert bot._ctp_open_slip_blocked(open_d, 3891.0) is False
+    close_d = StrategyDecision(StrategyAction.CLOSE, "fu2701", "止损", stop_price=3880)
+    # 平仓不会调用这道闸；函数本身只给开仓用，对手价更差也应能平出去。
+    assert close_d.action == StrategyAction.CLOSE
 
 
 def test_orders_are_blocked_outside_trading_session(tmp_path, monkeypatch) -> None:

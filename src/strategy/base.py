@@ -5,6 +5,13 @@ from __future__ import annotations
 from typing import Any
 
 
+def same_signal_bar(left: Any, right: Any) -> bool:
+    """两根信号K线是不是同一根。各策略写法可能略有差别，比较时只认字符串。"""
+    a = str(left or "").strip()
+    b = str(right or "").strip()
+    return bool(a and b and a == b)
+
+
 class StrategyBase:
     """保存信号去重和最近开仓 K 线；外部运行层不得直接改私有字典。"""
 
@@ -42,3 +49,21 @@ class StrategyBase:
         """从磁盘恢复最近开仓记录，保留当前进程里已有的其它品种。"""
         if isinstance(bars, dict):
             self._last_entry_bar.update({str(k): str(v) for k, v in bars.items()})
+
+    def note_flat_wait_next_bar(self, symbol: str, bar_id: Any = "") -> None:
+        """
+        仓已平（含手机/交易台人工平）。本根信号K线不再开仓。
+
+        下一根已收盘K线再按策略评估：还符合才开，不符合就等。
+        不要因为柜台和账本对不上而立刻把仓补回去。
+        """
+        key = str(symbol or "")
+        bid = str(bar_id or "")
+        if not key:
+            return
+        if bid:
+            self._signaled_bar[key] = bid
+            self._last_entry_bar[key] = bid
+            used = getattr(self, "_used_bar", None)
+            if isinstance(used, dict):
+                used[key] = bid

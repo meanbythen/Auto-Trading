@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from datetime import datetime, timedelta
 
 from loguru import logger
@@ -92,6 +93,53 @@ class LoginFlowMixin:
             pass
         return False
 
+    def _note_own_fill(self, symbol: str, kind: str = "open") -> None:
+        """记下本程序刚成交的品种，后面几分钟对账要手下留情。"""
+        key = str(symbol or "").strip().lower()
+        fills = getattr(self, "_own_fills_at", None)
+        if fills is None:
+            self._own_fills_at: dict[str, float] = {}
+            fills = self._own_fills_at
+        fills[key] = time.monotonic()
+        kinds = getattr(self, "_own_fill_kinds", None)
+        if kinds is None:
+            self._own_fill_kinds: dict[str, str] = {}
+            kinds = self._own_fill_kinds
+        # 开仓：柜台可能比账本快，要自动认领。平仓：柜台可能比账本慢，不能当成未认领再开回来。
+        kinds[key] = "close" if str(kind or "").strip().lower() in {"close", "flat", "平仓"} else "open"
+
+    def _own_fill_kind(self, symbol: str) -> str:
+        """最近一次本程序成交是开仓还是平仓。没有记录时按开仓，兼容旧测试。"""
+        kinds = getattr(self, "_own_fill_kinds", None) or {}
+        return str(kinds.get(str(symbol or "").strip().lower()) or "open")
+
+    def _own_fill_too_fresh(self, symbol: str, *, within: float = 90.0) -> bool:
+        """这一品种是不是刚被本程序成交过。"""
+        stamp = float(
+            (getattr(self, "_own_fills_at", {}) or {}).get(str(symbol or "").strip().lower()) or 0
+        )
+        if stamp <= 0:
+            return False
+        return (time.monotonic() - stamp) < max(0.0, float(within))
+
+    def _own_fill_context(self, symbol: str) -> tuple[bool, str]:
+        """对账用：刚成交过没有、以及是开还是平。缺方法时当没成交过。"""
+        fn = getattr(self, "_own_fill_too_fresh", None)
+        if not callable(fn):
+            return False, "open"
+        try:
+            fresh = bool(fn(symbol))
+        except Exception:  # noqa: BLE001
+            return False, "open"
+        kind_fn = getattr(self, "_own_fill_kind", None)
+        kind = "open"
+        if callable(kind_fn):
+            try:
+                kind = str(kind_fn(symbol) or "open")
+            except Exception:  # noqa: BLE001
+                kind = "open"
+        return fresh, kind
+
     def _internal_nets(self) -> dict[str, int]:
         """程序自己记的净持仓。多仓为正，空仓为负，用来和柜台对比。"""
         nets: dict[str, int] = {}
@@ -113,14 +161,23 @@ class LoginFlowMixin:
         try:
             report = self._call_reconcile()
             self._apply_reconcile(report, phase="runtime")
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("柜台对账修复出错: {}", exc)
+            self._record_event("reconcile_error", error=str(exc))
+            # 热更新缺了认领相关方法时不要熔断开仓；别的对账失败仍拦开仓。
+            msg = str(exc)
+            skip_halt = "has no attribute" in msg and any(
+                name in msg
+                for name in ("_own_fill_too_fresh", "_note_own_fill", "_book_external_close")
+            )
+            if not skip_halt:
+                mark = getattr(self.trader, "mark_reconcile_unknown", None)
+                if callable(mark):
+                    mark(f"对账异常：{exc}")
+        try:
             self._apply_broker_equity()
         except Exception as exc:  # noqa: BLE001
-            # 读不到柜台就当成「对不上」，绝不能沿用上一轮的 True 继续开仓。
-            logger.exception("柜台对账失败，按不匹配处理，暂停开新仓: {}", exc)
-            mark = getattr(self.trader, "mark_reconcile_unknown", None)
-            if callable(mark):
-                mark(f"对账异常：{exc}")
-            self._record_event("reconcile_error", error=str(exc))
+            logger.warning("同步期货公司资金失败: {}", exc)
 
     def _uses_ctp_broker_funds(self) -> bool:
         """当前是不是已经连上 CTP、并且有期货公司资金数字可以跟。"""

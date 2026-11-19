@@ -188,29 +188,6 @@ GRID_BODY: dict[str, list[Any]] = {
 }
 
 # 完整：把配置页里适合搜的项目都放进来。组合很多，靠「最多试几组」随机抽样。
-# 日内浮盈飘单：晚开仓、ATR 止损/保本、跳空顺向。
-GRID_FLOAT_LIGHT: dict[str, list[Any]] = {
-    "eth_minutes": [30, 60],
-    "stop_atr_mult": [1.0, 1.5, 2.0],
-    "flatten_at_close": [True, False],
-    "stop_mode": ["touch", "close"],
-}
-GRID_FLOAT: dict[str, list[Any]] = {
-    "eth_minutes": [20, 45, 60],
-    "stop_atr_mult": [1.0, 1.5, 2.0],
-    "be_atr_mult": [2.0, 3.0],
-    "flatten_at_close": [True, False],
-    "stop_mode": ["touch", "close"],
-    "day_cutoff": ["10:45", "14:45"],
-    "session_scope": ["all", "day", "night"],
-}
-GRID_FLOAT_FULL: dict[str, list[Any]] = {
-    **GRID_FLOAT,
-    "macd_timeframe": ["1", "5"],
-    "macd_combo": ["12/26/9", "5/34/5"],
-    "dir_ema_pair": ["5/20", "20/60", "60/120"],
-}
-
 GRID_BODY_FULL: dict[str, list[Any]] = {
     **GRID_BODY,
     # 箱沿止损再让几跳。
@@ -456,8 +433,6 @@ def default_grid_for_engine(engine: str, depth: str = "标准") -> dict[str, lis
         return _depth_grid(GRID_MULTI_LIGHT, GRID_MULTI, None, d)
     if e == "daily_body":
         return _depth_grid(GRID_BODY_LIGHT, GRID_BODY, GRID_BODY_FULL, d)
-    if e == "float_hold":
-        return _depth_grid(GRID_FLOAT_LIGHT, GRID_FLOAT, GRID_FLOAT_FULL, d)
     if e == "swing_trend":
         return _depth_grid(GRID_SWING_LIGHT, GRID_SWING, None, d)
     if e == "swing_box":
@@ -981,20 +956,6 @@ def _factory_values(engine: str) -> dict[str, Any]:
             values["stop_mode"] = snap["stop_mode"]
         # 交易时段写在 schedule 小节，出厂是全时段。
         values.setdefault("session_scope", "all")
-    if engine == "float_hold":
-        hold = snap.get("float_hold") or {}
-        values.setdefault("macd_timeframe", hold.get("macd_timeframe", "5"))
-        values.setdefault(
-            "macd_combo",
-            f"{hold.get('macd_fast', 12)}/{hold.get('macd_slow', 26)}/{hold.get('macd_signal', 9)}",
-        )
-        values.setdefault(
-            "dir_ema_pair",
-            f"{hold.get('dir_ema_fast', 5)}/{hold.get('dir_ema_slow', 20)}",
-        )
-        values.setdefault("flatten_at_close", bool(snap.get("flatten_at_close", True)))
-        if "stop_mode" not in values and "stop_mode" in snap:
-            values["stop_mode"] = snap["stop_mode"]
     if engine in ("ema_swing", "macd_swing"):
         box = snap.get("ema_swing") or snap.get("macd_swing") or {}
         values.setdefault("timeframe", snap.get("timeframe", "5"))
@@ -1449,16 +1410,15 @@ def _apply_params(cfg: dict[str, Any], params: dict[str, Any], engine: str | Non
         box = st.setdefault("dual_ma", {})
         for k, v in params.items():
             box[k] = v
-    elif engine in ("daily_body", "float_hold"):
+    elif engine == "daily_body":
         body = st.setdefault(engine, {})
-        eth_fallback = 60 if engine == "float_hold" else 20
         for k, v in params.items():
             if k == "eth_minutes":
                 # 与配置页「第一ETH窗口」同一项；写在对应策略小节。
                 try:
                     body["eth_minutes"] = max(0, int(v))
                 except (TypeError, ValueError):
-                    body["eth_minutes"] = eth_fallback
+                    body["eth_minutes"] = 20
             elif k == "timeframe":
                 tf = str(v).strip() or "5"
                 st["timeframe"] = tf
@@ -1473,41 +1433,6 @@ def _apply_params(cfg: dict[str, Any], params: dict[str, Any], engine: str | Non
             elif k == "stop_mode":
                 # 止损触发方式，全策略共用，写在 strategy 根；和配置页同一项。
                 st["stop_mode"] = normalize_stop_mode(v)
-            elif engine == "float_hold" and k == "flatten_at_close":
-                # 可搜「当天清仓」或「拿到隔夜」，写在策略公共开关上。
-                st["flatten_at_close"] = _opt_bool(v, True)
-            elif engine == "float_hold" and k == "direction":
-                from src.strategy.float_hold import normalize_direction_key
-
-                body["direction"] = normalize_direction_key(v)
-            elif engine == "float_hold" and k == "macd_combo":
-                from src.strategy.float_hold import parse_macd_combo
-
-                fast, slow, signal = parse_macd_combo(v)
-                body["macd_fast"] = fast
-                body["macd_slow"] = slow
-                body["macd_signal"] = signal
-                body["macd_combo"] = f"{fast}/{slow}/{signal}"
-                if "direction" not in params:
-                    body["direction"] = "macd_cycle"
-            elif engine == "float_hold" and k == "dir_ema_pair":
-                from src.strategy.float_hold import parse_ema_pair_label
-
-                ema_fast, ema_slow = parse_ema_pair_label(v)
-                body["dir_ema_fast"] = ema_fast
-                body["dir_ema_slow"] = ema_slow
-                body["dir_ema_pair"] = f"{ema_fast}/{ema_slow}"
-                if "direction" not in params:
-                    body["direction"] = "macd_cycle"
-            elif engine == "float_hold" and k == "macd_timeframe":
-                from src.strategy.float_hold import normalize_macd_timeframe
-
-                tf = normalize_macd_timeframe(v)
-                body["macd_timeframe"] = tf
-                if "direction" not in params:
-                    body["direction"] = "macd_cycle"
-                st["timeframe"] = tf
-                st["trail_timeframe"] = tf
             else:
                 body[k] = v
     elif engine in _ENGINE_PARAM_SECTION:
@@ -2778,13 +2703,35 @@ def apply_run_switches(
     name = str(engine or "")
     if name in (
         "daily_body",
-        "float_hold",
         "dual_ma",
         "ma_cross",
         "kelly_break",
         "liq_stop",
+        "multi_factor",
+        "multi",
+        "cta",
+        "bollinger",
+        "boll",
+        "sar_trend",
+        "sar",
+        "parabolic_sar",
     ):
         st["flatten_at_close"] = bool(flatten_at_close)
+        nested = {
+            "multi_factor": "multi_factor",
+            "multi": "multi_factor",
+            "cta": "multi_factor",
+            "bollinger": "bollinger",
+            "boll": "bollinger",
+            "sar_trend": "sar_trend",
+            "sar": "sar_trend",
+            "parabolic_sar": "sar_trend",
+        }
+        section = nested.get(name)
+        if section:
+            box = st.setdefault(section, {})
+            if isinstance(box, dict):
+                box["flatten_at_close"] = bool(flatten_at_close)
     return out
 
 
@@ -2812,18 +2759,24 @@ def describe_run_switches(
             "倾角均线走平不开。空仓时收盘前若干分钟不开（出厂 30，可改）。周期和仓位用公共项。"
         )
     if name in ("bollinger", "boll", "bollinger_break"):
+        flat = "开" if flatten_at_close else "关"
         return (
-            "开关      布林带突破用它自己的设置，不跟收盘清仓总开关。\n"
+            f"收盘清仓  {flat}\n"
+            "布林带突破听配置页「收盘清仓」总开关。"
             "入场：收盘同时站上中轨和上轨做多、跌破中轨和下轨做空；只顺势，不做反转。"
         )
     if name in ("sar_trend", "sar", "parabolic_sar"):
+        flat = "开" if flatten_at_close else "关"
         return (
-            "开关      SAR 波段用它自己的设置，不跟收盘清仓总开关。\n"
+            f"收盘清仓  {flat}\n"
+            "SAR 波段听配置页「收盘清仓」总开关。"
             "入场：SAR 翻向且收盘在均线同侧；离场靠 SAR 当移动止损。"
         )
     if name in ("multi_factor", "multi", "cta"):
+        flat = "开" if flatten_at_close else "关"
         return (
-            "开关      多因子 CTA 用它自己的设置，不跟收盘清仓总开关。\n"
+            f"收盘清仓  {flat}\n"
+            "多因子 CTA 听配置页「收盘清仓」总开关。"
             "入场：均线 / 唐奇安 / 布林 / SAR 加权打分，日线定方向，总分越过阈值才开仓。"
         )
     flat = "开" if flatten_at_close else "关"
@@ -2836,14 +2789,6 @@ def describe_run_switches(
             "触发方式可搜「触及即止损」或「收盘价确认」，中间不做回撤止损，没触发就拿到收盘。\n"
             "优化按深度搜：精简只比 ETH、信号周期、止损触发方式和通用止损开关；"
             "标准再加截止钟点、交易时段；完整再放开箱体过滤项和通用止损参数。"
-        )
-    if name == "float_hold":
-        return (
-            f"收盘清仓  {flat}（优化可搜当天清仓或拿到隔夜）\n"
-            "开仓：MACD一轮循环可搜 1/5 分钟、常见 MACD 参数、均线对 EMA5/20、20/60、60/120；"
-            "走完一轮红绿柱后再按均线对定方向。"
-            "止损离进场价大约 0.5 倍开盘前波动；浮盈大约 2 倍波动后保本。"
-            "开盘箱体那一套仍可手选，不在这几项优化里。"
         )
     if name == "swing_box":
         return (

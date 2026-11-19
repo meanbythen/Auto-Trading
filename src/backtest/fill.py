@@ -24,6 +24,8 @@ class FillModel:
     on_next_open: bool = True
     slippage_ticks: float = 1.0
     price_tick: float = 1.0
+    # 打开后开仓再套一层实盘的过期K/追价闸。默认关，不改历史回测成绩。
+    mirror_live_gates: bool = False
 
     @classmethod
     def from_cfg(cls, cfg: dict[str, Any], symbol: str | None = None) -> "FillModel":
@@ -56,6 +58,8 @@ class FillModel:
             on_next_open=config_flag(bt.get("fill_on_next_open"), default=True),
             slippage_ticks=slip_ticks,
             price_tick=tick,
+            # 必须从配置读进来；漏了的话界面打开开关也不会拦开仓。
+            mirror_live_gates=config_flag(bt.get("mirror_live_gates"), default=False),
         )
 
     @property
@@ -79,4 +83,6 @@ class FillModel:
         else:
             parts.append("未加滑点")
         parts.append("破止损按止损价成交，跳空按开盘价")
+        if self.mirror_live_gates:
+            parts.append("已套实盘过期K和追价闸（放弃的根不会成交）")
         return "成交近似  " + "；".join(parts)

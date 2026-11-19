@@ -10,6 +10,7 @@ from src.risk.universe_table import (
     apply_universe_table_to_cfg,
     parse_universe_rows,
     read_universe_table,
+    sync_ctp_contract_to_universe,
     write_universe_table,
 )
 
@@ -171,6 +172,49 @@ def test_margin_rate_roundtrip(tmp_path: Path) -> None:
     assert contracts["fu"]["margin_rate_pct"] == 23
     assert contracts["fu"]["multiplier"] == 10
     assert float(contracts["fu"].get("margin") or 0) == 0
+
+
+def test_sync_ctp_contract_updates_same_product(tmp_path: Path) -> None:
+    """交易台写入只改数量、跳、保证金、手续费，不改启用和时段。"""
+    path = tmp_path / "u.xlsx"
+    write_universe_table(
+        path,
+        [
+            {
+                "symbol": "lh2701",
+                "name": "生猪",
+                "margin_rate_pct": 10,
+                "multiplier": 10,
+                "commission": 1,
+                "enabled": True,
+                "trading_sessions": "09:00-11:30,13:30-15:00,21:00-23:00",
+                "flatten_times": "14:55,22:55",
+            }
+        ],
+    )
+    sync_ctp_contract_to_universe(
+        path,
+        {
+            "symbol": "lh2701",
+            "name": "生猪",
+            "multiplier": 16,
+            "price_tick": 5,
+            "margin_rate_pct": 13,
+            "commission": 29.92,
+            "commission_close": 14.96,
+            "commission_close_today": 0.0,
+        },
+    )
+    rows = read_universe_table(path)
+    _symbols, contracts = parse_universe_rows(rows)
+    assert contracts["lh"]["multiplier"] == 16
+    assert contracts["lh"]["price_tick"] == 5
+    assert contracts["lh"]["margin_rate_pct"] == 13
+    assert contracts["lh"]["commission"] == 29.92
+    assert contracts["lh"]["commission_close"] == 14.96
+    assert contracts["lh"]["commission_close_today"] == 0.0
+    assert rows[0]["enabled"] is True
+    assert "21:00" in (rows[0].get("trading_sessions") or "")
 
 
 def test_read_old_header_file(tmp_path: Path) -> None:

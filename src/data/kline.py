@@ -795,37 +795,84 @@ class KlineProvider:
         self._minute_cache = (sina_code, now, frame)
         return frame.copy()
 
-    def _local_minutes(self, symbol: str) -> pd.DataFrame | None:
-        """本地库存里的 1 分钟（回测补夜盘第一根要用历史，不能只靠刚下载的一小段）。"""
+    def _local_minutes(self, symbol: str, *, limit: int | None = None) -> pd.DataFrame | None:
+        """本地库存里的 1 分钟。实盘只读最近一段，回测才读全。"""
         stored_name = self._stored_symbol(symbol)
-        stored = self.store.load(stored_name, "1")
+        stored = self.store.load(stored_name, "1", limit=limit)
         if stored is not None and len(stored) > 0:
             return self._normalize_ohlc(stored)
+        if limit is not None:
+            return None
         cached = self._load_cache(stored_name, "1")
         if cached is not None and len(cached) > 0:
             return self._normalize_ohlc(cached)
         return None
 
-    def _minutes_for_rebuild(self, symbol: str, sina_code: str) -> pd.DataFrame | None:
+    def _minute_load_limit(self, frame: pd.DataFrame | None, period: str) -> int | None:
+        """实盘窗口大约 200 根，按周期估要多少根 1 分钟；回测长历史不截。"""
+        if frame is None or len(frame) == 0 or len(frame) > 800:
+            return None
+        try:
+            step = max(int(canonical_period(period)), 1)
+        except (TypeError, ValueError):
+            step = 60
+        return int(len(frame) * step * 3 + 800)
+
+    def _clip_minutes_to_frame(
+        self,
+        minutes: pd.DataFrame | None,
+        frame: pd.DataFrame | None,
+        period: str,
+    ) -> pd.DataFrame | None:
+        """只留下 frame 前后一小段 1 分钟。实盘 200 根不必拿全年 1 分钟来拼。"""
+        if minutes is None or len(minutes) == 0 or frame is None or len(frame) == 0:
+            return minutes
+        try:
+            step = max(int(canonical_period(period)), 1)
+        except (TypeError, ValueError):
+            step = 60
+        pad = pd.Timedelta(minutes=max(step * 3, 180))
+        lo = pd.Timestamp(frame.index.min()) - pad
+        hi = pd.Timestamp(frame.index.max()) + pad
+        clipped = minutes.loc[(minutes.index >= lo) & (minutes.index <= hi)]
+        return clipped if clipped is not None and len(clipped) else minutes
+
+    def _minutes_for_rebuild(
+        self,
+        symbol: str,
+        sina_code: str,
+        *,
+        period: str = "60",
+        frame: pd.DataFrame | None = None,
+        fetch_recent: bool = True,
+    ) -> pd.DataFrame | None:
         """本地 1 分钟 + 刚拉的最近 1 分钟拼在一起。"""
         pieces: list[pd.DataFrame] = []
-        local = self._local_minutes(symbol)
+        local = self._local_minutes(symbol, limit=self._minute_load_limit(frame, period))
         if local is not None and len(local) > 0:
             pieces.append(local)
-        try:
-            recent = self._recent_minutes(sina_code)
-            if recent is not None and len(recent) > 0:
-                pieces.append(recent)
-                # 顺手把最近 1 分钟写入库存，下次回测也能补齐。库里已经一样的行不再重写。
-                try:
-                    pending = rows_needing_write(recent, local)
-                    if pending is not None and len(pending) > 0:
-                        self.store.upsert(self._stored_symbol(symbol), "1", pending)
-                    self._save_cache(self._stored_symbol(symbol), "1", recent)
-                except Exception:  # noqa: BLE001
-                    pass
-        except Exception as exc:  # noqa: BLE001
-            logger.debug("最近1分钟暂时拉不到: {}", exc)
+            # 回测历史已经有 1 分钟盖住这段时，不再为拼 K 去网上拉，免得卡满超时。
+            if (
+                fetch_recent
+                and frame is not None
+                and len(frame) > 0
+                and pd.Timestamp(local.index.max()) >= pd.Timestamp(frame.index.max()) - pd.Timedelta(minutes=5)
+            ):
+                fetch_recent = False
+        if fetch_recent:
+            try:
+                recent = self._recent_minutes(sina_code)
+                if recent is not None and len(recent) > 0:
+                    pieces.append(recent)
+                    try:
+                        pending = rows_needing_write(recent, local)
+                        if pending is not None and len(pending) > 0:
+                            self.store.upsert(self._stored_symbol(symbol), "1", pending)
+                        self._save_cache(self._stored_symbol(symbol), "1", recent)
+                    except Exception:  # noqa: BLE001
+                        pass
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("最近1分钟暂时拉不到: {}", exc)
         if not pieces:
             return None
         pieces = [bars_without_attrs(part) for part in pieces]
@@ -848,7 +895,8 @@ class KlineProvider:
             return frame
         symbol = symbol_hint or sina_code
         try:
-            minutes = self._minutes_for_rebuild(symbol, sina_code)
+            minutes = self._minutes_for_rebuild(symbol, sina_code, period=period, frame=frame)
+            minutes = self._clip_minutes_to_frame(minutes, frame, period)
             if minutes is None or len(minutes) < 3:
                 return frame
             built = bars_from_minutes(minutes, period, symbol=symbol)
@@ -876,7 +924,11 @@ class KlineProvider:
         """只用本地这家来源的 1 分钟重拼，不混新浪。"""
         if frame is None or len(frame) == 0 or not _rebuildable_minute_period(period):
             return frame
-        minutes = self._local_minutes(symbol)
+        minutes = self._clip_minutes_to_frame(
+            self._local_minutes(symbol, limit=self._minute_load_limit(frame, period)),
+            frame,
+            period,
+        )
         if minutes is None or len(minutes) < 3:
             return frame
         try:

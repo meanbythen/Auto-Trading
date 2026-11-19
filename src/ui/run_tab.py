@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Callable
 from src.ui import theme as T
 from src.ui.app_common import QueueLogHandler, bind_wrap_to_parent
+from src.utils.ui_log import ui_sink_filter
 from src.utils import save_config
 from tkinter import messagebox
 import customtkinter as ctk
@@ -96,10 +97,10 @@ class RunTabMixin:
             state="disabled",
         )
         self.btn_stop.pack(side="left", expand=True, fill="x", padx=(6, 0))
-        # 对账确认：程序若在「点击下单」和「记账」之间崩溃，下次启动会熔断等人工核对。
+        # 核对委托：点单和记账之间崩溃后的熔断。和持仓卡「认领/拒绝仓单」不是一回事。
         self.btn_confirm = ctk.CTkButton(
             btn_row,
-            text="对账确认",
+            text="核对委托",
             width=86,
             height=38,
             fg_color=T.BG_ELEVATED,
@@ -112,7 +113,7 @@ class RunTabMixin:
 
         pause_hint = ctk.CTkLabel(
             left,
-            text="「暂停报单」后扫描还在跑，开平仓、止损、清仓都不会发出去。要结束常驻请点「停止常驻」。交易台只给人测开平撤；③④再启动常驻由策略接管。",
+            text="「暂停报单」后扫描还在跑，只停开新仓；止损和收盘清仓仍会发；要结束常驻请点「停止常驻」；「核对委托」只解除崩溃后的熔断，不改持仓。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=420,
@@ -121,13 +122,6 @@ class RunTabMixin:
         pause_hint.pack(anchor="w", padx=8, pady=(0, 8))
         bind_wrap_to_parent(pause_hint)
 
-        ctk.CTkLabel(
-            left,
-            text="CTP 上线四步（手工和策略同一套接口）",
-            font=T.FONT_SMALL,
-            text_color=T.TEXT_DIM,
-            anchor="w",
-        ).pack(anchor="w", padx=8, pady=(4, 0))
         self.go_live_menu = ctk.CTkOptionMenu(
             left,
             variable=self.go_live_var,
@@ -136,7 +130,7 @@ class RunTabMixin:
             width=360,
             height=32,
         )
-        self.go_live_menu.pack(fill="x", padx=8, pady=(4, 0))
+        self.go_live_menu.pack(fill="x", padx=8, pady=(0, 0))
         stage_hint_label = ctk.CTkLabel(
             left,
             textvariable=self.go_live_hint_var,
@@ -199,7 +193,7 @@ class RunTabMixin:
 
         ctk.CTkButton(
             left,
-            text="手工单录入",
+            text="手工单（只改程序账本）",
             height=36,
             fg_color=T.BG_ELEVATED,
             hover_color=T.BORDER,
@@ -207,17 +201,7 @@ class RunTabMixin:
             border_color=T.ACCENT,
             text_color=T.ACCENT,
             command=self._on_manual_trade,
-        ).pack(fill="x", padx=8, pady=(0, 4))
-        manual_hint = ctk.CTkLabel(
-            left,
-            text="手动在交易软件上开仓/平仓后，在这里录入。品种、价格、手数 + 买多/卖空/平仓。只改程序的账，不会去点交易软件。",
-            font=T.FONT_SMALL,
-            text_color=T.TEXT_DIM,
-            wraplength=420,
-            justify="left",
-        )
-        manual_hint.pack(anchor="w", padx=8, pady=(0, 8))
-        bind_wrap_to_parent(manual_hint)
+        ).pack(fill="x", padx=8, pady=(0, 8))
 
         ctk.CTkButton(
             left,
@@ -231,19 +215,6 @@ class RunTabMixin:
             command=self._on_export_all,
         ).pack(fill="x", padx=8, pady=(0, 8))
 
-        self.btn_save_dry = ctk.CTkButton(
-            left,
-            text="保存全部配置到文件",
-            height=34,
-            fg_color="transparent",
-            hover_color=T.BG_ELEVATED,
-            border_width=1,
-            border_color=T.ACCENT,
-            text_color=T.ACCENT,
-            command=self._on_save,
-        )
-        self.btn_save_dry.pack(fill="x", padx=8, pady=(0, 8))
-
         # 日志
         right = ctk.CTkFrame(tab, fg_color=T.BG_ELEVATED, corner_radius=12)
         right.grid(row=0, column=1, sticky="nsew", padx=(8, 8), pady=8)
@@ -252,6 +223,12 @@ class RunTabMixin:
         head = ctk.CTkFrame(right, fg_color="transparent")
         head.grid(row=0, column=0, sticky="ew", padx=12, pady=(12, 6))
         ctk.CTkLabel(head, text="运行日志", font=T.FONT_TITLE, text_color=T.TEXT).pack(side="left")
+        ctk.CTkLabel(
+            head,
+            text="只显示下单、告警和扫描结论变化；拉K线、对账通过写在 logs 文件夹",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+        ).pack(side="left", padx=(10, 0))
         ctk.CTkButton(
             head, text="清空", width=64, height=28, fg_color=T.BG_PANEL, hover_color=T.BORDER,
             command=lambda: self.log_box.delete("1.0", "end"),
@@ -260,7 +237,10 @@ class RunTabMixin:
             right, font=T.FONT_MONO, fg_color=T.BG, text_color=T.TEXT, corner_radius=10, wrap="word",
         )
         self.log_box.grid(row=1, column=0, sticky="nsew", padx=12, pady=(0, 12))
-        self._append_log("控制台就绪。点「启动常驻」或到了登录时间，都会先准备交易软件，完成后再开始扫描。")
+        self._append_log(
+            "控制台就绪。同花顺通道：启动或到点会先准备交易软件再扫描。"
+            "CTP 通道：到点直接启动常驻连柜台，不打开同花顺。"
+        )
 
 
     def _hook_logger(self) -> None:
@@ -268,7 +248,12 @@ class RunTabMixin:
             # 后台线程只入队，不碰 Tk。
             self._log_queue.put_nowait(text)
 
-        logger.add(QueueLogHandler(emit).write, format="{time:HH:mm:ss} | {level} | {message}", level="INFO")
+        logger.add(
+            QueueLogHandler(emit).write,
+            format="{time:HH:mm:ss} | {level} | {message}",
+            level="INFO",
+            filter=ui_sink_filter,
+        )
         self._log_after_id = self.after(100, self._drain_logs)
 
 
@@ -360,8 +345,10 @@ class RunTabMixin:
 
         target = normalize_stage(self.go_live_var.get())
         state = load_go_live(self.root_dir)
+        kept_exec = str(self.exec_var.get() or "sim").strip() or "sim"
         if target == normalize_stage(state.get("stage")):
             apply_stage_to_cfg(self.cfg, target)
+            self.cfg.setdefault("trade", {})["executor"] = kept_exec
             self.go_live_hint_var.set(stage_hint(target))
             return
         blocked = why_cannot_enter(state, target)
@@ -373,10 +360,25 @@ class RunTabMixin:
         state["stage"] = target
         save_state(self.root_dir, state)
         apply_stage_to_cfg(self.cfg, target)
-        self.exec_var.set(str((self.cfg.get("trade") or {}).get("executor", self.exec_var.get())))
+        self.cfg.setdefault("trade", {})["executor"] = kept_exec
+        self.exec_var.set(kept_exec)
         from src.trader.ctp_logic import ctp_kind_label
 
+        if hasattr(self, "_ctp_kind_syncing"):
+            self._ctp_kind_syncing = True
         self.ctp_kind_var.set(ctp_kind_label(((self.cfg.get("trade") or {}).get("ctp") or {}).get("account_kind")))
+        if hasattr(self, "_ctp_kind_syncing"):
+            self._ctp_kind_syncing = False
+        if hasattr(self, "_fill_ctp_profile_vars"):
+            from src.trader.ctp_profile import profile_name_for_kind
+
+            ctp_now = ((self.cfg.get("trade") or {}).get("ctp") or {})
+            name = profile_name_for_kind(ctp_now, ctp_now.get("account_kind"))
+            if name and hasattr(self, "ctp_profile_var"):
+                self._ctp_profile_syncing = True
+                self.ctp_profile_var.set(name)
+                self._ctp_profile_syncing = False
+            self._fill_ctp_profile_vars()
         self.go_live_hint_var.set(stage_hint(target))
         self._append_log(f"上线阶段已改为{stage_label(target)}")
 
@@ -417,14 +419,20 @@ class RunTabMixin:
             state["stage"] = nxt
             save_state(self.root_dir, state)
             apply_stage_to_cfg(self.cfg, nxt)
+            kept_exec = str(self.exec_var.get() or "sim").strip() or "sim"
+            self.cfg.setdefault("trade", {})["executor"] = kept_exec
             self.go_live_var.set(stage_label(nxt))
             self.go_live_hint_var.set(stage_hint(nxt))
-            self.exec_var.set(str((self.cfg.get("trade") or {}).get("executor", self.exec_var.get())))
+            self.exec_var.set(kept_exec)
             from src.trader.ctp_logic import ctp_kind_label
 
+            if hasattr(self, "_ctp_kind_syncing"):
+                self._ctp_kind_syncing = True
             self.ctp_kind_var.set(
                 ctp_kind_label(((self.cfg.get("trade") or {}).get("ctp") or {}).get("account_kind"))
             )
+            if hasattr(self, "_ctp_kind_syncing"):
+                self._ctp_kind_syncing = False
             self._append_log(f"已进入{stage_label(nxt)}")
 
 
@@ -433,6 +441,8 @@ class RunTabMixin:
 
         if self._prep_busy:
             messagebox.showwarning("正在准备", "交易软件还在登录或改价格。这几步做完之前不会启动常驻。")
+            return
+        if self._block_resident_if_research():
             return
         if self.worker.running:
             self._on_halt_resident()
@@ -448,9 +458,11 @@ class RunTabMixin:
         )
 
         stage_now = normalize_stage(self.go_live_var.get())
+        chosen_exec = str(self.exec_var.get() or "sim").strip() or "sim"
         apply_stage_to_cfg(self.cfg, stage_now)
-        if allows_strategy_orders(stage_now):
-            self.exec_var.set("ctp")
+        # 上线③④只表示「CTP 可以策略下单」，不能把已经选好的同花顺 gui 改掉。
+        self.cfg.setdefault("trade", {})["executor"] = chosen_exec
+        self.exec_var.set(chosen_exec)
         from src.trader.base import capabilities_for
 
         caps = capabilities_for(self.exec_var.get())
@@ -467,8 +479,11 @@ class RunTabMixin:
                 messagebox.showerror("还不能让策略自动下单", blocked)
                 return
         if caps.orders_via_broker:
-            from src.account.ctp_sync import resident_book_guard
+            from src.account.ctp_sync import align_active_book_to_ctp, resident_book_guard
 
+            self._apply_ctp_book_align(
+                align_active_book_to_ctp(self.root_dir, self.cfg, running=False)
+            )
             book_block = resident_book_guard(self.root_dir, self.cfg)
             if book_block:
                 messagebox.showerror("先核对账户", book_block)
@@ -476,10 +491,33 @@ class RunTabMixin:
                 return
             from src.trader.go_live import STAGE_AUTO_LIVE
 
+            from src.ui.ctp_probe import probe_login_block_reason, shutdown_probe_window
+
+            desk_block = probe_login_block_reason(self)
+            if desk_block:
+                if not messagebox.askyesno(
+                    "交易台还登着",
+                    desk_block + "\n\n是 = 关掉交易台再启动常驻\n否 = 不启动",
+                ):
+                    self._append_log("未启动常驻：交易台还登着柜台")
+                    return
+                close_fail = shutdown_probe_window(self)
+                if close_fail:
+                    messagebox.showwarning("还不能启动", close_fail)
+                    self._append_log("未启动常驻：" + close_fail)
+                    return
             if stage_now == STAGE_AUTO_LIVE:
+                from src.trader.protective import overnight_unprotected_notice
+
+                live_notice = overnight_unprotected_notice(
+                    live=True, dry_run=bool(self.dry_var.get())
+                )
+                extra = ("\n\n" + live_notice) if live_notice else ""
                 if not messagebox.askyesno(
                     "真实资金",
-                    "策略将用和交易台同一套接口，向真实资金账户报单。\n确认前置、资金账号都填对了吗？",
+                    "策略将用和交易台同一套接口，向真实资金账户报单。\n"
+                    "确认前置、资金账号都填对了吗？"
+                    + extra,
                 ):
                     return
         if caps.orders_via_broker:
@@ -632,10 +670,21 @@ class RunTabMixin:
 
 
     def _begin_prepare(self, *, automatic: bool) -> None:
-        """在后台做准备。界面保持可点，但常驻要等准备结果回来才启动。"""
+        """在后台做同花顺准备。界面保持可点，但常驻要等准备结果回来才启动。"""
+        from src.trader.base import capabilities_for
+
+        chosen_exec = str(self.exec_var.get() or "").strip() or "gui"
+        if not capabilities_for(chosen_exec).window_driven:
+            self._append_log(f"当前是 {chosen_exec} 通道，跳过同花顺准备。")
+            if automatic:
+                self._auto_launch_resident_at_login(chosen_exec)
+            else:
+                self._launch_resident()
+            return
         self._prep_busy = True
         self._append_log("开始准备交易软件：打开、登录、改对手价。这几步不下单。")
         cfg = self._clone_cfg()
+        cfg.setdefault("trade", {})["executor"] = "gui"
 
         def _work() -> None:
             from src.login.prepare import prepare_trading_desk
@@ -672,10 +721,9 @@ class RunTabMixin:
 
     def _tick_login_schedule(self) -> None:
         """
-        到了配置里的登录时间，先做准备，完成后再启动常驻。
+        到了配置里的登录时间：同花顺通道先准备软件；CTP 通道直接启动常驻连柜台。
 
-        常驻已经在跑时，不在这里再开一次。正在跑的程序会在下一轮扫描前自己登录，
-        登录过程中不会同时点买卖。
+        常驻已经在跑时，不在这里再开一次。
         """
         if self._closing:
             return
@@ -708,7 +756,11 @@ class RunTabMixin:
 
 
     def _maybe_start_at_login_time(self) -> None:
-        """当前这一分钟如果写在 login_times 里，而且今天还没触发过，就去准备并启动。"""
+        """当前这一分钟如果写在 login_times 里，而且今天还没触发过，就去启动。
+
+        同花顺点击通道：先拉软件、登录、改对手价，再启动常驻。
+        CTP / 模拟通道：不打开同花顺，直接启动常驻；CTP 由常驻自己连柜台。
+        """
         from datetime import datetime
 
         times = [str(item).strip() for item in ((self.cfg.get("schedule") or {}).get("login_times") or [])]
@@ -723,8 +775,80 @@ class RunTabMixin:
         if self.worker.running or self._prep_busy:
             self._append_log(f"到了登录时间 {current}，常驻已在运行，不重复启动。")
             return
-        self._append_log(f"到了登录时间 {current}。先准备交易软件，完成后再开始扫描。")
-        self._begin_prepare(automatic=True)
+        chosen_exec = str(self.exec_var.get() or "").strip() or str(
+            (self.cfg.get("trade") or {}).get("executor") or "sim"
+        )
+        from src.trader.base import capabilities_for
+
+        caps = capabilities_for(chosen_exec)
+        if caps.window_driven:
+            self._append_log(f"到了登录时间 {current}。同花顺通道：先准备交易软件，再开始扫描。")
+            self._begin_prepare(automatic=True)
+            return
+        self._append_log(
+            f"到了登录时间 {current}。当前是 {chosen_exec} 通道：不打开同花顺，直接启动常驻"
+            + ("并连接 CTP。" if caps.orders_via_broker else "。")
+        )
+        self._auto_launch_resident_at_login(chosen_exec)
+
+
+    def _auto_launch_resident_at_login(self, chosen_exec: str) -> None:
+        """定时启动：非同花顺通道无人值守启动常驻，尽量不弹确认框。"""
+        from src.trader.go_live import (
+            allows_strategy_orders,
+            apply_stage_to_cfg,
+            load_state as load_go_live,
+            normalize_stage,
+            stage_label,
+            why_cannot_enter,
+        )
+        from src.trader.base import capabilities_for
+
+        stage_now = normalize_stage(self.go_live_var.get())
+        apply_stage_to_cfg(self.cfg, stage_now)
+        self.cfg.setdefault("trade", {})["executor"] = chosen_exec
+        self.exec_var.set(chosen_exec)
+        caps = capabilities_for(chosen_exec)
+        if caps.orders_via_broker and not allows_strategy_orders(stage_now):
+            self._append_log(
+                f"未自动启动：当前是{stage_label(stage_now)}，策略还不能自动下单。"
+                "请先把上线阶段调到③或④，或白天用交易台。"
+            )
+            return
+        if allows_strategy_orders(stage_now):
+            blocked = why_cannot_enter(load_go_live(self.root_dir), stage_now)
+            if blocked:
+                self._append_log("未自动启动：" + blocked)
+                return
+        if caps.orders_via_broker:
+            from src.account.ctp_sync import align_active_book_to_ctp, resident_book_guard
+
+            self._apply_ctp_book_align(
+                align_active_book_to_ctp(self.root_dir, self.cfg, running=False)
+            )
+            book_block = resident_book_guard(self.root_dir, self.cfg)
+            if book_block:
+                self._append_log("未自动启动：" + book_block)
+                return
+            from src.ui.ctp_probe import probe_login_block_reason, shutdown_probe_window
+
+            desk_block = probe_login_block_reason(self)
+            if desk_block:
+                close_fail = shutdown_probe_window(self)
+                if close_fail:
+                    self._append_log("未自动启动：交易台还登着柜台，自动关掉失败。" + close_fail)
+                    return
+                self._append_log("定时启动前已关掉交易台，避免和常驻抢同一柜台。")
+            from src.trader.ctp_logic import ctp_kind_label
+
+            self._append_log(
+                f"定时启动常驻 | 上线{stage_label(stage_now)} | "
+                f"{ctp_kind_label(self.ctp_kind_var.get())} | "
+                f"模拟={'开' if self.dry_var.get() else '关'}"
+            )
+        # 定时启动不经过同花顺准备，常驻里自己连 CTP / 跑模拟。
+        self._skip_next_bot_login = False
+        self._launch_resident()
 
 
     def _bring_self_front(self) -> None:
@@ -754,52 +878,98 @@ class RunTabMixin:
 
         bot = getattr(self.worker, "bot", None)
         if bot is None:
-            messagebox.showinfo("对账确认", "常驻没有在跑，没有待核对的委托记录。")
+            messagebox.showinfo("核对委托", "常驻没有在跑，没有待核对的委托记录。")
             return
         if not messagebox.askyesno(
-            "对账确认",
-            "请先在交易软件里核对实际持仓与委托。\n"
-            "如果这笔其实已成交，先用「手工单录入」把仓位补进程序账，再回来点这里。\n\n"
+            "核对委托",
+            "这和右上「认领仓单 / 拒绝仓单」不是同一件事。\n\n"
+            "这里只清掉「点单后程序崩溃、还没记上账」留下的告警，不改持仓。\n"
+            "柜台手数和程序账对不上，请用程序持仓卡下的认领或拒绝。\n\n"
+            "请先在交易软件里核对实际持仓与委托。如果这笔其实已成交，先用「手工单录入」补进程序账。\n\n"
             "确认无误后解除熔断并继续扫描？",
         ):
             return
         ok, msg = bot.confirm_positions_reviewed()
         if ok:
-            messagebox.showinfo("对账确认", msg)
+            messagebox.showinfo("核对委托", msg)
         else:
-            messagebox.showwarning("对账确认", msg)
+            messagebox.showwarning("核对委托", msg)
 
 
-    def _on_reconcile_actions(self) -> None:
-        """对账处理：逐个品种选择认领 / 平掉 / 暂不处理。"""
+    def _reconcile_pending_symbols(self) -> list[str]:
+        """当前要对账的品种：柜台多出来的、或程序账有柜台没有的。"""
         bot = getattr(self.worker, "bot", None)
         if bot is None:
-            messagebox.showinfo("对账处理", "常驻没有在跑。启动常驻后再处理未认领持仓。")
-            return
+            return []
         rec = (bot.status_snapshot() or {}).get("reconcile") or {}
-        pending = list(dict.fromkeys([*(rec.get("unclaimed") or []), *(rec.get("phantom") or [])]))
+        return list(dict.fromkeys([*(rec.get("unclaimed") or []), *(rec.get("phantom") or [])]))
+
+    def _on_claim_lots(self) -> None:
+        """认领仓单：以华泰柜台为准，改程序账。"""
+        bot = getattr(self.worker, "bot", None)
+        if bot is None:
+            messagebox.showinfo("认领仓单", "常驻没有在跑。启动常驻后再认领。")
+            return
+        pending = self._reconcile_pending_symbols()
+        rec = (bot.status_snapshot() or {}).get("reconcile") or {}
+        unclaimed = {str(item).strip().lower() for item in (rec.get("unclaimed") or [])}
         if not pending:
-            messagebox.showinfo("对账处理", "当前没有需要处理的对账差异")
+            messagebox.showinfo("认领仓单", "现在柜台和程序账是对齐的，不用认领。")
+            return
+        names = "、".join(pending)
+        if not messagebox.askyesno(
+            "认领仓单",
+            "将以华泰柜台为准，改程序持仓和本地账本。\n"
+            f"涉及：{names}\n\n"
+            "柜台有仓、账本没有：把柜台的仓收进程序。\n"
+            "柜台已空、账本还有：按现价把账本也改成空（手机刚平完应点「是」）。\n\n"
+            "不想改账本、仍让程序记着仓，请点「否」，改用「拒绝仓单」。",
+        ):
             return
         for symbol in pending:
-            choice = messagebox.askyesnocancel(
-                f"对账处理 {symbol}",
-                f"{symbol} 存在柜台与账本差异。\n\n"
-                "是：认领（按柜台持仓补进信号账户）\n"
-                "否：平掉（按最新价补记平仓）\n"
-                "取消：暂不处理（保持冻结)",
-            )
-            if choice is None:
-                bot.ignore_reconcile_symbol(symbol)
-                continue
-            if choice:
+            if str(symbol).strip().lower() in unclaimed:
                 ok, msg = bot.adopt_broker_position(symbol)
             else:
                 ok, msg = bot.close_broker_position(symbol)
             self._append_log(msg)
             if not ok:
-                messagebox.showwarning("对账处理", msg)
+                messagebox.showwarning("认领仓单", msg)
         self._refresh_status_cards()
+
+    def _on_reject_lots(self) -> None:
+        """拒绝仓单：以程序账为准，不跟柜台改。柜台已空时也不会把账本平掉。"""
+        bot = getattr(self.worker, "bot", None)
+        if bot is None:
+            messagebox.showinfo("拒绝仓单", "常驻没有在跑。启动常驻后再拒绝。")
+            return
+        pending = self._reconcile_pending_symbols()
+        if not pending:
+            messagebox.showinfo("拒绝仓单", "现在柜台和程序账是对齐的，不用拒绝。")
+            return
+        names = "、".join(pending)
+        if not messagebox.askyesno(
+            "拒绝仓单",
+            "将以程序账为准，不按柜台改持仓。\n"
+            f"涉及：{names}\n\n"
+            "柜台有仓、账本没有：不把柜台的仓收进来。\n"
+            "柜台已空、账本还有：账本仍记着仓，不会替你平掉；该品种暂停自动开仓。\n\n"
+            "手机已经平完、要把账本也改成空，请点「否」，改用「认领仓单」。",
+        ):
+            return
+        reject = getattr(bot, "reject_broker_lots", None)
+        for symbol in pending:
+            if callable(reject):
+                ok, msg = reject(symbol)
+            else:
+                ok, msg = bot.ignore_reconcile_symbol(symbol)
+            self._append_log(msg)
+            if not ok:
+                messagebox.showwarning("拒绝仓单", msg)
+        self._refresh_status_cards()
+
+    def _on_reconcile_actions(self) -> None:
+        """旧入口转到认领仓单。"""
+        self._on_claim_lots()
 
 
     def _maybe_release_intent_halt(
@@ -849,7 +1019,7 @@ class RunTabMixin:
             return
         paused = not self.worker.orders_paused()
         self.worker.set_orders_paused(paused)
-        self._append_log("已暂停报单，开平仓不会发出去。" if paused else "已恢复报单。")
+        self._append_log("已暂停开新仓，止损和清仓仍会发。" if paused else "已恢复报单。")
         self._refresh_status_cards()
 
 

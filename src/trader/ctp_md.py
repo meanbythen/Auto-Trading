@@ -1,8 +1,8 @@
 """
-仿真行情。
+CTP 行情。
 
 功能：连接券商档案里配置的行情前置，订阅窗口里的那一个合约，
-把最新价、买一、卖一、涨停价、跌停价交给测试窗口。
+把最新价、买一、卖一、涨停价、跌停价交给交易台。仿真、真实同一套。
 原理：行情前置必须来自配置（md_front）；交易端口和行情端口不是同一个，
 程序不再按交易端口去猜行情端口。这里不计算开仓信号，也不发报单。
 """
@@ -17,7 +17,13 @@ from typing import Any
 
 from loguru import logger
 
-from src.trader.ctp_logic import ctp_depth_row, ctp_field_symbol, ctp_instrument_id
+from src.trader.ctp_logic import (
+    CTP_KIND_LIVE,
+    ctp_depth_row,
+    ctp_field_symbol,
+    ctp_instrument_id,
+    normalize_ctp_kind,
+)
 from src.trader.ctp_td import prepare_ctp_dll_search
 
 
@@ -92,23 +98,56 @@ def merge_quote(old: dict[str, Any] | None, incoming: dict[str, Any], *, replace
     return describe_quote(base)
 
 
-def quote_line(row: dict[str, Any]) -> str:
-    """一行说明。价格没变时调用方不要重复写日志。"""
+def quote_channel_word(settings: Any | None = None) -> str:
+    """日志里写真实还是仿真，避免实盘还显示仿真报价。"""
+    if settings is None:
+        return "柜台"
+    kind = normalize_ctp_kind(getattr(settings, "account_kind", "") or "")
+    if kind == CTP_KIND_LIVE:
+        return "真实"
+    return "仿真"
+
+
+def quote_book_key(row: dict[str, Any]) -> tuple[str, ...]:
+    """买一卖一涨跌停。最新价来回跳时不要靠这一组去刷日志。"""
+    view = describe_quote(row)
+    return (
+        str(view.get("symbol") or ""),
+        str(view.get("bid_text") or "—"),
+        str(view.get("ask_text") or "—"),
+        str(view.get("upper_text") or "—"),
+        str(view.get("lower_text") or "—"),
+    )
+
+
+def quote_line(row: dict[str, Any], *, channel: str = "") -> str:
+    """一行说明。交易台盘口用数字显示，不要拿这一行去刷运行日志。"""
     view = describe_quote(row)
     name = str(view.get("symbol") or "")
+    tag = f"{channel}报价" if str(channel or "").strip() else "柜台报价"
     return (
-        f"{name} 仿真报价 最新 {view.get('last_text', '—')}"
+        f"{name} {tag} 最新 {view.get('last_text', '—')}"
         f" 买一 {view.get('bid_text', '—')} 卖一 {view.get('ask_text', '—')}"
         f" 涨停 {view.get('upper_text', '—')} 跌停 {view.get('lower_text', '—')}"
     )
 
 
 class CtpMdClient:
-    """连仿真行情前置，只订阅当前要看的那一个合约。"""
+    """连行情前置，只订阅当前要看的那一个合约。仿真、真实同一套。"""
+
+    def _md_name(self) -> str:
+        """给窗口和日志用的名称：真实行情 / 仿真行情。"""
+        return f"{quote_channel_word(self.settings)}行情"
 
     def __init__(self, settings: Any) -> None:
+        from src.trader.ctp_fronts import collect_fronts
+
         self.settings = settings
-        self.front = market_front(getattr(settings, "md_front", ""))
+        self.fronts = collect_fronts(
+            getattr(settings, "md_front", ""),
+            getattr(settings, "md_fronts", ()),
+        )
+        self.front = self.fronts[0] if self.fronts else market_front(getattr(settings, "md_front", ""))
         self.wanted = ""
         self.latest: dict[str, Any] | None = None
         self.last_tick_at = 0.0
@@ -122,7 +161,7 @@ class CtpMdClient:
     def start(self) -> tuple[bool, str]:
         """连接行情前置并登录。已经登录过就直接返回。"""
         if self.ready and self._api is not None:
-            return True, f"仿真行情已登录 {self.front}"
+            return True, f"{self._md_name()}已登录 {self.front}"
         if not self.front:
             return (
                 False,
@@ -130,13 +169,13 @@ class CtpMdClient:
                 "程序不会按交易端口自动推断行情端口",
             )
         if not str(getattr(self.settings, "broker_id", "") or "").strip():
-            return False, "还没有 BrokerID，不能登录仿真行情"
+            return False, f"还没有 BrokerID，不能登录{self._md_name()}"
         if not str(getattr(self.settings, "user_id", "") or "").strip():
-            return False, "还没有仿真账号，不能登录仿真行情"
+            return False, f"还没有账号，不能登录{self._md_name()}"
         try:
             mdapi = _load_mdapi(getattr(self.settings, "project_root", "") or "")
         except Exception as exc:  # noqa: BLE001
-            text = f"仿真行情接口没有加载成功：{exc}"
+            text = f"{self._md_name()}接口没有加载成功：{exc}"
             logger.warning(text)
             return False, text
         flow = _md_flow_dir(getattr(self.settings, "flow_dir", "") or "data/ctp_flow")
@@ -147,16 +186,18 @@ class CtpMdClient:
         self._api.RegisterSpi(self._spi)
         self._api.RegisterFront(self.front)
         self._api.Init()
-        logger.info("正在连接仿真行情 {}", self.front)
+        logger.info("正在连接{} {}", self._md_name(), self.front)
         timeout = float(getattr(self.settings, "login_timeout_sec", 20) or 20)
         if not self._login_event.wait(timeout):
             self.close()
-            return False, "仿真行情登录超时。测试环境白天交易时段才开放"
+            if quote_channel_word(self.settings) == "真实":
+                return False, f"{self._md_name()}登录超时，请检查行情前置和网络"
+            return False, f"{self._md_name()}登录超时。仿真环境白天交易时段才开放"
         if not self.ready:
-            reason = self._error or "仿真行情登录失败"
+            reason = self._error or f"{self._md_name()}登录失败"
             self.close()
             return False, reason
-        return True, f"仿真行情已登录 {self.front}"
+        return True, f"{self._md_name()}已登录 {self.front}"
 
     def subscribe(self, symbol: str) -> tuple[bool, str]:
         """只订阅这一个合约。期权代码不会拿来覆盖它。"""
@@ -164,18 +205,18 @@ class CtpMdClient:
         if not code:
             return False, "请先填写合约"
         if not self.ready or self._api is None:
-            return False, "仿真行情还没登录"
+            return False, f"{self._md_name()}还没登录"
         self.wanted = code
         try:
             result = self._subscribe(code)
         except Exception as exc:  # noqa: BLE001
-            text = f"订阅仿真行情失败：{exc}"
+            text = f"订阅{self._md_name()}失败：{exc}"
             logger.warning(text)
             return False, text
         if int(result or 0) != 0:
             return False, f"订阅 {code} 没有成功，返回码 {result}"
-        logger.info("已订阅仿真行情 {}", code)
-        return True, f"已订阅仿真行情 {code}。报价会显示在上面，第一次收到时写进日志。"
+        logger.info("已订阅{} {}。报价看交易台数字，不再写入运行日志。", self._md_name(), code)
+        return True, f"已订阅{self._md_name()} {code}。报价看交易台上面的数字，不再写入运行日志。"
 
     def _subscribe(self, code: str) -> int:
         """6.7 封装要合约列表和个数。先按字节再按字符串试一次。"""
@@ -214,19 +255,19 @@ class CtpMdClient:
 
     def on_disconnected(self, reason: str) -> None:
         self.ready = False
-        self._error = reason or "仿真行情断开"
+        self._error = reason or f"{self._md_name()}断开"
         logger.warning(self._error)
         self._login_event.set()
 
     def on_login(self, ok: bool, message: str) -> None:
         if not ok:
             self.ready = False
-            self._error = message or "仿真行情登录失败"
+            self._error = message or f"{self._md_name()}登录失败"
             logger.warning(self._error)
         else:
             self.ready = True
             self._error = ""
-            logger.info("仿真行情登录成功 {}", self.front)
+            logger.info("{}登录成功 {}", self._md_name(), self.front)
         self._login_event.set()
 
     def on_tick(self, row: dict[str, Any]) -> None:
@@ -243,7 +284,7 @@ class CtpMdClient:
             api.RegisterSpi(None)
             api.Release()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("释放仿真行情接口时出错: {}", exc)
+            logger.warning("释放{}接口时出错: {}", self._md_name(), exc)
 
 
 def _md_flow_dir(trade_flow: str) -> str:
@@ -277,7 +318,7 @@ def _build_md_spi(mdapi: Any, client: CtpMdClient) -> Any:
             client.on_connected()
 
         def OnFrontDisconnected(self, reason: int) -> None:
-            client.on_disconnected(f"仿真行情断开，原因码 {reason}")
+            client.on_disconnected(f"{client._md_name()}断开，原因码 {reason}")
 
         def OnRspUserLogin(self, _data: Any, info: Any, _req: int, _last: bool) -> None:
             ok, message = _md_ok(info)
@@ -286,11 +327,11 @@ def _build_md_spi(mdapi: Any, client: CtpMdClient) -> Any:
         def OnRspSubMarketData(self, data: Any, info: Any, _req: int, _last: bool) -> None:
             ok, message = _md_ok(info)
             if not ok:
-                logger.warning("订阅仿真行情被拒绝: {}", message or "柜台没有说明原因")
+                logger.warning("订阅{}被拒绝: {}", client._md_name(), message or "柜台没有说明原因")
                 return
             symbol = ctp_field_symbol(data)
             if symbol:
-                logger.info("仿真行情订阅已确认 {}", symbol)
+                logger.info("{}订阅已确认 {}", client._md_name(), symbol)
 
         def OnRtnDepthMarketData(self, data: Any) -> None:
             row = ctp_depth_row(data)

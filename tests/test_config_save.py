@@ -51,3 +51,63 @@ def test_save_config_keeps_the_old_file_when_replace_fails(tmp_path, monkeypatch
 
     assert path.read_text(encoding="utf-8") == "old: 1\n"
     assert list((tmp_path / "config").glob("*.tmp")) == []
+
+
+def test_save_config_does_not_wipe_auth_code_in_memory(tmp_path, monkeypatch, _no_side_tables):
+    """启动常驻会先保存。写进 yaml 的不能带认证码，但内存里还要留着，否则停掉再开会连不上。"""
+    monkeypatch.setattr(config_loader, "_project_root", lambda: tmp_path)
+    path = tmp_path / "config" / "config.yaml"
+    path.parent.mkdir(parents=True)
+    cfg = {
+        "trade": {
+            "ctp": {
+                "auth_code_env": "CTP_AUTH_CODE",
+                "resolved_auth_code": "keep-me",
+                "ctp_profiles": {
+                    "huatai_live": {
+                        "kind": "live",
+                        "auth_code_env": "CTP_AUTH_CODE",
+                        "resolved_auth_code": "keep-me",
+                    }
+                },
+            }
+        }
+    }
+
+    saved = config_loader.save_config(cfg, path)
+    disk = yaml.safe_load(saved.read_text(encoding="utf-8"))
+    live = disk["trade"]["ctp"]["ctp_profiles"]["huatai_live"]
+    assert "resolved_auth_code" not in live
+    assert "resolved_auth_code" not in disk["trade"]["ctp"]
+    assert cfg["trade"]["ctp"]["resolved_auth_code"] == "keep-me"
+    assert cfg["trade"]["ctp"]["ctp_profiles"]["huatai_live"]["resolved_auth_code"] == "keep-me"
+
+
+def test_from_cfg_rereads_auth_after_memory_was_cleared(monkeypatch):
+    """内存里认证码被清掉后，连柜台前再从环境变量补上。"""
+    monkeypatch.setenv("CTP_AUTH_CODE", "from-env")
+    monkeypatch.setattr(config_loader, "load_secrets", lambda: {})
+    from src.trader.ctp_gateway import CtpSettings
+
+    settings = CtpSettings.from_cfg(
+        {
+            "account": {"user_id": "20318052", "resolved_password": "pw"},
+            "trade": {
+                "ctp": {
+                    "account_kind": "live",
+                    "ctp_profile": "huatai_live",
+                    "ctp_profiles": {
+                        "huatai_live": {
+                            "kind": "live",
+                            "td_front": "tcp://live:1",
+                            "md_front": "tcp://live:2",
+                            "broker_id": "8080",
+                            "auth_code_env": "CTP_AUTH_CODE",
+                        }
+                    },
+                }
+            },
+        }
+    )
+    assert settings.auth_code == "from-env"
+    assert settings.missing() == []

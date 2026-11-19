@@ -46,7 +46,8 @@ class SuperTrendStrategy(StrategyBase):
         trade = cfg.get("trade", {}) or {}
 
         self.timeframe = str(st.get("timeframe", "5"))
-        self.trail_timeframe = self.timeframe
+        # 止损周期跟左边公共项，不再强行抄成信号周期。
+        self.trail_timeframe = str(st.get("trail_timeframe") or self.timeframe)
         self.symbols: list[str] = list(st.get("symbols") or [trade.get("symbol", "bu2612")])
         self.volume = int(trade.get("volume", 1))
         # 止损触发方式（全策略共用）：touch 影线碰到止损线就平，close 等收盘确认。

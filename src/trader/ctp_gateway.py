@@ -25,7 +25,9 @@ from loguru import logger
 
 from src.trader.order_timeline import elapsed_ms, new_trace_id, now_iso
 from src.trader.ctp_logic import (
+    CTP_KIND_LIVE,
     CTP_KIND_SIM,
+    normalize_ctp_kind,
     OrderTable,
     PositionView,
     SessionTracker,
@@ -34,6 +36,7 @@ from src.trader.ctp_logic import (
     OrderActivity,
     apply_order_report,
     apply_trade,
+    foreign_report_notice,
     ctp_exchange_id,
     ctp_instrument_id,
     is_terminal,
@@ -89,6 +92,17 @@ def probe_front_tcp(td_front: str, timeout_sec: float = 3.0) -> bool | None:
         return False
 
 
+def _flow_dir_for_kind(base: str, kind: Any) -> str:
+    """仿真和真实各用一个流文件目录，避免两个账号抢同一份柜台缓存。"""
+    text = str(base or "data/ctp_flow").replace("\\", "/").rstrip("/")
+    if text.endswith("_sim") or text.endswith("_live"):
+        return str(base)
+    flag = "_live" if normalize_ctp_kind(kind) == CTP_KIND_LIVE else "_sim"
+    if text.endswith("ctp_flow"):
+        return f"{text}{flag}"
+    return str(base)
+
+
 @dataclass
 class CtpSettings:
     """连接柜台需要的参数。密码和认证码只留在内存里。"""
@@ -115,6 +129,9 @@ class CtpSettings:
     account_user_id: str = ""
     # 行情前置只认配置（券商档案或 trade.ctp.md_front），不按交易端口推断。
     md_front: str = ""
+    # 多台备用。连接时全部 RegisterFront，断线由柜台在列表里换。
+    td_fronts: tuple[str, ...] = ()
+    md_fronts: tuple[str, ...] = ()
     # sim=仿真账号，live=真实账号。窗口和策略共用这一项。
     account_kind: str = CTP_KIND_SIM
     # 交易台会话：报单代码与常驻相同，但不因「已有挂单」拒单，也不超时自动撤。
@@ -131,18 +148,40 @@ class CtpSettings:
 
         trade = cfg.get("trade") or {}
         account = cfg.get("account") or {}
+        # 保存配置会从磁盘副本拿掉密钥；连柜台前再从密钥文件补进内存。
+        try:
+            from src.utils.config_loader import inject_ctp_secrets
+
+            inject_ctp_secrets(cfg)
+            trade = cfg.get("trade") or trade
+            account = cfg.get("account") or account
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("补读 CTP 密钥失败，仍按当前内存配置连接: {}", exc)
         # 公共默认 + 券商档案覆盖；没有档案或档案名写错时连接字段留空，登录会明确报错。
-        ctp = resolve_ctp_profile(trade.get("ctp") or {}, account=account)
+        raw_ctp = trade.get("ctp") or {}
+        ctp = resolve_ctp_profile(
+            raw_ctp,
+            account=account,
+            kind=(raw_ctp.get("account_kind") if isinstance(raw_ctp, dict) else None),
+        )
         for note in profile_validation_notes(trade.get("ctp") or {}, account=account):
             logger.debug("CTP 档案提示：{}", note)
         root = str(cfg.get("_project_root") or "")
-        flow = str(ctp.get("flow_dir") or "data/ctp_flow")
+        flow = _flow_dir_for_kind(
+            str(ctp.get("flow_dir") or "data/ctp_flow"),
+            str(ctp.get("account_kind") or CTP_KIND_SIM),
+        )
         flow_path = Path(flow)
         if root and not flow_path.is_absolute():
             flow_path = Path(root) / flow_path
         products = ctp.get("close_split_products") or ["bu", "c"]
+        from src.trader.ctp_fronts import collect_fronts
+
+        td_list = collect_fronts(ctp.get("td_front"), ctp.get("td_fronts"))
+        md_list = collect_fronts(ctp.get("md_front"), ctp.get("md_fronts"))
         return cls(
-            td_front=str(ctp.get("td_front") or "").strip(),
+            td_front=td_list[0] if td_list else "",
+            td_fronts=tuple(td_list),
             broker_id=str(ctp.get("broker_id") or "").strip(),
             user_id=str(ctp.get("user_id") or "").strip(),
             password=str(ctp.get("resolved_password") or ""),
@@ -161,7 +200,8 @@ class CtpSettings:
             auto_cancel_on_timeout=_flag(ctp.get("auto_cancel_on_timeout"), True),
             cancel_wait_sec=float(ctp.get("cancel_wait_sec") or 3),
             account_user_id=str(account.get("user_id") or "").strip(),
-            md_front=str(ctp.get("md_front") or "").strip(),
+            md_front=md_list[0] if md_list else "",
+            md_fronts=tuple(md_list),
             account_kind=str(ctp.get("account_kind") or CTP_KIND_SIM),
             desk_session=_flag(ctp.get("desk_session"), False),
             auth_code_env=(
@@ -200,7 +240,7 @@ class CtpSettings:
         if not self.app_id:
             names.append("AppID")
         if self.auth_code_env and not self.auth_code:
-            names.append("认证码")
+            names.append("认证码（密钥没读到）")
         return names
 
 
@@ -222,7 +262,7 @@ class CtpGateway:
         self.fill_handler: Callable[[dict[str, Any]], None] | None = None
         # 只读时间线监听器，和真实成交入账 handler 分开；记录异常不能影响报单。
         self.order_event_handler: Callable[[str, dict[str, Any]], None] | None = None
-        self._last_quote_line = ""
+        self._last_quote_book: tuple[str, ...] | None = None
         self._lock = threading.RLock()
         self._ready_event = threading.Event()
         self._pos_event = threading.Event()
@@ -251,7 +291,7 @@ class CtpGateway:
         )
         # 测试时可以手动暂停。暂停后新报单留在本机，不发到柜台。
         self.trading_paused = False
-        # 仿真公用账号会把别人的成交一并推过来。那些单不是我们发的，只记次数，不逐条当错误。
+        # 本程序没发过的回报（实盘：其他终端/手机；仿真：公用账号别人的单）。只记次数，不逐条当错误。
         self.foreign_reports = 0
 
     def connect(self) -> tuple[bool, str]:
@@ -324,19 +364,26 @@ class CtpGateway:
 
     def _timeout_hint(self) -> str:
         """根据端口能不能通，写出用户能看懂的超时原因。"""
-        front = self.settings.td_front
+        from src.trader.ctp_fronts import collect_fronts, probe_front_list
+
+        fronts = collect_fronts(
+            self.settings.td_front,
+            getattr(self.settings, "td_fronts", ()),
+        )
         wait = int(self.settings.login_timeout_sec)
-        tcp_ok = probe_front_tcp(front)
-        if tcp_ok is False:
+        rows = probe_front_list(fronts)
+        ok_count = sum(1 for _front, ok in rows if ok is True)
+        front = fronts[0] if fronts else self.settings.td_front
+        if rows and ok_count == 0 and all(ok is False for _front, ok in rows):
             return (
-                f"连不上交易前置 {front}（网络或防火墙拦截）。"
-                "请检查网络，或向华泰确认最新仿真前置地址。"
+                f"连不上交易前置（已试 {len(rows)} 台，网络或防火墙拦截）。"
+                f"第一台 {front}。请检查网络，或向华泰确认最新前置地址。"
             )
-        if tcp_ok is True:
+        if ok_count:
             return (
-                f"交易前置 {front} 端口能通，但 {wait} 秒内柜台没有完成握手。"
-                "这通常是华泰仿真前置暂时无响应，不是账号或密码错误。"
-                "请过几分钟再点「连接登录」，或联系华泰确认仿真环境是否可用。"
+                f"交易前置有 {ok_count}/{len(rows)} 台端口能通，但 {wait} 秒内柜台没有完成握手。"
+                "这通常是前置暂时无响应，不是账号或密码错误。"
+                "请过几分钟再点「连接登录」，或联系华泰确认环境是否可用。"
             )
         return f"连接交易前置超时（已等 {wait} 秒）"
 
@@ -657,7 +704,14 @@ class CtpGateway:
                 self._note_foreign_report()
                 return
             order.last_report_received_at = received_at
-            apply_order_report(order, status_code="rejected", message=message or "拒单")
+            from src.trader.ctp_logic import explain_ctp_reject
+
+            hinted = explain_ctp_reject(
+                message or "拒单",
+                account_kind=str(self.settings.account_kind or ""),
+                user_id=str(self.settings.user_id or ""),
+            )
+            apply_order_report(order, status_code="rejected", message=hinted)
             logger.error("柜台返回错误，报单 {}：{}", order_ref, order.message)
             report, waiter = self._finish_locked(order)
             event = self._order_event_payload(
@@ -694,8 +748,8 @@ class CtpGateway:
             order = self.table.get(order_ref)
             extra = detail or {}
             if order is None:
-                # 不是这次登录由本程序发出的报单。共享账号上别人的单、手工单通常也带合约代码，
-                # 不能因为字段齐全就收编进来，否则它们的成交会写进本程序账本。
+                # 不是这次登录由本程序发出的报单。手机、其他终端、仿真公用账号上别人的单
+                # 通常也带合约代码，不能因为字段齐全就收编，否则成交会写进本程序账本。
                 self._note_foreign_report()
                 return
             if extra.get("symbol") and not order.symbol:
@@ -717,12 +771,14 @@ class CtpGateway:
             order.last_report_received_at = received_at
             self._stamp_order_meta(order, extra)
             apply_order_report(order, status_code=status_code, filled=filled, message=message)
-            logger.info(
-                "报单 {} {} {}",
-                order_ref,
-                STATUS_TEXT.get(order.status, order.status),
-                message,
-            )
+            mapped = STATUS_TEXT.get(order.status, order.status)
+            raw = str(message or "").strip()
+            # 本机状态已经是「全部成交」时，柜台仍可能再推「已提交/未成交」。
+            # 不要把两句并成「全部成交 未成交」，以免看起来像判断错了。
+            if raw and raw != mapped:
+                logger.info("报单 {} {}（柜台原文：{}）", order_ref, mapped, raw)
+            else:
+                logger.info("报单 {} {}", order_ref, mapped)
             report, waiter = self._finish_locked(order)
             event = self._order_event_payload(
                 order,
@@ -749,14 +805,15 @@ class CtpGateway:
 
     def _note_foreign_report(self) -> None:
         """
-        公用仿真账号上别人的回报。
+        本程序这次登录没发过的回报。
 
-        登录后柜台会把今天这个账号上所有人的成交、拒单一起推过来。
-        那些单不是我们发的，第一笔说明一次，后面不再逐条写成错误。
+        登录后柜台会把今天这个账号上的委托、成交一起推过来。
+        实盘多半是手机同花顺或其他终端下的；仿真才可能是公用账号上别人的。
+        第一笔说明一次，后面不再逐条写成错误。
         """
         self.foreign_reports += 1
         if self.foreign_reports == 1:
-            logger.info("仿真公用账号上有别人的历史回报。那些单不是这次登录发出的，后面不再逐条显示。")
+            logger.info(foreign_report_notice(self.settings.account_kind))
 
     def on_trade(self, order_ref: str, price: float, volume: int, detail: dict[str, Any] | None = None) -> None:
         received_at = now_iso()
@@ -937,7 +994,10 @@ class CtpGateway:
                 )
             if is_last:
                 self.session.on_orders_checked()
-                logger.info("今日委托已核对，共 {} 笔", len(self.table.orders))
+                counted = len(self.table.orders)
+                logger.info("今日委托已核对，共 {} 笔", counted)
+                # 顶栏「今日报单笔数」跟柜台今天的委托对齐，重启后不再显示 0。
+                self.activity.sync_from_broker_count(counted)
                 self._ready_event.set()
                 self._order_query_event.set()
         self._account_fill(report)
@@ -982,15 +1042,13 @@ class CtpGateway:
         band = self._instrument
         if not band:
             return False, self._instrument_error or "柜台没有这个合约的涨跌停"
-        from src.trader.ctp_md import describe_quote, quote_line
+        from src.trader.ctp_md import describe_quote, quote_channel_word, quote_line
 
         view = describe_quote(band)
         band.update(view)
         name = str(band.get("symbol") or symbol)
-        text = quote_line(band)
-        if text != self._last_quote_line:
-            self._last_quote_line = text
-            logger.info("柜台快照 {}", text)
+        text = quote_line(band, channel=quote_channel_word(self.settings))
+        # 涨跌停给窗口用。盘口跳动不要写「柜台快照」，否则交易台补刷时日志会刷满。
         if band.get("upper_text") == "—" and band.get("lower_text") == "—":
             return True, f"{name} 柜台这次没有给出涨停价和跌停价"
         return True, text
@@ -1013,15 +1071,33 @@ class CtpGateway:
         if isinstance(available, dict):
             self.account = dict(available)
             self.available = float(available.get("available") or 0)
-            logger.info(
-                "柜台可用资金 {:.2f}，动态权益 {:.2f}",
-                self.available,
-                float(available.get("balance") or 0),
-            )
+            balance = float(available.get("balance") or 0)
+            stamp = (round(self.available, 2), round(balance, 2))
+            # 查询每几十秒一次。数字没变、或只是几十元盯市跳动，不要刷屏。
+            last = getattr(self, "_last_logged_account", None)
+            last_at = float(getattr(self, "_last_account_log_at", 0) or 0)
+            now = time.monotonic()
+            jump = True
+            if isinstance(last, tuple) and len(last) >= 2:
+                jump = abs(stamp[1] - float(last[1])) >= 200.0 or abs(stamp[0] - float(last[0])) >= 200.0
+            if last is None or jump or now - last_at >= 180.0:
+                logger.info("柜台可用资金 {:.2f}，动态权益 {:.2f}", self.available, balance)
+                self._last_logged_account = stamp
+                self._last_account_log_at = now
         elif available is not None:
             self.available = float(available)
             self.account["available"] = self.available
-            logger.info("柜台可用资金 {:.2f}", self.available)
+            stamp = (round(self.available, 2),)
+            last = getattr(self, "_last_logged_account", None)
+            last_at = float(getattr(self, "_last_account_log_at", 0) or 0)
+            now = time.monotonic()
+            jump = True
+            if isinstance(last, tuple) and len(last) >= 1:
+                jump = abs(stamp[0] - float(last[0])) >= 200.0
+            if last is None or jump or now - last_at >= 180.0:
+                logger.info("柜台可用资金 {:.2f}", self.available)
+                self._last_logged_account = stamp
+                self._last_account_log_at = now
         if is_last:
             self._account_event.set()
 
@@ -1135,11 +1211,15 @@ class CtpGateway:
         """
         if not is_terminal(order.status):
             return None, None
+        leftover = max(0, int(order.filled) - int(order.accounted_volume))
+        # 委托回报已经「全部成交」，成交回报还没带价格：先不叫醒 submit。
+        # 否则会按限价记账，下一轮对账又说柜台还没仓，把程序账误平。
+        if leftover > 0 and float(order.avg_price or 0) <= 0 and order.status == "filled":
+            return None, None
         waiter = self._waiters.get(order.order_ref)
         # 撤单或部分成交后剩余作废时，已经成交的手数同样要入账；
         # 否则内部持仓会一直比柜台少一截，对账永远不通过。
         # 只记「还没记过的那部分」：回调可能在部分成交时就记过一次。
-        leftover = max(0, int(order.filled) - int(order.accounted_volume))
         report: dict[str, Any] | None = None
         if leftover > 0 and not order.foreign and self.fill_handler is not None:
             report = order.to_dict()

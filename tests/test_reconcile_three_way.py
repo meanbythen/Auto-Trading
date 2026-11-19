@@ -224,6 +224,21 @@ def test_unclaimed_broker_position_installed_and_frozen(tmp_path, monkeypatch) -
     assert "bu2612" in bot._frozen_noted
 
 
+def test_reject_unclaimed_follows_local_book(tmp_path, monkeypatch) -> None:
+    """拒绝仓单：柜台有、账本没有时不收进来，解除冻结，等下一根信号。"""
+    bot = TradingBot(_cfg(tmp_path, dry_run=False))
+    bot._frozen_symbols.add("lh2701")
+    bot._reconcile_state = {"unclaimed": ["lh2701"], "phantom": [], "extra": [], "ok": False}
+    monkeypatch.setattr(bot.kline, "fetch", lambda *_args, **_kwargs: None)
+
+    ok, msg = bot.reject_broker_lots("lh2701")
+
+    assert ok is True
+    assert "lh2701" not in bot._frozen_symbols
+    assert bot._reconcile_state["unclaimed"] == []
+    assert "程序账" in msg
+
+
 def test_ignore_keeps_symbol_frozen(tmp_path) -> None:
     """「忽略」只清待办提示，不解除冻结。"""
     bot = TradingBot(_cfg(tmp_path))
@@ -317,3 +332,104 @@ def test_persist_and_status_expose_reconcile(tmp_path) -> None:
     snap = bot.status_snapshot()
     assert snap["reconcile"]["queried"] is False
     assert snap["frozen_symbols"] == []
+
+
+def test_unclaimed_after_own_close_does_not_reopen(tmp_path, monkeypatch) -> None:
+    """刚收盘清仓成交后，柜台查询还显示空单：不能冻结，也不能把仓再开回来。"""
+    bot = TradingBot(_cfg(tmp_path, dry_run=False))
+    monkeypatch.setattr(bot.kline, "latest_price", lambda symbol: 9405.0)
+    monkeypatch.setattr(signal_book, "write_capital_to_config", lambda _balance: None)
+    bot._note_own_fill("lh2701", kind="close")
+    bot._apply_reconcile(
+        _report(
+            broker={"lh2701": -1},
+            ledger={},
+            memory={},
+            diffs=["lh2701 柜台 -1 手，账本 0 手"],
+            unclaimed=["lh2701"],
+        ),
+        phase="runtime",
+    )
+    pos = bot.strategy.positions.get("lh2701")
+    held = int(getattr(pos, "volume", 0) or 0) if pos is not None else 0
+    assert held == 0
+    assert "lh2701" not in bot._frozen_symbols
+    book = load_book(tmp_path) or {}
+    opens = [row for row in book.get("trades") or [] if str(row.get("offset")) == "开仓"]
+    assert opens == []
+    rec = bot._reconcile_state or {}
+    assert rec.get("unclaimed") == []
+    assert rec.get("ok") is True
+
+
+def test_unclaimed_recent_own_fill_is_auto_adopted(tmp_path, monkeypatch) -> None:
+    """本程序刚成交、柜台已有仓、账本还是 0：自动认领，不再每轮冻结刷屏。"""
+    bot = TradingBot(_cfg(tmp_path, dry_run=False))
+    monkeypatch.setattr(bot.kline, "latest_price", lambda symbol: 3500.0)
+    monkeypatch.setattr(signal_book, "write_capital_to_config", lambda _balance: None)
+    bot._note_own_fill("bu2612")
+    bot._apply_reconcile(
+        _report(
+            broker={"bu2612": -1},
+            ledger={},
+            memory={},
+            diffs=["bu2612 柜台 -1 手，账本 0 手"],
+            unclaimed=["bu2612"],
+        ),
+        phase="runtime",
+    )
+    book = load_book(tmp_path) or {}
+    opens = [row for row in book.get("trades") or [] if str(row.get("offset")) == "开仓"]
+    assert opens
+    assert "bu2612" not in bot._frozen_symbols
+
+
+def test_install_position_does_not_log_same_lot_twice(tmp_path) -> None:
+    bot = TradingBot(_cfg(tmp_path))
+    bot._install_position("bu2612", -1, 3892.0, "broker")
+    first = bot.strategy.positions.get("bu2612")
+    bot._install_position("bu2612", -1, 3892.0, "broker")
+    second = bot.strategy.positions.get("bu2612")
+    assert first is second
+
+
+def test_phantom_skips_while_own_fill_is_fresh(tmp_path, monkeypatch) -> None:
+    """刚成交时柜台查询可能还是 0 手，不能两轮就把程序账平掉。"""
+    _write_state(tmp_path, positions={"bu2612": _position(volume=1)})
+    bot = TradingBot(_cfg(tmp_path, dry_run=False))
+    monkeypatch.setattr(bot.kline, "latest_price", lambda symbol: 3500.0)
+    monkeypatch.setattr(signal_book, "write_capital_to_config", lambda _balance: None)
+    _record_open(tmp_path, volume=1)
+    bot._note_own_fill("bu2612")
+    report = _report(
+        broker={},
+        ledger={"bu2612": 1},
+        memory={"bu2612": 1},
+        diffs=["bu2612 柜台 0 手，账本 1 手"],
+        phantom=["bu2612"],
+    )
+    bot._apply_reconcile(report, phase="runtime")
+    bot._apply_reconcile(report, phase="runtime")
+    assert bot.strategy.positions["bu2612"].volume == 1
+    assert _close_rows(tmp_path) == []
+
+
+def test_reconcile_still_flattens_if_own_fill_helper_missing(tmp_path, monkeypatch) -> None:
+    """旧进程没有 _own_fill_too_fresh 时，对账也不能整轮崩掉。"""
+    _write_state(tmp_path, positions={"bu2612": _position(volume=1)})
+    bot = TradingBot(_cfg(tmp_path, dry_run=False))
+    monkeypatch.setattr(bot.kline, "latest_price", lambda symbol: 3500.0)
+    monkeypatch.setattr(signal_book, "write_capital_to_config", lambda _balance: None)
+    _record_open(tmp_path, volume=1)
+    bot._own_fill_too_fresh = None  # type: ignore[assignment]
+    report = _report(
+        broker={},
+        ledger={"bu2612": 1},
+        memory={"bu2612": 1},
+        diffs=["bu2612 柜台 0 手，账本 1 手"],
+        phantom=["bu2612"],
+    )
+    bot._apply_reconcile(report, phase="runtime")
+    bot._apply_reconcile(report, phase="runtime")
+    assert bot.strategy.positions["bu2612"].side == "flat"
+    assert len(_close_rows(tmp_path)) == 1

@@ -90,6 +90,82 @@ def _read_ctp_secret(env_name: str, secrets: dict[str, Any], *fallbacks: str) ->
     return ""
 
 
+def inject_ctp_secrets(cfg: dict[str, Any], secrets: dict[str, Any] | None = None) -> None:
+    """
+    把密码和认证码填进内存配置。不写磁盘、不打日志。
+
+    启动常驻会先保存配置；保存必须把密钥从文件里拿掉。
+    以前保存会把内存里那一份也清掉，停掉再开常驻就会报「缺少认证码」。
+    连柜台前再调用一次，密钥仍从环境变量或 secrets.local.yaml 读。
+    """
+    box = secrets if secrets is not None else load_secrets()
+    pwd_env = str((cfg.get("account") or {}).get("password_env") or "FUTURES_PASSWORD")
+    password = os.environ.get(pwd_env, "")
+    if not password:
+        password = str(box.get("password", "") or "")
+        if password:
+            os.environ[pwd_env] = password
+    account = cfg.setdefault("account", {})
+    if not isinstance(account, dict):
+        return
+    # 已经有的不覆盖：单测会手填 resolved_*；保存清掉之后才是空的，这时再补。
+    if not str(account.get("resolved_password") or "").strip():
+        account["resolved_password"] = password
+    else:
+        password = str(account.get("resolved_password") or "")
+
+    trade = cfg.setdefault("trade", {})
+    if not isinstance(trade, dict):
+        return
+    ctp = trade.setdefault("ctp", {})
+    if not isinstance(ctp, dict):
+        return
+    from src.trader.ctp_profile import (
+        DEFAULT_AUTH_CODE_ENV,
+        DEFAULT_LIVE_PASSWORD_ENV,
+        DEFAULT_SIM_PASSWORD_ENV,
+    )
+
+    auth_env = str(ctp.get("auth_code_env") or DEFAULT_AUTH_CODE_ENV)
+    if not str(ctp.get("resolved_auth_code") or "").strip():
+        ctp["resolved_auth_code"] = _read_ctp_secret(auth_env, box)
+    ctp_password = _read_ctp_secret(DEFAULT_SIM_PASSWORD_ENV, box, "ctp_password")
+    live_password = _read_ctp_secret(DEFAULT_LIVE_PASSWORD_ENV, box, "ctp_live_password")
+    if not live_password:
+        live_password = password
+    if not str(ctp.get("resolved_sim_password") or "").strip():
+        ctp["resolved_sim_password"] = ctp_password
+    if not str(ctp.get("resolved_live_password") or "").strip():
+        ctp["resolved_live_password"] = live_password
+    if not str(ctp.get("resolved_password") or "").strip():
+        ctp["resolved_password"] = ctp_password
+    profiles = ctp.get("ctp_profiles")
+    if not isinstance(profiles, dict):
+        return
+    for item in profiles.values():
+        if not isinstance(item, dict):
+            continue
+        kind_value = item.get("kind")
+        if kind_value is None:
+            kind_value = ctp.get("account_kind")
+        live_profile = _same_kind(kind_value, "live")
+        item_env = str(
+            item.get("password_env")
+            or (DEFAULT_LIVE_PASSWORD_ENV if live_profile else DEFAULT_SIM_PASSWORD_ENV)
+        )
+        pwd = _read_ctp_secret(item_env, box)
+        if not pwd and live_profile:
+            pwd = live_password or password
+        if not str(item.get("resolved_password") or "").strip():
+            item["resolved_password"] = pwd
+        code_env = item.get("auth_code_env")
+        if code_env is None:
+            code_env = auth_env
+        code_env = str(code_env or "")
+        if not str(item.get("resolved_auth_code") or "").strip():
+            item["resolved_auth_code"] = _read_ctp_secret(code_env, box) if code_env else ""
+
+
 def _same_kind(value: Any, kind: str) -> bool:
     """配置里的 kind 可能是 live / 真实账号 / real。"""
     text = str(value or "").strip().lower()
@@ -275,6 +351,10 @@ def _preview_keys(paths: list[str], limit: int = 8) -> str:
     return shown
 
 
+# 启动会多次 load_config，同一份未知键只告警一次，避免日志连打两行。
+_last_unknown_config_keys: tuple[str, ...] | None = None
+
+
 def _warn_config_key_diff(cfg: dict[str, Any], example: Path) -> None:
     """
     和 config.example.yaml 对键名，不中断加载。
@@ -282,6 +362,7 @@ def _warn_config_key_diff(cfg: dict[str, Any], example: Path) -> None:
     多写的键可能拼错或已废弃，记 warning；
     少写的键一律按程序默认值处理，属于正常裁剪，只在 debug 里提示。
     """
+    global _last_unknown_config_keys
     try:
         with example.open("r", encoding="utf-8") as f:
             data = yaml.safe_load(f) or {}
@@ -292,7 +373,10 @@ def _warn_config_key_diff(cfg: dict[str, Any], example: Path) -> None:
         return
     unknown, missing = diff_config_keys(cfg, data)
     if unknown:
-        logger.warning("配置里有示例没有的键（可能拼错或已废弃）: {}", _preview_keys(unknown))
+        stamp = tuple(unknown)
+        if stamp != _last_unknown_config_keys:
+            _last_unknown_config_keys = stamp
+            logger.warning("配置里有示例没有的键（可能拼错或已废弃）: {}", _preview_keys(unknown))
     if missing:
         logger.debug("配置缺少示例里的键，按程序默认值处理: {}", _preview_keys(missing))
 
@@ -332,63 +416,8 @@ def load_config(
 
     secrets = load_secrets()
     pwd_env = cfg.get("account", {}).get("password_env", "FUTURES_PASSWORD")
-    password = os.environ.get(pwd_env, "")
-    if not password:
-        password = str(secrets.get("password", "") or "")
-        if password:
-            # 同步到当前进程环境，方便其它模块读取
-            os.environ[pwd_env] = password
-
-    cfg.setdefault("account", {})["resolved_password"] = password
-
-    # 认证码和密码一样，只放环境变量或本地密钥，不写进 config.yaml，也不打日志。
-    trade = cfg.setdefault("trade", {})
-    if isinstance(trade, dict):
-        ctp = trade.setdefault("ctp", {})
-        if isinstance(ctp, dict):
-            from src.trader.ctp_profile import (
-                DEFAULT_AUTH_CODE_ENV,
-                DEFAULT_LIVE_PASSWORD_ENV,
-                DEFAULT_SIM_PASSWORD_ENV,
-            )
-
-            auth_env = str(ctp.get("auth_code_env") or DEFAULT_AUTH_CODE_ENV)
-            ctp["resolved_auth_code"] = _read_ctp_secret(auth_env, secrets)
-            # 仿真密码、实盘密码、同花顺密码三套分开，互不顶替。
-            ctp_password = _read_ctp_secret(DEFAULT_SIM_PASSWORD_ENV, secrets, "ctp_password")
-            live_password = _read_ctp_secret(DEFAULT_LIVE_PASSWORD_ENV, secrets, "ctp_live_password")
-            # 没单独写实盘密码时，CTP 真实通道用同一份交易密码（同花顺登录那一份）。
-            if not live_password:
-                live_password = password
-            ctp["resolved_sim_password"] = ctp_password
-            ctp["resolved_live_password"] = live_password
-            ctp["resolved_password"] = ctp_password
-
-            # 券商档案各自的密码/认证码环境变量。旧配置没有这一节时什么都不做。
-            profiles = ctp.get("ctp_profiles")
-            if isinstance(profiles, dict):
-                for item in profiles.values():
-                    if not isinstance(item, dict):
-                        continue
-                    kind_value = item.get("kind")
-                    if kind_value is None:
-                        kind_value = ctp.get("account_kind")
-                    live_profile = _same_kind(kind_value, "live")
-                    pwd_env = str(
-                        item.get("password_env")
-                        or (DEFAULT_LIVE_PASSWORD_ENV if live_profile else DEFAULT_SIM_PASSWORD_ENV)
-                    )
-                    pwd = _read_ctp_secret(pwd_env, secrets)
-                    if not pwd and live_profile:
-                        pwd = live_password or password
-                    item["resolved_password"] = pwd
-                    code_env = item.get("auth_code_env")
-                    if code_env is None:
-                        code_env = auth_env
-                    code_env = str(code_env or "")
-                    item["resolved_auth_code"] = (
-                        _read_ctp_secret(code_env, secrets) if code_env else ""
-                    )
+    inject_ctp_secrets(cfg, secrets)
+    password = str((cfg.get("account") or {}).get("resolved_password") or "")
 
     if not password:
         logger.warning(
@@ -463,16 +492,22 @@ def save_config(cfg: dict[str, Any], config_path: str | Path | None = None) -> P
             exc,
         )
 
+    # 只改准备写盘的副本。trade 是嵌套字典，浅拷贝后若直接改 ctp，会把内存里的认证码一并清掉。
     dump = {k: v for k, v in cfg.items() if not str(k).startswith("_")}
     risk_dump = dump.get("risk")
     if isinstance(risk_dump, dict):
-        risk_dump.pop("max_position", None)
+        dump["risk"] = dict(risk_dump)
+        dump["risk"].pop("max_position", None)
+        risk_dump = dump["risk"]
     _drop_dead_keys(dump)
     if "account" in dump and isinstance(dump["account"], dict):
         dump["account"] = {k: v for k, v in dump["account"].items() if k != "resolved_password"}
     trade_dump = dump.get("trade")
-    if isinstance(trade_dump, dict) and isinstance(trade_dump.get("ctp"), dict):
-        trade_dump["ctp"] = _strip_ctp_runtime(trade_dump["ctp"])
+    if isinstance(trade_dump, dict):
+        trade_dump = dict(trade_dump)
+        dump["trade"] = trade_dump
+        if isinstance(trade_dump.get("ctp"), dict):
+            trade_dump["ctp"] = _strip_ctp_runtime(trade_dump["ctp"])
 
     text = yaml.safe_dump(dump, allow_unicode=True, sort_keys=False)
     path.parent.mkdir(parents=True, exist_ok=True)

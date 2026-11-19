@@ -45,11 +45,35 @@ def test_events_snapshot_and_state_carry_run_id(tmp_path) -> None:
     snap = bot.status_snapshot()
     assert snap["run_id"] == bot.run_id
     assert snap["started_at"] == bot.started_at
+    # 界面「执行通道」卡片靠这几项判断连没连上；缺了会一直显示未连接。
+    assert snap["ctp_ready"] is False
+    assert snap["dry_run"] is True
+    assert "ctp_user" in snap
+    assert "ctp_error" in snap
 
     state = load_state(default_state_path(tmp_path))
     assert state["run_id"] == bot.run_id
     assert state["started_at"] == bot.started_at
     assert int(state["pid"]) > 0
+
+
+def test_ctp_card_ready_when_session_logged_in(tmp_path) -> None:
+    """柜台已就绪时，快照必须把 ctp_ready 设为真，否则顶栏会一直显示未连接。"""
+    from types import SimpleNamespace
+
+    bot = TradingBot(_cfg(tmp_path))
+    bot.logged_in = True
+    bot.trader = SimpleNamespace(
+        capabilities=SimpleNamespace(orders_via_broker=True),
+        gateway=SimpleNamespace(
+            session=SimpleNamespace(ready=True, last_error=""),
+            settings=SimpleNamespace(user_id="20318052", account_kind="live"),
+        ),
+    )
+    snap = bot.status_snapshot()
+    assert snap["ctp_ready"] is True
+    assert snap["ctp_user"] == "20318052"
+    assert snap["ctp_kind"] == "live"
 
 
 def test_run_id_format_and_uniqueness(tmp_path) -> None:

@@ -15,7 +15,43 @@ import pandas as pd
 
 from src.backtest.exit_policy import next_open_price, next_tradable_bar_index
 from src.data.periods import canonical_period, last_ohlc_price
+from src.utils.session_clock import bar_stamp_fillable
 from src.utils.trading_day import futures_trading_day
+
+
+def _precompute_next_fills(
+    signal: pd.DataFrame,
+    *,
+    timeframe: str,
+    symbol: str,
+    cfg: dict[str, Any] | None,
+) -> tuple[list[int | None], list[float | None]]:
+    """从后往前记下每一根后面第一根能成交的 K，回测循环里直接取。"""
+    n = len(signal)
+    nxt_i: list[int | None] = [None] * n
+    nxt_o: list[float | None] = [None] * n
+    if n == 0:
+        return nxt_i, nxt_o
+    code = canonical_period(timeframe)
+    opens = pd.to_numeric(signal["open"], errors="coerce")
+    if code in ("D", "W"):
+        for j in range(n - 1):
+            nxt_i[j] = j + 1
+            nxt_o[j] = float(opens.iloc[j + 1])
+        return nxt_i, nxt_o
+    if not str(code).isdigit():
+        return nxt_i, nxt_o
+    fillable = [
+        bar_stamp_fillable(signal.index[j], symbol=symbol, cfg=cfg) for j in range(n)
+    ]
+    next_fill: int | None = None
+    for j in range(n - 1, -1, -1):
+        nxt_i[j] = next_fill
+        if next_fill is not None:
+            nxt_o[j] = float(opens.iloc[next_fill])
+        if fillable[j]:
+            next_fill = j
+    return nxt_i, nxt_o
 
 
 def _ts_to_dt(ts: Any) -> datetime:
@@ -97,6 +133,13 @@ class BarCursor:
         self.fill_next_open = fill_next_open
         self.symbol = str(symbol or "")
         self.cfg = cfg
+        # 下一根可成交位置先整表算完，避免每根再往后扫一遍休市。
+        self._next_index: list[int | None] | None = None
+        self._next_open: list[float | None] | None = None
+        if fill_next_open:
+            self._next_index, self._next_open = _precompute_next_fills(
+                signal, timeframe=timeframe, symbol=self.symbol, cfg=self.cfg
+            )
 
     def __len__(self) -> int:
         return max(0, self.end - self.start)
@@ -121,17 +164,21 @@ class BarCursor:
         next_open: float | None = None
         next_index: int | None = None
         if self.fill_next_open:
-            next_open = next_open_price(
-                self.signal, i, self.timeframe, symbol=self.symbol, cfg=self.cfg
-            )
-            if next_open is not None:
-                code = canonical_period(self.timeframe)
-                if code in ("D", "W"):
-                    next_index = i + 1 if i + 1 < len(self.signal) else None
-                else:
-                    next_index = next_tradable_bar_index(
-                        self.signal, i, symbol=self.symbol, cfg=self.cfg
-                    )
+            if self._next_open is not None and self._next_index is not None:
+                next_open = self._next_open[i]
+                next_index = self._next_index[i]
+            else:
+                next_open = next_open_price(
+                    self.signal, i, self.timeframe, symbol=self.symbol, cfg=self.cfg
+                )
+                if next_open is not None:
+                    code = canonical_period(self.timeframe)
+                    if code in ("D", "W"):
+                        next_index = i + 1 if i + 1 < len(self.signal) else None
+                    else:
+                        next_index = next_tradable_bar_index(
+                            self.signal, i, symbol=self.symbol, cfg=self.cfg
+                        )
 
         return BarView(
             index=i,

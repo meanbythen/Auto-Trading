@@ -14,18 +14,33 @@ from typing import Any
 from loguru import logger
 
 from src.account.signal_book import (
+    _ctp_snap_changed,
     apply_ctp_equity,
     load_named_book,
     save_named_book,
-    write_capital_to_config,
 )
 from src.account.workspace import (
     book_id_for_ctp_kind,
     display_label,
     is_ctp_book,
     load_active_id,
+    set_active_id,
 )
 from src.version import read_version
+
+# 持仓时动态权益每跳都变。内存里每轮跟上，供算手数和日亏熔断。
+# 日志不要跟着每跳刷：第一次，或一下子变超过约 200 元，才说一声。
+_MTM_LOG_YUAN = 200.0
+
+
+def _should_log_mtm(before: float, after: float) -> bool:
+    """盯市几十元的跳动返回 False。"""
+    try:
+        before_n = float(before or 0)
+        after_n = float(after or 0)
+    except (TypeError, ValueError):
+        return True
+    return before_n <= 0 or abs(after_n - before_n) + 1e-9 >= _MTM_LOG_YUAN
 
 
 def broker_day_pnl(data: dict[str, Any] | None) -> float | None:
@@ -41,22 +56,40 @@ def broker_day_pnl(data: dict[str, Any] | None) -> float | None:
         pre = float(data.get("pre_balance") or 0)
         bal = float(data.get("balance") or 0)
         dep = float(data.get("deposit") or 0)
-        wdr = float(data.get("withdraw_amt") or 0)
+        if data.get("withdraw_amt") is not None:
+            wdr = float(data.get("withdraw_amt") or 0)
+        elif data.get("withdraw_quota") is not None:
+            wdr = float(data.get("withdraw") or 0)
+        else:
+            # 已翻译快照里 withdraw 是可取资金，不能当出金。
+            wdr = 0.0
     except (TypeError, ValueError):
         return None
-    if pre > 1e-9 and bal > 0:
-        return round(bal - pre - dep + wdr, 2)
+    # 可取资金几乎等于权益时，那是额度不是出金。
+    if wdr > 1 and pre > 1 and abs(wdr - pre) < 0.05:
+        wdr = 0.0
+    if wdr > 1 and bal > 1 and abs(wdr - bal) < 0.05:
+        wdr = 0.0
+    equity_pnl = round(bal - pre - dep + wdr, 2) if pre > 1e-9 and bal > 0 else None
     try:
-        close_p = data.get("close_profit")
-        pos_p = data.get("position_profit")
+        close_p = float(data.get("close_profit") or 0)
+        pos_p = float(data.get("position_profit") or 0)
+        fee = float(data.get("commission") or 0)
+        trade_pnl = round(close_p + pos_p - fee, 2)
+        has_trade = any(
+            data.get(key) is not None
+            for key in ("close_profit", "position_profit", "commission")
+        )
     except (TypeError, ValueError):
-        return None
-    if close_p is None and pos_p is None:
-        return None
-    try:
-        return round(float(close_p or 0) + float(pos_p or 0), 2)
-    except (TypeError, ValueError):
-        return None
+        trade_pnl = None
+        has_trade = False
+    if equity_pnl is not None:
+        if has_trade and abs(equity_pnl) < 0.005 and abs(trade_pnl or 0) >= 0.01:
+            return trade_pnl
+        return equity_pnl
+    if has_trade:
+        return trade_pnl
+    return None
 
 
 def apply_broker_runtime(
@@ -116,11 +149,8 @@ def apply_broker_runtime(
         except (TypeError, ValueError):
             equity = 0.0
     if equity > 0:
-        before = float(getattr(sizer, "capital", 0) or 0)
         sizer.capital = equity
         cfg.setdefault("risk", {})["capital"] = equity
-        if abs(equity - before) >= 0.01:
-            logger.info("本地仓位计算已改成期货公司动态权益 {:.2f}（原 {:.2f}）", equity, before)
     avail = snap.get("available")
     if avail is not None:
         try:
@@ -130,7 +160,8 @@ def apply_broker_runtime(
     if risk is not None:
         day = broker_day_pnl(snap)
         if day is not None and abs(float(getattr(risk, "daily_pnl", 0) or 0) - day) >= 0.01:
-            risk.set_daily_pnl(day)
+            # 盯市浮盈每轮都要对齐熔断数字，但不要每跳打「当日盈亏按账本校准」。
+            risk.set_daily_pnl(day, log=False)
     return note
 
 
@@ -156,21 +187,79 @@ def push_gateway_account(root: str | Path, gateway: Any) -> str:
     book_id = book_id_for_ctp_kind(kind)
     # 读-改-写要和成交记账共用一把锁，否则会拿旧账本把刚追加的成交行盖掉。
     from src.account.signal_book import book_lock
+    from src.account.workspace import book_file as named_book_path
 
+    book_path = named_book_path(root, book_id)
     with book_lock():
         old = load_named_book(root, book_id)
+        # 文件在却读失败时，绝不能当成「还没有账」新建一本盖上去，成交记录会丢。
+        if old is None and book_path.exists():
+            logger.warning("华泰账本暂时读不到，本轮不改文件（持仓和成交记录不动）")
+            return "账本正被占用，本轮不改文件。"
+        # 必须先拷贝旧快照。apply_ctp_equity 会改同一本字典，事后再比等于自己和自己比，永远以为没变。
+        raw_old_snap = (old or {}).get("ctp_snapshot") if isinstance(old, dict) else None
+        old_snap = dict(raw_old_snap) if isinstance(raw_old_snap, dict) else None
         target, book = apply_ctp_equity(old, snapshot, user_id=user_id, version=read_version())
-        save_named_book(root, book_id, book)
+        new_snap = book.get("ctp_snapshot") if isinstance(book, dict) else None
+        # 动态权益、可用、保证金没变时不必重写账本和配置，否则每轮扫描都会刷盘。
+        unchanged = isinstance(old_snap, dict) and isinstance(new_snap, dict) and not _ctp_snap_changed(
+            old_snap, new_snap
+        )
+        if not unchanged:
+            save_named_book(root, book_id, book)
+    if unchanged:
+        return ""
     label = display_label(book_id, root)
-    if load_active_id(root) == book_id:
-        # 只在真正的程序目录里改配置权益，测试用的临时文件夹不会去改 config.yaml。
-        from src.utils.config_loader import load_config
-
-        project = str((load_config() or {}).get("_project_root") or "")
-        if project and Path(root).resolve() == Path(project).resolve():
-            write_capital_to_config(target)
+    old_balance = 0.0
+    if isinstance(old_snap, dict):
+        try:
+            old_balance = float(old_snap.get("balance") or 0)
+        except (TypeError, ValueError):
+            old_balance = 0.0
+    # 手数用内存里的柜台权益。盯市跳动不要每轮改 config.yaml，否则会一直刷「配置已保存」。
+    # 成交后、账户分析手动刷新仍会写配置。
+    if not _should_log_mtm(old_balance, target):
+        return ""
     logger.info("已把柜台资金写入 {}，动态权益 {:.2f}", label, target)
     return f"已写入「{label}」动态权益 {target:.2f} 元。"
+
+
+def align_active_book_to_ctp(
+    root: str | Path,
+    cfg: dict[str, Any] | None,
+    *,
+    running: bool = False,
+) -> str:
+    """
+    把账户分析换成和这次 CTP 账号同一本。
+
+    程序基座只有一套：仿真连 28077 就看 CTP 仿真账，真实连资金账号就看 CTP 真实账。
+    开平仓规则不变。常驻还在跑时不换，避免内存持仓和账本对不上。
+    返回空字符串表示本来就对上了，或现在不是 CTP 通道。
+    """
+    trade = (cfg or {}).get("trade") or {}
+    if str(trade.get("executor") or "").strip().lower() != "ctp":
+        return ""
+    from src.trader.ctp_logic import normalize_ctp_kind, overlay_ctp_profile
+
+    overlaid = overlay_ctp_profile(
+        trade.get("ctp") if isinstance(trade.get("ctp"), dict) else {},
+        account=(cfg or {}).get("account") if isinstance((cfg or {}).get("account"), dict) else {},
+    )
+    needed = book_id_for_ctp_kind(normalize_ctp_kind(overlaid.get("account_kind")))
+    active = load_active_id(root)
+    if active == needed:
+        return ""
+    wanted = display_label(needed, root)
+    now = display_label(active, root)
+    if running:
+        return (
+            f"常驻还在跑，账户分析仍是「{now}」。"
+            f"请先停止常驻，再切到「{wanted}」。"
+        )
+    set_active_id(root, needed)
+    logger.info("账户分析已换成 {}，和这次 CTP 账号同一本", wanted)
+    return f"账户分析已换成「{wanted}」，和这次 CTP 账号同一本。"
 
 
 def resident_book_guard(root: str | Path, cfg: dict[str, Any] | None) -> str:

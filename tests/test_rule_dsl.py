@@ -308,6 +308,22 @@ def test_swing_stop_uses_lookback_extreme() -> None:
 # ---------------------------------------------------------------- 策略骨架
 
 
+def test_rule_strategy_trail_follows_public_stop_period() -> None:
+    """自定义规则的止损周期跟公共项，不再抄成信号周期。"""
+    cfg = {
+        "strategy": {
+            "timeframe": "30",
+            "trail_timeframe": "5",
+            "symbols": ["bu2612"],
+            "flatten_at_close": True,
+        },
+        "trade": {"volume": 2, "symbol": "bu2612"},
+    }
+    strategy = RuleStrategy(cfg, rule_data=MA_RULE)
+    assert strategy.timeframe == "30"
+    assert strategy.trail_timeframe == "5"
+
+
 def test_rule_strategy_loads_inline_rule() -> None:
     cfg = {
         "strategy": {"timeframe": "30", "symbols": ["bu2612"], "flatten_at_close": True},

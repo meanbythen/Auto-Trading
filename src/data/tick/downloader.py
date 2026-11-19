@@ -176,6 +176,108 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
     tmp.replace(path)
 
 
+def _dates_overlap(left_start: date, left_end: date, right_start: date, right_end: date) -> bool:
+    """两段闭区间有没有交叉。"""
+    return left_start <= right_end and right_start <= left_end
+
+
+def _contract_matches(stored: str, wanted: str | None) -> bool:
+    """SHFE.fu2701 既能对全名，也能对 fu2701。"""
+    if not wanted:
+        return True
+    text = str(stored or "").strip()
+    need = str(wanted).strip()
+    if not need:
+        return True
+    if text == need:
+        return True
+    if "." in text and text.split(".", 1)[-1] == need:
+        return True
+    if "." in need and need.split(".", 1)[-1] == text:
+        return True
+    return False
+
+
+def forget_downloaded_chunks(
+    out_dir: Path | str,
+    *,
+    contract: str | None = None,
+    start: date | None = None,
+    end: date | None = None,
+    delete_csv: bool = True,
+) -> dict[str, Any]:
+    """
+    忘掉这一段的断点续传，让下次「下载历史 tick」真的重新去下。
+
+    原理：下载成功后会在 manifest 里记 done，并且留下 csv。
+    只删库里的 tick 不够，下次仍会跳过。这里把交叉的 csv 删掉，并把 done 标记拿掉。
+    不改 tick 内容，只删文件和续传记录。
+    """
+    folder = Path(out_dir)
+    manifest = _load_manifest(folder)
+    removed_keys: list[str] = []
+    kept: dict[str, Any] = {}
+    for key, meta in (manifest.get("chunks") or {}).items():
+        info = meta if isinstance(meta, dict) else {}
+        stored = str(info.get("contract") or "")
+        if not stored and "|" in str(key):
+            stored = str(key).split("|", 1)[0]
+        chunk_start = _parse_day(info.get("start"))
+        chunk_end = _parse_day(info.get("end"))
+        if chunk_start is None or chunk_end is None:
+            parts = str(key).split("|")
+            if len(parts) >= 3:
+                chunk_start = chunk_start or _parse_day(parts[1])
+                chunk_end = chunk_end or _parse_day(parts[2])
+        hit_contract = _contract_matches(stored, contract)
+        hit_time = True
+        if start is not None and end is not None and chunk_start and chunk_end:
+            hit_time = _dates_overlap(chunk_start, chunk_end, start, end)
+        elif start is not None and chunk_end:
+            hit_time = chunk_end >= start
+        elif end is not None and chunk_start:
+            hit_time = chunk_start <= end
+        if hit_contract and hit_time:
+            removed_keys.append(str(key))
+        else:
+            kept[key] = meta
+    manifest["chunks"] = kept
+    if folder.exists() or removed_keys:
+        _write_json(folder / "download_manifest.json", manifest)
+
+    csv_deleted: list[str] = []
+    csv_locked: list[str] = []
+    if delete_csv and folder.exists():
+        from src.data.tick.inventory import _parse_history_csv_name
+
+        for path in folder.rglob("*.csv"):
+            parsed = _parse_history_csv_name(path)
+            if parsed is None:
+                continue
+            stored, file_start, file_end = parsed
+            if not _contract_matches(stored, contract):
+                continue
+            hit_time = True
+            if start is not None and end is not None:
+                hit_time = _dates_overlap(file_start, file_end, start, end)
+            elif start is not None:
+                hit_time = file_end >= start
+            elif end is not None:
+                hit_time = file_start <= end
+            if not hit_time:
+                continue
+            try:
+                path.unlink()
+                csv_deleted.append(str(path))
+            except OSError:
+                csv_locked.append(str(path))
+    return {
+        "manifest_cleared": len(removed_keys),
+        "csv_deleted": csv_deleted,
+        "csv_locked": csv_locked,
+    }
+
+
 def _download_chunk(api: Any, chunk: DownloadChunk, on_progress: Callable[[float], None] | None = None) -> None:
     """阻塞下载一块。没有专业版权限时给出明确提示。"""
     from tqsdk.tools import DataDownloader

@@ -365,10 +365,9 @@ def _attach_universe_contracts(risk: dict[str, Any]) -> None:
             box.setdefault("name", name)
 
 
-# 比策略时按这个顺序，每套只测一次。旧的短名字不单独测，避免同一套跑两遍。
-# 交叉测试可选策略：统一从策略工厂取，不再在这里另抄一份名单。
-# 以损定开、凯利突破参数维度太高，暂不参与交叉测试（见 factory.CROSS_TEST_ENGINE_ORDER）。
-SCREEN_STRATEGIES: list[tuple[str, str]] = cross_engine_choices()
+def listed_cross_engines() -> list[tuple[str, str]]:
+    """交叉测试勾选名单：每次现问工厂，删掉的立刻没了，新加的会出现。"""
+    return cross_engine_choices()
 
 # 配置里可能写着旧的短名字。交叉测试只认左边这一套，避免同一套跑两遍。
 _ENGINE_ALIAS = ENGINE_ALIASES
@@ -389,13 +388,13 @@ def engines_for_cross(cfg: dict[str, Any] | None) -> list[tuple[str, str]]:
     """
     这一轮要测的策略。
 
-    读配置里的 cross_engines。没写或写空时，用上面那一整份。
-    写了哪些就测哪些，不再自动把没勾的补回来。自定义和旧短名字忽略。
+    读配置里的 cross_engines。没写或写空时，用当前程序能交叉测试的全部策略。
+    写了哪些就测哪些，不再自动把没勾的补回来。已删名字和交叉测试不测的丢掉。
     """
-    known = {code: label for code, label in SCREEN_STRATEGIES}
+    known = {code: label for code, label in listed_cross_engines()}
     raw = ((cfg or {}).get("strategy") or {}).get("cross_engines")
     if not isinstance(raw, list) or not raw:
-        return list(SCREEN_STRATEGIES)
+        return list(listed_cross_engines())
     chosen: list[tuple[str, str]] = []
     seen: set[str] = set()
     for item in raw:
@@ -404,12 +403,12 @@ def engines_for_cross(cfg: dict[str, Any] | None) -> list[tuple[str, str]]:
             continue
         seen.add(name)
         chosen.append((name, known[name]))
-    return chosen or list(SCREEN_STRATEGIES)
+    return chosen or list(listed_cross_engines())
 
 
 def engines_from_codes(codes: list[str] | None) -> list[tuple[str, str]]:
     """把勾选的引擎名收成（代号, 中文名）。不认识的丢掉。"""
-    known = {code: label for code, label in SCREEN_STRATEGIES}
+    known = {code: label for code, label in listed_cross_engines()}
     chosen: list[tuple[str, str]] = []
     seen: set[str] = set()
     for item in codes or []:
@@ -702,7 +701,7 @@ def _evaluation_cells(result: Any) -> dict[str, Any]:
             "evaluation": verdict_text(report),
             "verdict": getattr(report, "conclusion", "watch"),
             "fail_items": report.failed_text() if hasattr(report, "failed_text") else "",
-            "r_expectancy": metrics.get("r_expectancy"),
+            "r_expectancy": metrics.get("expectancy", metrics.get("r_expectancy")),
             "calmar": metrics.get("calmar"),
             "consecutive_losses": metrics.get("consecutive_losses"),
             "eval_checks": checks,
@@ -799,10 +798,11 @@ def screen_strategies(
     spec["symbol"] = contract
     rows: list[dict[str, Any]] = []
     stopped = False
-    total = len(SCREEN_STRATEGIES)
+    engines = listed_cross_engines()
+    total = len(engines)
     volume = 1
 
-    for index, (engine, label) in enumerate(SCREEN_STRATEGIES, start=1):
+    for index, (engine, label) in enumerate(engines, start=1):
         if cancel is not None and cancel():
             stopped = True
             break
@@ -939,7 +939,7 @@ def screen_cross(
     spec.pop("engine", None)
     from src.data.periods import period_label
 
-    strategies = list(engines or SCREEN_STRATEGIES)
+    strategies = list(engines or listed_cross_engines())
     items, skipped_thin = _without_thin(list(universe or MAIN_UNIVERSE))
     period_codes = normalize_cross_periods(periods)
     if not period_codes:
@@ -1062,7 +1062,6 @@ def _market_snapshot(
         evaluate_market_state,
         ENGINE_TREND_SECTION,
         range_params_for_daily_body,
-        range_params_for_opening_break,
         score_market_state,
         trend_params_for_section,
     )
@@ -1096,10 +1095,6 @@ def _market_snapshot(
 
     if engine == "daily_body":
         params = range_params_for_daily_body(cfg)
-        if not params.enabled:
-            params = replace(params, enabled=True, mode="range")
-    elif engine == "float_hold":
-        params = range_params_for_opening_break(cfg, "float_hold", default_enabled=False)
         if not params.enabled:
             params = replace(params, enabled=True, mode="range")
     else:
@@ -1245,7 +1240,6 @@ def list_rows(result: dict[str, Any]) -> list[dict[str, str]]:
                 "profit_factor": "—",
                 "payoff": "—",
                 "expectancy": "—",
-                "r_expectancy": "—",
                 "max_drawdown": "—",
                 "calmar": "—",
                 "loss_streak": "—",
@@ -1405,7 +1399,6 @@ def _display_row(
         "profit_factor": _num(source.get("profit_factor")),
         "payoff": _payoff_text(source.get("payoff")),
         "expectancy": _expectancy_text(source),
-        "r_expectancy": _r_text(source.get("r_expectancy")),
         "max_drawdown": _money(source.get("max_drawdown")),
         "calmar": _calmar_text(source.get("calmar")),
         "loss_streak": _streak_text(source.get("consecutive_losses")),
@@ -1787,12 +1780,12 @@ def _expectancy_text(source: dict[str, Any]) -> str:
     avg_loss = source.get("avg_loss")
     if avg_win not in (None, "") and avg_loss not in (None, ""):
         try:
-            loss = float(avg_loss)
+            loss = abs(float(avg_loss))
         except (TypeError, ValueError):
             return "—"
         if loss <= 1e-9:
             return "—"
-        value = unit_expectancy(win_rate, avg_win, avg_loss)
+        value = unit_expectancy(win_rate, avg_win, loss)
         return f"{value:.2f}"
     try:
         payoff = float(source.get("payoff") or 0)
@@ -1820,16 +1813,6 @@ def _score(value: Any) -> str:
     if number <= -100:
         return "—"
     return f"{number:.2f}"
-
-
-def _r_text(value: Any) -> str:
-    """R 期望保留三位小数。0 也是有效值，不能被当成缺失。"""
-    if value is None or value == "":
-        return "—"
-    try:
-        return f"{float(value):.3f}"
-    except (TypeError, ValueError):
-        return "—"
 
 
 def _calmar_text(value: Any) -> str:

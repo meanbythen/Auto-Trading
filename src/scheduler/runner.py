@@ -982,9 +982,18 @@ class TradingBot(
         if current is not None:
             opened_at = str(getattr(current, "opened_at", "") or "")
             booked_symbol = str(getattr(current, "symbol", "") or key)
-            if str(getattr(current, "side", "flat") or "flat") == side:
+            same_side = str(getattr(current, "side", "flat") or "flat") == side
+            if same_side:
                 initial = float(getattr(current, "initial_stop", 0) or 0)
                 trail = float(getattr(current, "trail_stop", 0) or 0)
+            # 手数、方向、价格没变就不要再写一遍「对账校准」，也不换对象。
+            if (
+                same_side
+                and int(getattr(current, "volume", 0) or 0) == lots
+                and abs(float(getattr(current, "entry_price", 0) or 0) - float(entry_price or 0)) < 1e-9
+                and str(getattr(current, "origin", "") or "") == str(origin or "")
+            ):
+                return
         if float(stop_price or 0) > 0:
             initial = float(stop_price)
             trail = float(stop_price)
@@ -1081,6 +1090,16 @@ class TradingBot(
         """
         if report is None:
             return
+        ctx = getattr(self, "_own_fill_context", None)
+
+        def _fill_ctx(name: str) -> tuple[bool, str]:
+            if not callable(ctx):
+                return False, "open"
+            try:
+                return ctx(name)
+            except Exception:  # noqa: BLE001
+                return False, "open"
+
         state = report.to_dict()
         state["phase"] = phase
         self._reconcile_state = state
@@ -1088,19 +1107,55 @@ class TradingBot(
             self._reconcile_alert("reconcile_unavailable", "柜台对账未完成，本轮不修复持仓")
             self._safe_event("reconcile_unavailable", phase=phase, diffs=list(report.diffs))
             return
-        if report.unclaimed:
+
+        real_unclaimed: list[str] = []
+        for name in report.unclaimed:
+            fresh, kind = _fill_ctx(name)
+            if fresh:
+                continue
+            real_unclaimed.append(name)
+        real_phantom: list[str] = []
+        for name in report.phantom:
+            fresh, _kind = _fill_ctx(name)
+            if fresh:
+                continue
+            real_phantom.append(name)
+        stale_names = {
+            str(name).strip().lower()
+            for name in list(report.unclaimed) + list(report.phantom)
+            if _fill_ctx(name)[0]
+        }
+        state["unclaimed"] = list(real_unclaimed)
+        state["phantom"] = list(real_phantom)
+        if stale_names:
+            state["diffs"] = [
+                str(item)
+                for item in (state.get("diffs") or [])
+                if not any(token in str(item).lower() for token in stale_names)
+            ]
+        if not real_unclaimed and not real_phantom and not state.get("diffs"):
+            state["ok"] = True
+        self._reconcile_state = state
+        if real_unclaimed:
             self._reconcile_alert(
-                "position_unclaimed", "柜台有未认领持仓：" + "、".join(report.unclaimed)
+                "position_unclaimed", "柜台有未认领持仓：" + "、".join(real_unclaimed)
             )
-        if report.phantom:
+        if real_phantom:
             self._reconcile_alert(
-                "position_phantom", "账本有、柜台无的持仓：" + "、".join(report.phantom)
+                "position_phantom", "账本有、柜台无的持仓：" + "、".join(real_phantom)
             )
         if report.diffs:
-            self._reconcile_alert("reconcile_mismatch", "；".join(report.diffs))
+            noisy = False
+            for name in report.unclaimed + list(report.phantom):
+                fresh, _kind = _fill_ctx(name)
+                if fresh:
+                    noisy = True
+                    break
+            if not noisy:
+                self._reconcile_alert("reconcile_mismatch", "；".join(report.diffs))
 
         # 幽灵仓：runtime 连续两轮确认才补记，避免刚成交、柜台还没更新时误平。
-        phantom_now = {str(name).strip().lower() for name in report.phantom}
+        phantom_now = {str(name).strip().lower() for name in real_phantom}
         for name in list(self._phantom_rounds):
             if name not in phantom_now:
                 self._phantom_rounds.pop(name, None)
@@ -1129,6 +1184,25 @@ class TradingBot(
             at_ledger = int(ledger.get(key, 0))
             at_memory = int(memory.get(key, 0))
             if at_broker != 0 and at_ledger == 0:
+                fresh, kind = _fill_ctx(key)
+                if fresh and kind == "close":
+                    # 刚平仓：账本已是 0，柜台查询还停在旧仓。不能当成未认领再开回来。
+                    logger.info("{} 刚平仓，柜台持仓可能还没刷新，本轮不认领、不冻结", key)
+                    continue
+                if fresh:
+                    # 刚开仓：柜台已有仓、账本还是 0。按柜台补进账本，不要冻结等人。
+                    self._install_position(
+                        key, at_broker, self._reconcile_price(key, at_broker), "broker"
+                    )
+                    adopt = getattr(self, "adopt_broker_position", None)
+                    if callable(adopt):
+                        try:
+                            ok, msg = adopt(key)
+                            logger.info("{} 刚开仓，已按柜台持仓自动认领：{}", key, msg)
+                        except Exception as exc:  # noqa: BLE001
+                            logger.warning("{} 自动认领失败：{}", key, exc)
+                    self._frozen_symbols.discard(key)
+                    continue
                 # 柜台有、账本没有：补进内存并冻结，等人工认领。
                 self._install_position(key, at_broker, self._reconcile_price(key, at_broker), "broker")
                 self._frozen_symbols.add(key)
@@ -1469,6 +1543,32 @@ class TradingBot(
         except Exception as exc:  # noqa: BLE001
             logger.debug("行情告警写入失败: {}", exc)
 
+    def _ctp_card_fields(self) -> dict[str, Any]:
+        """
+        顶部「执行通道」卡片要用的柜台状态。
+
+        交易台和常驻看同一套：session 已就绪，并且本轮 logged_in 为真，才算连上。
+        午休也可以已登录；卡片不能因为本轮没扫描就写成未连接。
+        """
+        # 不是柜台通道时卡片不走 CTP 文案，这里仍给空字段，避免界面缺键。
+        if not self.trader_capabilities.orders_via_broker:
+            return {
+                "ctp_ready": False,
+                "ctp_user": "",
+                "ctp_kind": "",
+                "ctp_error": "",
+            }
+        gateway = getattr(self.trader, "gateway", None)
+        session = getattr(gateway, "session", None)
+        settings = getattr(gateway, "settings", None) or getattr(self.trader, "settings", None)
+        ready = bool(getattr(session, "ready", False)) and bool(self.logged_in)
+        return {
+            "ctp_ready": ready,
+            "ctp_user": str(getattr(settings, "user_id", "") or ""),
+            "ctp_kind": str(getattr(settings, "account_kind", "") or ""),
+            "ctp_error": str(getattr(session, "last_error", "") or ""),
+        }
+
     def status_snapshot(self) -> dict[str, Any]:
         """给界面看的健康快照。"""
         return {
@@ -1476,7 +1576,10 @@ class TradingBot(
             "run_id": self.run_id,
             "started_at": self.started_at,
             "orders_paused": bool(self._orders_paused),
+            "dry_run": bool(self.cfg.get("dry_run", True)),
+            "logged_in": bool(self.logged_in),
             "ctp_flow": self._ctp_flow_text(),
+            **self._ctp_card_fields(),
             "heartbeat_at": self.heartbeat_at,
             "last_scan_at": self.last_scan_at,
             "last_error": self.last_error,

@@ -36,11 +36,20 @@ def prepare_trading_desk(
     """
     拉起同花顺，自动登录，再把价格改成对手价。
 
+    只给同花顺点击通道用。CTP / 模拟通道不要走这里，否则会误开同花顺。
     返回 (能不能接着启动常驻, 写给界面的几句话)。
     任何一步失败都返回 False，调用方就不要启动常驻。
     """
     lines: list[str] = []
     desk = copy.deepcopy(cfg)
+    from src.trader.base import capabilities_for
+
+    executor = str((desk.get("trade") or {}).get("executor", "sim") or "sim").strip().lower()
+    # 柜台通道自己连 CTP，这里绝不能再拉同花顺、点华泰登录。
+    if capabilities_for(executor).orders_via_broker or executor != "gui":
+        lines.append(f"当前是 {executor or '未知'} 通道，不打开同花顺、不点交易软件登录。")
+        return True, lines
+
     account = desk.setdefault("account", {})
     # 这个准备动作本身就是要登录。配置页的「自动登录」开关管的是普通启动。
     account["skip_auto_login"] = False
@@ -68,11 +77,6 @@ def prepare_trading_desk(
     if not settled:
         lines.append("「确认结算单」窗口还在，没点到按钮。常驻不会启动。")
         return False, lines
-
-    executor = str((desk.get("trade") or {}).get("executor", "sim"))
-    if executor != "gui":
-        lines.append("当前不是同花顺点击通道，这一步不改价格框。")
-        return True, lines
 
     arm = arm_price or _arm_opponent_price
     dismiss = dismiss_settlement or _dismiss_settlement_state

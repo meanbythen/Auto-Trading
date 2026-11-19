@@ -109,7 +109,8 @@ def test_ctp_equity_writes_sim_book_only(tmp_path) -> None:
         available = 28000.0
 
     set_active_id(tmp_path, PAPER)
-    text = push_gateway_account(tmp_path, _Gateway())
+    gw = _Gateway()
+    text = push_gateway_account(tmp_path, gw)
     assert "30139.28" in text
     sim = load_named_book(tmp_path, CTP_SIM)
     assert sim is not None
@@ -117,6 +118,57 @@ def test_ctp_equity_writes_sim_book_only(tmp_path) -> None:
     assert sim["ctp_snapshot"]["user_id"] == "28077"
     assert load_named_book(tmp_path, PAPER) is None
     assert load_named_book(tmp_path, LIVE) is None
+    # 数字没变时不再写盘、也不再报「已写入」，否则常驻每轮扫描都会刷。
+    again = push_gateway_account(tmp_path, gw)
+    assert again == ""
+    history = list((load_named_book(tmp_path, CTP_SIM) or {}).get("ctp_history") or [])
+    assert len(history) == 1
+    gw.account = {"balance": 32699.02, "available": 32699.02, "pre_balance": 32743.76}
+    gw.available = 32699.02
+    gw.account = {"balance": 30219.28, "available": 28080.0, "pre_balance": 30000}
+    gw.available = 28080.0
+    small = push_gateway_account(tmp_path, gw)
+    assert small == ""
+    sim_small = load_named_book(tmp_path, CTP_SIM)
+    assert sim_small is not None
+    assert abs(float(sim_small["ctp_snapshot"]["balance"]) - 30219.28) < 0.01
+    gw.account = {"balance": 32699.02, "available": 32699.02, "pre_balance": 32743.76}
+    gw.available = 32699.02
+    changed = push_gateway_account(tmp_path, gw)
+    assert "32699.02" in changed
+    sim2 = load_named_book(tmp_path, CTP_SIM)
+    assert sim2 is not None
+    assert abs(float(sim2["ctp_snapshot"]["balance"]) - 32699.02) < 0.01
+
+
+def test_push_gateway_does_not_overwrite_unreadable_book(tmp_path, monkeypatch) -> None:
+    """账本文件还在但这一轮读失败时，不要新建空账把成交盖掉。"""
+    from src.account.ctp_sync import push_gateway_account
+    from src.account.signal_book import load_named_book, save_named_book
+
+    class _Settings:
+        user_id = "28077"
+        account_kind = "sim"
+
+    class _Gateway:
+        settings = _Settings()
+        account = {"balance": 40000.0, "available": 40000.0}
+        available = 40000.0
+
+    keep = {
+        "initial_capital": 10000.0,
+        "trades": [{"symbol": "lh2701", "offset": "开", "volume": 1}],
+        "changes": [{"kind": "initial", "amount": 10000.0}],
+        "ctp_snapshot": {"balance": 30139.28, "user_id": "28077"},
+    }
+    save_named_book(tmp_path, CTP_SIM, keep)
+    monkeypatch.setattr("src.account.ctp_sync.load_named_book", lambda *_a, **_k: None)
+    text = push_gateway_account(tmp_path, _Gateway())
+    assert "不改文件" in text
+    book = load_named_book(tmp_path, CTP_SIM)
+    assert book is not None
+    assert book["trades"][0]["symbol"] == "lh2701"
+    assert abs(float(book["ctp_snapshot"]["balance"]) - 30139.28) < 0.01
 
 
 def _ctp_cfg(kind: str, user_id: str) -> dict:
@@ -175,6 +227,27 @@ def test_resident_guard_requires_sim_book_for_sim_ctp(tmp_path) -> None:
     assert "CTP仿真" in text
     set_active_id(tmp_path, CTP_SIM)
     assert resident_book_guard(tmp_path, cfg) == ""
+
+
+def test_align_active_book_follows_ctp_kind(tmp_path) -> None:
+    """切到仿真就看 CTP 仿真账，切到真实就看 CTP 真实账。常驻在跑时不换。"""
+    from src.account.ctp_sync import align_active_book_to_ctp
+
+    cfg = _ctp_cfg("sim", "28077")
+    set_active_id(tmp_path, CTP_LIVE)
+    note = align_active_book_to_ctp(tmp_path, cfg, running=False)
+    assert "仿真" in note
+    assert load_active_id(tmp_path) == CTP_SIM
+    assert align_active_book_to_ctp(tmp_path, cfg, running=False) == ""
+    set_active_id(tmp_path, CTP_LIVE)
+    blocked = align_active_book_to_ctp(tmp_path, cfg, running=True)
+    assert "常驻还在跑" in blocked
+    assert load_active_id(tmp_path) == CTP_LIVE
+    live_cfg = _ctp_cfg("live", "20318052")
+    set_active_id(tmp_path, CTP_SIM)
+    live_note = align_active_book_to_ctp(tmp_path, live_cfg, running=False)
+    assert "真实" in live_note
+    assert load_active_id(tmp_path) == CTP_LIVE
 
 
 def test_resident_guard_skips_non_ctp() -> None:
@@ -266,7 +339,7 @@ def test_apply_broker_runtime_syncs_lots_and_daily_pnl(tmp_path) -> None:
     class _Risk:
         daily_pnl = 0.0
 
-        def set_daily_pnl(self, value):
+        def set_daily_pnl(self, value, *, log: bool = True):
             self.daily_pnl = round(float(value or 0), 2)
 
     set_active_id(tmp_path, CTP_SIM)
@@ -283,3 +356,121 @@ def test_apply_broker_runtime_syncs_lots_and_daily_pnl(tmp_path) -> None:
     assert abs(cfg["risk"]["capital"] - 30139.28) < 0.01
     assert abs(risk.daily_pnl - 139.28) < 0.01
     assert abs(broker_day_pnl(book["ctp_snapshot"]) - 139.28) < 0.01
+
+
+def test_broker_day_pnl_does_not_treat_quota_as_withdraw() -> None:
+    """可取资金等于权益时，当日盈亏不能变成整户出金。"""
+    from src.account.ctp_sync import broker_day_pnl
+
+    assert broker_day_pnl(
+        {
+            "pre_balance": 32743.76,
+            "balance": 32699.0,
+            "deposit": 0.0,
+            "withdraw": 32743.76,
+            "withdraw_amt": 0.0,
+        }
+    ) == -44.76
+    assert broker_day_pnl(
+        {
+            "pre_balance": 32743.76,
+            "balance": 32743.76,
+            "deposit": 0.0,
+            "withdraw": 32743.76,
+            "withdraw_amt": 0.0,
+        }
+    ) == 0.0
+
+
+def test_settled_zero_snapshot_does_not_wipe_ctp_daily() -> None:
+    """收盘后柜台清零当日字段时，不能把白天已记的日历盈亏盖成 0。"""
+    from src.account.signal_book import apply_ctp_equity
+
+    _, book = apply_ctp_equity(
+        None,
+        {
+            "account_id": "20318052",
+            "balance": 33139.29,
+            "available": 30000.0,
+            "pre_balance": 32743.76,
+            "close_profit": 520.0,
+            "position_profit": 0.0,
+            "commission": 124.47,
+        },
+        user_id="20318052",
+        version="0",
+    )
+    # 人为把时间钉在日盘，避免测试跑在夜盘时交易日跳到明天。
+    book["ctp_snapshot"]["time"] = "2026-11-19 14:55:22"
+    book["ctp_history"][-1]["time"] = "2026-11-19 14:55:22"
+    from src.account.signal_book import _store_ctp_day_pnl
+
+    _store_ctp_day_pnl(book, book["ctp_snapshot"])
+    assert abs(float(book["ctp_daily"]["2026-11-19"]) - 395.53) < 0.02
+
+    _, book = apply_ctp_equity(
+        book,
+        {
+            "account_id": "20318052",
+            "balance": 33139.33,
+            "available": 33139.33,
+            "pre_balance": 33139.33,
+            "close_profit": 0.0,
+            "position_profit": 0.0,
+            "commission": 0.0,
+        },
+        user_id="20318052",
+        version="0",
+    )
+    book["ctp_snapshot"]["time"] = "2026-11-19 20:50:52"
+    book["ctp_history"][-1]["time"] = "2026-11-19 20:50:52"
+    _store_ctp_day_pnl(book, book["ctp_snapshot"])
+    assert abs(float(book["ctp_daily"]["2026-11-19"]) - 395.53) < 0.02
+
+
+def test_repair_ctp_daily_from_history_recovers_wiped_zero() -> None:
+    """已经被盖成 0 的日历，打开账本时能从柜台历史找回白天盈亏。"""
+    from src.account.signal_book import repair_ctp_daily
+    from src.account.signal_stats import analyze_book
+    from datetime import date
+
+    book = {
+        "funding": "ctp",
+        "trades": [],
+        "changes": [{"time": "2026-11-19 09:00:00", "kind": "initial", "amount": 32743.76}],
+        "ctp_daily": {"2026-11-19": 0.0},
+        "ctp_history": [
+            {
+                "time": "2026-11-19 14:55:22",
+                "balance": 33139.29,
+                "pre_balance": 32743.76,
+                "close_profit": 520.0,
+                "position_profit": 0.0,
+                "commission": 124.47,
+                "available": 30000.0,
+            },
+            {
+                "time": "2026-11-19 20:50:52",
+                "balance": 33139.33,
+                "pre_balance": 33139.33,
+                "close_profit": 0.0,
+                "position_profit": 0.0,
+                "commission": 0.0,
+                "available": 33139.33,
+            },
+        ],
+        "ctp_snapshot": {
+            "time": "2026-11-19 20:50:52",
+            "balance": 33139.33,
+            "pre_balance": 33139.33,
+            "close_profit": 0.0,
+            "position_profit": 0.0,
+            "commission": 0.0,
+            "available": 33139.33,
+        },
+    }
+    assert repair_ctp_daily(book) is True
+    assert abs(float(book["ctp_daily"]["2026-11-19"]) - 395.53) < 0.02
+    report = analyze_book(book, start=date(2026, 11, 19), end=date(2026, 11, 19))
+    assert abs(report.daily_pnl[date(2026, 11, 19)] - 395.53) < 0.02
+    assert abs(report.account.net_pnl - 395.53) < 0.02

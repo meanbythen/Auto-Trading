@@ -75,6 +75,7 @@ class BacktestActionsMixin:
     ) -> str:
         """把一次回测结果写成绩效报告文本。历史回测页和策略编辑器共用这一份。"""
         from src.backtest.evaluation import format_evaluation_lines
+        from src.backtest.live_gates import format_mirror_gate_lines
         from src.backtest.metrics import format_expectancy_line, format_payoff_lines
         from src.backtest.rollover import format_rollover_lines
         from src.screen.picker import format_cover_lines
@@ -104,6 +105,10 @@ class BacktestActionsMixin:
             str(snap.get("coverage_note") or "").strip(),
             *([rollover_text] if rollover_text else []),
             str(snap.get("fill_note") or "").strip(),
+            *format_mirror_gate_lines(
+                snap.get("mirror_gate_hits") or [],
+                enabled=bool(snap.get("mirror_live_gates")),
+            ),
             f"K线根数   {result.bars}",
             f"成交      {p.trades} 笔（赢{p.wins} / 亏{p.losses}）",
             f"没开成    {len(result.rejected)} 条开仓信号（被策略过滤或风控挡住，明细在下面）"
@@ -130,10 +135,12 @@ class BacktestActionsMixin:
             f"—— 成交明细（最多显示最近 {max_trades} 笔）——",
         ]
         for t in result.trades[-max_trades:]:
+            # 换月连续时必须写出合约，否则 lh2609 平仓和 lh2611 开仓会看成同一张合约被强平。
+            exit_txt = str(t.reason_exit or "")
             lines.append(
-                f"{t.entry_time[:16]}→{t.exit_time[:16]} {t.side}{t.volume}手 "
+                f"{t.symbol} {t.entry_time[:16]}→{t.exit_time[:16]} {t.side}{t.volume}手 "
                 f"{t.entry_price:.1f}->{t.exit_price:.1f} "
-                f"pnl={t.pnl:.0f} | {t.reason_exit[:40]}"
+                f"pnl={t.pnl:.0f} | {exit_txt[:48]}"
             )
         if result.rejected:
             lines.append("")
@@ -169,6 +176,8 @@ class BacktestActionsMixin:
         engine_override：策略编辑器用，临时把策略换成正在编辑的规则，不改页面上的下拉。
         result_box：为空时写历史回测页的结果框；策略编辑器传自己的报告框。
         """
+        if self._block_research_if_resident():
+            return
         prepared = self._prepare_backtest_run()
         if prepared is None:
             return
@@ -177,6 +186,7 @@ class BacktestActionsMixin:
         if engine_override:
             st["engine"] = engine_override
         box = result_box if result_box is not None else getattr(self, "bt_result_box", None)
+        self._mark_research_busy(header)
 
         self._append_log(
             f"开始{header}… engine={st['engine']} symbol={symbol} "
@@ -267,6 +277,8 @@ class BacktestActionsMixin:
                 if box is not None:
                     self._post_to_main(lambda m=err: self._set_result_text(box, f"{header}失败:\n{m}"))
                 self._post_to_main(lambda m=err: messagebox.showerror(f"{header}失败", m))
+            finally:
+                self._post_to_main(self._clear_research_busy)
 
         threading.Thread(target=_run, daemon=True).start()
 
@@ -401,16 +413,55 @@ class BacktestActionsMixin:
         self._append_log(f"回测滑点已改成建议值 {suggested:g} 跳（未自动保存配置文件）")
 
 
+    def _quote_busy_name(self) -> str:
+        """正在占用天勤连接的研究任务名称。没有则空。"""
+        return str(getattr(self, "_research_busy", "") or "").strip()
+
+    def _mark_research_busy(self, name: str) -> None:
+        self._research_busy = str(name or "历史回测")
+
+    def _clear_research_busy(self) -> None:
+        self._research_busy = ""
+
+    def _block_resident_if_research(self) -> bool:
+        """回测还在跑时不准启动常驻。拦住返回 True。"""
+        name = self._quote_busy_name()
+        if not name:
+            return False
+        messagebox.showwarning(
+            "回测还在跑",
+            f"{name}还没结束。常驻和回测共用天勤行情，不能同时开。\n"
+            "请等回测出结果后再启动常驻。",
+        )
+        return True
+
+    def _block_research_if_resident(self) -> bool:
+        """常驻还在跑时不准开历史回测。拦住返回 True。"""
+        if bool(getattr(self.worker, "running", False)):
+            messagebox.showwarning(
+                "常驻还在跑",
+                "请先点「停止常驻」，再做历史回测。\n"
+                "两边共用同一条行情线，同时开会拖住实盘扫描。",
+            )
+            return True
+        if self._quote_busy_name():
+            messagebox.showwarning("还在算", f"{self._quote_busy_name()}还没结束，请等它做完。")
+            return True
+        return False
+
     def _on_slippage_scan(self) -> None:
         """滑点灵敏度：同一份K线换几档滑点重跑，看利润边缘和盈亏分水岭。"""
         from tkinter import messagebox
 
+        if self._block_research_if_resident():
+            return
         prepared = self._prepare_backtest_run()
         if prepared is None:
             return
         cfg, symbol, start, end = prepared
         st = cfg["strategy"]
 
+        self._mark_research_busy("滑点灵敏度")
         self._append_log(f"开始滑点灵敏度… {symbol} 区间={start or '起'}~{end or '止'}")
         self.tabs.set("历史回测")
         if hasattr(self, "bt_result_box"):
@@ -453,6 +504,8 @@ class BacktestActionsMixin:
                 if hasattr(self, "bt_result_box"):
                     self._post_to_main(lambda m=err: self._set_result_text(self.bt_result_box, f"滑点灵敏度失败:\n{m}"))
                 self._post_to_main(lambda m=err: messagebox.showerror("滑点灵敏度失败", m))
+            finally:
+                self._post_to_main(self._clear_research_busy)
 
         threading.Thread(target=_run, daemon=True).start()
 

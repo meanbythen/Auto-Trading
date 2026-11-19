@@ -312,6 +312,25 @@ def test_daily_bar_groups_night_into_next_day_session() -> None:
     assert float(hog["open"].iloc[0]) == float(day["open"].iloc[0])
 
 
+def test_session_clock_rebuild_is_fast_on_long_minutes() -> None:
+    """一年的 1 分钟不能再逐根循环，否则回测会卡在请稍候。"""
+    import time
+
+    minutes = _session_minutes(
+        "2026-10-27",
+        [("09:00", "10:15"), ("10:30", "11:30"), ("13:30", "15:00")],
+    )
+    copies = [minutes.copy() for _ in range(80)]
+    for i, piece in enumerate(copies):
+        piece.index = piece.index + pd.Timedelta(i, unit="D")
+    long_minutes = pd.concat(copies).sort_index()
+    started = time.perf_counter()
+    built = bars_from_minutes(long_minutes, "5", symbol="lh2701")
+    elapsed = time.perf_counter() - started
+    assert len(built) > 1000
+    assert elapsed < 2.5
+
+
 def test_session_close_times_sixty_matches_clock_bars() -> None:
     """缺口检查用的应收时刻，要和拼出来的 60 分钟一致。"""
     day = date(2026, 10, 27)

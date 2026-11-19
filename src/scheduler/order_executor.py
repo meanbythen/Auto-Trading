@@ -20,6 +20,56 @@ from src.trader.ctp_orders import ctp_order
 from src.trader.order_timeline import elapsed_ms, new_trace_id, now_iso
 
 
+def ctp_opponent_limit(
+    *,
+    is_buy: bool,
+    last: float,
+    bid: float = 0.0,
+    ask: float = 0.0,
+    upper: float = 0.0,
+    lower: float = 0.0,
+    tick: float = 1.0,
+    extra_ticks: int = 2,
+) -> float | None:
+    """
+    CTP 限价按对手价方向挂，贴近同花顺「对手价」。
+
+    买入用卖一（没有卖一就用最新价），再往上让几跳，更容易立刻成交。
+    卖出用买一，再往下让几跳。最后夹在涨跌停之间，并对齐最小变动价位。
+    """
+    step = float(tick or 1)
+    if step <= 0:
+        step = 1.0
+    extra = max(0, int(extra_ticks or 0)) * step
+    if is_buy:
+        start = float(ask or 0) or float(last or 0)
+        if start <= 0:
+            return None
+        price = start + extra
+        cap = float(upper or 0)
+        if cap > 0:
+            price = min(price, cap)
+    else:
+        start = float(bid or 0) or float(last or 0)
+        if start <= 0:
+            return None
+        price = start - extra
+        floor = float(lower or 0)
+        if floor > 0:
+            price = max(price, floor)
+    if price <= 0:
+        return None
+    from decimal import Decimal, ROUND_CEILING, ROUND_FLOOR
+
+    quant = Decimal(str(step))
+    raw = Decimal(str(price))
+    rounded = (raw / quant).to_integral_value(
+        rounding=ROUND_CEILING if is_buy else ROUND_FLOOR
+    ) * quant
+    out = float(rounded)
+    return out if out > 0 else None
+
+
 def _same_contract(left: object, right: object) -> bool:
     """两个写法是不是同一个合约。郑商所三位和四位年月写法算同一个。"""
     a = str(left or "").strip().lower()
@@ -437,6 +487,7 @@ class OrderExecutorMixin:
             logger.error("手工平仓记账成功但程序仓位未清掉，请核对: {}", booked_symbol)
             return None, balance
         self.risk.on_order_filled("close", volume, symbol=booked_symbol)
+        self._consume_signal_bar_after_flat(booked_symbol)
 
         if self._uses_ctp_broker_funds():
             self._apply_broker_equity()
@@ -669,6 +720,37 @@ class OrderExecutorMixin:
             )
             return True, f"已按 {price:g} 补记平仓 {volume} 手"
 
+    def reject_broker_lots(self, symbol: str) -> tuple[bool, str]:
+        """
+        拒绝仓单：以程序账为准，不跟柜台改。
+
+        柜台有仓、账本没有：不把柜台的仓收进策略。
+        柜台已空、账本还有：账本不动（空仓不是一笔要收的仓，这里也不会替你平掉），
+        该品种继续暂停自动开仓，避免对着空气下单。
+        要把账本改成空，应走认领仓单（按柜台补记平仓）。
+        """
+        lock = getattr(self, "_trade_lock", None)
+        with (lock if lock is not None else nullcontext()):
+            key = str(symbol or "").strip().lower()
+            state = getattr(self, "_reconcile_state", None) or {}
+            unclaimed = {
+                str(item).strip().lower()
+                for item in (state.get("unclaimed") or [])
+                if str(item).strip()
+            }
+            self._drop_reconcile_pending(symbol)
+            if key in unclaimed:
+                self._release_frozen_symbol(symbol)
+                consume = getattr(self, "_consume_signal_bar_after_flat", None)
+                if callable(consume):
+                    consume(symbol)
+                self._persist_state()
+                self._record_event("position_rejected", symbol=symbol, mode="local_book")
+                return True, f"已拒绝把柜台 {symbol} 收进程序。以程序账为准，等下一根信号再开"
+            self._persist_state()
+            self._record_event("reconcile_rejected", symbol=symbol, mode="keep_local")
+            return True, f"已拒绝按柜台改 {symbol}。程序账不动，该品种仍暂停自动开仓"
+
     def ignore_reconcile_symbol(self, symbol: str) -> tuple[bool, str]:
         """人工决定先不处理这个品种：只清掉待办提示，品种仍保持冻结不自动交易。"""
         lock = getattr(self, "_trade_lock", None)
@@ -719,6 +801,13 @@ class OrderExecutorMixin:
         fill_evidence: dict[str, Any] | None = None,
     ) -> bool:
         """更新策略仓位、风控、信号账户，并且只落盘一次。返回这一笔是否已经入账。"""
+        note = getattr(self, "_note_own_fill", None)
+        if callable(note):
+            kind = "close" if decision.action == StrategyAction.CLOSE else "open"
+            try:
+                note(symbol, kind=kind)
+            except TypeError:
+                note(symbol)
         # 同一份回报再来一次时，账本会跳过。这里也直接返回，避免把仓位再改一遍。
         if fill_key and not self.cfg.get("dry_run", True):
             from src.account.signal_book import load_book
@@ -848,6 +937,11 @@ class OrderExecutorMixin:
         if bar_id:
             # 通过公共接口记录，重启后才能认出「这根已经开过」。
             self.strategy.set_last_entry_bar(symbol, bar_id)
+
+        if decision.action == StrategyAction.CLOSE:
+            self._consume_signal_bar_after_flat(
+                symbol, str((decision.meta or {}).get("bar_id", "") or "")
+            )
 
         try:
             self.risk.on_order_filled(decision.action.value, vol, symbol=symbol)
@@ -1141,6 +1235,25 @@ class OrderExecutorMixin:
         cfg = getattr(self, "cfg", None) or {}
         caps = self.trader_capabilities
         bar_key = str((decision.meta or {}).get("bar_id", "") or "")
+        last_bar = ""
+        get_last = getattr(self.strategy, "get_last_entry_bar", None)
+        if callable(get_last):
+            last_bar = str(get_last(decision.symbol) or "")
+        from src.strategy.base import same_signal_bar
+
+        # 策略没带 bar_id 时，用最新已收盘K线，让「平仓后等下一根」对所有引擎生效。
+        if not bar_key:
+            try:
+                from src.data.periods import drop_forming_bar
+
+                period = str(getattr(self.strategy, "timeframe", "15") or "15")
+                frame = self.kline.fetch(decision.symbol, period=period)
+                closed = drop_forming_bar(frame)
+                if closed is not None and len(closed) > 0:
+                    bar_key = str(closed.index[-1])
+            except Exception:  # noqa: BLE001
+                bar_key = last_bar
+        bar_consumed = same_signal_bar(last_bar, bar_key)
         stage = ""
         if caps.can_query_orders:
             from src.trader.go_live import strategy_order_block_reason
@@ -1159,6 +1272,7 @@ class OrderExecutorMixin:
             orders_paused=bool(getattr(self, "_orders_paused", False)),
             ledger_failed=bool(getattr(self, "_ledger_failed", False)),
             already_sent_this_bar=bool(bar_key and sent.get(decision.symbol) == bar_key),
+            bar_consumed=bar_consumed,
             can_query_positions=caps.can_query_positions,
             can_query_orders=caps.can_query_orders,
             confirms_fill=caps.confirms_fill,
@@ -1180,6 +1294,8 @@ class OrderExecutorMixin:
             self.last_error = reason
         elif code == "order_dedup":
             logger.info("{} 这根K线已经发过开仓单，跳过重复发单 | {}", decision.symbol, bar_key)
+        elif code == "order_wait_next_bar":
+            logger.info("{} {} | {}", decision.symbol, reason, bar_key)
         elif code == "close_skip_no_position":
             logger.warning("策略要求平仓，但程序账上无持仓，跳过 {} | {}", decision.symbol, decision.reason)
         elif code == "size_skip":
@@ -1196,7 +1312,7 @@ class OrderExecutorMixin:
         else:
             logger.warning("{} {}: {}", code, decision.symbol, reason)
         extra = {"reason": reason}
-        if code == "order_dedup":
+        if code in {"order_dedup", "order_wait_next_bar"}:
             extra = {"bar_id": bar_key}
         elif code == "close_skip_no_position":
             extra = {"reason": decision.reason}
@@ -1279,6 +1395,27 @@ class OrderExecutorMixin:
             )
             return False
         bar_key = str((decision.meta or {}).get("bar_id", "") or "")
+        # 手机/同花顺已经把仓平了：柜台是 0，程序还当自己有仓，会反复报平仓被拒。
+        if (
+            decision.action == StrategyAction.CLOSE
+            and self.trader_capabilities.orders_via_broker
+            and self._broker_net_for(decision.symbol) == 0
+        ):
+            booked = self._book_external_close(
+                decision.symbol, "柜台已无持仓（可能已在别处平掉），补记平仓"
+            )
+            if booked:
+                logger.warning(
+                    "{} 柜台已经空仓，不再报平仓，已按现价补记程序账",
+                    decision.symbol,
+                )
+            return booked
+        if decision.action == StrategyAction.CLOSE:
+            key = str(decision.symbol or "").strip().lower()
+            last_try = float((getattr(self, "_close_attempt_at", {}) or {}).get(key) or 0)
+            if last_try and (time.monotonic() - last_try) < 8.0:
+                logger.info("{} 刚报过平仓，8 秒内不连发", decision.symbol)
+                return False
         early = run_early_gates(
             self._trade_intent(decision, volume=1),
             getattr(self, "risk", None),
@@ -1380,13 +1517,19 @@ class OrderExecutorMixin:
         # 不在这里提前读价格，免得日志刷新把本程序叫到前面，也免得价格菜单被点开两次。
 
         # 窗口点击时永远不把策略里的价格写进价格框。启动时已经选好对手价。
-        # 柜台报单必须带限价。平仓策略通常不给价格，就用这根 K 线的收盘价。
+        # 柜台报单必须带限价。价格按对手价方向挂，不把止损价当成限价。
         position_side = None
         if caps.orders_via_broker:
             price = self._ctp_limit_price(decision)
             if price is None or price <= 0:
                 logger.error("CTP 没有可用价格，这次不报单 | {}", decision.symbol)
                 self._record_event("order_no_price", symbol=decision.symbol, side=side)
+                self._release_signal_mark(decision)
+                return False
+            if (
+                decision.action in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN)
+                and self._ctp_open_slip_blocked(decision, float(price))
+            ):
                 self._release_signal_mark(decision)
                 return False
             if decision.action == StrategyAction.CLOSE:
@@ -1400,7 +1543,9 @@ class OrderExecutorMixin:
         decision.meta = {
             **(decision.meta or {}),
             "order_price": price,
-            "price_mode": "limit" if price is not None else "opponent",
+            "price_mode": "opponent_limit" if caps.orders_via_broker else (
+                "limit" if price is not None else "opponent"
+            ),
         }
         self._timeline_trace(decision)
 
@@ -1456,6 +1601,15 @@ class OrderExecutorMixin:
         caps = self.trader_capabilities
         self._order_dispatch_started = True
         self._order_unclean = False
+        if decision.action == StrategyAction.CLOSE:
+            stamps = getattr(self, "_close_attempt_at", None)
+            if stamps is None:
+                self._close_attempt_at: dict[str, float] = {}
+                stamps = self._close_attempt_at
+            stamps[str(decision.symbol or "").strip().lower()] = time.monotonic()
+            flatten_try = getattr(self, "_flatten_try", None)
+            if isinstance(flatten_try, dict):
+                flatten_try[decision.symbol] = time.monotonic()
         trace_id = self._timeline_trace(decision)
         dispatch_started_at = now_iso()
         decision.meta = {**(decision.meta or {}), "dispatch_started_at": dispatch_started_at}
@@ -1706,6 +1860,36 @@ class OrderExecutorMixin:
             self._record_event("order_fail", symbol=decision.symbol, side=side, message=result.message)
             return False
 
+    def _consume_signal_bar_after_flat(self, symbol: str, bar_id: str = "") -> None:
+        """人工或策略平仓后，本根已收盘信号不再开，等下一根。"""
+        bid = str(bar_id or "").strip()
+        if not bid:
+            try:
+                from src.data.periods import drop_forming_bar
+
+                period = str(getattr(self.strategy, "timeframe", "15") or "15")
+                frame = self.kline.fetch(symbol, period=period)
+                closed = drop_forming_bar(frame)
+                if closed is not None and len(closed) > 0:
+                    bid = str(closed.index[-1])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("{} 平仓后取信号K线失败，仍标记等下一根: {}", symbol, exc)
+        note = getattr(self.strategy, "note_flat_wait_next_bar", None)
+        if callable(note):
+            note(symbol, bid)
+        elif bid:
+            setter = getattr(self.strategy, "set_signaled_bar", None)
+            if callable(setter):
+                setter(symbol, bid)
+            last = getattr(self.strategy, "set_last_entry_bar", None)
+            if callable(last):
+                last(symbol, bid)
+        logger.info(
+            "{} 已平仓，本根信号 {} 不再开。等下一根已收盘K线再评估，不会因为仓单对不上立刻补仓",
+            symbol,
+            bid or "（当前）",
+        )
+
     def _release_signal_mark(self, decision: StrategyDecision) -> None:
         """
         下单没发出去时，把策略里「这根 K 线已处理」的标记撤销。
@@ -1713,9 +1897,24 @@ class OrderExecutorMixin:
         策略在产生信号时就写标记，原本是为了同一根 K 线不重复评估；
         但下单失败也被一起锁住，信号会静默丢掉。这里只在确认没点单时撤销，
         让下一轮扫描还能在同一根 K 线上再试一次。
+        刚平过仓的那一根不能撤：否则会把你刚平掉的仓立刻补回去。
         """
         bar_key = str((decision.meta or {}).get("bar_id", "") or "")
         if not bar_key:
+            return
+        last_fn = getattr(self.strategy, "get_last_entry_bar", None)
+        last_bar = str(last_fn(decision.symbol) or "") if callable(last_fn) else ""
+        too_fresh = getattr(self, "_own_fill_too_fresh", None)
+        kind_of = getattr(self, "_own_fill_kind", None)
+        just_closed = callable(too_fresh) and too_fresh(decision.symbol) and (
+            not callable(kind_of) or str(kind_of(decision.symbol)) == "close"
+        )
+        if just_closed or (last_bar and last_bar == bar_key):
+            logger.info(
+                "{} 这一根已经平过仓（{}），不撤销已处理标记，避免立刻补仓",
+                decision.symbol,
+                bar_key,
+            )
             return
         if self.strategy.clear_signaled_bar(decision.symbol, expected_bar_id=bar_key):
             logger.warning(
@@ -1728,6 +1927,47 @@ class OrderExecutorMixin:
             item = pending.get(decision.symbol)
             if isinstance(item, dict) and str(item.get("bar_id", "")) == bar_key:
                 pending.pop(decision.symbol, None)
+
+    def _broker_net_for(self, symbol: str) -> int | None:
+        """柜台净仓：多正空负。没有柜台对象时返回 None，不当成空仓。"""
+        gateway = getattr(getattr(self, "trader", None), "gateway", None)
+        if gateway is None:
+            return None
+        positions = getattr(gateway, "positions", None)
+        if not isinstance(positions, dict):
+            return None
+        from src.trader.ctp_logic import symbol_key
+
+        view = positions.get(symbol_key(symbol))
+        if view is None:
+            return 0
+        try:
+            return int(getattr(view, "net", 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    def _book_external_close(self, symbol: str, reason: str) -> bool:
+        """柜台已经空了，只补记程序账，不再向柜台报平仓。"""
+        pos = self._position_for(symbol)
+        if pos is None or str(getattr(pos, "side", "flat") or "flat") == "flat":
+            return False
+        price = 0.0
+        try:
+            price = float(self.kline.latest_price(symbol) or 0)
+        except Exception:  # noqa: BLE001
+            price = 0.0
+        if price <= 0:
+            price = float(getattr(pos, "entry_price", 0) or 0)
+        if price <= 0:
+            logger.warning("柜台已空但没有平仓价，无法补记 {}", symbol)
+            return False
+        closed, _balance = self._manual_close_locked(symbol, price, reason=reason)
+        if closed is None:
+            return False
+        frozen = getattr(self, "_frozen_symbols", None)
+        if isinstance(frozen, set):
+            frozen.discard(str(symbol or "").strip().lower())
+        return True
 
     def _price_tick_for(self, symbol: str) -> float:
         """每跳价格：先看品种表，再看 CTP/交易配置，最后退回 1。"""
@@ -1748,47 +1988,156 @@ class OrderExecutorMixin:
         return tick if tick > 0 else 1.0
 
     def _close_protect_ticks(self) -> int:
-        """平仓保护滑点跳数。行情快时用收盘价原样挂限价常常挂不上。"""
+        """平仓保护滑点跳数。对手价再让几跳，避免刚好挂在盘口外侧。"""
         trade = self.cfg.get("trade") or {}
         try:
             return max(0, int(trade.get("ctp_close_protect_ticks", 2)))
         except (TypeError, ValueError):
             return 2
 
+    def _open_protect_ticks(self) -> int:
+        """开仓保护滑点跳数。默认比平仓少，避免开仓追得太远。"""
+        trade = self.cfg.get("trade") or {}
+        try:
+            return max(0, int(trade.get("ctp_open_protect_ticks", 1)))
+        except (TypeError, ValueError):
+            return 1
+
+    def _ctp_quote_snapshot(self, symbol: str) -> dict[str, float]:
+        """盘口：优先柜台行情，没有就用 1 分钟最新价，再没有用信号周期收盘。"""
+        last = bid = ask = upper = lower = 0.0
+        gateway = getattr(getattr(self, "trader", None), "gateway", None)
+        md = getattr(gateway, "md", None) or getattr(getattr(self, "trader", None), "md", None)
+        row = getattr(md, "latest", None) if md is not None else None
+        if isinstance(row, dict):
+            last = float(row.get("last") or 0)
+            bid = float(row.get("bid") or 0)
+            ask = float(row.get("ask") or 0)
+            upper = float(row.get("upper") or 0)
+            lower = float(row.get("lower") or 0)
+        band = getattr(gateway, "_instrument", None) if gateway is not None else None
+        if isinstance(band, dict):
+            upper = upper or float(band.get("upper") or band.get("UpperLimitPrice") or 0)
+            lower = lower or float(band.get("lower") or band.get("LowerLimitPrice") or 0)
+        if last <= 0:
+            try:
+                last = float(self.kline.latest_price(symbol) or 0)
+            except Exception:  # noqa: BLE001
+                last = 0.0
+        if last <= 0:
+            try:
+                period = str(getattr(self.strategy, "timeframe", "5") or "5")
+                df = self.kline.fetch(symbol, period=period)
+                if df is not None and len(df) > 0:
+                    last = float(df["close"].iloc[-1])
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("读取 {} 最新价失败: {}", symbol, exc)
+        return {
+            "last": last,
+            "bid": bid,
+            "ask": ask,
+            "upper": upper,
+            "lower": lower,
+        }
+
+    def _ctp_is_buy(self, decision: StrategyDecision) -> bool:
+        """这一笔柜台方向是不是买入。平空、买开都是买。"""
+        if decision.action == StrategyAction.BUY_OPEN:
+            return True
+        if decision.action == StrategyAction.SELL_OPEN:
+            return False
+        pos = self._position_for(decision.symbol)
+        return str(getattr(pos, "side", "") or "") == "short"
+
     def _ctp_limit_price(self, decision: StrategyDecision) -> float | None:
         """
-        CTP 限价。开仓用策略价格；平仓用最新价加保护性滑点，挂成对手价方向。
+        CTP 限价按对手价挂，和同花顺价格框选「对手价」同一思路。
 
-        平仓用「已收线那根的收盘价」在快行情里挂不上，submit 超时撤单后要等下一轮，
-        止损会被拖慢一整根K线。
+        止损价只用来判断要不要平，不能拿去当限价：空单止损在现价下方时，
+        买平挂在止损价会永远不成交，撤了又挂。
         """
-        if decision.action != StrategyAction.CLOSE and decision.entry_price and float(decision.entry_price) > 0:
-            return float(decision.entry_price)
-        try:
-            df = self.kline.fetch(decision.symbol, period=str(self.strategy.timeframe))
-            if df is None or len(df) == 0:
-                return None
-            price = float(df["close"].iloc[-1])
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("读取 {} 最新价失败: {}", decision.symbol, exc)
-            return None
-        if price <= 0:
-            return None
+        quote = self._ctp_quote_snapshot(decision.symbol)
+        last = float(quote.get("last") or 0)
         decision.meta = {
             **(decision.meta or {}),
-            "latest_price": price,
+            "latest_price": last,
             "latest_price_at": now_iso(),
-            "latest_price_source": "kline_close",
+            "latest_price_source": "ctp_opponent",
+            "theory_price": (
+                decision.entry_price
+                if decision.action != StrategyAction.CLOSE
+                else decision.stop_price
+            ),
         }
-        # 平多是卖出、平空是买入：往对手价方向让几跳，确保能成交。
-        protect = self._price_tick_for(decision.symbol) * self._close_protect_ticks()
-        pos = self._position_for(decision.symbol)
-        side = str(getattr(pos, "side", "") or "")
-        if side == "long":
-            price -= protect
-        elif side == "short":
-            price += protect
-        return price if price > 0 else None
+        extra = self._close_protect_ticks() if decision.action == StrategyAction.CLOSE else self._open_protect_ticks()
+        if decision.action == StrategyAction.CLOSE:
+            chased = int((getattr(self, "_close_chase_ticks", {}) or {}).get(
+                str(decision.symbol or "").strip().lower()
+            ) or 0)
+            extra = min(8, extra + max(0, chased))
+        price = ctp_opponent_limit(
+            is_buy=self._ctp_is_buy(decision),
+            last=last,
+            bid=float(quote.get("bid") or 0),
+            ask=float(quote.get("ask") or 0),
+            upper=float(quote.get("upper") or 0),
+            lower=float(quote.get("lower") or 0),
+            tick=self._price_tick_for(decision.symbol),
+            extra_ticks=extra,
+        )
+        if price is not None:
+            logger.info(
+                "CTP {} 对手价限价 {}（买={} 最新={} 买一={} 卖一={} 让{}跳）",
+                decision.symbol,
+                price,
+                self._ctp_is_buy(decision),
+                last,
+                quote.get("bid"),
+                quote.get("ask"),
+                extra,
+            )
+        return price
+
+    def _ctp_open_slip_blocked(self, decision: StrategyDecision, order_price: float) -> bool:
+        """开仓对手价比信号价追得太远就放弃这一根，平仓不拦。"""
+        from src.scheduler.runner import entry_slip_blocked
+
+        trade = (getattr(self, "cfg", None) or {}).get("trade") or {}
+        try:
+            limit_atr = float(trade.get("max_entry_slip_atr", 0.5) or 0)
+        except (TypeError, ValueError):
+            limit_atr = 0.5
+        try:
+            limit_points = float(trade.get("max_entry_slip_points", 0) or 0)
+        except (TypeError, ValueError):
+            limit_points = 0.0
+        atr = 0.0
+        try:
+            bars = self.kline.fetch(decision.symbol, period=str(self.strategy.timeframe))
+            if bars is not None and len(bars) > 0 and hasattr(self.strategy, "_atr"):
+                got = self.strategy._atr(bars)
+                atr = float(got or 0)
+        except Exception:  # noqa: BLE001
+            atr = 0.0
+        blocked, chase, limit = entry_slip_blocked(
+            float(decision.entry_price or 0),
+            float(order_price or 0),
+            atr,
+            is_long=decision.action == StrategyAction.BUY_OPEN,
+            limit_atr=limit_atr,
+            limit_points=limit_points,
+        )
+        if blocked:
+            logger.warning(
+                "{} 对手价滑点过大，放弃开仓 | 信号价 {:.2f} 报单价 {:.2f} 追 {:.2f} 点 > 上限 {:.2f}",
+                decision.symbol,
+                float(decision.entry_price or 0),
+                float(order_price or 0),
+                chase,
+                limit,
+            )
+            self._record_event("slip_block_open", symbol=decision.symbol, reason="对手价滑点过大")
+        return blocked
 
     def _on_ctp_fill(self, report: dict[str, Any]) -> bool:
         """CTP 回调线程入口：拿交易锁后入账，超时返回 False 交回补记路径。"""
@@ -1868,6 +2217,9 @@ class OrderExecutorMixin:
         )
         if not ok:
             return False
+        chased = getattr(self, "_close_chase_ticks", None)
+        if isinstance(chased, dict):
+            chased.pop(str(decision.symbol or "").strip().lower(), None)
         if fill_key:
             if recent is None:
                 recent = OrderedDict()
@@ -1958,6 +2310,35 @@ class OrderExecutorMixin:
     ) -> None:
         """根据 CTP 回报决定记账还是继续等。部分成交按实际成交手数记账。"""
         if not result.ok:
+            message = str(getattr(result, "message", "") or "")
+            already_flat = "没有可平仓位" in message or "平仓量超过持仓量" in message
+            if decision.action == StrategyAction.CLOSE and already_flat:
+                if self._book_external_close(
+                    decision.symbol, "柜台已无持仓（可能已在别处平掉），补记平仓"
+                ):
+                    logger.warning(
+                        "{} 柜台拒绝平仓（已无仓），已补记程序账，不再重报",
+                        decision.symbol,
+                    )
+                    return
+                logger.info(
+                    "{} 柜台确认已无仓（{}）。本地账本已是空仓，按成交回报处理，不告警",
+                    decision.symbol,
+                    message,
+                )
+                return
+            if decision.action == StrategyAction.CLOSE and "未成交" in message:
+                key = str(decision.symbol or "").strip().lower()
+                chased = getattr(self, "_close_chase_ticks", None)
+                if chased is None:
+                    self._close_chase_ticks: dict[str, int] = {}
+                    chased = self._close_chase_ticks
+                chased[key] = min(8, int(chased.get(key, 0) or 0) + 2)
+                logger.warning(
+                    "{} 平仓未成交，下次对手价再多让 {} 跳",
+                    decision.symbol,
+                    chased[key],
+                )
             logger.warning("CTP 报单没有成功 | {} {} | {}", decision.symbol, side, result.message)
             self._record_event(
                 "order_rejected",
@@ -1987,6 +2368,14 @@ class OrderExecutorMixin:
         leftover = max(0, filled - accounted)
         fill_price = float(raw.get("fill_price") or 0)
         booked = leftover <= 0
+        if filled > 0:
+            note = getattr(self, "_note_own_fill", None)
+            if callable(note):
+                kind = "close" if "close" in str(side) or decision.action == StrategyAction.CLOSE else "open"
+                try:
+                    note(decision.symbol, kind=kind)
+                except TypeError:
+                    note(decision.symbol)
         if leftover > 0:
             # 回报回调没记账（例如没挂记账函数），这里补记实际成交的部分。
             if isinstance(raw.get("orders"), list) and raw.get("orders"):

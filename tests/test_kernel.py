@@ -27,6 +27,37 @@ def test_event_payload_is_copied() -> None:
     assert seen[1]["symbol"] == "bu2612"
 
 
+def test_wait_next_bar_blocks_open_for_every_engine() -> None:
+    """平仓后等下一根：拦在公共风控链，不依赖某一套策略自己判断。"""
+    g = RiskGuardian(min_order_interval_sec=0)
+    intent = TradeIntent(
+        symbol="lh2701",
+        side="sell_open",
+        volume=1,
+        bar_id="2026-11-19 14:30:00",
+        bar_consumed=True,
+    )
+    result = run_pretrade_gates(intent, g)
+    assert result.ok is False
+    assert result.code == "order_wait_next_bar"
+
+
+def test_wait_next_bar_does_not_block_close() -> None:
+    """止损和清仓不受「等下一根」影响。"""
+    g = RiskGuardian(min_order_interval_sec=0)
+    g.on_order_filled("sell_open", 1, "lh2701")
+    intent = TradeIntent(
+        symbol="lh2701",
+        side="close",
+        volume=1,
+        bar_id="2026-11-19 14:30:00",
+        bar_consumed=True,
+        force=True,
+    )
+    result = run_pretrade_gates(intent, g)
+    assert result.ok is True
+
+
 def test_pause_blocks_before_risk_limit() -> None:
     """暂停报单时风控链拦住开新仓，执行器不该再去组报单。"""
     g = RiskGuardian(min_order_interval_sec=0)

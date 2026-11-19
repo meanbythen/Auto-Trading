@@ -298,6 +298,37 @@ def test_daily_bias_uses_ema_and_can_flip_short_after_a_crash() -> None:
     assert daily_bias(bars, 60) == -1
 
 
+def test_bind_history_matches_逐根最后一根() -> None:
+    """回测预计算必须和逐根算到同一根的分数一致，不然开仓点会漂。"""
+    from src.backtest.bar_cursor import _trend_frame_for_signal
+
+    bars = _up_signal()
+    daily = _daily_up()
+    strategy = MultiFactorStrategy(_cfg("multi_factor"))
+    strategy.bind_history(bars, daily)
+    for i in (70, len(bars) - 1):
+        window = bars.iloc[: i + 1]
+        trend = _trend_frame_for_signal(daily, window.index[-1], "D")
+        cached = strategy.prepare(window)
+        live = compute_factors(window, strategy.params, trend, daily_required=True)
+        assert cached is not None
+        assert live is not None
+        snap = cached["snap"]
+        assert abs(float(snap.total) - float(live.total)) < 1e-9
+        assert snap.block_entry is live.block_entry
+        assert snap.daily_bias == live.daily_bias
+
+
+def test_multi_factor_follows_public_flatten_switch() -> None:
+    """公共开关关掉时，即使自己那一节还写着每天平仓，也不能到点强平。"""
+    cfg = _cfg("multi_factor")
+    cfg["strategy"]["multi_factor"]["flatten_at_close"] = True
+    cfg["strategy"]["flatten_at_close"] = False
+    assert MultiFactorStrategy(cfg).flatten_at_close is False
+    cfg["strategy"]["flatten_at_close"] = True
+    assert MultiFactorStrategy(cfg).flatten_at_close is True
+
+
 def test_allocate_all_zero_scores_is_zero() -> None:
     from src.strategy.cta_factors import allocate_factor_pnl, dominant_factor_label
 

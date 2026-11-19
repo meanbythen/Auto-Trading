@@ -69,6 +69,97 @@ def pct_from_ratio(ratio: float) -> str:
     return f"{float(ratio) * 100:.0f}%" if abs(ratio) >= 0.001 else f"{float(ratio) * 100:.4f}%"
 
 
+def fee_yuan_per_lot(
+    by_volume: float,
+    by_money: float,
+    *,
+    last_price: float,
+    multiplier: float,
+) -> float | None:
+    """
+    把柜台手续费收成「每手多少元」，好写入品种表。
+
+    柜台两套：按成交额比例、按手数金额。品种表只认每手元。
+    只有比例、又没有最新价时，算不出来，返回空，不要把 0.0002 当成 2 毫元写进去。
+    """
+    vol = float(by_volume or 0)
+    money = float(by_money or 0)
+    last = float(last_price or 0)
+    mult = float(multiplier or 0)
+    if abs(money) > 1e-12:
+        if last <= 0 or mult <= 0:
+            return None
+        extra = vol if abs(vol) >= 0.01 else 0.0
+        return round(last * mult * money + extra, 4)
+    if abs(vol) >= 0.01:
+        return round(vol, 4)
+    if abs(vol) < 1e-12 and abs(money) < 1e-12:
+        return 0.0
+    return None
+
+
+def ctp_row_to_universe_costs(row: dict[str, Any] | None, last_price: float) -> tuple[dict[str, Any], str]:
+    """
+    柜台合约行 → 品种表要改的数字。
+
+    不改启用、交易时段、清仓时刻。手续费按当前最新价估成每手元。
+    """
+    if not row:
+        return {}, "还没有合约资料。"
+    mult = float(row.get("volume_multiple") or 0)
+    tick = float(row.get("price_tick") or 0)
+    long_m = float(row.get("long_margin_money") or 0)
+    short_m = float(row.get("short_margin_money") or 0)
+    ratio = max(long_m, short_m)
+    fields: dict[str, Any] = {
+        "symbol": str(row.get("symbol") or "").strip(),
+        "name": str(row.get("name") or "").strip(),
+    }
+    if mult > 0:
+        fields["multiplier"] = mult
+    if tick > 0:
+        fields["price_tick"] = tick
+    if ratio > 0:
+        fields["margin_rate_pct"] = round(ratio * 100.0, 4)
+    notes: list[str] = []
+    open_fee = fee_yuan_per_lot(
+        float(row.get("open_volume") or 0),
+        float(row.get("open_money") or 0),
+        last_price=last_price,
+        multiplier=mult,
+    )
+    close_fee = fee_yuan_per_lot(
+        float(row.get("close_volume") or 0),
+        float(row.get("close_money") or 0),
+        last_price=last_price,
+        multiplier=mult,
+    )
+    today_fee = fee_yuan_per_lot(
+        float(row.get("close_today_volume") or 0),
+        float(row.get("close_today_money") or 0),
+        last_price=last_price,
+        multiplier=mult,
+    )
+    if open_fee is None or close_fee is None or today_fee is None:
+        notes.append("手续费是成交额比例，窗口上没有最新价，这一次先不改手续费。请先订阅行情再点写入。")
+    else:
+        fields["commission"] = open_fee
+        fields["commission_close"] = close_fee
+        fields["commission_close_today"] = today_fee
+    bits = [
+        f"{fields.get('symbol') or '合约'}",
+        f"每手{int(mult) if mult else '—'}",
+        f"最小变动{tick:g}" if tick else "最小变动—",
+        f"保证金{fields['margin_rate_pct']:g}%" if "margin_rate_pct" in fields else "保证金—",
+    ]
+    if "commission" in fields:
+        bits.append(f"开仓约{fields['commission']:g}元/手")
+        bits.append(f"平仓约{fields['commission_close']:g}元/手")
+        bits.append(f"平今约{fields['commission_close_today']:g}元/手")
+    notes.insert(0, "、".join(bits))
+    return fields, "。".join(notes)
+
+
 def fee_text(by_volume: float, by_money: float) -> str:
     """
     手续费：按手是金额，按金额是比率。
@@ -86,20 +177,54 @@ def fee_text(by_volume: float, by_money: float) -> str:
     return f"{vol:g} / {money * 100:.8f}%"
 
 
+def _account_num(raw: dict[str, Any], key: str) -> float:
+    """资金字段转成数字。缺的或写坏的当 0。"""
+    try:
+        return float(raw.get(key) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _has_account_key(raw: dict[str, Any], key: str) -> bool:
+    """这个键是不是柜台或账本里真正有的，避免 0 和「没给」分不清。"""
+    return key in raw and raw.get(key) is not None
+
+
+def cash_in_out(raw: dict[str, Any] | None) -> tuple[float, float, float]:
+    """
+    入金、出金、可取资金。
+
+    柜台原始回报：WithdrawQuota 是可取，Withdraw 是出金。
+    账本里已经翻译过：withdraw 是可取，withdraw_amt 是出金。
+    这两套不能再交叉减一次，否则可取资金会被当成整笔出金。
+    """
+    data = raw if isinstance(raw, dict) else {}
+    deposit = _account_num(data, "deposit")
+    if _has_account_key(data, "withdraw_quota"):
+        quota = _account_num(data, "withdraw_quota")
+        withdrawn = (
+            _account_num(data, "withdraw_amt")
+            if _has_account_key(data, "withdraw_amt")
+            else _account_num(data, "withdraw")
+        )
+    else:
+        quota = _account_num(data, "withdraw")
+        withdrawn = _account_num(data, "withdraw_amt")
+    return deposit, withdrawn, quota
+
+
 def parse_account(row: dict[str, Any] | None) -> dict[str, float | str]:
-    """把资金查询收成统一键名。缺的当 0。"""
+    """把资金查询收成统一键名。缺的当 0。同一份数字再解析一遍结果不变。"""
     raw = row or {}
 
     def num(key: str) -> float:
-        try:
-            return float(raw.get(key) or 0)
-        except (TypeError, ValueError):
-            return 0.0
+        return _account_num(raw, key)
 
     balance = num("balance")
     margin = num("margin")
     close_pnl = num("close_profit")
     float_pnl = num("position_profit")
+    deposit, withdrawn, quota = cash_in_out(raw)
     usage = (margin / balance) if abs(balance) > 1e-9 else 0.0
     close_rate = (close_pnl / balance) if abs(balance) > 1e-9 else 0.0
     float_rate = (float_pnl / balance) if abs(balance) > 1e-9 else 0.0
@@ -108,10 +233,11 @@ def parse_account(row: dict[str, Any] | None) -> dict[str, float | str]:
         "pre_balance": num("pre_balance"),
         "balance": balance,
         "available": num("available"),
-        "withdraw": num("withdraw_quota"),
+        "withdraw": quota,
+        "withdraw_quota": quota,
         "currency": _currency_cn(str(raw.get("currency") or "")),
-        "deposit": num("deposit"),
-        "withdraw_amt": num("withdraw"),
+        "deposit": deposit,
+        "withdraw_amt": withdrawn,
         "margin": margin,
         "frozen": num("frozen_cash") + num("frozen_margin"),
         "frozen_margin": num("frozen_margin"),
@@ -156,6 +282,7 @@ def account_pairs(account: dict[str, Any] | None) -> list[tuple[str, str]]:
         ("货币质出", money_text(float(data["mortgage_out"]))),
         ("保证金", money_text(float(data["margin"]))),
         ("出入金", money_text(float(data["deposit"]) - float(data["withdraw_amt"]))),
+        # 出入金 = 入金 − 出金。可取资金在下一列，不能拿来减。
         ("冻结资金", money_text(float(data["frozen"]))),
         ("手续费", money_text(float(data["commission"]))),
         ("资金使用率", f"{float(data['usage']) * 100:.2f}%"),

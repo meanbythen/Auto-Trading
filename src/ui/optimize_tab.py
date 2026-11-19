@@ -134,7 +134,7 @@ class OptimizeTabMixin:
         )
         ctk.CTkLabel(
             box,
-            text="一次切断：按比例切一刀。滚动前进：把检验段拆成多段，走一步再验一步。打开「冻结最后半年」时，最后这段永远不参与挑参数；过关后再验收一次，看过就不能用同一段再调参。优化结束后还会把检验成交打乱，分不清规则还是运气时不写入。其它关注品种会用同一组参数再跑一遍（不再重搜）。开仓限制与保证金开跑前跟实盘配置/品种表对齐。",
+            text="一次切断：按比例切一刀。滚动前进：把检验段拆成多段，走一步再验一步。打开「冻结最后半年」时，最后这段永远不参与挑参数；过关后再验收一次，看过就不能用同一段再调参。优化结束后还会把检验成交打乱，分不清规则还是运气时不写入。其它关注品种会用同一组参数再跑一遍（不再重搜）。开仓限制跟下面这一块（和历史回测共用），点开始不会被交易配置改回去。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=320,
@@ -465,8 +465,7 @@ class OptimizeTabMixin:
         if not symbol or symbol == "（还没有）":
             messagebox.showwarning("还没有合约", "请先到配置页的关注品种里添加要优化的合约。")
             return
-        # 开仓限制、保证金、收盘清仓跟实盘一致；账户权益用回测/优化页填的测试资金。
-        self._align_backtest_trading_params_with_live()
+        # 开仓限制、收盘清仓、测试资金都听回测/优化页上已经填好的格子。
         cfg = self._clone_cfg()
         try:
             self._apply_backtest_limits(cfg, symbol=symbol)
@@ -1162,7 +1161,7 @@ class OptimizeTabMixin:
         # 日内实体优化可能带 timeframe / eth_minutes，写入后信号周期和 ETH 分钟数会跟着变。
         period_note = (
             "若参数里带有信号周期或 ETH 分钟数，这两项会一并写入；正在用的策略名和关注品种仍不改。\n"
-            if engine in ("daily_body", "float_hold")
+            if engine in ("daily_body",)
             else "正在用的策略、品种、周期不会改。另外几套的参数也不会改。\n"
         )
         group_note = "" if group_index == 1 else f"这次写入的是第 {group_index} 组（不是训练最优那组）。\n"
@@ -1360,7 +1359,6 @@ class OptimizeTabMixin:
             self._append_log(note)
             section = {
                 "daily_body": "daily_body",
-                "float_hold": "float_hold",
                 "trend_follow": "trend_follow",
                 "supertrend": "supertrend",
                 "dual_ma": "dual_ma",
@@ -1385,7 +1383,6 @@ class OptimizeTabMixin:
             extra = ""
             if engine in (
                 "daily_body",
-                "float_hold",
                 "dual_ma",
                 "ma_cross",
             ):

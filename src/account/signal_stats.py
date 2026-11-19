@@ -4,7 +4,7 @@
 功能：按时间段、按品种，算出胜率、盈利因子、最大回撤、资金使用率和每日盈亏。
 原理：平仓仍按先开先平配对。盈利因子是赚到的钱除以亏掉的钱的绝对值，和历史回测用的是同一个名字。
 资金使用率是这段时间里保证金占用的最高值，除以这段开始时的余额。
-日历上的每日盈亏只加已经平仓的交易盈亏，入金、出金和每日结算不放进日历。
+日历上的每日盈亏：同花顺账只加已经平仓的交易盈亏；华泰账跟期货公司当日动态权益，不跟程序配对平仓。
 日历按期货交易日分：夜盘 21:00 起算下一个交易日，归到次日那格。
 """
 
@@ -125,6 +125,10 @@ def analyze_book(
         if day is None:
             continue
         daily[day] = round(daily.get(day, 0.0) + float(row.get("pnl") or 0), 2)
+    broker_daily = _ctp_broker_daily(book)
+    if broker_daily:
+        # 华泰账：日历只跟期货公司当日盈亏，不把配对平仓混进来。
+        daily = broker_daily
 
     equity = _equity_in_span(book, start, end)
     base = _equity_before(book, start)
@@ -150,7 +154,49 @@ def analyze_book(
         stat.utilization = _ratio(by_symbol_margin.get(symbol, 0.0), base)
         symbols.append(SymbolStat(symbol=symbol, stat=stat))
     symbols.sort(key=lambda item: abs(item.stat.net_pnl), reverse=True)
+    if broker_daily:
+        span_pnl = round(
+            sum(value for day, value in broker_daily.items() if _in_span(day, start, end)),
+            2,
+        )
+        account.net_pnl = span_pnl
+        if len(symbols) == 1:
+            symbols[0].stat.net_pnl = span_pnl
     return SignalReport(account=account, symbols=symbols, equity=equity, daily_pnl=daily)
+
+
+def _ctp_broker_daily(book: dict[str, Any]) -> dict[date, float]:
+    """华泰账每个交易日的期货公司盈亏。没有记录就空。"""
+    if str(book.get("funding") or "") != "ctp":
+        return {}
+    # 收盘后柜台常把当日字段清零；先按历史把日历盈亏纠正回来。
+    try:
+        from src.account.signal_book import repair_ctp_daily
+
+        repair_ctp_daily(book)
+    except Exception:  # noqa: BLE001
+        pass
+    stored = book.get("ctp_daily")
+    out: dict[date, float] = {}
+    if isinstance(stored, dict):
+        for key, raw in stored.items():
+            try:
+                day = date.fromisoformat(str(key)[:10])
+                out[day] = round(float(raw), 2)
+            except (TypeError, ValueError):
+                continue
+    snap = book.get("ctp_snapshot") if isinstance(book.get("ctp_snapshot"), dict) else {}
+    if snap:
+        from src.account.ctp_sync import broker_day_pnl
+        from src.account.signal_book import broker_snapshot_day_pnl_usable
+
+        # 结算后的空壳快照不要再盖日历；白天有效快照才覆盖。
+        if broker_snapshot_day_pnl_usable(snap):
+            pnl = broker_day_pnl(snap)
+            if pnl is not None:
+                when = _as_date(snap.get("time")) or futures_trading_day()
+                out[when] = round(float(pnl), 2)
+    return out
 
 
 def format_win_rate(rate: float | None) -> str:

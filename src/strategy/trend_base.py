@@ -70,10 +70,14 @@ class TrendStrategyBase(StrategyBase):
 
         live = self.symbols[0] if self.symbols else ""
         self.flatten_times = flatten_clocks_for_symbol(cfg, live)
-        # 与 trend_follow / supertrend 一致：默认不按钟点清仓，听自己这节的开关。
-        self.flatten_at_close = config_flag(
-            self.box.get("flatten_at_close", False), default=False
-        )
+        # 布林 / SAR / 多因子 / 凯利 / 以损定开：收盘清仓听交易配置总开关。
+        # 总开关写过就用总开关；没写过才看自己那一节（旧 yaml）。
+        if "flatten_at_close" in st:
+            self.flatten_at_close = config_flag(st.get("flatten_at_close"), default=True)
+        else:
+            self.flatten_at_close = config_flag(
+                self.box.get("flatten_at_close", False), default=False
+            )
         self.entry_sessions = session_tuples(cfg, live)
         self.session_scope = scope_from_cfg(cfg)
 
@@ -206,6 +210,7 @@ class TrendStrategyBase(StrategyBase):
                 StrategyAction.HOLD, symbol, f"K线不足，{self.label}指标还算不出来"
             )
         ind = self.prepare(bars)
+        self._last_prepare = ind
         if ind is None:
             return StrategyDecision(StrategyAction.HOLD, symbol, f"{self.label}指标还没算稳")
 
@@ -249,7 +254,7 @@ class TrendStrategyBase(StrategyBase):
         self._pending[symbol] = {"time": now, "stop": stop, "bar_id": bar_id}
         self._signaled_bar[symbol] = bar_id
         action = StrategyAction.BUY_OPEN if side == "long" else StrategyAction.SELL_OPEN
-        logger.info("{} {} {}", symbol, self.label, reason)
+        logger.debug("{} {} {}", symbol, self.label, reason)
         return StrategyDecision(
             action,
             symbol,

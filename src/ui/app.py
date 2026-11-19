@@ -1,6 +1,6 @@
 """
 Auto-Trading 桌面控制台
-功能：运行控制 + 配置选项卡（策略/账号/密码/软件路径等）。
+功能：运行控制 + 账号页 + 配置选项卡（策略/软件路径等）。
 原理：CustomTkinter Tabview；BotWorker 后台跑策略；密码存 secrets.local.yaml。
 
 启动（任选其一）:
@@ -136,7 +136,11 @@ class AutoTradingApp(
         self._status = "待命"
         self._show_password = ctk.BooleanVar(value=False)
         self._show_tq_password = ctk.BooleanVar(value=False)
+        self._show_ctp_sim_password = ctk.BooleanVar(value=False)
+        self._show_ctp_auth = ctk.BooleanVar(value=False)
         self._prep_busy = False
+        # 历史回测等研究任务占用天勤连接时的名称；空字符串表示没有。
+        self._research_busy = ""
         # 天勤 tick 常驻采集器。界面上点启动/停止，关窗口时要先停掉。
         self._tick_recorder = None
         self._tick_synth_busy = False
@@ -183,19 +187,20 @@ class AutoTradingApp(
         )
         self.hero_sub.pack(anchor="w", pady=(2, 0))
 
-        # 状态卡。五列按固定比例分同一行：窗口变宽时一起变，不会再被某一句长文字单独撑开。
+        # 状态卡。六列按固定比例分同一行：窗口变宽时一起变，不会再被某一句长文字单独撑开。
         self.status_row = ctk.CTkFrame(self, fg_color=T.BG)
         self.status_row.pack(fill="x", padx=28, pady=(10, 6))
         self._status_card_frames: list[ctk.CTkFrame] = []
-        # 执行通道那句最长，只比旁边宽一档。其余四张一样宽，避免品种和持仓缩成一条。
-        status_weights = (5, 5, 6, 5, 5)
+        # 信号周期字短，收窄一档；执行通道、策略名、持仓略宽。
+        status_weights = (5, 5, 3, 5, 4, 5)
         for i, weight in enumerate(status_weights):
-            self.status_row.grid_columnconfigure(i, weight=weight, uniform="status_cards", minsize=140)
+            self.status_row.grid_columnconfigure(i, weight=weight, uniform="status_cards", minsize=108)
         self.card_mode = self._make_stat_card(self.status_row, 0, "运行状态", "待命")
         self.card_engine = self._make_stat_card(self.status_row, 1, "策略引擎", "-")
-        self.card_exec = self._make_stat_card(self.status_row, 2, "执行通道", "-")
-        self.card_symbols = self._make_stat_card(self.status_row, 3, "关注品种", "-")
-        self.card_position = self._make_stat_card(self.status_row, 4, "程序持仓", "空仓")
+        self.card_timeframe = self._make_stat_card(self.status_row, 2, "信号周期", "-")
+        self.card_exec = self._make_stat_card(self.status_row, 3, "执行通道", "-")
+        self.card_symbols = self._make_stat_card(self.status_row, 4, "关注品种", "-")
+        self.card_position = self._make_stat_card(self.status_row, 5, "程序持仓", "空仓")
         # 持仓句子可能写成「bu2612 空1手 @4662 止损4700」，用小一号字，避免一有仓就把整排撑高。
         self.card_position.configure(font=T.FONT_BODY)
         self.status_row.bind("<Configure>", self._fit_status_card_text)
@@ -226,7 +231,8 @@ class AutoTradingApp(
         )
         self.tabs.pack(fill="both", expand=True, padx=28, pady=(6, 22))
         self.tabs.add("运行")
-        self.tabs.add("配置")
+        self.tabs.add("账号")
+        self.tabs.add("交易配置")
         self.tabs.add("策略编辑器")
         self.tabs.add("历史回测")
         self.tabs.add("数据管理")
@@ -237,7 +243,8 @@ class AutoTradingApp(
         self.tabs.add("规律候选")
 
         self._build_run_tab(self.tabs.tab("运行"))
-        self._build_config_tab(self.tabs.tab("配置"))
+        self._build_credentials_tab(self.tabs.tab("账号"))
+        self._build_config_tab(self.tabs.tab("交易配置"))
         self._build_rule_editor_tab(self.tabs.tab("策略编辑器"))
         self._build_backtest_tab(self.tabs.tab("历史回测"))
         self._build_data_tab(self.tabs.tab("数据管理"))
@@ -247,8 +254,19 @@ class AutoTradingApp(
         self._build_account_tab(self.tabs.tab("账户分析"))
         self._build_research_tab(self.tabs.tab("规律候选"))
         self._load_saved_picks()
+        # 切到交叉测试时重画策略名单，避免还停在启动那一份。
+        self.tabs.configure(command=self._on_main_tab_change)
         # 打开程序先看一眼当前关注合约是不是主力，非主力时在配置页亮提示。
         self.after(300, self._refresh_main_contract_hint)
+
+    def _on_main_tab_change(self) -> None:
+        """顶部分页切换。交叉测试名单跟当前程序策略走，每次点开都刷新。"""
+        try:
+            name = self.tabs.get()
+        except Exception:
+            return
+        if name == "交叉测试" and not getattr(self, "_pick_running", False):
+            self._refresh_cross_lists()
 
 
 def main() -> None:

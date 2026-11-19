@@ -10,6 +10,7 @@ principle:
   - 出场：反向交叉平仓（reverse_on_cross=true 时反手）
   - 市场状态过滤：ADX < 20 或 ATR 处于近 60 根最低 20% 分位时不开新仓
   - 是否 14:55、22:55 清仓，听配置页「收盘清仓」总开关
+  - 止损周期跟左边公共项，可以和信号周期不同
 
 defaults:
   short_period: 20

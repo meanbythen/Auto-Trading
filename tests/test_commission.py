@@ -18,6 +18,14 @@ def test_open_and_close_today_fees() -> None:
     assert fee_close(contracts, "fu2701", 1, close_today=False) == 2.63
 
 
+def test_close_yesterday_can_differ_from_open() -> None:
+    """生猪这类开仓、平昨费率不同时，平昨用平仓手续费。"""
+    contracts = {"lh": {"commission": 30.0, "commission_close": 15.0, "commission_close_today": 0.0}}
+    assert fee_open(contracts, "lh2701", 1) == 30.0
+    assert fee_close(contracts, "lh2701", 1, close_today=False) == 15.0
+    assert fee_close(contracts, "lh2701", 1, close_today=True) == 0.0
+
+
 def test_blank_close_today_follows_per_lot() -> None:
     contracts = {"rb": {"commission": 1.5}}
     assert fee_close(contracts, "rb2701", 2, close_today=True) == 3.0

@@ -32,8 +32,8 @@ class DataTabMixin:
         ctk.CTkLabel(
             left,
             text=(
-                "本地 K 线库的建立和管理都在这里。从同花顺图按「周期 + 时段」读 K 线，"
-                "每根带时间戳，分几次读会按时间接上；每次读完自动更新库存 Excel。"
+                "本地 K 线和 tick 的增加、删除、查看都在这里，不改已经存下的基础数据。"
+                "从同花顺图按「周期 + 时段」读 K 线，每根带时间戳，分几次读会按时间接上；每次读完自动更新库存 Excel。"
             ),
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
@@ -211,6 +211,42 @@ class DataTabMixin:
             text_color=T.TEXT,
             command=self._on_download_history_tick,
         ).pack(fill="x", padx=4, pady=(0, 4))
+        ctk.CTkButton(
+            left,
+            text="查看本地tick库存",
+            height=34,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_show_tick_inventory,
+        ).pack(fill="x", padx=4, pady=(0, 4))
+        tick_io = ctk.CTkFrame(left, fg_color="transparent")
+        tick_io.pack(fill="x", padx=4, pady=(0, 4))
+        ctk.CTkButton(
+            tick_io,
+            text="查看这段tick",
+            height=34,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_inspect_ticks,
+        ).pack(side="left", fill="x", expand=True, padx=(0, 6))
+        ctk.CTkButton(
+            tick_io,
+            text="删除本地tick",
+            height=34,
+            width=120,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_purge_ticks,
+        ).pack(side="left")
         ctk.CTkLabel(
             left,
             textvariable=self.tick_inventory_var,
@@ -224,7 +260,8 @@ class DataTabMixin:
             text=(
                 "合约名单空着时，自动用配置页的关注品种。"
                 "「启动 tick 采集」攒盘中实时；「下载历史 tick」需要天勤专业版/试用，免费账号会明确提示没权限。"
-                "合成后的 K 线单独存 tick_bars 库，回测数据源选「tick合成」，不覆盖天勤官方 K 线。"
+                "tick 只做增删查、不改每一笔：采集/下载是增，库存和「查看这段tick」是查，"
+                "「删除本地tick」清掉乱段后再重新下载。逐笔仍只在数据库，不写进 K 线库存表。"
             ),
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
@@ -236,6 +273,14 @@ class DataTabMixin:
             left, text="本地库存", font=T.FONT_TITLE, text_color=T.TEXT
         ).pack(anchor="w", padx=4, pady=(8, 4))
         inv_row = ctk.CTkFrame(left, fg_color="transparent")
+        ctk.CTkLabel(
+            left,
+            text="K 线和 tick 都只做增加、删除、查看。已经存下的基础数据不改；乱了就删掉再拉。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=380,
+            justify="left",
+        ).pack(anchor="w", padx=4, pady=(0, 4))
         inv_row.pack(fill="x", padx=4, pady=(0, 4))
         ctk.CTkButton(
             inv_row,
@@ -884,6 +929,231 @@ class DataTabMixin:
         self._dm_write(f"行情质量 {symbol} {report.status} | {path}")
 
     # ---------- 天勤 tick ----------
+    def _on_show_tick_inventory(self) -> None:
+        """写出 tick 统计 Excel 并打开。逐笔不进表，也不写进 K 线库存。"""
+        from tkinter import messagebox
+
+        from src.data.tick.downloader import download_settings
+        from src.data.tick.inventory import (
+            collect_tick_inventory,
+            tick_inventory_message,
+            write_tick_inventory,
+        )
+
+        try:
+            settings = download_settings(self.cfg)
+            book = collect_tick_inventory(
+                self.root_dir,
+                database=settings["database"],
+                history_dir=settings["out_dir"],
+            )
+            path = write_tick_inventory(self.root_dir, book)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("查看本地tick库存失败")
+            messagebox.showerror("打不开库存", str(exc))
+            return
+        opened = self._open_local_file(path)
+        self._dm_write(f"本地tick库存 {tick_inventory_message(book)} | {path}")
+        self._refresh_tick_card()
+        if not opened:
+            messagebox.showerror(
+                "打不开统计表",
+                f"表已经写好，但系统没能打开 Excel。\n请自己打开：\n{path}",
+            )
+
+    def _on_inspect_ticks(self) -> None:
+        """抽查一段 tick：根数、起止、头尾几笔。只读不改。"""
+        from src.data.tick.downloader import download_settings
+        from src.data.tick.manage import format_tick_inspect, inspect_ticks
+        from src.ui.datetime_pickers import DateTimeField
+
+        settings = download_settings(self.cfg)
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("查看这段tick")
+        dialog.geometry("520x720")
+        dialog.minsize(480, 560)
+        dialog.transient(self)
+        dialog.grab_set()
+        ctk.CTkLabel(
+            dialog,
+            text="只看本地已经存下的 tick，不拉网、不改数、不下单。\n"
+            "时间段留空表示这一合约全部。夜盘过零点算第二天，抽查夜盘请把「到」多选一天。",
+            justify="left",
+            text_color=T.TEXT_DIM,
+            wraplength=460,
+        ).pack(anchor="w", padx=16, pady=(16, 10))
+        ctk.CTkLabel(dialog, text="合约（fu2701 或 SHFE.fu2701）").pack(anchor="w", padx=16)
+        symbol_entry = ctk.CTkEntry(dialog, height=32, placeholder_text="fu2701")
+        symbol_entry.pack(fill="x", padx=16, pady=(0, 8))
+        current = (self.dm_symbol_var.get() or "").strip()
+        if current and current != "（还没有）":
+            symbol_entry.insert(0, current)
+        ctk.CTkLabel(dialog, text="从（可空）").pack(anchor="w", padx=16)
+        from_field = DateTimeField(dialog)
+        from_field.frame.pack(anchor="w", padx=16, pady=(0, 8))
+        ctk.CTkLabel(dialog, text="到（可空）").pack(anchor="w", padx=16)
+        to_field = DateTimeField(dialog)
+        to_field.frame.pack(anchor="w", padx=16, pady=(0, 8))
+        result = ctk.CTkTextbox(
+            dialog, height=260, font=T.FONT_MONO, fg_color=T.BG, text_color=T.TEXT, wrap="word"
+        )
+        result.pack(fill="both", expand=True, padx=16, pady=(0, 8))
+        result.insert("end", "选好合约和时间后点「查看」。不会改库。")
+
+        def _lookup() -> None:
+            try:
+                book = inspect_ticks(
+                    database=settings["database"],
+                    symbol=symbol_entry.get().strip(),
+                    ts_from=from_field.get() or None,
+                    ts_to=to_field.get() or None,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("查看这段tick失败")
+                result.delete("1.0", "end")
+                result.insert("end", f"查看失败：{exc}")
+                return
+            result.delete("1.0", "end")
+            result.insert("end", format_tick_inspect(book))
+
+        def _open_folder() -> None:
+            folder = Path(settings["database"]).parent
+            folder.mkdir(parents=True, exist_ok=True)
+            if not self._open_local_file(folder):
+                result.insert("end", f"\n打不开文件夹：{folder}")
+
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(0, 16))
+        ctk.CTkButton(btn_row, text="查看", command=_lookup, width=100).pack(side="left")
+        ctk.CTkButton(btn_row, text="打开tick文件夹", command=_open_folder, width=140).pack(side="right")
+
+    def _on_purge_ticks(self) -> None:
+        """按时段删除 tick，并清掉续传，才能重新下载。先数再删。"""
+        from tkinter import messagebox
+
+        from src.data.tick.downloader import download_settings
+        from src.data.tick.manage import preview_purge_ticks, purge_ticks
+        from src.ui.datetime_pickers import DateTimeField
+
+        recorder = getattr(self, "_tick_recorder", None)
+        if recorder is not None and recorder.running:
+            if not messagebox.askokcancel(
+                "删除本地tick",
+                "实时采集还在跑，删库可能和正在写入打架。建议先停采集再删。仍要继续？",
+            ):
+                return
+
+        settings = download_settings(self.cfg)
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("删除本地tick")
+        dialog.geometry("520x640")
+        dialog.minsize(480, 560)
+        dialog.transient(self)
+        dialog.grab_set()
+        ctk.CTkLabel(
+            dialog,
+            text="某一段 tick 很乱时，整段删掉再点「下载历史 tick」重下。\n"
+            "不会改留下的 tick，只整段删除。时间段留空表示这一合约全部。\n"
+            "会同时忘掉这段的下载续传，并删对应历史 csv，否则下次还会跳过。",
+            justify="left",
+            text_color=T.TEXT_DIM,
+            wraplength=460,
+        ).pack(anchor="w", padx=16, pady=(16, 10))
+        ctk.CTkLabel(dialog, text="合约（fu2701 或 SHFE.fu2701，必填）").pack(anchor="w", padx=16)
+        symbol_entry = ctk.CTkEntry(dialog, height=32, placeholder_text="fu2701")
+        symbol_entry.pack(fill="x", padx=16, pady=(0, 8))
+        current = (self.dm_symbol_var.get() or "").strip()
+        if current and current != "（还没有）":
+            symbol_entry.insert(0, current)
+        ctk.CTkLabel(dialog, text="从（可空：日历选日期，时分可选）").pack(anchor="w", padx=16)
+        from_field = DateTimeField(dialog)
+        from_field.frame.pack(anchor="w", padx=16, pady=(0, 8))
+        ctk.CTkLabel(dialog, text="到（可空）").pack(anchor="w", padx=16)
+        to_field = DateTimeField(dialog)
+        to_field.frame.pack(anchor="w", padx=16, pady=(0, 8))
+        synth_var = ctk.BooleanVar(value=True)
+        ctk.CTkSwitch(dialog, text="同时删这段 tick 合成的K线", variable=synth_var).pack(
+            anchor="w", padx=16, pady=(0, 10)
+        )
+        hint = ctk.CTkLabel(dialog, text="", text_color=T.TEXT_DIM, wraplength=460, justify="left")
+        hint.pack(anchor="w", padx=16, pady=(0, 8))
+
+        def _args() -> dict:
+            return {
+                "symbol": symbol_entry.get().strip(),
+                "ts_from": from_field.get() or None,
+                "ts_to": to_field.get() or None,
+            }
+
+        def _preview() -> None:
+            try:
+                seen = preview_purge_ticks(database=settings["database"], **_args())
+            except Exception as exc:  # noqa: BLE001
+                hint.configure(text=str(exc))
+                return
+            hint.configure(
+                text=(
+                    f"将删除 {seen['exchange']}.{seen['symbol']} 共 {seen['count']} 笔"
+                    f"（{seen['start'] or '起'} ~ {seen['end'] or '止'}）。"
+                    "确认后不可恢复，请再点下面的删除。"
+                )
+            )
+
+        def _do_delete() -> None:
+            try:
+                seen = preview_purge_ticks(database=settings["database"], **_args())
+            except Exception as exc:  # noqa: BLE001
+                messagebox.showerror("还不能删", str(exc), parent=dialog)
+                return
+            if int(seen.get("count") or 0) <= 0:
+                messagebox.showinfo("没有可删的", "按现在的条件，库里没有匹配的 tick。", parent=dialog)
+                return
+            if not messagebox.askokcancel(
+                "确认删除",
+                f"将删除 {seen['exchange']}.{seen['symbol']} 共 {seen['count']} 笔。\n"
+                "对应历史 csv 和续传标记也会清掉，然后才能重新下载。不可恢复。",
+                parent=dialog,
+            ):
+                return
+            try:
+                result = purge_ticks(
+                    self.root_dir,
+                    database=settings["database"],
+                    history_dir=settings["out_dir"],
+                    also_synth_bars=bool(synth_var.get()),
+                    **_args(),
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("删除本地tick失败")
+                messagebox.showerror("删除失败", str(exc), parent=dialog)
+                return
+            bars = result.get("synth_bars") or {}
+            msg = (
+                f"已删除 {result['exchange']}.{result['symbol']} {result['deleted']} 笔。"
+                f"续传忘掉 {result.get('manifest_cleared') or 0} 块，"
+                f"csv 删掉 {len(result.get('csv_deleted') or [])} 个。"
+            )
+            if bars.get("clean_deleted") or bars.get("raw_deleted"):
+                msg += (
+                    f" 合成K线删了清洗 {bars.get('clean_deleted') or 0} 根、"
+                    f"原样 {bars.get('raw_deleted') or 0} 根。"
+                )
+            locked = list(result.get("csv_locked") or [])
+            if locked:
+                msg += "\n有 csv 正被占用，请关掉后再删一次，否则重下仍可能跳过：\n" + "\n".join(locked)
+            self._dm_write(f"删除本地tick {msg.replace(chr(10), ' ')}")
+            self._refresh_tick_card()
+            messagebox.showinfo("已删除" if not locked else "库已删，csv 还被占用", msg, parent=dialog)
+            if not locked:
+                dialog.destroy()
+
+        btn_row = ctk.CTkFrame(dialog, fg_color="transparent")
+        btn_row.pack(fill="x", padx=16, pady=(8, 16))
+        ctk.CTkButton(btn_row, text="先看要删多少", command=_preview, width=140).pack(side="left")
+        ctk.CTkButton(btn_row, text="确认删除", command=_do_delete, width=140, fg_color="#8B2E2E").pack(
+            side="right"
+        )
+
 
     def _refresh_tick_card(self) -> None:
         """刷 tick 采集心跳和本地库存摘要。每 2 秒由主心跳调用，只读文件。"""
@@ -932,7 +1202,8 @@ class DataTabMixin:
             total = sum(int(item["count"]) for item in overview)
             latest = max((str(item["end"]) for item in overview if item.get("end")), default="")
             self.tick_inventory_var.set(
-                f"tick 库存：{len(overview)} 个合约，{total} 条，最新 {latest or '—'}"
+                f"tick 库存：{len(overview)} 个合约，{total} 条，最新 {latest or '—'}。"
+                "点「查看本地tick库存」看连续时段和来源"
             )
         else:
             self.tick_inventory_var.set("tick 库存：空，先启动采集或下载历史 tick")

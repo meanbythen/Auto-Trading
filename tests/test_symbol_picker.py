@@ -21,7 +21,7 @@ from src.screen.picker import (
     list_rows,
     window_rows,
     prepare_screen_cfg,
-    SCREEN_STRATEGIES,
+    listed_cross_engines,
     screen_cross,
     screen_strategies,
     screen_symbols,
@@ -604,7 +604,7 @@ def test_strategy_compare_keeps_one_symbol_and_ranks_each_engine() -> None:
         },
         runner=runner,
     )
-    engines = [item[0] for item in SCREEN_STRATEGIES]
+    engines = [item[0] for item in listed_cross_engines()]
     assert "custom" not in engines
     assert "macd_divergence" not in engines
     assert "liquidity_exhaustion" not in engines
@@ -612,7 +612,7 @@ def test_strategy_compare_keeps_one_symbol_and_ranks_each_engine() -> None:
     assert "sar_flip" not in engines
     assert "morning_gap_c" not in engines
     assert "morning_box_a" not in engines
-    # 含长线趋势加减仓和布林/SAR/多因子；以后再加策略时这里要跟着 SCREEN_STRATEGIES 变。
+    # 含长线趋势加减仓和布林/SAR/多因子；名单跟当前程序策略走。
     assert "swing_trend" in engines
     assert "ema_swing" in engines
     assert "bollinger" in engines
@@ -623,11 +623,13 @@ def test_strategy_compare_keeps_one_symbol_and_ranks_each_engine() -> None:
     assert "jesse_casper" not in engines
     assert "daily_body_expand" not in engines
     assert "swing_box" in engines
-    assert "float_hold" in engines
+    assert "float_hold" not in engines
     from src.strategy.factory import CROSS_TEST_ENGINE_ORDER
 
-    assert len(engines) == len(set(engines)) == len(CROSS_TEST_ENGINE_ORDER)
-    assert [item[0] for item in seen] == ["rb2701"] * len(CROSS_TEST_ENGINE_ORDER)
+    builtins = [code for code in engines if not str(code).startswith("rule_dsl:")]
+    assert builtins[: len(CROSS_TEST_ENGINE_ORDER)] == list(CROSS_TEST_ENGINE_ORDER)
+    assert len(engines) == len(set(engines))
+    assert [item[0] for item in seen] == ["rb2701"] * len(engines)
     assert [item[1] for item in seen] == engines
     shown = list_rows(result)
     assert shown[0]["symbol"] == "日内实体"
@@ -637,7 +639,7 @@ def test_strategy_compare_keeps_one_symbol_and_ranks_each_engine() -> None:
 
 
 def test_cross_row_keeps_full_evaluation_dimensions(monkeypatch) -> None:
-    """交叉测试每个组合沿用回测自带的评估，R期望、卡尔玛、连亏和未通过项都要带出来。"""
+    """交叉测试每个组合沿用回测自带的评估，收益期望、卡尔玛、连亏和未通过项都要带出来。"""
     from src.backtest.evaluation import EvaluationReport
 
     monkeypatch.setattr("src.screen.picker._market_snapshot", lambda *_a, **_k: {})
@@ -698,7 +700,8 @@ def test_cross_row_keeps_full_evaluation_dimensions(monkeypatch) -> None:
     assert row["evaluation"] == "淘汰"
 
     shown = list_rows(result)[0]
-    assert shown["r_expectancy"] == "0.120"
+    assert "r_expectancy" not in shown
+    assert shown["expectancy"] not in ("", None)
     assert shown["calmar"] == "0.80"
     assert shown["loss_streak"] == "6笔"
     assert shown["evaluation"] == "淘汰"
@@ -898,7 +901,7 @@ def test_cross_uses_config_contracts_and_strategies() -> None:
     assert codes == ["daily_body", "supertrend"]
     assert "custom" not in codes
     assert "sar_flip" not in codes
-    assert len(engines_for_cross({})) == len(SCREEN_STRATEGIES)
+    assert len(engines_for_cross({})) == len(listed_cross_engines())
 
     # 交叉测试本体只跑这两套，用来核对合约名单，不把补全后的整份名单再测一遍。
     engines = [("daily_body", "日内实体"), ("supertrend", "SuperTrend趋势")]

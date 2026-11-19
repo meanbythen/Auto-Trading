@@ -91,6 +91,11 @@ def prepare_live_ctp_cfg(cfg: dict[str, Any], kind: str) -> dict[str, Any]:
     ctp = trade.setdefault("ctp", {})
     cfg["dry_run"] = False
     ctp["account_kind"] = kind
+    from src.trader.ctp_profile import profile_name_for_kind
+
+    matched = profile_name_for_kind(ctp, kind)
+    if matched:
+        ctp["ctp_profile"] = matched
     # 只在内存里标记：这是交易台会话。不改 yaml 里的等待秒数。
     # 挂单留给人撤，方便华泰测手撤、批量撤、重复报单；常驻仍一次只挂一笔并超时撤。
     ctp["desk_session"] = True

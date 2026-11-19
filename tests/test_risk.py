@@ -7,6 +7,34 @@
 from src.risk.guardian import RiskGuardian
 
 
+def test_open_waits_after_close_fill() -> None:
+    """手机或本程序刚平仓后，不能立刻再开；配置页「下单最小间隔」要生效。"""
+    g = RiskGuardian(min_order_interval_sec=60)
+    g.on_order_filled("sell_open", 1, "lh2701")
+    g.on_order_filled("close", 1, "lh2701")
+    ok, reason = g.allow("sell_open", 1, symbol="lh2701")
+    assert ok is False
+    assert "不足" in reason
+    assert "60" in reason
+
+
+def test_second_open_waits_after_first_open() -> None:
+    """两笔开仓之间也要等够间隔。"""
+    g = RiskGuardian(min_order_interval_sec=60)
+    g.on_order_filled("buy_open", 1, "bu2612")
+    ok, reason = g.allow("buy_open", 1, symbol="bu2612")
+    assert ok is False
+    assert "不足" in reason
+
+
+def test_force_close_ignores_interval() -> None:
+    """收盘清仓带 force，不被间隔挡住。"""
+    g = RiskGuardian(min_order_interval_sec=60)
+    g.on_order_filled("buy_open", 1, "bu2612")
+    ok, reason = g.allow("close", 1, symbol="bu2612", force=True)
+    assert ok is True
+
+
 def test_block_when_no_position_close() -> None:
     """没有持仓时不允许平仓。"""
     g = RiskGuardian(min_order_interval_sec=0)

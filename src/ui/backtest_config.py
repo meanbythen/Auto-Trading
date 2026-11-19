@@ -105,44 +105,33 @@ class BacktestConfigMixin:
         """
         把配置页上会影响回测的内容抄到回测页。不改磁盘。
 
-        full=True 是「按配置页重新填入」：连策略、品种、周期和行情来源一起抄，优化页同一组条件也跟着变。
-        平时重新加载只抄资金数字和三个开关，不改回测页正在看的策略和品种。
-        「启用限制」不抄。配置页没有这个开关，实盘一直按这些数字算手数。
-        清仓时刻、ETH 分钟、实体 ATR 倍数、趋势进场根数、SuperTrend 倍数等没有单独的回测框，开始回测时直接用配置页当时的值。
+        只有点「按配置页重新填入」（full=True）才抄。点开始回测、保存、重新加载都不要改回测页手改过的项。
+        「启用限制」不抄。配置页没有这个开关。
+        清仓时刻、ETH 分钟等没有单独的回测框，开始回测时仍用配置页当时的策略参数。
         """
+        if not full:
+            return
         from src.ui.backtest_fill import first_symbol
 
-        if full:
-            engine = _ui_engine(self.engine_var.get())
-            # 用配置页下拉框里当前选中的合约，不是列表里随便第一个旧名字。
-            symbol = self._config_symbol_now() or first_symbol(self.symbols_var.get())
-            tf_code = self._period_code(self.tf_var, self.tf_custom_var)
-            trail_code = self._period_code(self.trail_var, self.trail_custom_var)
-            self.bt_engine_var.set(engine)
-            self.opt_engine_var.set(engine)
-            self._sync_bt_symbol_menu(prefer=symbol, force=True)
-            symbol = self.bt_symbol_var.get().strip()
-            if symbol and symbol != "（还没有）":
-                self._sync_symbol_choice("opt_symbol_menu", self.opt_symbol_var, prefer=symbol, force=True)
-                self._sync_symbol_choice("rv_symbol_menu", self.rv_symbol_var, prefer=symbol, force=True)
-            self._set_period_vars(tf_code, self.bt_tf_var, self.bt_tf_custom_var)
-            self._set_period_vars(tf_code, self.opt_tf_var, self.opt_tf_custom_var)
-            self._set_period_vars(trail_code, self.bt_trail_var, self.bt_trail_custom_var)
-            self._set_period_vars(trail_code, self.opt_trail_var, self.opt_trail_custom_var)
-            self.bt_source_var.set(self.source_var.get())
-            self.opt_source_var.set(self.source_var.get())
-        else:
-            symbol = self.bt_symbol_var.get().strip()
-            if symbol == "（还没有）":
-                symbol = ""
-            symbol = symbol or self._config_symbol_now() or first_symbol(self.symbols_var.get())
-            engine = self.bt_engine_var.get()
-            tf_code = self._period_code(self.bt_tf_var, self.bt_tf_custom_var)
-            trail_code = self._period_code(self.bt_trail_var, self.bt_trail_custom_var)
-
-        # 收盘清仓要一起抄。以前只抄数字，回测仍用页面上旧的关。
+        engine = _ui_engine(self.engine_var.get())
+        # 用配置页下拉框里当前选中的合约，不是列表里随便第一个旧名字。
+        symbol = self._config_symbol_now() or first_symbol(self.symbols_var.get())
+        tf_code = self._period_code(self.tf_var, self.tf_custom_var)
+        trail_code = self._period_code(self.trail_var, self.trail_custom_var)
+        self.bt_engine_var.set(engine)
+        self.opt_engine_var.set(engine)
+        self._sync_bt_symbol_menu(prefer=symbol, force=True)
+        symbol = self.bt_symbol_var.get().strip()
+        if symbol and symbol != "（还没有）":
+            self._sync_symbol_choice("opt_symbol_menu", self.opt_symbol_var, prefer=symbol, force=True)
+            self._sync_symbol_choice("rv_symbol_menu", self.rv_symbol_var, prefer=symbol, force=True)
+        self._set_period_vars(tf_code, self.bt_tf_var, self.bt_tf_custom_var)
+        self._set_period_vars(tf_code, self.opt_tf_var, self.opt_tf_custom_var)
+        self._set_period_vars(trail_code, self.bt_trail_var, self.bt_trail_custom_var)
+        self._set_period_vars(trail_code, self.opt_trail_var, self.opt_trail_custom_var)
+        self.bt_source_var.set(self.source_var.get())
+        self.opt_source_var.set(self.source_var.get())
         self.bt_flatten_var.set(bool(self.flatten_at_close_var.get()))
-
         self.bt_sizing_var.set(self.sizing_mode_var.get())
         self.bt_capital_var.set(self.capital_var.get())
         if hasattr(self, "pk_capital_var"):
@@ -156,12 +145,12 @@ class BacktestConfigMixin:
         risk = self.cfg.get("risk", {}) if isinstance(self.cfg, dict) else {}
         self.bt_min_vol_var.set(str(risk.get("min_volume", self.bt_min_vol_var.get() or 1)))
         self._sync_bt_margin_from_table(symbol)
-        if not full:
-            return
         if hasattr(self, "opt_hist_menu"):
             self._refresh_opt_history()
+
         def on_off(flag: object) -> str:
             return "开" if flag else "关"
+
         self._append_log(
             "已按配置页填入历史回测："
             f"策略 {ENGINE_LABELS.get(engine, engine)}，品种 {symbol}，"
@@ -282,10 +271,10 @@ class BacktestConfigMixin:
             f"清仓{on_off(flatten_on)} | {path}"
         )
         self._refresh_status_cards()
-        self.tabs.set("配置")
+        self.tabs.set("交易配置")
         messagebox.showinfo(
             "已写入",
-            "配置页已换成历史回测本页的策略、品种、周期、开关和开仓限制，并保存到配置文件。",
+            "交易配置已换成历史回测本页的策略、品种、周期、开关和开仓限制，并保存到配置文件。",
         )
 
 
@@ -296,15 +285,35 @@ class BacktestConfigMixin:
 
     def _apply_backtest_switches(self, cfg: dict) -> None:
         """
-        收盘清仓跟实盘配置页总开关一致，写进这一次回测副本。
+        收盘清仓听历史回测页上那一格，写进这一次回测副本。
 
-        趋势跟随看的是自己那一节里的开关，这里不动。
+        不要用交易配置把这一格改回去：关掉再点开始，必须还是关。
+        要跟交易配置一样，请点「按配置页重新填入」。
+        趋势跟随、SuperTrend 看自己那一节，这里只改总开关。
+        多因子 / 布林 / SAR 自己那一节跟着这一格，避免仍到点强平。
         """
         st = cfg.setdefault("strategy", {})
-        live_flat = bool(self.flatten_at_close_var.get())
-        st["flatten_at_close"] = live_flat
         if hasattr(self, "bt_flatten_var"):
-            self.bt_flatten_var.set(live_flat)
+            page_flat = bool(self.bt_flatten_var.get())
+        else:
+            page_flat = bool(self.flatten_at_close_var.get())
+        st["flatten_at_close"] = page_flat
+        engine = str(st.get("engine") or "")
+        nested_flatten = {
+            "multi_factor": "multi_factor",
+            "multi": "multi_factor",
+            "cta": "multi_factor",
+            "bollinger": "bollinger",
+            "boll": "bollinger",
+            "sar_trend": "sar_trend",
+            "sar": "sar_trend",
+            "parabolic_sar": "sar_trend",
+        }
+        section = nested_flatten.get(engine)
+        if section:
+            box = st.setdefault(section, {})
+            if isinstance(box, dict):
+                box["flatten_at_close"] = page_flat
         # 成交近似：下一根开盘 + 滑点跳数，只写进这一次回测副本。
         bt = cfg.setdefault("backtest", {})
         # 真实账户口径只这一处写入副本，换月分段和单合约都读它，不再另设手数规则。
@@ -312,6 +321,8 @@ class BacktestConfigMixin:
             bt["chain_capital"] = bool(self.bt_rollover_chain_var.get())
         if hasattr(self, "bt_fill_next_open_var"):
             bt["fill_on_next_open"] = bool(self.bt_fill_next_open_var.get())
+        if hasattr(self, "bt_mirror_gates_var"):
+            bt["mirror_live_gates"] = bool(self.bt_mirror_gates_var.get())
         if hasattr(self, "bt_slippage_var"):
             try:
                 bt["slippage_ticks"] = max(0.0, float(self.bt_slippage_var.get() or 0))
@@ -362,36 +373,20 @@ class BacktestConfigMixin:
 
     def _align_backtest_trading_params_with_live(self) -> None:
         """
-        仓位、风险、保证金、收盘清仓与实盘配置对齐，并刷新回测页显示。
+        旧入口：点开始回测时曾经把配置页数字盖到回测页上。
 
-        策略引擎 / 周期 / 品种仍可由回测页单独选。账户权益不在这里覆盖：
-        测试页可以填准备投入的资金，只有点「按配置页重新填入」才抄回当前余额。
+        现在什么都不改。要跟交易配置一样，只点「按配置页重新填入」。
         """
-        if not hasattr(self, "bt_capital_var"):
-            return
-        risk = self.cfg.get("risk") or {}
-        self.bt_sizing_var.set(self.sizing_mode_var.get() or "risk_pct")
-        self.bt_risk_pct_var.set(self.risk_pct_var.get())
-        self.bt_margin_usage_pct_var.set(self.margin_usage_pct_var.get())
-        self.bt_volume_var.set(self.volume_var.get())
-        self.bt_max_loss_var.set(self.max_loss_var.get())
-        self.bt_interval_var.set(self.min_interval_var.get())
-        self.bt_max_orders_var.set(self.max_orders_var.get())
-        self.bt_min_vol_var.set(str(risk.get("min_volume", 1)))
-        if hasattr(self, "bt_flatten_var") and hasattr(self, "flatten_at_close_var"):
-            self.bt_flatten_var.set(bool(self.flatten_at_close_var.get()))
-        self._sync_bt_margin_from_table()
+        return
 
 
     def _apply_backtest_limits(self, cfg: dict, *, symbol: str | None = None) -> None:
         """
-        把实盘配置里的开仓限制写进这一次回测/优化副本（保证金优先品种表）。
+        把回测页上的开仓限制写进这一次回测/优化副本（保证金优先品种表）。
 
-        不写磁盘。回测页「启用限制」关掉时仍固定 1 手，便于只看信号。
-        账户权益读本页填的数（准备投入的资金），其它手数规则仍跟配置页。
+        不写磁盘。不回头改回测页上的格子。启用限制关掉时仍固定 1 手，便于只看信号。
         symbol：算哪一个合约的表内保证金；空则用历史回测页当前品种。
         """
-        self._align_backtest_trading_params_with_live()
         risk = cfg.setdefault("risk", {})
         trade = cfg.setdefault("trade", {})
         # 开关关掉：固定 1 手，后面的数字先留着，下次打开还在。
@@ -405,19 +400,19 @@ class BacktestConfigMixin:
                 pass
             return
         try:
-            risk["sizing_mode"] = self.sizing_mode_var.get() or "risk_pct"
+            risk["sizing_mode"] = self.bt_sizing_var.get() or "risk_pct"
             risk["capital"] = float(self.bt_capital_var.get())
-            risk["risk_per_trade_pct"] = float(self.risk_pct_var.get())
-            risk["margin_usage_pct"] = max(0.0, float(self.margin_usage_pct_var.get() or 0))
-            trade["volume"] = int(float(self.volume_var.get()))
-            risk["min_volume"] = max(1, int(float(risk.get("min_volume", 1) or 1)))
+            risk["risk_per_trade_pct"] = float(self.bt_risk_pct_var.get())
+            risk["margin_usage_pct"] = max(0.0, float(self.bt_margin_usage_pct_var.get() or 0))
+            trade["volume"] = int(float(self.bt_volume_var.get()))
+            risk["min_volume"] = max(1, int(float(self.bt_min_vol_var.get() or 1)))
             risk.pop("max_position", None)
-            risk["max_daily_loss"] = float(self.max_loss_var.get())
-            risk["min_order_interval_sec"] = max(0, int(float(self.min_interval_var.get())))
-            risk["max_orders_per_day"] = max(1, int(float(self.max_orders_var.get())))
-            generic_margin = max(0.0, float(self.margin_var.get() or 0))
+            risk["max_daily_loss"] = float(self.bt_max_loss_var.get())
+            risk["min_order_interval_sec"] = max(0, int(float(self.bt_interval_var.get())))
+            risk["max_orders_per_day"] = max(1, int(float(self.bt_max_orders_var.get())))
+            generic_margin = max(0.0, float(self.bt_margin_var.get() or 0))
         except ValueError as e:
-            raise ValueError("回测页的账户权益、以及配置页的风险和手数要填数字") from e
+            raise ValueError("回测页的账户权益、风险和手数要填数字") from e
         code = (symbol or self.bt_symbol_var.get() or "").strip()
         # 有保证金比例时按每笔开仓价现算，不要绑死一个金额把比例清掉。
         risk["margin_per_lot"] = generic_margin
@@ -435,8 +430,7 @@ class BacktestConfigMixin:
         """把回测页的选项收成一份可跑的回测配置。参数不对时弹窗并返回 None。"""
         from tkinter import messagebox
 
-        # 先对齐手数规则（账户权益不覆盖），再克隆成这一次回测副本。
-        self._align_backtest_trading_params_with_live()
+        # 只克隆一份来跑，不改回测页上已经填好的格子。
         cfg = self._clone_cfg()
         try:
             self._apply_backtest_limits(cfg)
@@ -456,7 +450,7 @@ class BacktestConfigMixin:
             messagebox.showwarning("还没有品种", "请先在配置页的关注品种里添加合约，例如 bu2612。")
             return None
         st["symbols"] = [symbol]
-        # 收盘清仓跟实盘配置页总开关一致。
+        # 收盘清仓听本页开关。
         self._apply_backtest_switches(cfg)
         try:
             preset = self.bt_range_var.get()

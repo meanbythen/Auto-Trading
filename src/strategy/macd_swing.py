@@ -23,8 +23,7 @@ import pandas as pd
 from loguru import logger
 
 from .base import StrategyBase
-from .float_hold.trend_gate import ema_angle_deg
-from .indicators import average_true_range, ema_series
+from .indicators import average_true_range, ema_angle_deg, ema_series
 from .session_scope import scope_allows, scope_from_cfg
 from .types import (
     STOP_MODE_TOUCH,
@@ -56,7 +55,8 @@ class MacdSwingStrategy(StrategyBase):
         trade = cfg.get("trade", {}) or {}
 
         self.timeframe = str(st.get("timeframe", "5"))
-        self.trail_timeframe = self.timeframe
+        # 止损周期跟左边公共项，不再强行抄成信号周期。
+        self.trail_timeframe = str(st.get("trail_timeframe") or self.timeframe)
         self.symbols: list[str] = list(st.get("symbols") or [trade.get("symbol", "bu2612")])
         self.volume = int(trade.get("volume", 1))
         self.stop_mode = stop_mode_from_cfg(cfg)
@@ -532,10 +532,41 @@ def parse_ema_len(value: Any, default: int = 120) -> int:
     return _period(text, default, 2, 240)
 
 
+def parse_ema_pair_label(value: Any, *, default_fast: int = 5, default_slow: int = 20) -> tuple[int, int]:
+    """认「EMA5 / EMA20」「5/20」。认不出就用出厂短线和长线。"""
+    text = str(value or "").strip().upper().replace(" ", "")
+    text = text.replace("EMA", "")
+    for sep in ("/", "-", ",", "对"):
+        if sep in text:
+            left, right = text.split(sep, 1)
+            try:
+                return _ema_pair_ints(int(left), int(right), default_fast, default_slow)
+            except (TypeError, ValueError):
+                break
+    return _ema_pair_ints(default_fast, default_slow, default_fast, default_slow)
+
+
+def _ema_pair_ints(fast: Any, slow: Any, default_fast: int, default_slow: int) -> tuple[int, int]:
+    """短均线必须小于长均线。"""
+    try:
+        a = int(float(fast))
+    except (TypeError, ValueError):
+        a = int(default_fast)
+    try:
+        b = int(float(slow))
+    except (TypeError, ValueError):
+        b = int(default_slow)
+    a = max(2, min(240, a))
+    b = max(3, min(240, b))
+    if a == b:
+        b = a + 1
+    if a > b:
+        a, b = b, a
+    return a, b
+
+
 def parse_dir_pair(label: Any, fast: Any, slow: Any) -> tuple[int, int]:
     """方向均线对。认「EMA(21)/EMA(122)」或两个数字。短的在前、长的在后。"""
-    from src.strategy.float_hold import parse_ema_pair_label
-
     if label:
         text = str(label)
         for junk in ("(", ")", "（", "）"):

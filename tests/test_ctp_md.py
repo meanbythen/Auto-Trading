@@ -1,7 +1,16 @@
-"""仿真报价的数字格式。不连接柜台。"""
+"""柜台报价的数字格式。不连接柜台。"""
 
 from src.trader.ctp_logic import ctp_depth_row, ctp_field_symbol
-from src.trader.ctp_md import CtpMdClient, describe_quote, market_front, merge_quote, quote_line, quote_text
+from src.trader.ctp_md import (
+    CtpMdClient,
+    describe_quote,
+    market_front,
+    merge_quote,
+    quote_book_key,
+    quote_channel_word,
+    quote_line,
+    quote_text,
+)
 
 
 def test_market_front_comes_from_config_only() -> None:
@@ -30,6 +39,21 @@ def test_quote_text_hides_empty_prices() -> None:
     assert quote_text(0) == "—"
     assert quote_text(1.797e308) == "—"
 
+    raw = {"symbol": "fu2701", "last": 4035, "bid": 4034, "ask": 0, "upper": 4440, "lower": 4017}
+    assert "柜台报价" in quote_line(raw)
+    assert "仿真报价" not in quote_line(raw, channel="真实")
+    assert "真实报价" in quote_line(raw, channel="真实")
+
+
+def test_quote_book_key_ignores_last_price_flicker() -> None:
+    """最新价 9350/9355 来回跳时，买一卖一没变就不该再写日志。"""
+    a = {"symbol": "lh2701", "last": 9355, "bid": 9350, "ask": 9355, "upper": 10175, "lower": 9025}
+    b = {"symbol": "lh2701", "last": 9350, "bid": 9350, "ask": 9355, "upper": 10175, "lower": 9025}
+    assert quote_book_key(a) == quote_book_key(b)
+    live = type("S", (), {"account_kind": "live"})()
+    sim = type("S", (), {"account_kind": "sim"})()
+    assert quote_channel_word(live) == "真实"
+    assert quote_channel_word(sim) == "仿真"
 
 def test_quote_reads_old_instrument_field() -> None:
     """6.7 行情常把合约写在 reserve1，只读 InstrumentID 会丢跳动。"""

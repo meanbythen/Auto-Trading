@@ -24,6 +24,8 @@ class TradeIntent:
     orders_paused: bool = False
     ledger_failed: bool = False
     already_sent_this_bar: bool = False
+    # 本根已平过仓（人工/策略）。所有引擎共用：等下一根已收盘K线，禁止立刻补仓。
+    bar_consumed: bool = False
     # 通道能力：柜台能查持仓/委托，才需要上线阶段、未完成委托和对账这几道闸门。
     can_query_positions: bool = False
     can_query_orders: bool = False
@@ -67,7 +69,15 @@ def _ledger(intent: TradeIntent, _risk: Any) -> GateResult | None:
 
 
 def _dedup(intent: TradeIntent, _risk: Any) -> GateResult | None:
-    if _is_open(intent.side) and intent.bar_id and intent.already_sent_this_bar:
+    if not _is_open(intent.side) or not intent.bar_id:
+        return None
+    if intent.bar_consumed:
+        return GateResult(
+            False,
+            "order_wait_next_bar",
+            "本根信号已经平过仓，等下一根已收盘K线再评估，不会立刻补仓",
+        )
+    if intent.already_sent_this_bar:
         return GateResult(False, "order_dedup", "这根K线已经发过开仓单，跳过重复发单")
     return None
 

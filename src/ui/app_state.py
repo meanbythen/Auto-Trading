@@ -4,8 +4,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from src.data.periods import period_label
-
 
 class AppStateMixin:
     """运行期状态与配置辅助：实盘扫描用的 cfg、回测周期同步。"""
@@ -35,20 +33,6 @@ class AppStateMixin:
     def _sync_bt_periods_after_save(
         self, old_tf: str, old_trail: str, cur_tf: str, cur_trail: str, cfg: dict[str, Any]
     ) -> None:
-        """
-        配置页保存后，把回测页还跟着旧配置的信号/止损周期一起换过来。
-
-        回测页有自己的周期选择器（故意和实盘分开）。只有它当前值还是配置页上一次
-        的值——也就是没在回测页单独改过——才跟着换，免得把特意选的周期冲掉。
-        """
-        st = cfg.get("strategy") or {}
-        pairs = (
-            ("信号周期", old_tf, cur_tf, str(st.get("timeframe") or ""),
-             self.bt_tf_var, self.bt_tf_custom_var),
-            ("止损周期", old_trail, cur_trail, str(st.get("trail_timeframe") or ""),
-             self.bt_trail_var, self.bt_trail_custom_var),
-        )
-        for name, old, cur, new, var, custom in pairs:
-            if new and old and cur == old and new != old:
-                self._set_period_vars(new, var, custom)
-                self._append_log(f"回测页{name}跟着配置页改成 {period_label(new)}。")
+        """旧入口：保存配置页时曾经顺手改回测周期。现在不改，避免手改的周期被冲掉。"""
+        _ = (old_tf, old_trail, cur_tf, cur_trail, cfg)
+        return

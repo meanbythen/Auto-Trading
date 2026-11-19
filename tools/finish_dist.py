@@ -21,7 +21,7 @@ def _readme_txt(version: str) -> str:
 一、怎么用
 1. 把整个「Auto-Trading」文件夹拷到目标电脑（不要只拷 exe）
 2. 双击 Auto-Trading.exe 打开图形界面
-3. 首次运行会自动生成 config\\config.yaml，请在界面「配置」里改账号、品种等并保存
+3. 首次运行会自动生成 config\\config.yaml，请在「账号」页填号码密码和通道，在「交易配置」改策略品种并保存
 
 二、重要说明
 - 不需要安装 Python
@@ -40,7 +40,7 @@ def _readme_txt(version: str) -> str:
 - 已删除的策略（如均线Pin动量、缺口C、SAR、MACD 等）不会再出现在程序里；旧配置会回退到日内实体
 - 开平仓规则以当前版本说明书为准，换版本后请重新回测
 - 交叉测试 / 回测 / 优化导出含盈利覆盖、每笔收益、日均等列
-- 交易密码请在界面填写，或自建 config\\secrets.local.yaml（发布包故意不带密钥文件）
+- 交易密码、仿真密码、认证码、天勤密码请到界面「账号」页填写（发布包故意不带密钥文件）
 - config\\品种与合约.xlsx 是保证金比例和每手数量的来源，请勿删除；比例填 23 表示 23%，占用随开仓价变
 - config\\主力合约表.xlsx 是回测换月的依据：回测页「更新主力合约表」手动重算，「打开表格」可在「手动修正」页覆盖任意换月段，更新时该页保留
 - config\\优化参数.xlsx 是策略优化的网格档位和中文名：优化页「打开优化参数表」直接改，保存后下次优化生效
@@ -101,6 +101,12 @@ def main() -> int:
     else:
         print(f"[警告] 未找到 {param_src}，首次运行会按内置默认生成")
 
+    holidays_src = ROOT / "config" / "holidays.yaml"
+    if holidays_src.exists():
+        shutil.copy2(holidays_src, DIST / "config" / "holidays.yaml")
+    else:
+        print("[警告] 未找到 config/holidays.yaml，实盘可能因节假日表不够而禁开仓")
+
     # 自定义规则模板：不写代码加策略的入口，用户复制一份改成自己的。
     rules_src = ROOT / "config" / "rules"
     if rules_src.is_dir():
@@ -122,16 +128,20 @@ def main() -> int:
     docs_dst.mkdir(parents=True, exist_ok=True)
     for doc_name in (
         "日内实体操作说明书.md",
-        "日内浮盈飘单.md",
         "均线波段.md",
         "配置说明书.md",
         "实盘交易简易说明书.md",
         "CTP上线流程.md",
         "华泰程序化外接测试操作说明.md",
         "系统蓝图.md",
+        "策略编辑器使用说明.md",
     ):
-        doc_src = ROOT / "docs" / doc_name
-        if doc_src.exists():
+        candidates = (
+            ROOT / "docs" / doc_name,
+            ROOT / "docs" / "archive" / doc_name,
+        )
+        doc_src = next((p for p in candidates if p.exists()), None)
+        if doc_src is not None:
             shutil.copy2(doc_src, docs_dst / doc_name)
 
     cfg_dst = DIST / "config" / "config.yaml"
@@ -180,9 +190,11 @@ def main() -> int:
             if yaml_path.name in _ACTIVE_STRATEGY_DOCS:
                 shutil.copy2(yaml_path, strat_dst / yaml_path.name)
     # 华泰指定的 CTP 动态库。没有 dll 时目录也可以是空的，不报错。
-    api_src = ROOT / "ctp" / "api"
-    if api_src.is_dir():
-        api_dst = DIST / "ctp" / "api"
+    for rel in ("ctp/api", "ctp/vendor_libs"):
+        api_src = ROOT / Path(rel)
+        if not api_src.is_dir():
+            continue
+        api_dst = DIST / rel
         api_dst.mkdir(parents=True, exist_ok=True)
         for dll in api_src.glob("*.dll"):
             shutil.copy2(dll, api_dst / dll.name)

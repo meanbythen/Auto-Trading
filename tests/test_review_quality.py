@@ -238,6 +238,6 @@ def test_live_vs_backtest_shows_new_metrics(tmp_path) -> None:
     text = "\n".join(build_live_vs_backtest(tmp_path, "bu2612", {}))
 
     assert "最近回测评估  观察" in text
-    assert "R期望 0.120" in text
+    assert "收益期望 0.12" in text
     assert "卡尔玛 0.85" in text
     assert "最大连亏 6笔" in text

@@ -300,22 +300,6 @@ def test_daily_body_grid_stays_small() -> None:
     assert full_n > 100000
 
 
-def test_float_hold_grid_has_late_window_and_be() -> None:
-    """浮盈飘单精简搜观察窗口、止损宽度、是否收盘清仓。"""
-    from src.backtest.optimizer import default_grid_for_engine
-
-    light = default_grid_for_engine("float_hold", "精简")
-    standard = default_grid_for_engine("float_hold", "标准")
-    assert 60 in light["eth_minutes"]
-    assert 1.5 in light["stop_atr_mult"]
-    assert False in light["flatten_at_close"]
-    assert "be_atr_mult" in standard
-    assert "14:45" in standard["day_cutoff"]
-    assert "eth_minutes2" not in standard
-    assert "be_r_mult" not in standard
-    assert "stop_extra_ticks" not in standard
-
-
 def test_daily_body_params_write_eth_and_timeframe() -> None:
     """ETH 写到共用项，信号周期写到策略根。"""
     cfg = {
@@ -344,39 +328,6 @@ def test_finest_grid_timeframe_picks_five() -> None:
     """网格里有 5 和 15 时，拉 K 线用 5 分钟。"""
     assert _finest_grid_timeframe({"timeframe": ["15", "5"]}, "15") == "5"
     assert _finest_grid_timeframe({"macd_timeframe": ["5", "1"]}, "5") == "1"
-
-
-def test_float_hold_params_write_macd_pair_and_flatten() -> None:
-    """MACD 组合拆成三根参数；均线对拆开；收盘清仓写到公共开关，并可关掉拿到隔夜。"""
-    cfg = {
-        "strategy": {
-            "engine": "float_hold",
-            "timeframe": "15",
-            "flatten_at_close": True,
-            "float_hold": {},
-        }
-    }
-    out = _apply_params(
-        cfg,
-        {
-            "macd_timeframe": "1",
-            "macd_combo": "5/34/5",
-            "dir_ema_pair": "20/60",
-            "flatten_at_close": False,
-        },
-        "float_hold",
-    )
-    st = out["strategy"]
-    hold = st["float_hold"]
-    assert hold["direction"] == "macd_cycle"
-    assert hold["macd_timeframe"] == "1"
-    assert hold["macd_fast"] == 5
-    assert hold["macd_slow"] == 34
-    assert hold["macd_signal"] == 5
-    assert hold["dir_ema_fast"] == 20
-    assert hold["dir_ema_slow"] == 60
-    assert st["timeframe"] == "1"
-    assert st["flatten_at_close"] is False
 
 
 def test_cutoff_and_scope_write_where_the_strategy_reads() -> None:

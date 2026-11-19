@@ -21,15 +21,7 @@ class BacktestTabMixin(BacktestConfigMixin, BacktestActionsMixin):
         left = ctk.CTkScrollableFrame(tab, fg_color="transparent")
         left.grid(row=0, column=0, sticky="nsew", padx=(8, 8), pady=8)
 
-        ctk.CTkLabel(left, text="历史回测", font=T.FONT_TITLE, text_color=T.TEXT).pack(anchor="w", padx=4, pady=(4, 2))
-        ctk.CTkLabel(
-            left,
-            text="用历史K线模拟开平仓。分钟、日线、周线都可以选。开始日期比网上行情更早时，会先下载新K线，再接到电脑里已经存好的K线上；这段本地已经齐，就直接用本地的。",
-            font=T.FONT_SMALL,
-            text_color=T.TEXT_DIM,
-            wraplength=360,
-            justify="left",
-        ).pack(anchor="w", padx=4, pady=(0, 10))
+        ctk.CTkLabel(left, text="历史回测", font=T.FONT_TITLE, text_color=T.TEXT).pack(anchor="w", padx=4, pady=(4, 10))
 
         box = self._card(left)
         engines = list(ENGINE_CHOICES)
@@ -98,7 +90,7 @@ class BacktestTabMixin(BacktestConfigMixin, BacktestActionsMixin):
         ).pack(side="left")
         ctk.CTkLabel(
             box,
-            text="开=到点强平。关=仓可以留过收盘。趋势跟随不听这个开关，仍用它自己的设置。",
+            text="开=到点强平。关=仓可以留过收盘。点开始回测就按这一格，不会被交易配置改回去。趋势跟随、SuperTrend、均线波段仍用它们自己的设置。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=340,
@@ -123,7 +115,7 @@ class BacktestTabMixin(BacktestConfigMixin, BacktestActionsMixin):
         ).pack(side="left")
         ctk.CTkLabel(
             box,
-            text="开=按「主力时段」分段回测。换月日当天仍用旧合约，次日切新主力：若旧仓还在，就在新主力同方向移过去（止损改挂新主力均线）。任何合约都不进入自己的交割月，到点改用下一手。关=只测当前选的合约（交割月同样不开、有仓会平）。",
+            text="开=按「主力时段」分段回测。换月日当天仍用旧合约，次日切新主力：旧仓在段末平掉，新主力空仓，等策略自己给开仓信号，不沿用上一手的多空。任何合约都不进入自己的交割月，到点改用下一手。关=只测当前选的合约（交割月同样不开、有仓会平）。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=340,
@@ -213,7 +205,31 @@ class BacktestTabMixin(BacktestConfigMixin, BacktestActionsMixin):
         ).pack(side="left")
         ctk.CTkLabel(
             box,
-            text="开=信号这根收盘确认后，按下一根开盘价成交，和实盘一致；关=按当根收盘价。",
+            text="开=信号这根收盘确认后，按下一根开盘价再让滑点成交（接近柜台，跳空按开盘）；关=按当根收盘价。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=340,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 6))
+        mirror_row = ctk.CTkFrame(box, fg_color="transparent")
+        mirror_row.pack(fill="x", pady=4)
+        ctk.CTkLabel(
+            mirror_row,
+            text="实盘镜像闸门",
+            font=T.FONT_BODY,
+            text_color=T.TEXT_DIM,
+            width=140,
+            anchor="w",
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkSwitch(
+            mirror_row,
+            text="",
+            variable=self.bt_mirror_gates_var,
+            progress_color=T.OK,
+        ).pack(side="left")
+        ctk.CTkLabel(
+            box,
+            text="默认关，回测成绩和以前一样。打开后，过期K、追价过大的根会放弃开仓。上限数字用交易配置里的「开仓滑点上限」，不是下面的「滑点(跳)」。用来对照「信号有、当时没开」。不改影线止损。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=340,
@@ -247,6 +263,64 @@ class BacktestTabMixin(BacktestConfigMixin, BacktestActionsMixin):
         ).pack(anchor="w", padx=(148, 0), pady=(0, 6))
 
         self._pack_open_limits(left)
+
+        ctk.CTkLabel(
+            left,
+            text="策略评估",
+            font=T.FONT_TITLE,
+            text_color=T.TEXT,
+        ).pack(anchor="w", padx=4, pady=(14, 4))
+        ev_box = self._card(left)
+        ctk.CTkLabel(
+            ev_box,
+            text=(
+                "门槛默认值来自 docs/策略评估标准/评估指标.md。"
+                "回测和交叉测试只给通过/观察/淘汰结论；策略优化碰到红线可拦住写入。"
+                "滑点压力=当前滑点再加 1 跳；参数扰动=数值参数各动 10%。"
+            ),
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=340,
+            justify="left",
+        ).pack(anchor="w", pady=(0, 8))
+        for label, var, hint in (
+            ("启用评估", self.ev_enabled_var, "关=回测和优化都不再打评估结论"),
+            ("回测跑压力测试", self.ev_stress_var, "开=回测完成后再跑滑点+1跳和参数扰动"),
+            ("优化不达标不写入", self.ev_gate_var, "开=评估红线时不写入参数"),
+        ):
+            row = ctk.CTkFrame(ev_box, fg_color="transparent")
+            row.pack(fill="x", pady=4)
+            ctk.CTkLabel(
+                row, text=label, font=T.FONT_BODY, text_color=T.TEXT_DIM, width=140, anchor="w"
+            ).pack(side="left", padx=(0, 8))
+            ctk.CTkSwitch(
+                row, text="", variable=var, progress_color=T.OK, fg_color=T.BORDER
+            ).pack(side="left")
+            ctk.CTkLabel(
+                ev_box,
+                text=hint,
+                font=T.FONT_SMALL,
+                text_color=T.TEXT_DIM,
+                wraplength=340,
+                justify="left",
+            ).pack(anchor="w", padx=(148, 0), pady=(0, 4))
+        self._entry_row(ev_box, "最低盈利因子", self.ev_pf_var, hint="默认1.3；低于它是红线", width=160)
+        self._entry_row(
+            ev_box, "最低收益期望", self.ev_r_var, hint="默认0.12；低于它只给观察", width=160
+        )
+        self._entry_row(ev_box, "最低卡尔玛", self.ev_calmar_var, hint="默认1.0；低于0.8是红线", width=160)
+        self._entry_row(
+            ev_box, "最大回撤(小数)", self.ev_dd_var, hint="默认0.15=15%；超过0.20是红线", width=160
+        )
+        self._entry_row(
+            ev_box, "样本参考线(笔)", self.ev_trades_var, hint="默认150；低于它只提示", width=160
+        )
+        self._entry_row(
+            ev_box, "样本观察线(笔)", self.ev_observe_var, hint="默认100；低于它提示样本偏少", width=160
+        )
+        self._entry_row(
+            ev_box, "最大连亏(笔)", self.ev_streak_var, hint="默认8；超过只给观察", width=160
+        )
 
         ctk.CTkButton(
             left,
@@ -391,7 +465,7 @@ class BacktestTabMixin(BacktestConfigMixin, BacktestActionsMixin):
         ).pack(anchor="w", pady=(0, 4))
         ctk.CTkLabel(
             box_risk,
-            text="开仓限制、保证金、收盘清仓开跑前跟配置页对齐。账户权益可在本页改成你准备拿来交易的资金，只影响回测和策略优化，不会改实盘余额。点「按配置页重新填入」会抄回账户当前权益。关掉「启用限制」后固定 1 手。",
+            text="账户权益可在本页改，只影响回测和策略优化，不会改实盘余额。收盘清仓、策略、周期、品种以本页为准，点开始不会被交易配置改回去。要跟交易配置一样，点「按配置页重新填入」。关掉「启用限制」后固定 1 手。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=340,
@@ -414,7 +488,7 @@ class BacktestTabMixin(BacktestConfigMixin, BacktestActionsMixin):
             progress_color=T.OK,
         ).pack(side="left")
         menu = self._option_row(box_risk, "仓位模式", self.bt_sizing_var, ["risk_pct", "fixed"], width=160)
-        # 开跑前会按配置页覆盖，这里不让改，避免白填一遍。
+        # 跟交易配置同一组数字：要改去交易配置，或点「按配置页重新填入」抄过来。
         menu.configure(state="disabled")
         self._entry_row(
             box_risk,

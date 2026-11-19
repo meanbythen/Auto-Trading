@@ -137,8 +137,6 @@ def run_pre_session_audit(
             if expected_mode is None:
                 if eng == "swing_box":
                     skip_note = "日线箱子和 ADX 写在策略里，不走公共行情过滤"
-                elif eng == "float_hold":
-                    skip_note = "行情过滤默认关，方向靠观察窗口和跳空顺向"
                 else:
                     skip_note = "未接入行情过滤"
                 rows.append(

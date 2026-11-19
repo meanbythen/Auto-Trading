@@ -9,16 +9,23 @@ from __future__ import annotations
 
 from typing import Any
 
+import numpy as np
 import pandas as pd
 from loguru import logger
 
 from .cta_factors import (
     FactorParams,
     FactorSnapshot,
+    _score_boll,
+    _score_ma,
+    _score_turtle,
+    apply_daily_bias,
     compute_factors,
+    score_to_vote,
 )
-from .cta_filter import CtaFilterParams, CtaGate, evaluate_cta_filter
-from .market_state import MarketFilter, MarketFilterParams
+from .cta_filter import CtaFilterParams, CtaGate, evaluate_cta_filter, gate_from_values
+from .indicators import average_true_range, ema_series, parabolic_sar
+from .market_state import MarketFilter, MarketFilterParams, adx_series
 from .trend_base import TrendStrategyBase
 from .types import PositionState, StrategyAction, config_flag
 
@@ -54,11 +61,18 @@ class CtaFactorStrategy(TrendStrategyBase):
         self.max_position_ratio = float(self.box.get("max_position_ratio", 1.0) or 1.0)
         # 日线周期写在策略自己这一节；信号周期仍是配置页公共项 timeframe。
         self.trend_timeframe = str(self.box.get("trend_timeframe", "D") or "D")
-        self.flatten_at_close = config_flag(
-            self.box.get("flatten_at_close", True), default=True
-        )
+        # 收盘清仓听交易配置总开关。以前燃油为主时写死每天平仓，公共开关关了也不管用。
+        # 总开关写过就用总开关；没写过才看自己那一节，再没有则仍按到点平仓。
+        st = cfg.get("strategy") or {}
+        if "flatten_at_close" in st:
+            flatten_raw = st.get("flatten_at_close")
+        else:
+            flatten_raw = self.box.get("flatten_at_close", True)
+        self.flatten_at_close = config_flag(flatten_raw, default=True)
         self._open_snap: dict[str, dict[str, Any]] = {}
         self._last_closed_snap: dict[str, dict[str, Any]] = {}
+        self._hist_index: pd.DatetimeIndex | None = None
+        self._hist_prep: list[dict[str, Any] | None] | None = None
 
     def note_factor_pnl(
         self,
@@ -134,7 +148,228 @@ class CtaFactorStrategy(TrendStrategyBase):
             return None
         return trend
 
+    def bind_history(
+        self,
+        bars: pd.DataFrame | None,
+        trend_bars: pd.DataFrame | None = None,
+    ) -> None:
+        """回测开始前把因子整表算一遍。逐根再算 SAR 会按根数平方变慢。"""
+        self._hist_index = None
+        self._hist_prep = None
+        if bars is None or len(bars) == 0:
+            return
+        self._trend_bars = trend_bars
+        n = len(bars)
+        prep: list[dict[str, Any] | None] = [None] * n
+        need = max(self.need_bars(), 3)
+        close = pd.to_numeric(bars["close"], errors="coerce")
+        high = pd.to_numeric(bars["high"], errors="coerce")
+        low = pd.to_numeric(bars["low"], errors="coerce")
+        params = self.params
+        ma_s = ema_series(close, params.ma_short)
+        ma_l = ema_series(close, params.ma_long)
+        prior_high = high.rolling(params.channel).max().shift(1)
+        prior_low = low.rolling(params.channel).min().shift(1)
+        mid = ema_series(close, params.boll_window)
+        std = close.rolling(params.boll_window).std(ddof=0)
+        atr_s = average_true_range(high, low, close, period=params.atr_period)
+        sar = (
+            parabolic_sar(
+                high,
+                low,
+                af_start=params.af_start,
+                af_step=params.af_step,
+                af_max=params.af_max,
+            )
+            if params.use_sar
+            else None
+        )
+        bull = None
+        flips = None
+        if sar is not None:
+            bull = close > sar
+            flips = (bull != bull.shift(1)).fillna(False).rolling(params.sar_flip_lookback).sum()
+        adx_s, _p, _m = adx_series(high, low, close, period=self.cta_filter.adx_period)
+        atr_gate = average_true_range(high, low, close, period=self.cta_filter.adx_period)
+        atr_v = atr_gate.to_numpy(dtype=float) if atr_gate is not None else None
+        look = max(2, int(self.cta_filter.atr_lookback))
+        daily_close = None
+        daily_ma = None
+        daily_index = None
+        daily = self._daily_frame(bars)
+        if daily is not None and len(daily) >= params.bias_ma:
+            daily_close = pd.to_numeric(daily["close"], errors="coerce")
+            daily_ma = ema_series(daily_close, params.bias_ma)
+            daily_index = pd.DatetimeIndex(daily.index)
+
+        from src.utils.trading_day import futures_trading_day
+
+        for i in range(need - 1, n):
+            if (
+                pd.isna(ma_s.iloc[i])
+                or pd.isna(ma_l.iloc[i])
+                or pd.isna(prior_high.iloc[i])
+                or pd.isna(mid.iloc[i])
+                or pd.isna(std.iloc[i])
+                or pd.isna(atr_s.iloc[i])
+                or pd.isna(ma_s.iloc[i - 1])
+                or pd.isna(ma_l.iloc[i - 1])
+                or pd.isna(mid.iloc[i - 1])
+            ):
+                continue
+            atr = float(atr_s.iloc[i])
+            if atr <= 0:
+                continue
+            close_now = float(close.iloc[i])
+            score_ma = _score_ma(
+                close_now,
+                float(ma_s.iloc[i]),
+                float(ma_l.iloc[i]),
+                float(ma_s.iloc[i - 1]),
+                float(ma_l.iloc[i - 1]),
+                atr,
+            )
+            score_turtle = _score_turtle(
+                close_now, float(prior_high.iloc[i]), float(prior_low.iloc[i])
+            )
+            mid_now = float(mid.iloc[i])
+            std_now = float(std.iloc[i])
+            slope = mid_now - float(mid.iloc[i - 1])
+            score_boll = _score_boll(
+                close_now,
+                mid_now,
+                mid_now + params.boll_dev * std_now,
+                mid_now - params.boll_dev * std_now,
+                slope,
+            )
+            score_sar = 0.0
+            if params.use_sar:
+                if sar is None or pd.isna(sar.iloc[i]):
+                    continue
+                sar_now = float(sar.iloc[i])
+                if close_now > sar_now:
+                    score_sar = 1.0
+                elif close_now < sar_now:
+                    score_sar = -1.0
+                flip_now = 0.0
+                if flips is not None and not pd.isna(flips.iloc[i]):
+                    flip_now = float(flips.iloc[i])
+                if flip_now > params.sar_flip_max:
+                    score_sar = 0.0
+            bias: int | None = None
+            if daily_index is not None and daily_close is not None and daily_ma is not None:
+                stamp = pd.Timestamp(bars.index[i]).to_pydatetime()
+                if getattr(stamp, "tzinfo", None) is not None:
+                    stamp = stamp.replace(tzinfo=None)
+                cutoff = pd.Timestamp(futures_trading_day(stamp))
+                pos = int(daily_index.searchsorted(cutoff, side="left")) - 1
+                # 和逐根 daily_bias 一样：截到这一天之前，至少要有 bias_ma 根日线。
+                if (
+                    pos + 1 >= params.bias_ma
+                    and not pd.isna(daily_ma.iloc[pos])
+                    and not pd.isna(daily_close.iloc[pos])
+                ):
+                    last_c = float(daily_close.iloc[pos])
+                    last_m = float(daily_ma.iloc[pos])
+                    if last_c > last_m:
+                        bias = 1
+                    elif last_c < last_m:
+                        bias = -1
+                    else:
+                        bias = 0
+            block_entry = False
+            block_reason = ""
+            if bias is None:
+                block_entry = True
+                block_reason = "日线没拿到，方向看不清，不开新仓"
+            elif bias == 0:
+                block_entry = True
+                block_reason = "日线贴着均线，方向不清，不开新仓"
+            filtered_ma = apply_daily_bias(score_ma, 0 if bias == 0 else bias)
+            filtered_turtle = apply_daily_bias(score_turtle, 0 if bias == 0 else bias)
+            filtered_boll = apply_daily_bias(score_boll, 0 if bias == 0 else bias)
+            filtered_sar = apply_daily_bias(score_sar, 0 if bias == 0 else bias)
+            if bias is None:
+                filtered_ma, filtered_turtle, filtered_boll, filtered_sar = (
+                    score_ma,
+                    score_turtle,
+                    score_boll,
+                    score_sar,
+                )
+            total = (
+                params.w_ma * filtered_ma
+                + params.w_turtle * filtered_turtle
+                + params.w_boll * filtered_boll
+                + params.w_sar * filtered_sar
+            )
+            used = [filtered_ma, filtered_turtle, filtered_boll]
+            if params.use_sar:
+                used.append(filtered_sar)
+            disagreement = float(np.std(used, ddof=0))
+            vote_ma = score_to_vote(filtered_ma)
+            vote_turtle = score_to_vote(filtered_turtle)
+            vote_boll = score_to_vote(filtered_boll)
+            vote_sar = score_to_vote(filtered_sar) if params.use_sar else 0
+            votes = [vote_ma, vote_turtle, vote_boll]
+            if params.use_sar:
+                votes.append(vote_sar)
+            snap = FactorSnapshot(
+                score_ma=filtered_ma,
+                score_turtle=filtered_turtle,
+                score_boll=filtered_boll,
+                score_sar=filtered_sar,
+                vote_ma=vote_ma,
+                vote_turtle=vote_turtle,
+                vote_boll=vote_boll,
+                vote_sar=vote_sar,
+                total=float(total),
+                disagreement=disagreement,
+                long_votes=sum(1 for item in votes if item > 0),
+                short_votes=sum(1 for item in votes if item < 0),
+                atr=atr,
+                daily_bias=bias,
+                block_entry=block_entry,
+                block_reason=block_reason,
+                use_sar=params.use_sar,
+                weights={
+                    "ma": params.w_ma,
+                    "turtle": params.w_turtle,
+                    "boll": params.w_boll,
+                    "sar": params.w_sar,
+                },
+            )
+            if not self.cta_filter.enabled:
+                gate = CtaGate(True, "本策略行情过滤已关闭")
+            elif (i + 1) < self.cta_filter.adx_period + 5:
+                gate = CtaGate(True, "K线不足，暂不限制开仓")
+            else:
+                adx_now = (
+                    float(adx_s.iloc[i])
+                    if adx_s is not None and not pd.isna(adx_s.iloc[i])
+                    else 0.0
+                )
+                rank = 1.0
+                if atr_v is not None:
+                    lo = max(0, i - look + 1)
+                    window = atr_v[lo : i + 1]
+                    window = window[np.isfinite(window)]
+                    if len(window):
+                        rank = float((window <= window[-1]).mean())
+                gate = gate_from_values(adx_now, rank, self.cta_filter)
+            prep[i] = {"snap": snap, "gate": gate}
+        self._hist_index = pd.DatetimeIndex(bars.index)
+        self._hist_prep = prep
+
     def prepare(self, bars: pd.DataFrame) -> dict[str, Any] | None:
+        n = len(bars)
+        if (
+            self._hist_prep is not None
+            and self._hist_index is not None
+            and n <= len(self._hist_prep)
+            and n > 0
+            and self._hist_index[n - 1] == bars.index[-1]
+        ):
+            return self._hist_prep[n - 1]
         snap = compute_factors(
             bars,
             self.params,
@@ -270,15 +505,17 @@ class CtaFactorStrategy(TrendStrategyBase):
         # 改成：若 reason 仍是默认等待，用最新 bars 补一句更准的原因。
         if "空仓等待" not in str(decision.reason):
             return decision
-        snap = compute_factors(
-            bars, self.params, self._daily_frame(bars), daily_required=True
-        )
+        # 刚在 prepare 里算过，不要每根空仓再算一遍 SAR/均线，回测会按根数平方变慢。
+        ind = getattr(self, "_last_prepare", None)
+        if not isinstance(ind, dict) or "snap" not in ind:
+            return decision
+        snap = ind["snap"]
         if snap is None:
             return decision
         if snap.block_entry:
             decision.reason = f"{self.label}空仓等待  {snap.block_reason}"
             return decision
-        gate = evaluate_cta_filter(bars, self.cta_filter)
+        gate = ind.get("gate")
         if self._gate_blocks(gate):
             decision.reason = f"{self.label}空仓等待  {gate.reason}"
             return decision

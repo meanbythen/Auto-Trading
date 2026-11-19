@@ -8,12 +8,30 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
 
 from src.domain.accounts import book_file
+
+# 同一文件正在被另一线程替换时，Windows 会暂时 Permission denied。多试几次，不要当成账丢了。
+_READ_TRIES = 8
+_last_busy_warn_at: dict[str, float] = {}
+
+
+def _file_busy(exc: BaseException) -> bool:
+    """文件正被占用：权限不足、共享冲突、锁定。"""
+    if isinstance(exc, PermissionError):
+        return True
+    if isinstance(exc, OSError):
+        win = getattr(exc, "winerror", None)
+        if win in (5, 32, 33):
+            return True
+        if exc.errno in (11, 13, 16):
+            return True
+    return False
 
 
 def safe_float(value: Any, default: float = 0.0) -> float:
@@ -29,10 +47,28 @@ def read_book_file(path: Path | str) -> dict[str, Any] | None:
     target = Path(path)
     if not target.exists():
         return None
-    try:
-        data = json.loads(target.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        logger.warning("信号账户账本读不出来: {}", exc)
+    data: Any = None
+    last_exc: BaseException | None = None
+    for attempt in range(_READ_TRIES):
+        try:
+            data = json.loads(target.read_text(encoding="utf-8"))
+            last_exc = None
+            break
+        except json.JSONDecodeError as exc:
+            last_exc = exc
+            break
+        except OSError as exc:
+            last_exc = exc
+            if _file_busy(exc) and attempt + 1 < _READ_TRIES:
+                time.sleep(0.05 * (attempt + 1))
+                continue
+            break
+    if last_exc is not None:
+        key = str(target)
+        now = time.monotonic()
+        if now - float(_last_busy_warn_at.get(key) or 0) >= 60:
+            _last_busy_warn_at[key] = now
+            logger.warning("信号账户账本读不出来: {}", last_exc)
         return None
     if not isinstance(data, dict):
         return None

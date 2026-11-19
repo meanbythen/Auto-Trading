@@ -39,6 +39,10 @@ if rules_dir.is_dir():
     datas.append((str(rules_dir), "config/rules"))
 if (ROOT / "strategies").exists():
     datas.append((str(ROOT / "strategies"), "strategies"))
+# 节假日表：实盘开仓要盖到未来 60 天。漏打会退回内置表或缺年份禁开仓。
+holidays = ROOT / "config" / "holidays.yaml"
+if holidays.exists():
+    datas.append((str(holidays), "config"))
 
 binaries = []
 hiddenimports = []
@@ -52,7 +56,17 @@ for _lib_dir in (ROOT / "ctp" / "vendor_libs", ROOT / "ctp" / "api"):
 
 # 只对「带资源文件或动态库」的包做 collect_all；pandas/numpy 走官方 hook，避免打进 tests。
 # uiautomation / comtypes 负责交易登录框；curl_cffi 是行情库自带的网络库；tqsdk 带行情的配置与数据文件。
-for pkg in ("customtkinter", "akshare", "uiautomation", "comtypes", "curl_cffi", "openctp_ctp", "tqsdk"):
+for pkg in (
+    "customtkinter",
+    "akshare",
+    "uiautomation",
+    "comtypes",
+    "curl_cffi",
+    "openctp_ctp",
+    "tqsdk",
+    "vnpy_sqlite",
+    "matplotlib",
+):
     try:
         b, d, h = collect_all(pkg)
         binaries += b
@@ -136,6 +150,14 @@ hiddenimports += [
     "matplotlib",
     "matplotlib.pyplot",
     "matplotlib.backends.backend_agg",
+    "vnpy",
+    "vnpy.trader.setting",
+    "vnpy.trader.constant",
+    "vnpy.trader.object",
+    "vnpy.trader.database",
+    "vnpy_sqlite",
+    "vnpy_sqlite.sqlite_database",
+    "peewee",
 ]
 
 excludes = [

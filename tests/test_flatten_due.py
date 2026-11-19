@@ -74,6 +74,16 @@ def test_flatten_due_closes_without_waiting_for_a_new_bar() -> None:
     assert calls == [("close", "fu2701")]
 
 
+def test_flatten_skips_retry_right_after_own_close() -> None:
+    """刚平仓成交后，即使内存还挂着仓，也不要马上再报一次平仓。"""
+    bot, calls = _bot(True, {"fu2701": _Pos("short", 1)})
+    bot._note_own_fill("fu2701", kind="close")
+
+    bot.flatten_if_due(now=NOW)
+
+    assert calls == []
+
+
 def test_flatten_due_waits_before_retrying_and_stops_once_flat() -> None:
     positions = {"fu2701": _Pos("long", 1)}
     bot, calls = _bot(True, positions)

@@ -99,3 +99,12 @@ def test_coverage_check() -> None:
     assert not calendar_coverage_ok(calendar, datetime(2026, 11, 15), min_days=60)
     # 没外置日历时按内置表处理，一律放行，避免旧环境突然停开仓。
     assert calendar_coverage_ok(None, datetime(2026, 11, 15), min_days=60)
+
+
+def test_shipped_calendar_covers_sixty_days_in_november_2026() -> None:
+    """仓库自带表必须盖住 2026 年 11 月开实盘所需的 60 天，否则一开 CTP 就会禁开仓。"""
+    calendar = HolidayCalendar.load(ROOT / "config" / "holidays.yaml")
+    assert calendar is not None
+    assert calendar.covers(date(2027, 1, 17))
+    assert calendar_coverage_ok(calendar, datetime(2026, 11, 18), min_days=60)
+    assert calendar.is_closed(date(2027, 1, 1))

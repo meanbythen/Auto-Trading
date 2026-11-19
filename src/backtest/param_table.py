@@ -476,7 +476,7 @@ def _notes_rows() -> list[tuple[str, str]]:
         ("这张表做什么", "改策略优化（网格搜索）试哪些参数、每档试哪几个值。程序每次开始优化前读一次，保存即生效，不用重启。"),
         ("不要改什么", "不要改四张工作表的名字，也不要删掉第一行表头；认不出表头时程序会整表回退内置默认。"),
         ("打包后的位置", "改程序旁的 config/优化参数.xlsx。_internal 里也有一份，那份只是首次启动的种子；要改就改外面这一份。"),
-        ("参数网格 · 策略引擎", "用表里的键：daily_body / float_hold / trend_follow / supertrend / dual_ma / ema_swing / bollinger / sar_trend / multi_factor / swing_trend / swing_box / dual_donchian / dual_fractal。"),
+        ("参数网格 · 策略引擎", "用表里的键：daily_body / trend_follow / supertrend / dual_ma / ema_swing / bollinger / sar_trend / multi_factor / swing_trend / swing_box / dual_donchian / dual_fractal。"),
         ("参数网格 · 搜索深度", "精简 / 标准 / 完整。三档各写各的行；界面选哪一档就只读那一档。"),
         ("参数网格 · 参数键", "程序认识的键，见「参数名称」页。不要自己发明；认不出的行会被忽略。"),
         ("参数网格 · 取值", "逗号分隔即可：15,20,30；文字参数直接写：touch,close；开关写 true,false。也支持 JSON 数组 [15, 20, 30]。均线波段的方向选择器可写 21/122、60/120 这类任意两根；信号发生器写 5/10/30。"),

@@ -67,6 +67,78 @@ def _order_row_sort_key(row: tuple[str, ...]) -> tuple[str, int]:
     return (clock, number)
 
 
+def resident_ctp_trader(app: object) -> CtpTrader | None:
+    """
+    常驻已经在用的那条柜台连接。
+
+    有就还给交易台画持仓、资金、委托，不要再登录一次（柜台会把一边踢下线）。
+    常驻没开、或还在点同花顺时，返回空，交易台自己连。
+    """
+    worker = getattr(app, "worker", None)
+    if worker is None or not bool(getattr(worker, "running", False)):
+        return None
+    bot = getattr(worker, "bot", None)
+    trader = getattr(bot, "trader", None)
+    if not isinstance(trader, CtpTrader):
+        return None
+    return trader
+
+
+def desk_login_block_reason(trader: CtpTrader | None) -> str:
+    """交易台这条连接还登着柜台时，说明为什么不能再开常驻。没登着返回空。"""
+    if trader is None:
+        return ""
+    session = getattr(getattr(trader, "gateway", None), "session", None)
+    phase = str(getattr(session, "phase", "idle") or "idle")
+    # idle / disconnected：窗口开着但没登录，常驻可以连。正在握手或已登录都不能再开第二条。
+    if phase in ("", "idle", "disconnected"):
+        return ""
+    user = str(getattr(getattr(trader, "settings", None), "user_id", "") or "").strip()
+    who = f"资金账号 {user}" if user else "当前账户"
+    return (
+        f"交易台还登着{who}。常驻再连会被柜台踢下线。"
+        "请先关掉交易台，再启动常驻。"
+    )
+
+
+def probe_login_block_reason(app: tk.Misc) -> str:
+    """主窗口上的交易台还登着时，返回给启动常驻看的原因。"""
+    window = getattr(app, "_ctp_probe", None)
+    if window is None:
+        return ""
+    try:
+        if not window.winfo_exists():
+            return ""
+    except tk.TclError:
+        return ""
+    # 窗口只是在看常驻那条连接，不是第二条登录，启动常驻不必先关窗。
+    if bool(getattr(window, "_attached_resident", False)):
+        return ""
+    return desk_login_block_reason(getattr(window, "trader", None))
+
+
+def shutdown_probe_window(app: tk.Misc) -> str:
+    """
+    关掉交易台并释放柜台连接。
+
+    窗口正忙着等回报时先不关，返回原因。成功关掉返回空字符串。
+    """
+    window = getattr(app, "_ctp_probe", None)
+    if window is None:
+        return ""
+    try:
+        if not window.winfo_exists():
+            return ""
+    except tk.TclError:
+        return ""
+    if bool(getattr(window, "_busy", False)):
+        return "交易台还在等柜台回应，请等窗口出现结果后再关，然后再启动常驻。"
+    closer = getattr(window, "_close", None)
+    if callable(closer):
+        closer()
+    return ""
+
+
 def open_ctp_probe(master: tk.Misc) -> None:
     """打开交易窗口。重复点击只把原来的窗口提到前面。"""
     existing = getattr(master, "_ctp_probe", None)
@@ -123,16 +195,19 @@ class CtpProbeWindow(tk.Toplevel):
         self._go_live = load_state(self._root)
         self._huatai_vars: dict[str, tk.BooleanVar] = {}
         self._shown_quote: tuple[str, ...] | None = None
-        self._logged_quote = ""
         self._last_said = ""
         self._buttons: list[ttk.Button] = []
         self._busy = False
         self._ui_queue: queue.Queue = queue.Queue()
         self._blotter_tick = 0
         self._quote_pump_on = False
+        # True：窗口画的是常驻已登录的柜台。关掉窗口不能 shutdown，否则挂机会断线。
+        self._attached_resident = False
+        self._kind_box: ttk.Combobox | None = None
         self._build()
         self.protocol("WM_DELETE_WINDOW", self._close)
         self.after(100, self._drain_ui)
+        self._attach_resident_if_any()
 
     def _build(self) -> None:
         pad = {"padx": 8, "pady": 4}
@@ -153,6 +228,7 @@ class CtpProbeWindow(tk.Toplevel):
         )
         kind_box.grid(row=0, column=1, sticky="w", padx=(4, 12))
         kind_box.bind("<<ComboboxSelected>>", lambda _e: self._on_kind_change())
+        self._kind_box = kind_box
         ttk.Label(top, text="仿真和真实走同一套下单，只换账号和前置。换账后请再点连接登录。").grid(
             row=0, column=2, sticky="w"
         )
@@ -422,7 +498,11 @@ class CtpProbeWindow(tk.Toplevel):
         ttk.Label(bar, text="合约搜索").pack(side="left")
         ttk.Entry(bar, textvariable=self.contract_q, width=16).pack(side="left", padx=4)
         ttk.Button(bar, text="查询", command=self._query_contracts).pack(side="left")
-        ttk.Label(bar, text="空着就按当前下单合约的品种字母搜。不要一次拉全市场。").pack(side="left", padx=8)
+        ttk.Button(bar, text="写入品种表", command=self._sync_contract_to_universe).pack(side="left", padx=4)
+        ttk.Label(
+            bar,
+            text="查询后点一行，再点「写入品种表」：每手数量、最小变动、保证金、手续费写入 config/品种与合约.xlsx。不改启用和时段。",
+        ).pack(side="left", padx=8)
         self.ins_tree = self._tree_in(
             frame,
             (
@@ -483,12 +563,24 @@ class CtpProbeWindow(tk.Toplevel):
     def _on_ui(self, task) -> None:
         self._ui_queue.put(task)
 
+    def _log_tag(self) -> str:
+        """运行日志前缀。实盘写真实账号，仿真写仿真账号，不再一律叫仿真测试。"""
+        from src.trader.ctp_logic import ctp_kind_label
+        from src.trader.ctp_md import quote_channel_word
+
+        trader = self.trader
+        if trader is None:
+            return "交易台"
+        kind = ctp_kind_label(trader.settings.account_kind)
+        channel = quote_channel_word(trader.settings)
+        return f"交易台（{kind}/{channel}）"
+
     def _say(self, text: str) -> None:
         # 同一句话不连着刷。选中持仓、盘口没变时运行日志不再重复写。
         if text == self._last_said:
             return
         self._last_said = text
-        logger.info("仿真测试：{}", text)
+        logger.info("{}：{}", self._log_tag(), text)
         if threading.current_thread() is threading.main_thread():
             self._write(text)
             return
@@ -517,7 +609,7 @@ class CtpProbeWindow(tk.Toplevel):
             try:
                 work()
             except Exception as exc:  # noqa: BLE001
-                logger.exception("仿真测试后台任务失败")
+                logger.exception("交易台后台任务失败")
                 self._say(f"出错了：{exc}")
             finally:
                 self._on_ui(lambda: self._set_busy(False))
@@ -533,11 +625,21 @@ class CtpProbeWindow(tk.Toplevel):
         if self.md is not None:
             self.md.close()
             self.md = None
+        if self._attached_resident:
+            # 常驻那条连接不能关，只放开本窗口的引用。
+            self.trader = None
+            self._attached_resident = False
+            return
         if self.trader is not None:
             self.trader.shutdown()
             self.trader = None
 
     def _on_kind_change(self) -> None:
+        if self._attached_resident:
+            self._say("正在看常驻柜台，不能在这里换操作账。要换仿真/真实请先停止常驻。")
+            if self.trader is not None:
+                self.kind.set(ctp_kind_label(self.trader.settings.account_kind))
+            return
         kind = self._selected_kind()
         if self.trader is not None and self.trader.settings.account_kind != kind:
             self._drop_session()
@@ -545,6 +647,8 @@ class CtpProbeWindow(tk.Toplevel):
             self._say(f"已改成{ctp_kind_label(kind)}。换账后必须重新登录。")
 
     def _ensure(self) -> CtpTrader | None:
+        if self._attached_resident and self.trader is not None:
+            return self.trader
         kind = self._selected_kind()
         if self.trader is not None:
             if self.trader.settings.account_kind == kind:
@@ -557,7 +661,7 @@ class CtpProbeWindow(tk.Toplevel):
             self._say("真实账号还缺交易前置。请到配置页在「档案交易前置」里填实盘地址。")
             return None
         if kind == "live" and not str(preview.get("user_id") or "").strip():
-            self._say("真实账号还缺资金账号。请到配置页「账号与登录」填「资金账号」。")
+            self._say("真实账号还缺资金账号。请到「账号」页填「资金账号」。")
             return None
         self.trader = CtpTrader(cfg)
         return self.trader
@@ -571,7 +675,101 @@ class CtpProbeWindow(tk.Toplevel):
             return None
         return trader
 
+    def _attach_resident_if_any(self) -> None:
+        """常驻已开时，把交易台接到同一条柜台上，立刻画出资金和持仓。"""
+        trader = resident_ctp_trader(self.master)
+        if trader is None:
+            return
+        self._attached_resident = True
+        self.trader = trader
+        self.kind.set(ctp_kind_label(trader.settings.account_kind))
+        if self._kind_box is not None:
+            self._kind_box.configure(state="disabled")
+        bot = getattr(getattr(self.master, "worker", None), "bot", None)
+        watch = ""
+        if bot is not None:
+            watch = str(getattr(bot, "default_symbol", "") or "").strip()
+            if not watch:
+                symbols = list(getattr(bot, "scan_symbols", None) or [])
+                watch = str(symbols[0]).strip() if symbols else ""
+        if watch:
+            self.symbol.set(watch)
+        self.title("CTP 交易台（正在看常驻柜台；关掉窗口不断线）")
+        self._say(
+            "已接到常驻正在用的柜台，不再重新登录。"
+            "资金、持仓、委托、成交跟这一条连接。"
+            "这里点买开卖开也会真下单，请小心。"
+            "关掉本窗口不会把常驻踢下线。"
+        )
+        session = getattr(getattr(trader, "gateway", None), "session", None)
+        if session is not None and bool(getattr(session, "ready", False)):
+            self._paint_logged_in_header(trader, attached=True)
+            self._sync_attached_desk(trader)
+            return
+        self.account_line.set("常驻正在登录柜台，登录完成后会自动填表。")
+        self.after(400, lambda: self._wait_resident_ready(0))
+
+    def _wait_resident_ready(self, tries: int) -> None:
+        """常驻还在握手时，隔一会儿再看一次是否已经登录完成。"""
+        if not self.winfo_exists() or not self._attached_resident:
+            return
+        trader = self.trader
+        session = getattr(getattr(trader, "gateway", None), "session", None) if trader else None
+        if trader is not None and session is not None and bool(getattr(session, "ready", False)):
+            self._paint_logged_in_header(trader, attached=True)
+            self._sync_attached_desk(trader)
+            return
+        if tries >= 40:
+            self._say("常驻还没登录完成。等顶栏变成「CTP 已连接」后再点「刷新持仓」。")
+            return
+        self.after(400, lambda: self._wait_resident_ready(tries + 1))
+
+    def _paint_logged_in_header(self, trader: CtpTrader, *, attached: bool) -> None:
+        """登录成功或接到常驻后，把账号和限额写到窗口顶上。"""
+        prefix = "正在看常驻 · " if attached else ""
+        warn = trader.settings.order_count_warn
+        lots = trader.settings.max_order_volume
+        self.account_line.set(
+            f"{prefix}已登录{ctp_kind_label(trader.settings.account_kind)}"
+            f" {trader.settings.user_id}  AppID {trader.settings.app_id}"
+            f"  前置 {trader.settings.td_front}"
+        )
+        extra = "关掉窗口不断线。" if attached else "挂单留给你手撤（测撤单用）；常驻挂机仍会超时自动撤。"
+        self.limit_line.set(
+            f"本机单笔最多 {lots} 手（超过会拦住，不是柜台上限）。"
+            f"报单/撤单到 {warn} 笔只提醒、不拦单。"
+            f"最小变动价位 {trader.settings.price_tick}。"
+            f"{extra}"
+        )
+        self._paint_blotter()
+
+    def _sync_attached_desk(self, trader: CtpTrader) -> None:
+        """接到常驻后查一遍资金、持仓、委托、成交，并订行情。"""
+        counted = len(getattr(getattr(trader.gateway, "table", None), "orders", {}) or {})
+        trader.gateway.activity.sync_from_broker_count(counted)
+
+        def work() -> None:
+            self._load_price_band(trader)
+            time.sleep(0.4)
+            self._show_positions(trader)
+            time.sleep(0.4)
+            self._show_orders(trader)
+            time.sleep(0.4)
+            self._show_trades(trader)
+            self._open_market(trader)
+            self._on_ui(self._start_quote_pump)
+            self._on_ui(lambda: self._paint_logged_in_header(trader, attached=True))
+
+        self._run_in_background("正在同步常驻柜台的资金、持仓和委托。", work)
+
     def _connect(self) -> None:
+        if self._attached_resident and self.trader is not None:
+            if self.trader.gateway.session.ready:
+                self._say("已经在看常驻柜台，不用再登录。正在刷新持仓和委托。")
+                self._sync_attached_desk(self.trader)
+                return
+            self._say("常驻还在登录，请稍等。")
+            return
         trader = self._ensure()
         if trader is None:
             return
@@ -580,8 +778,8 @@ class CtpProbeWindow(tk.Toplevel):
             executor = str(((load_config().get("trade") or {}).get("executor") or "")).lower()
             if capabilities_for(executor).orders_via_broker:
                 self._say(
-                    "常驻已经在用 CTP 连这个账号。请先到运行页点「停止常驻」，再在交易台登录，"
-                    "否则柜台可能把一边踢下线。"
+                    "常驻已经在用 CTP 连这个账号。请关掉本窗口再点「打开交易台」，"
+                    "会直接看到常驻的持仓，不要再单独登录。"
                 )
                 return
         self._say(f"准备用{ctp_kind_label(trader.settings.account_kind)}登录 {trader.settings.user_id}")
@@ -591,24 +789,10 @@ class CtpProbeWindow(tk.Toplevel):
             self._say(("连接成功：" if ok else "连接失败：") + message)
             if not ok:
                 return
-            warn = trader.settings.order_count_warn
-            lots = trader.settings.max_order_volume
-            self._on_ui(
-                lambda: self.account_line.set(
-                    f"已登录账号 {trader.settings.user_id}  AppID {trader.settings.app_id}  前置 {trader.settings.td_front}"
-                )
-            )
-            self._on_ui(
-                lambda: self.limit_line.set(
-                    f"本机单笔最多 {lots} 手（超过会拦住，不是柜台上限）。"
-                    f"报单/撤单到 {warn} 笔只提醒、不拦单。"
-                    f"最小变动价位 {trader.settings.price_tick}。"
-                    f"挂单留给你手撤（测撤单用）；常驻挂机仍会超时自动撤。"
-                )
-            )
+            self._on_ui(lambda: self._paint_logged_in_header(trader, attached=False))
             self._say(
-                f"账号 {trader.settings.user_id}。本机单笔最多 {lots} 手。"
-                f"到 {warn} 笔只是提醒，不是只能报 {warn} 次。"
+                f"账号 {trader.settings.user_id}。本机单笔最多 {trader.settings.max_order_volume} 手。"
+                f"到 {trader.settings.order_count_warn} 笔只是提醒，不是只能报那么多次。"
             )
             time.sleep(1.1)
             self._load_price_band(trader)
@@ -772,7 +956,7 @@ class CtpProbeWindow(tk.Toplevel):
     def _show_quote(self, row: dict) -> None:
         if not self.winfo_exists():
             return
-        from src.trader.ctp_md import describe_quote, quote_line
+        from src.trader.ctp_md import describe_quote
 
         view = describe_quote(row)
         signature = (
@@ -801,12 +985,7 @@ class CtpProbeWindow(tk.Toplevel):
             self.quote_hint.set("卖一是横线=盘口暂时没人挂卖。卖开请点买一填价（对手价），不要等卖一。")
         else:
             self.quote_hint.set("点蓝色的最新/买一/卖一/涨停/跌停，价格会填进上面的框。")
-
-        line = quote_line(view)
-        if line != self._logged_quote:
-            self._logged_quote = line
-            logger.info("仿真测试：{}", line)
-            self._write(line)
+        # 盘口只画在交易台数字上。买一卖一每跳一次都写日志，运行窗口会被刷满。
 
     def _paint_blotter(self) -> None:
         if not self.winfo_exists() or self.trader is None:
@@ -1084,13 +1263,19 @@ class CtpProbeWindow(tk.Toplevel):
         if trader is None:
             return
         trader.gateway.trading_paused = True
-        self._say("已暂停报单。")
+        worker = getattr(self.master, "worker", None)
+        if self._attached_resident and worker is not None:
+            worker.set_orders_paused(True)
+        self._say("已暂停开新仓，平仓仍可发。")
 
     def _resume(self) -> None:
         trader = self._ensure()
         if trader is None:
             return
         trader.gateway.trading_paused = False
+        worker = getattr(self.master, "worker", None)
+        if self._attached_resident and worker is not None:
+            worker.set_orders_paused(False)
         self._say("已恢复报单。")
 
     def _query_positions(self) -> None:
@@ -1220,6 +1405,106 @@ class CtpProbeWindow(tk.Toplevel):
             self._on_ui(self._paint_contracts)
 
         self._run_in_background(f"正在查询合约 {keyword}。", work)
+
+    def _picked_contract_code(self) -> str:
+        """合约页选中的交易代码；没点行就用上方下单合约。"""
+        chosen = self.ins_tree.selection()
+        if chosen:
+            code = self._cell(self.ins_tree, chosen[0], "交易代码")
+            if code:
+                return str(code).strip()
+        return str(self.symbol.get() or "").strip()
+
+    def _contract_row_for(self, code: str) -> dict | None:
+        trader = self.trader
+        if trader is None or not code:
+            return None
+        want = symbol_key(code)
+        for item in trader.gateway.contracts:
+            if symbol_key(str(item.get("symbol") or "")) == want:
+                return item
+        return None
+
+    def _quote_last_price(self) -> float:
+        text = str(self.last.get() or "").strip()
+        if not text or text == "—":
+            return 0.0
+        try:
+            return float(text)
+        except ValueError:
+            return 0.0
+
+    def _sync_contract_to_universe(self) -> None:
+        """把当前合约的每手数量、最小变动、保证金、手续费写入品种与合约表。"""
+        from tkinter import messagebox
+
+        from src.risk.universe_table import resolve_universe_path, sync_ctp_contract_to_universe
+        from src.trader.ctp_display import ctp_row_to_universe_costs
+        from src.utils.config_loader import load_config
+
+        trader = self._need_login()
+        if trader is None:
+            return
+        code = self._picked_contract_code()
+        if not code:
+            self._say("请先查询并点中一行合约。")
+            return
+        row = self._contract_row_for(code)
+        if not row:
+            self._say("表格里还没有这一行。请先点「查询」，再点中合约。")
+            return
+        has_costs = any(
+            abs(float(row.get(key) or 0)) > 1e-12
+            for key in (
+                "long_margin_money",
+                "short_margin_money",
+                "open_money",
+                "open_volume",
+                "close_money",
+                "close_volume",
+                "close_today_money",
+                "close_today_volume",
+            )
+        )
+        if not has_costs:
+            self._say("这一行还没查到保证金和手续费。请再点一次该行，等下面出现说明后再写入。")
+            return
+        last = self._quote_last_price()
+        fields, note = ctp_row_to_universe_costs(row, last)
+        if not fields.get("symbol"):
+            self._say(note)
+            return
+        if not messagebox.askyesno(
+            "写入品种表",
+            note
+            + "\n\n会写入 config/品种与合约.xlsx。"
+            "不改「启用」「交易时段」「清仓时刻」。"
+            "同品种其它月份的保证金和手续费也会改成一样。"
+            "请先关掉正在打开的 Excel。\n\n确定写入？",
+        ):
+            return
+        cfg = load_config()
+        path = resolve_universe_path(cfg, root=self._root)
+        try:
+            sync_ctp_contract_to_universe(path, fields)
+        except PermissionError:
+            messagebox.showerror("写不进去", "品种表正在被 Excel 打开。请先关掉 Excel 再点一次。")
+            return
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("写入品种表失败")
+            messagebox.showerror("写入失败", str(exc))
+            return
+        self._say(f"已写入品种表 {path.name}：{note}")
+        reload_fn = getattr(self.master, "_reload_margin_table", None)
+        if callable(reload_fn):
+            try:
+                reload_fn(silent=True)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("写入后重新读取品种表失败: {}", exc)
+        messagebox.showinfo(
+            "已写入",
+            f"{note}\n\n配置页已按新表重读。正在挂机的手数要下次启动常驻才按新保证金算。",
+        )
 
     def _pick_contract(self) -> None:
         if self._filling_tree:
@@ -1389,6 +1674,12 @@ class CtpProbeWindow(tk.Toplevel):
         if self.md is not None:
             self.md.close()
             self.md = None
+        if self._attached_resident:
+            # 只关窗口。常驻继续挂机，不能在这里登出。
+            self.trader = None
+            self._attached_resident = False
+            self.destroy()
+            return
         if self.trader is not None:
             self.trader.shutdown()
             self.trader = None

@@ -2250,7 +2250,8 @@ class RuleStrategy(StrategyBase):
 
         self.cfg = cfg
         self.timeframe = str(self.rule.timeframe or strategy.get("timeframe", "15"))
-        self.trail_timeframe = self.timeframe
+        # 止损周期跟左边公共项；规则文件只覆盖信号周期。
+        self.trail_timeframe = str(strategy.get("trail_timeframe") or self.timeframe)
         self.symbols: list[str] = list(strategy.get("symbols") or [trade.get("symbol", "bu2612")])
         self.volume = int(trade.get("volume", 1))
         self.required_bars = self.rule.required_bars

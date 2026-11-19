@@ -62,6 +62,7 @@ def main() -> int:
         "config/全品种备查.txt",
         "config/品种与合约.xlsx",
         "config/优化参数.xlsx",
+        "config/holidays.yaml",
         "config/rules/dual_ma_equiv.yaml",
         "config/rules/dualthrust.yaml",
         "config/rules/r_breaker.yaml",
@@ -80,7 +81,6 @@ def main() -> int:
         "strategies/multi_factor.yaml",
         "strategies/swing_box.yaml",
         "docs/均线波段.md",
-        "docs/日内浮盈飘单.md",
         "VERSION",
         "CHANGELOG.md",
         "docs/日内实体操作说明书.md",
@@ -120,6 +120,10 @@ def main() -> int:
     # 不得把密钥打进发布包
     if (DIST / "config" / "secrets.local.yaml").exists():
         errors.append("发布包里出现了 secrets.local.yaml，请删除后再分发")
+
+    dlls = list((DIST / "ctp" / "api").glob("*.dll")) + list((DIST / "ctp" / "vendor_libs").glob("*.dll"))
+    if not dlls:
+        errors.append("缺少华泰 CTP 动态库（ctp/api 或 ctp/vendor_libs 下的 dll）")
 
     pyz = ROOT / "build" / "Auto-Trading" / "PYZ-00.toc"
     if pyz.exists():

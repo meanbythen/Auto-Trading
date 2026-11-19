@@ -2,8 +2,8 @@
 品种手续费。
 
 功能：按「品种与合约」表里的每手手续费，算开仓/平仓要扣多少钱。
-原理：开仓、平昨各按「每手手续费」×手数；平今按「平今手续费」×手数。
-      平今手续费空着时，跟每手手续费相同；填 0 表示平今免费（燃油常见）。
+原理：      开仓按「开仓手续费」×手数；平昨按「平仓手续费」（空=跟开仓相同）；
+      平今按「平今手续费」（空=跟平仓/开仓相同）；填 0 表示免费。
 """
 
 from __future__ import annotations
@@ -37,14 +37,18 @@ def close_commission_per_lot(
     """
     平仓：每手多少元。
 
-    平今用 commission_close_today；没单独写时跟开仓/平昨同一价。
+    平昨优先用 commission_close，没有就跟开仓相同。
+    平今用 commission_close_today；没单独写时跟平昨同一价。
     """
     box = _box(contracts, symbol)
-    base = max(0.0, float(box.get("commission") or 0))
+    open_fee = max(0.0, float(box.get("commission") or 0))
+    close_fee = open_fee
+    if "commission_close" in box and box.get("commission_close") is not None:
+        close_fee = max(0.0, float(box.get("commission_close") or 0))
     if not close_today:
-        return base
+        return close_fee
     if "commission_close_today" not in box or box.get("commission_close_today") is None:
-        return base
+        return close_fee
     return max(0.0, float(box.get("commission_close_today") or 0))
 
 

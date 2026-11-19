@@ -63,15 +63,17 @@ class RiskGuardian:
         logger.info("当日盈亏更新: {:+.2f} → 合计 {:.2f}", pnl_delta, self.daily_pnl)
         self._check_daily_loss()
 
-    def set_daily_pnl(self, value: float) -> None:
+    def set_daily_pnl(self, value: float, *, log: bool = True) -> None:
         """
         用账本口径直接覆盖当日盈亏。
 
         信号账户记完账后调用，避免策略和风控各算一次。覆盖后同样检查熔断，
         已经熔断的不会因为数值回升而自动恢复。
+        常驻盯市每轮都会对一次；那种小跳动不要打日志（log=False）。
         """
         self.daily_pnl = round(float(value or 0), 2)
-        logger.info("当日盈亏按账本校准: {:.2f}", self.daily_pnl)
+        if log:
+            logger.info("当日盈亏按账本校准: {:.2f}", self.daily_pnl)
         self._check_daily_loss()
 
     def _check_daily_loss(self) -> None:
@@ -195,9 +197,13 @@ class RiskGuardian:
             return False, f"已熔断: {self.halt_reason}"
 
         now = time.time()
-        if self.last_open_ts and (now - self.last_open_ts) < self.min_order_interval_sec:
-            wait = int(self.min_order_interval_sec - (now - self.last_open_ts))
-            return False, f"开仓过于频繁，请再等 {wait} 秒"
+        need = int(self.min_order_interval_sec or 0)
+        # 配置页写的是「下单」间隔：上一笔开仓或平仓（含手机平仓记进账本）之后，
+        # 再开新仓都要等够。止损/收盘清仓走上面的平仓分支，不会被挡住。
+        last = max(float(self.last_order_ts or 0), float(self.last_open_ts or 0))
+        if need > 0 and last and (now - last) < need:
+            wait = max(1, int(need - (now - last)))
+            return False, f"距上一笔下单不足 {need} 秒，请再等 {wait} 秒"
 
         if self.open_orders_today >= self.max_orders_per_day:
             return False, f"今日开仓次数已达上限 {self.max_orders_per_day}"

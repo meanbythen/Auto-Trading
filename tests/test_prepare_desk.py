@@ -44,8 +44,13 @@ def test_gui_ready_does_not_claim_an_order() -> None:
     assert "没有点买开" in text
 
 
-def test_sim_channel_skips_the_price_click() -> None:
-    called = {"price": False}
+def test_sim_channel_does_not_open_ths() -> None:
+    """模拟通道也不走同花顺准备，避免定时登录误开软件。"""
+    called = {"login": False, "price": False}
+
+    def _login(_cfg):
+        called["login"] = True
+        return True, "不该被调用"
 
     def _arm(_cfg):
         called["price"] = True
@@ -53,13 +58,34 @@ def test_sim_channel_skips_the_price_click() -> None:
 
     ok, lines = prepare_trading_desk(
         {"trade": {"executor": "sim"}, "account": {}},
-        login=lambda _cfg: (True, "已登录"),
+        login=_login,
         arm_price=_arm,
         confirm_settlement=_settled,
     )
     assert ok is True
+    assert called["login"] is False
     assert called["price"] is False
-    assert any("不改价格框" in line for line in lines)
+    assert any("不打开同花顺" in line for line in lines)
+
+
+def test_ctp_channel_does_not_open_ths() -> None:
+    """CTP 通道绝不能拉同花顺或点华泰登录框。"""
+    called = {"login": False}
+
+    def _login(_cfg):
+        called["login"] = True
+        return True, "不该被调用"
+
+    ok, lines = prepare_trading_desk(
+        {"trade": {"executor": "ctp"}, "account": {}},
+        login=_login,
+        arm_price=lambda _cfg: (_raise_if_called(), ""),
+        confirm_settlement=_settled,
+    )
+    assert ok is True
+    assert called["login"] is False
+    assert any("ctp" in line.lower() for line in lines)
+    assert any("不打开同花顺" in line for line in lines)
 
 
 def test_settlement_window_blocks_the_resident_start() -> None:

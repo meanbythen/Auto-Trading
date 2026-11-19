@@ -55,10 +55,15 @@ class FlattenManagerMixin:
         ):
             return
         if force:
-            # 新的一轮清仓开始：重新计数、允许重新尝试（上一轮的「已发单」标记作废）。
+            # 新的一轮清仓开始。几秒内策略刚报过的平仓不要清掉，避免和止损各打一次。
             self._flatten_sent.clear()
             self._flatten_attempts.clear()
-            self._flatten_try.clear()
+            recent = time.monotonic() - 15.0
+            self._flatten_try = {
+                name: stamp
+                for name, stamp in (self._flatten_try or {}).items()
+                if float(stamp or 0) >= recent
+            }
         # 已经过了 10 分钟窗口、但仓位还没平：只在交易时段内继续重试。
         # 收盘后的夜里不再反复点同花顺，待办保留到下一节开盘再平。
         if not in_window and self.sessions and not in_trading_session(self.sessions):
@@ -72,6 +77,14 @@ class FlattenManagerMixin:
                 self._flatten_sent.discard(symbol)
                 self._flatten_try.pop(symbol, None)
                 continue
+            too_fresh = getattr(self, "_own_fill_too_fresh", None)
+            fill_kind = getattr(self, "_own_fill_kind", None)
+            # 刚平仓成交时，柜台持仓查询常慢几秒。这时不要按「程序账又有仓」再报一次平仓。
+            if callable(too_fresh) and too_fresh(symbol):
+                kind = fill_kind(symbol) if callable(fill_kind) else "open"
+                if str(kind) == "close":
+                    remaining = True
+                    continue
             if symbol in self._flatten_sent:
                 # GUI 已经点出发单但配置不改内部持仓，别再重复点。
                 continue

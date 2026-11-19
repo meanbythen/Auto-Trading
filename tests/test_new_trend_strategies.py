@@ -130,6 +130,16 @@ def test_sar_trend_builds_and_ratchets_the_stop() -> None:
     assert decision.stop_price > 110.0
 
 
+def test_bollinger_and_sar_follow_public_flatten_switch() -> None:
+    """公共开关关掉时，布林/SAR 自己那一节即使写着每天平仓，也不能到点强平。"""
+    for engine, cls in (("bollinger", BollingerBreakStrategy), ("sar_trend", SarTrendStrategy)):
+        cfg = _cfg(engine, flatten_at_close=True)
+        cfg["strategy"]["flatten_at_close"] = False
+        assert cls(cfg).flatten_at_close is False
+        cfg["strategy"]["flatten_at_close"] = True
+        assert cls(cfg).flatten_at_close is True
+
+
 def test_sar_trend_short_position_exits_when_sar_flips_up() -> None:
     closes = [100 - i * 0.8 for i in range(55)] + [101.0, 108.0, 116.0]
     bars = _frame(closes, 2.0)

@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import os
 import threading
+import time
 from copy import deepcopy
 from datetime import date, datetime
 from pathlib import Path
@@ -107,13 +108,15 @@ def load_named_book(root: str | Path, account_id: Any) -> dict[str, Any] | None:
     from src.account.workspace import book_file
 
     path = book_file(root, account_id)
-    return read_book_file(path)
+    with _LOCK:
+        return read_book_file(path)
 
 
 def load_book(root: str | Path) -> dict[str, Any] | None:
     """读账本。还没有文件、或文件坏了，就返回空，调用方不要当成已经开始记账。"""
     path = book_path(root)
-    return read_book_file(path)
+    with _LOCK:
+        return read_book_file(path)
 
 
 def save_named_book(root: str | Path, account_id: Any, book: dict[str, Any]) -> Path:
@@ -132,6 +135,7 @@ _CTP_SNAP_KEYS = (
     "balance",
     "available",
     "withdraw",
+    "withdraw_quota",
     "deposit",
     "withdraw_amt",
     "margin",
@@ -199,7 +203,125 @@ def apply_ctp_equity(
         slim = {key: packed[key] for key in ("user_id", "account_id", "time", "currency", *_CTP_SNAP_KEYS)}
         history.append(slim)
         book["ctp_history"] = history[-_CTP_HISTORY_MAX:]
+    # 先写入历史，再按「白天有效快照」更新日历；结算后空壳 0 不能盖掉已记盈亏。
+    try:
+        _store_ctp_day_pnl(book, packed)
+        repair_ctp_daily(book)
+    except Exception:  # noqa: BLE001
+        pass
     return target, book
+
+
+def broker_snapshot_day_pnl_usable(snap: dict[str, Any] | None) -> bool:
+    """
+    这笔柜台快照能不能用来更新「当日盈亏」日历。
+
+    日盘收完、夜盘还没开，或结算确认之后，柜台常把平仓盈亏/手续费清零，
+    并把昨结改成今天收盘权益。这时算出来是 0，不能盖掉白天已经记下的真实盈亏。
+    """
+    if not isinstance(snap, dict):
+        return False
+    try:
+        close_p = abs(float(snap.get("close_profit") or 0))
+        pos_p = abs(float(snap.get("position_profit") or 0))
+        fee = abs(float(snap.get("commission") or 0))
+        bal = float(snap.get("balance") or 0)
+        pre = float(snap.get("pre_balance") or 0)
+    except (TypeError, ValueError):
+        return True
+    if close_p < 0.005 and pos_p < 0.005 and fee < 0.005 and pre > 1 and abs(bal - pre) < 0.05:
+        return False
+    return True
+
+
+def day_pnl_from_ctp_history(
+    history: list[Any] | None,
+    day: date | str,
+) -> float | None:
+    """从柜台历史里，取某个交易日最后一笔「还没被结算清零」的当日盈亏。"""
+    from src.account.ctp_sync import broker_day_pnl
+
+    want = str(day)[:10]
+    best: float | None = None
+    for row in history or []:
+        if not isinstance(row, dict):
+            continue
+        try:
+            key = str(futures_trading_day(row.get("time")))
+        except Exception:  # noqa: BLE001
+            continue
+        if key != want:
+            continue
+        if not broker_snapshot_day_pnl_usable(row):
+            continue
+        pnl = broker_day_pnl(row)
+        if pnl is None:
+            continue
+        best = round(float(pnl), 2)
+    return best
+
+
+def _store_ctp_day_pnl(book: dict[str, Any], snap: dict[str, Any]) -> None:
+    """把这一笔快照写进 ctp_daily；结算空壳且已有非零记录时不动。"""
+    from src.account.ctp_sync import broker_day_pnl
+
+    day_key = str(futures_trading_day(snap.get("time")))
+    days = dict(book.get("ctp_daily") or {})
+    prev = days.get(day_key)
+    try:
+        prev_n = float(prev) if prev is not None else None
+    except (TypeError, ValueError):
+        prev_n = None
+    if not broker_snapshot_day_pnl_usable(snap):
+        if prev_n is None:
+            rebuilt = day_pnl_from_ctp_history(book.get("ctp_history"), day_key)
+            if rebuilt is not None:
+                days[day_key] = rebuilt
+                book["ctp_daily"] = days
+        return
+    pnl = broker_day_pnl(snap)
+    if pnl is None:
+        return
+    days[day_key] = round(float(pnl), 2)
+    book["ctp_daily"] = days
+
+
+def repair_ctp_daily(book: dict[str, Any] | None) -> bool:
+    """
+    用柜台历史把日历盈亏补全或纠正。
+
+    返回是否改过账本。已有非零、历史也推不出更好结果时不改。
+    """
+    if not isinstance(book, dict) or str(book.get("funding") or "") != "ctp":
+        return False
+    history = list(book.get("ctp_history") or [])
+    if not history:
+        return False
+    days = dict(book.get("ctp_daily") or {})
+    day_keys: set[str] = set(str(k)[:10] for k in days.keys())
+    for row in history:
+        if not isinstance(row, dict):
+            continue
+        try:
+            day_keys.add(str(futures_trading_day(row.get("time"))))
+        except Exception:  # noqa: BLE001
+            continue
+    changed = False
+    for day_key in sorted(day_keys):
+        rebuilt = day_pnl_from_ctp_history(history, day_key)
+        if rebuilt is None:
+            continue
+        try:
+            old = float(days[day_key]) if day_key in days else None
+        except (TypeError, ValueError):
+            old = None
+        # 被结算空壳盖成 0，或这一天还没记过：用历史里白天的数。
+        if old is None or (abs(old) < 0.005 and abs(rebuilt) >= 0.01):
+            days[day_key] = rebuilt
+            changed = True
+    if changed:
+        book["ctp_daily"] = days
+    return changed
 
 
 def _ctp_snap_changed(old: dict[str, Any], new: dict[str, Any]) -> bool:
@@ -511,7 +633,7 @@ def describe(book: dict[str, Any], multipliers: dict[str, float] | None = None) 
 
 
 def describe_ctp_funds(book: dict[str, Any] | None) -> str:
-    """华泰账右边说明：只展示期货公司回报，不把程序估的盈亏写进去。"""
+    """华泰账右边说明：柜台资金 + 日历盈亏 + 程序成交。资金数字不按程序估的盈亏改。"""
     from src.trader.ctp_display import account_headline, account_pairs
 
     if not isinstance(book, dict):
@@ -527,26 +649,40 @@ def describe_ctp_funds(book: dict[str, Any] | None) -> str:
             "还没有期货公司资金回报。请先打开交易台，用这一本账对应的账号登录，"
             "点「刷新持仓」或本页「从柜台刷新资金」。查到的数字会原样存到本地，不能手改。"
         )
+    repair_ctp_daily(book)
     lines = [
         account_headline(snap),
         f"资金账号 {snap.get('account_id') or snap.get('user_id') or '—'}",
         f"更新于 {snap.get('time') or '—'}",
         "",
-        "下面和交易台「资金」页是同一份柜台查询，原样保存：",
+        "账户日历用的「期货公司当日盈亏」（不会被收盘后清零的柜台快照盖掉）：",
     ]
-    for title, value in account_pairs(snap):
-        lines.append(f"{title}    {value}")
+    daily = book.get("ctp_daily") if isinstance(book.get("ctp_daily"), dict) else {}
+    if not daily:
+        lines.append("  还没有。白天交易时点「从柜台刷新资金」会自动记。")
+    else:
+        for day_key in sorted(str(k) for k in daily.keys())[-14:]:
+            try:
+                value = float(daily.get(day_key) or 0)
+            except (TypeError, ValueError):
+                continue
+            lines.append(f"  {day_key}    {_signed(value)} 元")
     trades = list(book.get("trades") or [])
     lines.append("")
-    lines.append("程序成交只作策略记录，不改上面的资金：")
+    lines.append(f"程序成交记录（共 {len(trades)} 笔，只作策略对照，不改柜台资金）：")
     if not trades:
-        lines.append("  还没有。")
+        lines.append("  还没有。常驻用 CTP 成交后会出现在这里。")
     else:
-        for row in trades[-30:]:
+        for row in trades[-40:]:
             lines.append(
                 f"  {row.get('time')}  {row.get('offset')}  {row.get('direction')}  {row.get('symbol')}  "
                 f"价格 {_money(row.get('price'))}  {row.get('volume')} 手"
+                + (f"  {row.get('reason')}" if row.get("reason") else "")
             )
+    lines.append("")
+    lines.append("下面和交易台「资金」页是同一份柜台查询，原样保存：")
+    for title, text in account_pairs(snap):
+        lines.append(f"{title}    {text}")
     return "\n".join(lines)
 
 
@@ -666,6 +802,8 @@ def book_lock() -> threading.RLock:
 
 def _write_json(path: Path, payload: dict[str, Any]) -> None:
     """先写临时文件并落盘，再换上，避免存档只写了一半；同一进程内串行写。"""
+    from src.domain.ledger import _file_busy
+
     with _LOCK:
         path.parent.mkdir(parents=True, exist_ok=True)
         temp = path.with_suffix(path.suffix + ".tmp")
@@ -674,7 +812,20 @@ def _write_json(path: Path, payload: dict[str, Any]) -> None:
                 json.dump(payload, fh, ensure_ascii=False, indent=2)
                 fh.flush()
                 os.fsync(fh.fileno())
-            os.replace(temp, path)
+            last_exc: OSError | None = None
+            for attempt in range(8):
+                try:
+                    os.replace(temp, path)
+                    last_exc = None
+                    break
+                except OSError as exc:
+                    last_exc = exc
+                    if _file_busy(exc) and attempt < 7:
+                        time.sleep(0.05 * (attempt + 1))
+                        continue
+                    raise
+            if last_exc is not None:
+                raise last_exc
         finally:
             if temp.exists():
                 try:

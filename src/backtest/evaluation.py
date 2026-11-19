@@ -4,7 +4,7 @@
 原理：门槛取自 docs/策略评估标准/评估指标.md。
       - 红线（fail）：盈利因子过低、滑点后盈利因子掉到 1 以下、卡尔玛过低、
         回撤过大、参数扰动断崖、震荡组大量开仓且持续赚钱。
-      - 观察（watch）：没碰红线，但低于最低合格门槛（样本、R 期望、盈利覆盖、连亏等）。
+      - 观察（watch）：没碰红线，但低于最低合格门槛（样本、收益期望、盈利覆盖、连亏等）。
         样本不足只压到观察，不判红线：笔数少说明统计显著性不足，不等于策略无效。
       - 通过（pass）：全部达到最低门槛；到优秀标准时在说明里标「优秀」。
       没有数据可算的检查记 skip，不参与结论。
@@ -537,7 +537,7 @@ def _check_r_expectancy(value: float, win_rate: float, avg_win: float, avg_loss:
     if avg_loss <= 1e-9:
         return EvaluationCheck(
             key="r_expectancy",
-            label="R期望",
+            label="收益期望",
             value="—",
             threshold=f"≥{th.r_expect_min:.2f}",
             status=SKIP,
@@ -551,7 +551,7 @@ def _check_r_expectancy(value: float, win_rate: float, avg_win: float, avg_loss:
         status, note = PASS, ""
     return EvaluationCheck(
         key="r_expectancy",
-        label="R期望",
+        label="收益期望",
         value=f"{value:.2f}",
         threshold=f"≥{th.r_expect_min:.2f}",
         status=status,
@@ -787,6 +787,8 @@ def _evaluate_core(
         {
             "net_pnl": float(perf.net_pnl),
             "profit_factor": float(perf.profit_factor),
+            # 对外只叫收益期望；r_expectancy 留给旧报告读同一数字。
+            "expectancy": float(r_value),
             "r_expectancy": float(r_value),
             "annual_return": float(annual),
             "calmar": None if calmar is None else float(calmar),

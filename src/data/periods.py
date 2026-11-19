@@ -433,6 +433,9 @@ def _bar_close_for(
     先看墙上整点，再和这段收盘取较早的那个。
     这样 10:00～10:15 不会并进 11:00，11:00～11:30 也不会并进下午。
     """
+    # 开盘时刻本身是 00 分时，不能收成开盘那根，要并进第一根完整格子。
+    if stamp.hour == start.hour and stamp.minute == start.minute:
+        stamp = stamp + timedelta(minutes=1)
     clock = _next_clock_close(stamp, step)
     return min(clock, _segment_end_at(stamp, start, end))
 
@@ -496,32 +499,67 @@ def bars_from_session_clock(
     商品日盘 60 分钟：10:00、10:15（短）、11:00（短）、11:30（短）、14:00（短）、15:00。
     没有 12:00、13:00，也不会把上午最后几分钟并进下午那根。
     时间戳是结束时刻（右标签）。09:00、10:30、13:30、21:00 是开盘，不是收线。
+
+    整列用 numpy 分组，不用逐根 Python 循环。一年的 1 分钟也能在一秒内拼完，
+    否则历史回测会在「请稍候」停很久。
     """
     step = max(int(step), 1)
     segments = trading_segments_for_symbol(symbol)
     data = minutes.sort_index()
     columns = [name for name in ("open", "high", "low", "close", "volume", "oi") if name in data.columns]
-    buckets: dict[datetime, list[pd.Series]] = {}
-    order: list[datetime] = []
-
-    for ts, row in data.iterrows():
-        stamp = pd.Timestamp(ts).to_pydatetime()
-        if getattr(stamp, "tzinfo", None) is not None:
-            stamp = stamp.replace(tzinfo=None)
-        stamp = stamp.replace(second=0, microsecond=0)
-        seg = _segment_for_stamp(stamp, segments)
-        if seg is None:
-            continue
-        close_at = _bar_close_for(stamp, step, seg[0], seg[1])
-        if close_at not in buckets:
-            buckets[close_at] = []
-            order.append(close_at)
-        buckets[close_at].append(row)
-
-    if not order:
+    if not columns or "close" not in columns:
         return pd.DataFrame(columns=list(dict.fromkeys(columns + ["minute_count"])))
-    records = [_emit_bucket(buckets[stamp], columns) for stamp in order]
-    out = pd.DataFrame(records, index=pd.DatetimeIndex(order, name="datetime"))
+
+    index = pd.DatetimeIndex(data.index)
+    if index.tz is not None:
+        index = index.tz_convert("Asia/Shanghai").tz_localize(None)
+    index = index.floor("min")
+    hm = (index.hour * 60 + index.minute).to_numpy(dtype=np.int64)
+    n = len(index)
+    close_hm = np.full(n, -1, dtype=np.int64)
+    extra_days = np.zeros(n, dtype=np.int64)
+
+    for start, end in segments:
+        start_m = start.hour * 60 + start.minute
+        end_m = end.hour * 60 + end.minute
+        overnight = start > end
+        if overnight:
+            mask = (hm == start_m) | (hm > start_m) | (hm <= end_m)
+        else:
+            mask = (hm == start_m) | ((hm > start_m) & (hm <= end_m))
+        if not mask.any():
+            continue
+        work = hm[mask].copy()
+        # 开盘那一分钟并进第一根，不要单独收成 09:00 / 21:00。
+        work = np.where(work == start_m, work + 1, work)
+        rem = work % step
+        clock = np.where(rem == 0, work, work + (step - rem))
+        cap = np.where(overnight & (hm[mask] >= start_m), 1440 + end_m, end_m)
+        capped = np.minimum(clock, cap)
+        days, of_day = np.divmod(capped, 1440)
+        close_hm[mask] = of_day
+        extra_days[mask] = days
+
+    valid = close_hm >= 0
+    if not valid.any():
+        return pd.DataFrame(columns=list(dict.fromkeys(columns + ["minute_count"])))
+
+    midnight = index[valid].normalize()
+    keys = midnight + pd.to_timedelta(extra_days[valid], unit="D") + pd.to_timedelta(
+        close_hm[valid], unit="m"
+    )
+    kept = data.loc[valid, columns].copy()
+    kept.index = pd.DatetimeIndex(keys, name="datetime")
+    grouped = kept.groupby(level=0, sort=True)
+    agg: dict[str, str] = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    if "volume" in columns:
+        agg["volume"] = "sum"
+    if "oi" in columns:
+        agg["oi"] = "last"
+    out = grouped.agg(agg)
+    out["minute_count"] = grouped["close"].count()
+    out = out.dropna(subset=["close"])
+    out.index.name = "datetime"
     return out.sort_index()
 
 

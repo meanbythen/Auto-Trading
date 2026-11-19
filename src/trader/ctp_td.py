@@ -166,14 +166,21 @@ class OpenctpClient:
         quick = getattr(self.tdapi, "THOST_TERT_QUICK", 1)
         self.api.SubscribePrivateTopic(quick)
         self.api.SubscribePublicTopic(quick)
-        self.api.RegisterFront(str(settings.td_front))
+        from src.trader.ctp_fronts import collect_fronts, register_fronts
+
+        td_fronts = collect_fronts(
+            getattr(settings, "td_front", ""),
+            getattr(settings, "td_fronts", ()),
+        )
+        registered = register_fronts(self.api, td_fronts)
         try:
             api_ver = str(self.tdapi.CThostFtdcTraderApi.GetApiVersion() or "")
         except Exception:  # noqa: BLE001
             api_ver = "未知"
         logger.info(
-            "CTP 正在连接交易前置 {}，接口版本 {}，BrokerID {}，账号 {}，AppID {}",
-            settings.td_front,
+            "CTP 正在连接交易前置 {} 台：{}，接口版本 {}，BrokerID {}，账号 {}，AppID {}",
+            registered,
+            "；".join(td_fronts) or str(settings.td_front),
             api_ver,
             settings.broker_id,
             settings.user_id,

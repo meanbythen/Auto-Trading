@@ -224,70 +224,7 @@ class ConfigCollectMixin:
         body.pop("reverse_atr_mult", None)
         # 止损触发方式已挪到 strategy 根，旧键顺手清掉。
         body.pop("stop_mode", None)
-
-        hold = st.setdefault("float_hold", {})
-        from src.strategy.float_hold import (
-            format_macd_combo,
-            normalize_direction_key,
-            normalize_macd_timeframe,
-            parse_ema_pair_label,
-            parse_macd_combo,
-        )
-
-        hold["direction"] = normalize_direction_key(self.float_direction_var.get())
-        hold["macd_timeframe"] = normalize_macd_timeframe(self.float_macd_tf_var.get())
-
-        try:
-            macd_fast = int(float(self.float_macd_fast_var.get()))
-            macd_slow = int(float(self.float_macd_slow_var.get()))
-            macd_signal = int(float(self.float_macd_signal_var.get()))
-        except (TypeError, ValueError):
-            macd_fast, macd_slow, macd_signal = parse_macd_combo(self.float_macd_combo_var.get())
-        macd_fast, macd_slow, macd_signal = parse_macd_combo(
-            f"{macd_fast}/{macd_slow}/{macd_signal}"
-        )
-        hold["macd_fast"] = macd_fast
-        hold["macd_slow"] = macd_slow
-        hold["macd_signal"] = macd_signal
-        hold["macd_combo"] = format_macd_combo(macd_fast, macd_slow, macd_signal)
-        ema_fast, ema_slow = parse_ema_pair_label(self.float_ema_pair_var.get())
-        hold["dir_ema_fast"] = ema_fast
-        hold["dir_ema_slow"] = ema_slow
-        hold["dir_ema_pair"] = f"{ema_fast}/{ema_slow}"
-        hold["trend_align_enabled"] = bool(self.float_trend_align_var.get())
-        hold["trend_align_fast"] = 60
-        hold["trend_align_slow"] = 120
-        try:
-            hold["trend_slope_min_deg"] = max(0.0, min(80.0, float(self.float_trend_slope_var.get())))
-        except (TypeError, ValueError):
-            hold["trend_slope_min_deg"] = 0.0
-        try:
-            hold["trend_slope_lookback"] = max(2, min(60, int(float(self.float_trend_lookback_var.get()))))
-        except (TypeError, ValueError):
-            hold["trend_slope_lookback"] = 5
-        try:
-            hold["eth_minutes"] = max(0, int(self.float_eth_var.get()))
-        except ValueError:
-            hold["eth_minutes"] = 60
-        try:
-            hold["cluster_max_width"] = max(1, min(80, int(float(self.float_cluster_width_var.get()))))
-        except (TypeError, ValueError):
-            hold["cluster_max_width"] = 10
-        hold["stop_atr_mult"] = max(0.1, _read_atr_mult(self.float_stop_atr_var.get(), 1.5))
-        hold["skip_gap_atr_mult"] = _read_atr_mult(self.float_skip_gap_var.get(), 0.0)
-        hold["max_box_atr_mult"] = _read_atr_mult(self.float_max_box_var.get(), 0.0)
-        hold["max_chase_atr_mult"] = _read_atr_mult(self.float_max_chase_var.get(), 0.0)
-        hold["gap_align_atr_mult"] = _read_atr_mult(self.float_gap_align_var.get(), 0.0)
-        hold["be_atr_mult"] = _read_atr_mult(self.float_be_atr_var.get(), 2.0)
-        hold["day_cutoff"] = _clock_text(self.float_day_cutoff_var.get(), "14:45")
-        hold["night_cutoff"] = _clock_text(self.float_night_cutoff_var.get(), "22:50")
-        hold["eth_minutes2"] = 0
-        hold.pop("skip_gap_ticks", None)
-        hold.pop("max_box_ticks", None)
-        hold.pop("max_chase_ticks", None)
-        hold.pop("stop_extra_ticks", None)
-        hold.pop("be_r_mult", None)
-        hold.pop("stop_mode", None)
+        st.pop("float_hold", None)
 
         trend_box = st.setdefault("trend_follow", {})
         try:
@@ -390,6 +327,7 @@ class ConfigCollectMixin:
             boll_box["atr_stop_mult"] = max(0.1, float(self.boll_atr_mult_var.get()))
         except ValueError:
             boll_box["atr_stop_mult"] = 1.5
+        boll_box["flatten_at_close"] = bool(self.flatten_at_close_var.get())
         kb_box = st.setdefault("kelly_break", {})
         try:
             kb_box["lookback"] = max(5, int(self.kb_lookback_var.get()))
@@ -463,6 +401,7 @@ class ConfigCollectMixin:
             sar_box["af_step"] = max(0.005, float(self.sar_af_step_var.get()))
         except ValueError:
             sar_box["af_step"] = 0.02
+        sar_box["flatten_at_close"] = bool(self.flatten_at_close_var.get())
         multi_box = st.setdefault("multi_factor", {})
         try:
             multi_box["threshold"] = min(0.95, max(0.1, float(self.multi_threshold_var.get())))
@@ -491,6 +430,8 @@ class ConfigCollectMixin:
         except ValueError:
             multi_box["disagree_max"] = 0.7
         multi_box["use_sar"] = bool(self.multi_use_sar_var.get())
+        # 多因子收盘清仓跟左边总开关，不再单独留一份写死的 true。
+        multi_box["flatten_at_close"] = bool(self.flatten_at_close_var.get())
         self._write_cta_filter_vars(multi_box, "multi_factor")
         swing_box = st.setdefault("swing_trend", {})
         from src.strategy.swing_trend import DEFAULT_SCALE, SCALE_PAIRS
@@ -606,13 +547,17 @@ class ConfigCollectMixin:
         rt = self.cfg.setdefault("runtime", {})
         rt["auto_shutdown_after_close"] = bool(self.auto_shutdown_var.get())
 
-        # 回测成交模拟：下一根开盘成交、滑点跳数。只影响回测/优化，配置页和历史回测页共用同一组。
+        # 回测成交模拟：开关在历史回测页。保存交易配置时一并写盘，下次打开还在。
         bt = self.cfg.setdefault("backtest", {})
-        bt["fill_on_next_open"] = bool(self.bt_fill_next_open_var.get())
-        try:
-            bt["slippage_ticks"] = max(0.0, float(self.bt_slippage_var.get() or 0))
-        except (TypeError, ValueError):
-            bt["slippage_ticks"] = 1.0
+        if hasattr(self, "bt_fill_next_open_var"):
+            bt["fill_on_next_open"] = bool(self.bt_fill_next_open_var.get())
+        if hasattr(self, "bt_mirror_gates_var"):
+            bt["mirror_live_gates"] = bool(self.bt_mirror_gates_var.get())
+        if hasattr(self, "bt_slippage_var"):
+            try:
+                bt["slippage_ticks"] = max(0.0, float(self.bt_slippage_var.get() or 0))
+            except (TypeError, ValueError):
+                bt["slippage_ticks"] = 1.0
         # 策略优化页的搜索设置：写进配置，下次打开还是上次的样子，不再关窗口就回默认。
         depth = self.opt_depth_var.get().strip()
         bt["optimize_depth"] = depth if depth in ("精简", "标准", "完整") else "标准"
@@ -636,7 +581,7 @@ class ConfigCollectMixin:
         except (TypeError, ValueError):
             bt["max_trials"] = 80
 
-        # 策略评估：门槛写回配置，非法值回落到默认并夹在合理范围内。
+        # 策略评估：界面在历史回测页。保存交易配置时写盘；回测/优化经 _clone_cfg 也会带上当前值。
         ev = self.cfg.setdefault("evaluation", {})
         if not isinstance(ev, dict):
             ev = {}
@@ -661,22 +606,40 @@ class ConfigCollectMixin:
         ev["max_consecutive_losses"] = int(_ev_num(self.ev_streak_var, 8, 0, 100))
 
         trade = self.cfg.setdefault("trade", {})
-        trade["executor"] = self.exec_var.get()
-        from src.trader.go_live import apply_stage_to_cfg, normalize_stage
+        chosen_exec = str(self.exec_var.get() or "sim").strip() or "sim"
+        trade["executor"] = chosen_exec
+        from src.trader.go_live import (
+            apply_stage_to_cfg,
+            load_state as load_go_live,
+            pair_stage_with_kind,
+            save_state as save_go_live,
+            stage_hint,
+            stage_label,
+        )
+        from src.trader.ctp_logic import ctp_kind_label, normalize_ctp_kind
 
-        apply_stage_to_cfg(self.cfg, normalize_stage(self.go_live_var.get()))
+        # 「账号」页「CTP操作账」和交易台一样：只换仿真/真实接口，开平仓规则不动。
+        kind = normalize_ctp_kind(self.ctp_kind_var.get())
+        stage = pair_stage_with_kind(self.go_live_var.get(), kind)
+        apply_stage_to_cfg(self.cfg, stage)
+        trade["executor"] = chosen_exec
+        self.go_live_var.set(stage_label(stage))
+        self.go_live_hint_var.set(stage_hint(stage))
+        try:
+            state = load_go_live(self.root_dir)
+            state["stage"] = stage
+            save_go_live(self.root_dir, state)
+        except Exception:  # noqa: BLE001
+            pass
 
         ctp_box = trade.setdefault("ctp", {})
         if not isinstance(ctp_box, dict):
             ctp_box = {}
             trade["ctp"] = ctp_box
-        from src.trader.go_live import account_kind_for_stage
-        from src.trader.ctp_logic import ctp_kind_label
-
-        # 账号种类以上线阶段为准，手工台和策略始终对同一本账。
-        ctp_box["account_kind"] = account_kind_for_stage(self.go_live_var.get())
-        self.ctp_kind_var.set(ctp_kind_label(ctp_box["account_kind"]))
+        self.ctp_kind_var.set(ctp_kind_label(ctp_box.get("account_kind") or kind))
         # 券商档案：页面上改的是当前选中的那一份。旧写法不再读写。
+        from src.trader.ctp_profile import profile_name_for_kind
+
         profile_name = str(self.ctp_profile_var.get() or "").strip()
         if profile_name:
             profiles = ctp_box.get("ctp_profiles")
@@ -685,16 +648,42 @@ class ConfigCollectMixin:
             ctp_box["ctp_profiles"] = profiles
             current = profiles.get(profile_name)
             item = dict(current) if isinstance(current, dict) else {}
-            item.setdefault("kind", ctp_box["account_kind"])
+            # 档案自己的仿真/真实种类不要被当前操作账盖掉，避免把实盘前置写进仿真档。
+            item.setdefault(
+                "kind",
+                (current or {}).get("kind") if isinstance(current, dict) else ctp_box["account_kind"],
+            )
             item.setdefault("label", profile_name)
-            item["td_front"] = str(self.ctp_profile_td_var.get() or "").strip()
-            item["md_front"] = str(self.ctp_profile_md_var.get() or "").strip()
+            from src.trader.ctp_fronts import dump_front_field, split_fronts
+
+            item["td_front"] = dump_front_field(split_fronts(self.ctp_profile_td_var.get()))
+            item["md_front"] = dump_front_field(split_fronts(self.ctp_profile_md_var.get()))
+            item.pop("td_fronts", None)
+            item.pop("md_fronts", None)
             item["broker_id"] = str(self.ctp_profile_broker_var.get() or "").strip()
             item["user_id"] = str(self.ctp_profile_user_var.get() or "").strip()
             item["password_env"] = str(self.ctp_profile_pwd_env_var.get() or "").strip()
             item["auth_code_env"] = str(self.ctp_profile_auth_env_var.get() or "").strip()
             profiles[profile_name] = item
-            ctp_box["ctp_profile"] = profile_name
+            from src.trader.ctp_profile import set_sim_profile_user_id
+
+            # 账号页的仿真号码始终写仿真档案，避免真实资金号盖掉 28077。
+            sim_user = str(self.ctp_sim_user_var.get() or "").strip()
+            sim_name = set_sim_profile_user_id(ctp_box, sim_user)
+            if sim_name and profile_name == sim_name:
+                item["user_id"] = sim_user
+                self.ctp_profile_user_var.set(sim_user)
+            matched = profile_name_for_kind(ctp_box, ctp_box.get("account_kind"))
+            ctp_box["ctp_profile"] = matched or profile_name
+            if matched and matched != profile_name:
+                self._ctp_profile_syncing = True
+                self.ctp_profile_var.set(matched)
+                self._ctp_profile_syncing = False
+                self._fill_ctp_profile_vars()
+        else:
+            from src.trader.ctp_profile import set_sim_profile_user_id
+
+            set_sim_profile_user_id(ctp_box, str(self.ctp_sim_user_var.get() or "").strip())
         try:
             trade["volume"] = int(self.volume_var.get())
         except ValueError:
@@ -781,11 +770,21 @@ class ConfigCollectMixin:
         risk["dynamic"] = self._dynamic_cfg_from_ui()
         risk["kelly"] = self._kelly_cfg_from_ui()
 
-        # 密码：写入本地密钥 + 当前进程环境。同花顺密码和天勤密码一次写进同一份文件。
+        # 密码：写入本地密钥 + 当前进程环境。某一格留空表示不改已经存过的值。
         pwd = self.password_var.get()
         pwd_env = acc["password_env"]
         tq_pwd = self.tq_password_var.get()
-        extra = {"tq_password": tq_pwd} if tq_pwd else None
+        sim_pwd = str(self.ctp_sim_password_var.get() or "")
+        auth_code = str(self.ctp_auth_code_var.get() or "")
+        extra: dict[str, Any] = {}
+        if tq_pwd:
+            extra["tq_password"] = tq_pwd
+        if sim_pwd:
+            extra["ctp_password"] = sim_pwd
+            os.environ["CTP_PASSWORD"] = sim_pwd
+        if auth_code:
+            extra["ctp_auth_code"] = auth_code
+            os.environ["CTP_AUTH_CODE"] = auth_code
         if pwd or extra:
             save_secrets(password=pwd if pwd else "", extra=extra)
         if pwd:

@@ -9,6 +9,7 @@ import pytest
 
 from src.data.kline import KlineProvider
 from src.data.tq_source import (
+    _clear_history_short,
     _filled_close_count,
     config_symbol_from_tq,
     fetch_frame,
@@ -341,7 +342,44 @@ def test_fetch_frame_waits_until_history_is_filled() -> None:
             upto = min(len(raw), self.waits * 4)
             raw.loc[raw.index[:upto], "close"] = 4700.0
 
+    _clear_history_short()
     fake = _SlowApi()
     frame = fetch_frame("fu2701", "5", limit=10, api=fake)
     assert fake.waits == 3  # 0 → 4 → 8 → 10 填满就停，不死等
     assert len(frame) == 10
+
+
+def test_short_history_warns_once_and_does_not_wait_again(monkeypatch) -> None:
+    """合约历史不够时：close 不再增加就停；同一条告警只写一次，下一轮不再空等。"""
+    from src.data import tq_source
+
+    _clear_history_short()
+    raw = _raw(*[f"2026-10-30 01:{m:02d}" for m in range(5)])
+    warnings: list[str] = []
+    real_warning = tq_source.logger.warning
+
+    def _capture_warning(message, *args, **kwargs):
+        warnings.append(str(message).format(*args) if args else str(message))
+        return real_warning(message, *args, **kwargs)
+
+    monkeypatch.setattr(tq_source.logger, "warning", _capture_warning)
+
+    class _ShortApi:
+        def __init__(self) -> None:
+            self.waits = 0
+
+        def get_kline_serial(self, symbol: str, seconds: int, data_length: int = 200) -> pd.DataFrame:
+            return raw
+
+        def wait_update(self, deadline: float | None = None) -> None:
+            self.waits += 1
+
+    fake = _ShortApi()
+    first = fetch_frame("fu2701", "5", limit=10, api=fake)
+    second = fetch_frame("fu2701", "5", limit=10, api=fake)
+    short_warnings = [text for text in warnings if "只填满" in text]
+    assert len(first) == 5
+    assert len(second) == 5
+    assert fake.waits == 3
+    assert len(short_warnings) == 1
+    assert "5/10" in short_warnings[0]

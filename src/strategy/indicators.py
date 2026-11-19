@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -119,6 +120,19 @@ def ema_series(close: pd.Series, period: int) -> pd.Series:
     """
     n = max(1, int(period))
     return pd.to_numeric(close, errors="coerce").ewm(span=n, adjust=False).mean()
+
+
+def ema_angle_deg(now: float, prev: float, bars: int, scale: float) -> float:
+    """
+    均线自己的倾角（度）。正数往上、负数往下。
+
+    竖直用「现在的均线 − 回看那根的均线」，水平用「回看根数 × 当时 ATR」。
+    均线波段拦走平开仓时用。
+    """
+    n = max(1, int(bars))
+    step = float(scale) if scale is not None and float(scale) > 1e-12 else 1.0
+    rise = float(now) - float(prev)
+    return math.degrees(math.atan(rise / (n * step)))
 
 
 def macd_lines(

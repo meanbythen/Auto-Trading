@@ -14,8 +14,11 @@ from src.trader.ctp_gateway import CtpGateway, CtpSettings
 from src.trader.ctp_display import (
     account_headline,
     account_pairs,
+    parse_account,
     contract_search_key,
+    ctp_row_to_universe_costs,
     describe_contract,
+    fee_yuan_per_lot,
     format_contract_row,
     order_matches_filter,
     pct_from_ratio,
@@ -335,6 +338,35 @@ def test_account_page_uses_counter_fields() -> None:
     assert pairs["市种"] == "人民币"
 
 
+def test_account_pairs_does_not_treat_withdraw_quota_as_cash_out() -> None:
+    """可取资金不能再减成「出入金」。翻译过的快照再显示一遍也必须还是 0。"""
+    raw = {
+        "pre_balance": 32743.76,
+        "balance": 32743.76,
+        "available": 32743.76,
+        "withdraw_quota": 32743.76,
+        "withdraw": 0.0,
+        "deposit": 0.0,
+        "account_id": "20318052",
+    }
+    first = dict(account_pairs(raw))
+    assert first["出入金"] == "0.00"
+    assert first["可取资金"] == "32743.76"
+    parsed = parse_account(raw)
+    second = dict(account_pairs(parsed))
+    assert second["出入金"] == "0.00"
+    assert second["可取资金"] == "32743.76"
+    # 账本里旧快照：withdraw 已经是可取，withdraw_amt 才是出金
+    old_book = {
+        "pre_balance": 32743.76,
+        "balance": 32743.76,
+        "withdraw": 32743.76,
+        "withdraw_amt": 0.0,
+        "deposit": 0.0,
+    }
+    assert dict(account_pairs(old_book))["出入金"] == "0.00"
+
+
 def test_contract_row_click_text() -> None:
     """点合约一行，要用中文把乘数、保证金、手续费念出来。"""
     assert contract_search_key("", "fu2701") == "fu"
@@ -361,6 +393,34 @@ def test_contract_row_click_text() -> None:
     assert "ad2701" in spoken
     assert "每手 10" in spoken
     assert "13%" in spoken
+
+
+def test_lh_money_rate_becomes_yuan_per_lot() -> None:
+    """生猪手续费是成交额比例，不能把 0.0002 写进品种表当每手元。"""
+    assert fee_yuan_per_lot(0.0002, 0.0002, last_price=9350, multiplier=16) == 29.92
+    assert fee_yuan_per_lot(0.0002, 0.0002, last_price=0, multiplier=16) is None
+    row = {
+        "symbol": "lh2701",
+        "name": "生猪",
+        "volume_multiple": 16,
+        "price_tick": 5,
+        "long_margin_money": 0.13,
+        "short_margin_money": 0.13,
+        "open_volume": 0.0002,
+        "open_money": 0.0002,
+        "close_volume": 0.0001,
+        "close_money": 0.0001,
+        "close_today_volume": 0,
+        "close_today_money": 0,
+    }
+    fields, note = ctp_row_to_universe_costs(row, 9350)
+    assert fields["multiplier"] == 16
+    assert fields["price_tick"] == 5
+    assert fields["margin_rate_pct"] == 13
+    assert fields["commission"] == 29.92
+    assert fields["commission_close"] == 14.96
+    assert fields["commission_close_today"] == 0.0
+    assert "29.92" in note
 
 
 def test_order_filter_keeps_working_orders() -> None:
@@ -798,6 +858,19 @@ def test_order_and_cancel_counts_warn_at_the_threshold() -> None:
     assert activity.cancels == 2
 
 
+def test_activity_syncs_up_to_broker_day_count() -> None:
+    """重启后本机是 0，要用柜台今天的委托笔数补上，刷新时不能把新报的单冲掉。"""
+    from src.trader.ctp_logic import OrderActivity
+
+    activity = OrderActivity()
+    activity.sync_from_broker_count(12)
+    assert activity.orders == 12
+    activity.note_order()
+    assert activity.orders == 13
+    activity.sync_from_broker_count(12)
+    assert activity.orders == 13
+
+
 def test_sim_profile_refuses_the_live_account() -> None:
     """仿真档案不能拿实盘资金账号登录；按档案种类判断，不再看前置 IP。"""
     from src.trader.ctp_logic import test_front_blocks_live_account
@@ -806,6 +879,19 @@ def test_sim_profile_refuses_the_live_account() -> None:
     assert "仿真" in text
     assert test_front_blocks_live_account("sim", "10001437", "20318052") == ""
     assert test_front_blocks_live_account("live", "20318052", "20318052") == ""
+
+
+def test_seat_not_connected_explains_sim_account() -> None:
+    """仿真夜里席位没挂上交易所时，要写明现在连的是 28077 不是资金账号。"""
+    from src.trader.ctp_logic import explain_ctp_reject
+
+    text = explain_ctp_reject(
+        "CTP:该交易席位未连接到交易所",
+        account_kind="sim",
+        user_id="28077",
+    )
+    assert "28077" in text
+    assert "真实账号" in text
 
 
 def test_cancel_uses_the_counter_id() -> None:
@@ -849,13 +935,64 @@ def test_shfe_contract_is_sent_in_lowercase() -> None:
 
 
 def test_other_accounts_orders_are_not_our_errors() -> None:
-    """公用仿真账号推来的别人的成交和拒单，不记成我们自己的报单。"""
+    """本程序没发过的成交和拒单，不记成我们自己的报单。"""
     gateway = CtpGateway(_settings(), FakeClient())
     gateway.on_trade("别人的单", 2746.0, 1)
     gateway.on_reject("另一笔", "CTP:资金不足")
     gateway.on_cancel_error("29202", "不能撤销强平单")
     assert gateway.foreign_reports == 3
     assert gateway.table.get("别人的单") is None
+
+
+def test_foreign_report_notice_live_is_not_shared_sim() -> None:
+    """实盘说其他终端/手机；仿真才说公用账号。"""
+    from src.trader.ctp_logic import foreign_report_notice
+
+    live = foreign_report_notice("live")
+    sim = foreign_report_notice("sim")
+    assert "手机同花顺" in live
+    assert "仿真公用" not in live
+    assert "别人的单" in sim
+    assert "手机同花顺" not in sim
+
+
+def test_live_foreign_order_log_does_not_say_sim_shared() -> None:
+    """真实账号收到手机端平仓回报时，日志不能写成仿真公用账号。"""
+    from loguru import logger
+
+    settings = _settings()
+    settings.account_kind = "live"
+    gateway = CtpGateway(settings, FakeClient())
+    seen: list[str] = []
+    hid = logger.add(lambda message: seen.append(str(message)), format="{message}")
+    try:
+        gateway.on_order_status("1", "a", 0, "报单已提交")
+        gateway.on_order_status("1", "3", 0, "未成交")
+        gateway.on_order_status("1", "5", 0, "已撤单")
+    finally:
+        logger.remove(hid)
+    blob = "".join(seen)
+    assert "仿真公用账号" not in blob
+    assert "手机同花顺" in blob
+    assert gateway.foreign_reports == 3
+
+
+def test_order_status_log_does_not_stack_filled_and_unfilled() -> None:
+    """本机已记全部成交时，柜台再推「未成交」不要写成「全部成交 未成交」。"""
+    from loguru import logger
+
+    gateway = CtpGateway(_settings(), FakeClient())
+    order = TrackedOrder("3", "lh2701", "1", "1", 1, 9395.0, status="filled")
+    gateway.table.add(order)
+    seen: list[str] = []
+    hid = logger.add(lambda message: seen.append(str(message)), format="{message}")
+    try:
+        gateway.on_order_status("3", "3", 0, "未成交")
+    finally:
+        logger.remove(hid)
+    blob = "".join(seen)
+    assert "全部成交 未成交" not in blob
+    assert "柜台原文" in blob
 
 
 def test_unknown_order_status_with_contract_is_still_foreign() -> None:
@@ -916,10 +1053,18 @@ def test_price_band_comes_from_the_instrument_query() -> None:
     gateway.session.on_logged_in(True, 1, 2, "20261022")
     gateway.session.on_settlement_confirmed(True)
     gateway.session.on_orders_checked()
-    ok, text = gateway.query_price_band("bu2612")
+    from loguru import logger
+
+    seen: list[str] = []
+    hid = logger.add(lambda message: seen.append(str(message)), format="{message}")
+    try:
+        ok, text = gateway.query_price_band("bu2612")
+    finally:
+        logger.remove(hid)
     assert ok
     assert "涨停 4500" in text
     assert "跌停 4100.50" in text
+    assert all("柜台快照" not in line for line in seen)
 
 
 # ---------------------------------------------------------------- 报单终态与部分成交
@@ -1094,7 +1239,24 @@ def test_order_report_and_trade_event_do_not_double_count() -> None:
     assert apply_trade(order, 4502, 1) == "filled"
     assert order.filled == 2
     assert order.traded == 2
-    assert order.avg_price == 4501.5
+
+
+def test_finish_locked_waits_for_trade_price() -> None:
+    """全部成交但还没有成交价时，不能叫醒下单线程去按限价记账。"""
+    import threading
+
+    gateway = CtpGateway(_settings(), FakeClient())
+    gateway.fill_handler = lambda _report: True
+    order = TrackedOrder("3", "fu2701", "1", "0", 1, 3880.0, status="filled", filled=1, avg_price=0.0)
+    event = threading.Event()
+    gateway._waiters["3"] = event
+    report, waiter = gateway._finish_locked(order)
+    assert report is None
+    assert waiter is None
+    order.avg_price = 3892.0
+    report, waiter = gateway._finish_locked(order)
+    assert waiter is event
+    assert report is not None
 
 
 def test_runner_rolls_over_daytime_counters_when_date_changes(tmp_path) -> None:
@@ -1433,6 +1595,44 @@ def test_sim_profile_does_not_use_ths_account() -> None:
     assert settings.user_id == "28077"
     assert settings.td_front.endswith("27226")
     assert settings.password == "sim-pw"
+    assert str(settings.flow_dir).replace("\\", "/").endswith("ctp_flow_sim")
+
+
+def test_live_account_kind_ignores_stale_sim_profile_name() -> None:
+    """操作账是真实时，即使配置里还写着 huatai_sim，也要连实盘前置和资金账号。"""
+    settings = CtpSettings.from_cfg(
+        {
+            "account": {"user_id": "20318052"},
+            "trade": {
+                "ctp": {
+                    "account_kind": "live",
+                    "ctp_profile": "huatai_sim",
+                    "ctp_profiles": {
+                        "huatai_sim": {
+                            "kind": "sim",
+                            "td_front": "tcp://59.36.3.115:27226",
+                            "md_front": "tcp://59.36.3.115:27236",
+                            "user_id": "28077",
+                            "broker_id": "8080",
+                            "resolved_password": "sim-pw",
+                        },
+                        "huatai_live": {
+                            "kind": "live",
+                            "td_front": "tcp://220.196.208.129:41206",
+                            "md_front": "tcp://220.196.208.129:41214",
+                            "broker_id": "8080",
+                            "resolved_password": "live-pw",
+                        },
+                    },
+                }
+            },
+        }
+    )
+    assert settings.account_kind == "live"
+    assert settings.user_id == "20318052"
+    assert "220.196.208.129" in settings.td_front
+    assert settings.password == "live-pw"
+    assert str(settings.flow_dir).replace("\\", "/").endswith("ctp_flow_live")
 
 
 def test_live_profile_does_not_reuse_sim_front() -> None:

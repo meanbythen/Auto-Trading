@@ -35,7 +35,7 @@ STAGE_HINTS = {
     STAGE_DESK_SIM: "交易台只给人手工测开、平、撤、反手。这一步点「启动常驻」也不会让策略向柜台下单。",
     STAGE_DESK_LIVE: "同一套交易台连真实资金，再手工开平撤一笔。策略仍不会自动下单。",
     STAGE_AUTO_SIM: "测完后点「启动常驻」：策略自动出信号，下单走和交易台同一套 CTP（仿真）。挂机时请先关掉交易台登录，避免同一账号被踢。",
-    STAGE_AUTO_LIVE: "点「启动常驻」后策略对真实资金自动下单。接口与交易台相同。挂机时不要再开交易台登录。",
+    STAGE_AUTO_LIVE: "点「启动常驻」后策略对真实资金自动下单。接口与交易台相同。挂机时不要再开交易台登录。仓上没有交易所止损单，不要无人值守过夜。",
 }
 
 # 华泰指引：除重复报单、批量撤单为选测外，其余必测。
@@ -169,11 +169,30 @@ def current_stage_from_cfg(cfg: dict[str, Any] | None) -> str:
     return STAGE_DESK_SIM
 
 
+def pair_stage_with_kind(stage: Any, kind: Any) -> str:
+    """
+    只换仿真/真实接口，不改「手工点还是策略自动」。
+
+    策略自动真实 ↔ 策略自动仿真；手工真实 ↔ 手工仿真。
+    开平仓规则不变，只换账号、前置和账本。
+    """
+    live = normalize_ctp_kind(kind) == CTP_KIND_LIVE
+    if allows_strategy_orders(stage):
+        return STAGE_AUTO_LIVE if live else STAGE_AUTO_SIM
+    return STAGE_DESK_LIVE if live else STAGE_DESK_SIM
+
+
+def apply_account_kind_to_cfg(cfg: dict[str, Any], kind: Any) -> dict[str, Any]:
+    """配置页切仿真/真实：沿用当前是手工还是策略自动，只换接口。"""
+    return apply_stage_to_cfg(cfg, pair_stage_with_kind(current_stage_from_cfg(cfg), kind))
+
+
 def apply_stage_to_cfg(cfg: dict[str, Any], stage: Any) -> dict[str, Any]:
     """
-    把阶段写进配置：账号种类、执行通道跟阶段走。
+    把阶段写进配置：账号种类和券商档案跟阶段走。
 
-    手工两步不改成自动下单。策略两步把执行通道改成 ctp，和交易台同一套接口。
+    不改执行通道。同花顺 gui、模拟 sim、柜台 ctp 由「账号」页自己选。
+    上线四步只约束「策略能不能向 CTP 发单」，不能把已经选好的 gui 改掉。
     """
     chosen = normalize_stage(stage)
     trade = cfg.setdefault("trade", {})
@@ -190,8 +209,11 @@ def apply_stage_to_cfg(cfg: dict[str, Any], stage: Any) -> dict[str, Any]:
         trade["go_live"] = live_box
     live_box["stage"] = chosen
     ctp["account_kind"] = account_kind_for_stage(chosen)
-    if allows_strategy_orders(chosen):
-        trade["executor"] = "ctp"
+    from src.trader.ctp_profile import profile_name_for_kind
+
+    matched = profile_name_for_kind(ctp, ctp["account_kind"])
+    if matched:
+        ctp["ctp_profile"] = matched
     return cfg
 
 
@@ -250,12 +272,15 @@ def next_stage(stage: Any) -> str | None:
 
 
 def strategy_order_block_reason(cfg: dict[str, Any] | None) -> str:
-    """策略准备向柜台发单时，若还在手工阶段，返回拦下的原因。"""
+    """策略准备向 CTP 发单时，若还在手工阶段，返回拦下的原因。同花顺通道不拦。"""
+    executor = str(((cfg or {}).get("trade") or {}).get("executor") or "").strip().lower()
+    if executor and executor != "ctp":
+        return ""
     stage = current_stage_from_cfg(cfg)
     if allows_strategy_orders(stage):
         return ""
     return (
         f"当前上线阶段是{stage_label(stage)}。"
         "这一步只用交易台手工下单，策略不会向柜台发单。"
-        "要让策略自动下单，请把上线阶段改到③或④。"
+        "要让策略自动下单，请把上线阶段改到③或④；要用同花顺点单，请把执行通道改成 gui。"
     )

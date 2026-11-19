@@ -433,59 +433,55 @@ def test_format_rollover_lines_lists_segments() -> None:
     text = rollover.format_rollover_lines(snap)
 
     assert "共 2 段" in text
-    assert "移到新主力" in text
+    assert "新主力空仓按策略重新开" in text
     assert "rb2605" in text and "rb2610" in text
     assert "+100元" in text and "-50元" in text
 
 
-def test_carry_from_end_flatten_only() -> None:
-    held = TradeRecord(
-        symbol="fu2611",
-        side="long",
-        entry_time="2026-09-30 11:00:00",
-        exit_time="2026-10-12 15:00:00",
-        entry_price=4400.0,
-        exit_price=5100.0,
-        volume=1,
-        pnl=7000.0,
+def test_relabel_mid_segment_flatten_not_backtest_end() -> None:
+    """中间段强平改成换月平仓；整段最后一笔仍是回测结束。"""
+    old = TradeRecord(
+        symbol="lh2609",
+        side="short",
+        entry_time="2026-07-14T10:00:00",
+        exit_time="2026-08-03T15:00:00",
+        entry_price=11915.0,
+        exit_price=10695.0,
+        volume=2,
+        pnl=39040.0,
         reason_exit="回测结束强平",
     )
-    stopped = replace_exit(held, "碰到 EMA120 止损")
-    assert rollover._carry_from_result(_result_with(held)) == {"side": "long", "volume": 1}
-    assert rollover._carry_from_result(_result_with(stopped)) is None
-    rolled = replace_exit(held, "fu2701 已到交割月（2027年1月），交割月不再开仓，有仓必须平掉并换到下一手")
-    assert rollover._carry_from_result(_result_with(rolled)) == {"side": "long", "volume": 1}
-
-
-def replace_exit(trade: TradeRecord, reason: str) -> TradeRecord:
-    return TradeRecord(
-        symbol=trade.symbol,
-        side=trade.side,
-        entry_time=trade.entry_time,
-        exit_time=trade.exit_time,
-        entry_price=trade.entry_price,
-        exit_price=trade.exit_price,
-        volume=trade.volume,
-        pnl=trade.pnl,
-        reason_exit=reason,
+    nxt = TradeRecord(
+        symbol="lh2611",
+        side="long",
+        entry_time="2026-08-11T10:15:00",
+        exit_time="2026-08-12T10:15:00",
+        entry_price=12185.0,
+        exit_price=12038.0,
+        volume=3,
+        pnl=-7056.0,
+        reason_entry="均线波段快线多头排列开多",
+        reason_exit="碰到 EMA120 止损",
     )
-
-
-def _result_with(trade: TradeRecord) -> BacktestResult:
-    equity = [1000.0, 1000.0 + float(trade.pnl)]
-    return BacktestResult(
-        symbol=trade.symbol,
-        timeframe="30",
-        trail_timeframe="30",
-        bars=10,
-        performance=calc_performance([trade], equity, min_trades=1),
-        trades=[trade],
-        equity=equity,
+    last = TradeRecord(
+        symbol="lh2701",
+        side="long",
+        entry_time="2026-11-12T11:30:00",
+        exit_time="2026-11-18T15:00:00",
+        entry_price=9645.0,
+        exit_price=9654.0,
+        volume=3,
+        pnl=450.0,
+        reason_exit="回测结束强平",
     )
+    trades = [old, nxt, last]
+    rollover._relabel_rollover_exits(trades)
+    assert trades[0].reason_exit == rollover.ROLLOVER_FLAT_REASON
+    assert trades[2].reason_exit == "回测结束强平"
 
 
-def test_rollover_passes_carry_into_next_segment(tmp_path, monkeypatch) -> None:
-    """上一段结束强平还持仓时，下一段 run_backtest 要收到同方向移仓。"""
+def test_rollover_does_not_pass_carry_into_next_segment(tmp_path, monkeypatch) -> None:
+    """换月后新主力从空仓开始，不把上一手方向交给下一段。"""
     path = tmp_path / "2026年主力合约表.xlsx"
     _write_table(path, _periods())
     seen: list[object] = []
@@ -526,8 +522,8 @@ def test_rollover_passes_carry_into_next_segment(tmp_path, monkeypatch) -> None:
         end_date="2026-10-30",
         table_path=path,
     )
-    assert seen[0] is None
-    assert seen[1] == {"side": "long", "volume": 1}
+    assert seen
+    assert all(item is None for item in seen)
 
 
 def test_rollover_merges_execution_ambiguities(tmp_path, monkeypatch) -> None:

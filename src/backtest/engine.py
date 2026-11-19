@@ -562,6 +562,8 @@ class _BacktestRun:
     open_meta: dict[str, Any] = field(default_factory=dict)
     rejected: list[RejectedSignal] = field(default_factory=list)
     ambiguities: list[dict[str, Any]] = field(default_factory=list)
+    # 打开「实盘镜像」时记下因过期或追价放弃的开仓，默认回测为空。
+    gate_hits: list[dict[str, Any]] = field(default_factory=list)
     # 同一交易时段里，同一层、同方向、同一类原因只留第一条。
     seen_rejects: set[tuple[str, str, str, str, str]] = field(default_factory=set)
 
@@ -1084,6 +1086,63 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
     else:
         entry_ref = px
         entry_ts = run.bars_signal.index[ctx.i]
+    moving = bool(meta.get("rollover_carry") or (run.carry and want == run.carry.get("side")))
+    if run.fill.mirror_live_gates and not moving:
+        from src.backtest.live_gates import inspect_live_open_gate, live_gate_settings
+
+        limit_atr, limit_points, stale_min = live_gate_settings(run.cfg)
+        try:
+            atr = float(meta.get("atr") or 0)
+        except (TypeError, ValueError):
+            atr = 0.0
+        # 对照价不能只用下一根开盘：今早信号收 9495、下一根也开 9495，追价=0，
+        # 但挂机在收线后几十秒已看到 9480/9450 并放弃。没有分笔时，用成交那根的
+        # 开盘与收盘里更不利的一边近似「等开盘这段时间的现价」。
+        live_proxy = float(entry_ref or 0)
+        if run.fill.on_next_open:
+            try:
+                fill_i = _fill_bar_index(ctx)
+                if fill_i is not None and 0 <= int(fill_i) < len(run.bars_signal):
+                    next_close = float(run.bars_signal["close"].iloc[int(fill_i)])
+                    if next_close > 0 and live_proxy > 0:
+                        if want == "long":
+                            live_proxy = max(live_proxy, next_close)
+                        else:
+                            live_proxy = min(live_proxy, next_close)
+            except Exception:  # noqa: BLE001
+                pass
+        hit = inspect_live_open_gate(
+            enabled=True,
+            is_long=want == "long",
+            signal_price=float(decision.entry_price or px or 0),
+            fill_price=float(live_proxy or 0),
+            signal_time=now,
+            fill_time=_ts_to_dt(entry_ts),
+            atr=atr,
+            period=str(getattr(run.strategy, "timeframe", "") or run.cfg.get("strategy", {}).get("timeframe") or "15"),
+            max_stale_minutes=stale_min,
+            limit_atr=limit_atr,
+            limit_points=limit_points,
+        )
+        if hit is not None:
+            hit = {
+                **hit,
+                "bar_id": str(meta.get("bar_id") or now.isoformat(timespec="seconds")),
+                "time": now.isoformat(timespec="seconds"),
+                "side": "多" if want == "long" else "空",
+            }
+            run.gate_hits.append(hit)
+            run.note_reject(
+                "实盘镜像",
+                f"{hit.get('label')} 信号价 {hit.get('signal_price')} 对照价 {hit.get('live_price')} "
+                f"偏移 {hit.get('chase')} > {hit.get('limit')}",
+                "多" if want == "long" else "空",
+                at=now,
+                price=float(entry_ref or 0),
+                stop=decision.stop_price,
+                key=str(hit.get("kind") or "mirror_gate"),
+            )
+            return None
     # 开多=买入，开空=卖出，都要让滑点。
     entry = (
         run.fill.buy(float(entry_ref))
@@ -1562,6 +1621,8 @@ def _params_snapshot(setup: _BacktestSetup, run: _BacktestRun) -> dict[str, Any]
         "slippage_ticks": fill.slippage_ticks,
         "price_tick": fill.price_tick,
         "fill_note": fill.describe(),
+        "mirror_live_gates": bool(fill.mirror_live_gates),
+        "mirror_gate_hits": list(run.gate_hits),
         # 涨跌停/流动性口径。默认关闭时会原样写明，便于和历史结果对照。
         "liquidity": run.liquidity.snapshot(),
         "sizing_mode": str(risk.get("sizing_mode", "risk_pct")),
@@ -1679,7 +1740,8 @@ def run_backtest(
         equity_times=[str(bars_signal.index[min(max(loop_start, 0), n - 1)])],
     )
     # 回测循环里策略会狂打 info，先关掉这几个模块日志，结束再打开
-    for _mod in (
+    _quiet_backtest_logs = (
+        "src.strategy.trend_base",
         "src.strategy.trend_follow",
         "src.strategy.supertrend",
         "src.strategy.dual_ma",
@@ -1695,7 +1757,8 @@ def run_backtest(
         "src.risk.sizing",
         "src.risk.guardian",
         "src.risk.dynamic",
-    ):
+    )
+    for _mod in _quiet_backtest_logs:
         logger.disable(_mod)
 
     try:
@@ -1711,29 +1774,23 @@ def run_backtest(
             symbol=symbol,
             cfg=cfg,
         )
+        binder = getattr(strategy, "bind_history", None)
+        if callable(binder):
+            try:
+                binder(bars_signal, bars_trend)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("回测预计算失败，改回逐根计算: {}", exc)
         for i in cursor.indices():
             view = cursor.at(i)
             if view is None:
                 continue
             _step_backtest_bar(run, i, view)
     finally:
-        for _mod in (
-            "src.strategy.trend_follow",
-            "src.strategy.supertrend",
-            "src.strategy.dual_ma",
-            "src.strategy.macd_swing",
-            "src.strategy.bollinger_break",
-            "src.strategy.sar_trend",
-            "src.strategy.multi_factor",
-            "src.strategy.daily_body",
-            "src.strategy.swing_trend",
-            "src.strategy.swing_box",
-            "src.strategy.dual_donchian",
-            "src.strategy.dual_fractal",
-            "src.risk.sizing",
-            "src.risk.guardian",
-        ):
+        for _mod in _quiet_backtest_logs:
             logger.enable(_mod)
+        clearer = getattr(strategy, "bind_history", None)
+        if callable(clearer):
+            clearer(None, None)
 
     _force_close_at_end(run)
     trades, equity, equity_times = run.trades, run.equity, run.equity_times
