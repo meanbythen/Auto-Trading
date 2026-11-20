@@ -19,7 +19,7 @@ from src.screen.picker import (
     is_candidate,
     liquidity_text,
     list_rows,
-    window_rows,
+    board_page,
     prepare_screen_cfg,
     listed_cross_engines,
     screen_cross,
@@ -856,16 +856,51 @@ def test_market_snapshot_scores_by_engine_and_skips_unfiltered_ones() -> None:
     assert missing["market_note"] == "K线不足"
 
 
-def test_window_only_draws_the_front_rows_when_there_are_too_many() -> None:
-    """结果太多时，窗口只画前面几十行，避免一打开就退出。"""
+def test_board_page_draws_a_hundred_rows_at_a_time() -> None:
+    """结果太多时先画一百行，点「显示更多」再往下加，避免一打开就退出。"""
     rows = [{"picked": "较好" if index < 3 else "一般"} for index in range(1036)]
-    shown, note = window_rows(rows, limit=60)
-    assert len(shown) == 60
-    assert shown[0]["picked"] == "较好"
-    assert "1036" in note
-    short, empty = window_rows(rows[:10], limit=60)
+    page, shown, note = board_page(rows)
+    assert len(page) == 100
+    assert page[0]["picked"] == "较好"
+    assert shown == 100
+    assert "1036" in note and "还有 936 行" in note
+    second, shown2, note2 = board_page(rows, shown)
+    assert len(second) == 100
+    assert shown2 == 200
+    assert "还有 836 行" in note2
+    last, shown3, note3 = board_page(rows, 1000)
+    assert len(last) == 36
+    assert shown3 == 1036
+    assert "已全部显示" in note3
+    short, shown4, note4 = board_page(rows[:10], 0)
     assert len(short) == 10
-    assert empty == ""
+    assert shown4 == 10
+    assert note4 == ""
+
+
+def test_prepared_cross_cfg_reuses_one_template_per_engine_and_period() -> None:
+    """并行进程里同一套策略、同一个周期只准备一次配置；换了策略或周期才重做。"""
+    from src.screen import picker
+
+    cfg = {"strategy": {}, "trade": {}, "risk": {}, "backtest": {}}
+    spec = {"fixed_volume": 2, "fair_compare": True, "ignore_equity": True}
+    picker._WORKER_PREPARED.clear()
+    try:
+        first = picker._prepared_cross_cfg(cfg, spec, "daily_body", "15")
+        again = picker._prepared_cross_cfg(cfg, spec, "daily_body", "15")
+        other_period = picker._prepared_cross_cfg(cfg, spec, "daily_body", "30")
+        other_engine = picker._prepared_cross_cfg(cfg, spec, "supertrend", "15")
+    finally:
+        picker._WORKER_PREPARED.clear()
+    assert first is again
+    assert other_period is not first
+    assert other_engine is not first
+    # 模板里已经写进这一组的策略和周期，原配置始终保持原样。
+    assert first[0]["strategy"]["engine"] == "daily_body"
+    assert first[0]["strategy"]["timeframe"] == "15"
+    assert first[0]["strategy"]["trail_timeframe"] == "15"
+    assert "engine" not in cfg["strategy"]
+    assert "timeframe" not in cfg["strategy"]
 
 
 def test_cross_uses_config_contracts_and_strategies() -> None:

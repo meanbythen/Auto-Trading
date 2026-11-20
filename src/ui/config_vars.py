@@ -104,6 +104,10 @@ class ConfigVarsMixin:
         # 交叉测试进度先攒着，最多每 100 毫秒重画一次，别让每套策略都清空重建控件。
         self._pick_progress_pending: tuple[int, int, str] | None = None
         self._pick_progress_after_id: str | None = None
+        # 结果表分批画：先画前一百行，点「显示更多」再往下加，别一次建上千个控件。
+        self._pick_board_rows: list[dict[str, str]] = []
+        self._pick_board_shown = 0
+        self._pick_board_more: list[Any] = []
         self.volume_var = ctk.StringVar(value=str(trade.get("volume", 1)))
         self.max_slip_var = ctk.StringVar(value=str(trade.get("max_entry_slip_atr", 0.5)))
         self.max_slip_points_var = ctk.StringVar(value=str(trade.get("max_entry_slip_points", 0)))

@@ -23,7 +23,16 @@ if str(_FALLBACK_ROOT) not in sys.path:
 
 from loguru import logger
 
-from src.kernel.events import BACKTEST_DONE, CROSS_TEST_DONE, Event, EventBus
+from src.kernel.events import (
+    BACKTEST_DONE,
+    CROSS_TEST_DONE,
+    CROSS_TEST_FAILED,
+    CROSS_TEST_PROGRESS,
+    CROSS_TEST_START,
+    CROSS_TEST_STOPPED,
+    Event,
+    EventBus,
+)
 from src.ui import theme as T
 from src.ui.bot_worker import BotWorker
 from src.utils import load_config, setup_logger
@@ -138,6 +147,10 @@ class AutoTradingApp(
         self.events = EventBus()
         self.events.subscribe(BACKTEST_DONE, self._on_backtest_done)
         self.events.subscribe(CROSS_TEST_DONE, self._on_cross_test_done)
+        self.events.subscribe(CROSS_TEST_START, self._on_cross_test_start)
+        self.events.subscribe(CROSS_TEST_PROGRESS, self._on_cross_test_progress)
+        self.events.subscribe(CROSS_TEST_STOPPED, self._on_cross_test_stopped)
+        self.events.subscribe(CROSS_TEST_FAILED, self._on_cross_test_failed)
         self._status = "待命"
         self._show_password = ctk.BooleanVar(value=False)
         self._show_tq_password = ctk.BooleanVar(value=False)
@@ -291,6 +304,33 @@ class AutoTradingApp(
         d = event.data
         text = f"交叉测试完成，测了 {int(d.get('rows') or 0)} 个组合，较好 {int(d.get('better') or 0)} 个"
         self._post_to_main(lambda: self._append_log(text))
+
+
+    def _on_cross_test_start(self, event: Event) -> None:
+        """交叉测试开跑。文案由发起方拼好，这里只负责写进运行日志。"""
+        text = str(event.data.get("text") or "开始交叉测试")
+        self._post_to_main(lambda: self._append_log(text))
+
+
+    def _on_cross_test_progress(self, event: Event) -> None:
+        """交叉测试进度。交给主线程记账，界面最多每 100 毫秒重画一次。"""
+        d = event.data
+        index = int(d.get("index") or 0)
+        total = int(d.get("total") or 0)
+        label = str(d.get("label") or "")
+        self._post_to_main(lambda: self._note_pick_progress(index, total, label))
+
+
+    def _on_cross_test_stopped(self, event: Event) -> None:
+        """点了停止。真正的收尾仍在跑测线程完成后再做。"""
+        text = str(event.data.get("text") or "已请求停止交叉测试")
+        self._post_to_main(lambda: self._append_log(text))
+
+
+    def _on_cross_test_failed(self, event: Event) -> None:
+        """交叉测试失败。只写日志，弹窗和结果区由发起方处理。"""
+        message = str(event.data.get("message") or "")
+        self._post_to_main(lambda: self._append_log(f"交叉测试失败: {message}"))
 
 
 def main() -> None:

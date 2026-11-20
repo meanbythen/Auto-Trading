@@ -6,7 +6,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from loguru import logger
-from src.kernel.events import CROSS_TEST_DONE
+from src.kernel.events import (
+    CROSS_TEST_DONE,
+    CROSS_TEST_FAILED,
+    CROSS_TEST_PROGRESS,
+    CROSS_TEST_START,
+    CROSS_TEST_STOPPED,
+)
 from src.ui import theme as T
 import customtkinter as ctk
 import threading
@@ -372,6 +378,14 @@ class PickerTabMixin:
             return
         for child in body.winfo_children():
             child.destroy()
+        for widget in getattr(self, "_pick_board_more", []):
+            try:
+                widget.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+        self._pick_board_more = []
+        self._pick_board_rows = list(rows or [])
+        self._pick_board_shown = 0
         if not rows:
             ctk.CTkLabel(
                 body,
@@ -381,11 +395,30 @@ class PickerTabMixin:
                 anchor="w",
             ).pack(anchor="w", padx=8, pady=8)
             return
-        # 上次如果测了上千个组合，一次画出来会让窗口打不开。这里只画前面几十行。
-        from src.screen.picker import window_rows
+        self._append_pick_rows()
 
-        visible, extra = window_rows(rows)
-        for item in visible:
+
+    def _append_pick_rows(self) -> None:
+        """
+        把下一批结果行加在表尾。
+
+        一次只画一百行，底部给「显示更多」。上次如果测了上千个组合，
+        一次全画出来会让窗口打不开；分批以后首屏和中途刷新都快得多。
+        """
+        body = getattr(self, "pick_table_body", None)
+        if body is None:
+            return
+        for widget in getattr(self, "_pick_board_more", []):
+            try:
+                widget.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+        self._pick_board_more = []
+        from src.screen.picker import board_page
+
+        page, shown, note = board_page(self._pick_board_rows, self._pick_board_shown)
+        self._pick_board_shown = shown
+        for item in page:
             self._pack_pick_metric_line(
                 body,
                 [
@@ -421,16 +454,33 @@ class PickerTabMixin:
                 picked=str(item.get("picked") or ""),
                 on_open=lambda row=item: self._open_pick_chart(row),
             )
-        if extra:
-            ctk.CTkLabel(
+        total = len(self._pick_board_rows)
+        if shown < total:
+            button = ctk.CTkButton(
                 body,
-                text=extra,
+                text=f"显示更多（还有 {total - shown} 行）",
+                height=32,
+                fg_color=T.BG_ELEVATED,
+                hover_color=T.BORDER,
+                border_width=1,
+                border_color=T.BORDER,
+                text_color=T.TEXT,
+                command=self._append_pick_rows,
+            )
+            button.pack(anchor="w", padx=8, pady=8)
+            self._pick_board_more.append(button)
+        if note:
+            label = ctk.CTkLabel(
+                body,
+                text=note,
                 font=T.FONT_SMALL,
                 text_color=T.TEXT_DIM,
                 anchor="w",
                 justify="left",
                 wraplength=640,
-            ).pack(anchor="w", padx=8, pady=8)
+            )
+            label.pack(anchor="w", padx=8, pady=8)
+            self._pick_board_more.append(label)
 
 
     def _open_pick_chart(self, row: dict[str, str]) -> None:
@@ -814,13 +864,18 @@ class PickerTabMixin:
         st["cross_engines"] = list(engine_names)
         st["cross_periods"] = list(periods)
         combo_n = len(engines) * len(contracts) * len(periods)
-        self._append_log(
-            f"开始交叉测试：{len(engines)} 套策略 × {len(contracts)} 个合约 × {len(periods)} 个周期 = {combo_n} 组，"
-            f"每个组合 {settings['fixed_volume']} 手（跟实盘手数），"
-            f"间隔 {settings['min_order_interval_sec']} 秒，每天最多 {settings['max_orders_per_day']} 次，"
-            f"收盘清仓={'开' if settings.get('flatten_at_close') else '关'}，"
-            f"主力换月={'开' if bt.get('rollover_main') else '关'}，"
-            f"评估本金 {settings.get('capital'):g} 元（本页账户权益），行情 {self.pk_source_var.get()}"
+        self.events.publish(
+            CROSS_TEST_START,
+            {
+                "text": (
+                    f"开始交叉测试：{len(engines)} 套策略 × {len(contracts)} 个合约 × {len(periods)} 个周期 = {combo_n} 组，"
+                    f"每个组合 {settings['fixed_volume']} 手（跟实盘手数），"
+                    f"间隔 {settings['min_order_interval_sec']} 秒，每天最多 {settings['max_orders_per_day']} 次，"
+                    f"收盘清仓={'开' if settings.get('flatten_at_close') else '关'}，"
+                    f"主力换月={'开' if bt.get('rollover_main') else '关'}，"
+                    f"评估本金 {settings.get('capital'):g} 元（本页账户权益），行情 {self.pk_source_var.get()}"
+                )
+            },
         )
         # 只用交叉测试页选中的这一家。配置页当时存的来源不参与这一轮。
         from src.data.quote_check import normalize_source
@@ -840,8 +895,11 @@ class PickerTabMixin:
             )
 
             def on_progress(index: int, total: int, label: str) -> None:
-                # 每测一个组合记一条日志；进度文案交给主线程合并刷新。
-                self._post_to_main(lambda i=index, n=total, name=label: self._note_pick_progress(i, n, name))
+                # 进度只发事件，由界面订阅后排队刷新；日志仍在主线程逐条记。
+                self.events.publish(
+                    CROSS_TEST_PROGRESS,
+                    {"index": index, "total": total, "label": label},
+                )
 
             try:
                 workers = cross_worker_count(cfg)
@@ -890,7 +948,7 @@ class PickerTabMixin:
                 def _fail() -> None:
                     self._reset_pick_progress()
                     self._pick_running = False
-                    self._append_log(f"交叉测试失败: {err}")
+                    self.events.publish(CROSS_TEST_FAILED, {"message": err})
                     self._render_pick_board(f"交叉测试失败：{err}", [])
                     messagebox.showerror("交叉测试失败", err)
 
@@ -947,7 +1005,7 @@ class PickerTabMixin:
             self._append_log("现在没有在做交叉测试")
             return
         self._pick_cancel.set()
-        self._append_log("将在当前组合测完后停止")
+        self.events.publish(CROSS_TEST_STOPPED, {"text": "将在当前组合测完后停止"})
 
 
     def _pack_cross_check_group(

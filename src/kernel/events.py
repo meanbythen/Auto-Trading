@@ -21,6 +21,11 @@ RISK_BLOCK = "risk_block"
 # 完成类事件只带汇总数字，不带结果对象。界面自己决定怎么显示。
 BACKTEST_DONE = "backtest_done"
 CROSS_TEST_DONE = "cross_test_done"
+# 进度类事件带序号和文案，也不带结果对象。界面订阅后切回主线程更新。
+CROSS_TEST_START = "cross_test_start"
+CROSS_TEST_PROGRESS = "cross_test_progress"
+CROSS_TEST_STOPPED = "cross_test_stopped"
+CROSS_TEST_FAILED = "cross_test_failed"
 
 
 @dataclass(frozen=True)

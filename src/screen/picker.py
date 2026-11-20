@@ -728,19 +728,23 @@ def _run_cross_backtest(
     engine: str,
     runner: Callable[..., Any],
     risk_sizing: bool = False,
+    prepared: tuple[dict[str, Any], int] | None = None,
 ) -> tuple[Any, int | None]:
     """
     交叉测试里的一个组合：按这组条件调用同一次历史回测。
 
     准备配置和手数仍走 prepare_screen_cfg，保证各组对照变量一致。
+    并行进程里同一套策略、同一个周期已经准备过时，从 prepared 直接取用。
     交叉测试始终按固定手数比；比策略时才允许按每笔风险重算手数。
     """
-    prepared, volume = prepare_screen_cfg(cfg, settings=settings)
+    if prepared is None:
+        prepared = prepare_screen_cfg(cfg, settings=settings)
+    run_cfg, volume = prepared
     call_volume: int | None = volume
     if risk_sizing and settings.get("apply_limits", True) and str(settings.get("sizing_mode") or "") == "risk_pct":
         call_volume = None
     result = runner(
-        prepared,
+        run_cfg,
         symbol=symbol,
         volume=call_volume,
         start_date=settings.get("start_date") or None,
@@ -1056,6 +1060,9 @@ _WORKER_SPEC: dict[str, Any] | None = None
 _WORKER_RUNNER: Callable[..., Any] | None = None
 _WORKER_CANCEL: Any = None
 _WORKER_PROGRESS: Any = None
+# 每个子进程按（策略, 周期）留一份已准备的配置。回测入口自己会深拷贝，
+# 这份模板不会被某一次回测改掉，所以同一套策略同一个周期不必每次重做深拷贝。
+_WORKER_PREPARED: dict[tuple[str, str], tuple[dict[str, Any], int]] = {}
 
 _CROSS_MAX_WORKERS = 4
 
@@ -1198,6 +1205,28 @@ def _cross_worker_init(
     _WORKER_CANCEL = cancel
     _WORKER_PROGRESS = progress
     _WORKER_RUNNER = aligned_backtest_runner(cfg)
+    # 新一轮测试从干净的模板开始，不拿上一个任务的配置。
+    _WORKER_PREPARED.clear()
+
+
+def _prepared_cross_cfg(
+    cfg: dict[str, Any],
+    spec: dict[str, Any],
+    engine: str,
+    period: str,
+) -> tuple[dict[str, Any], int]:
+    """取这一套策略、这个周期准备好的回测配置；同一进程里只准备一次。"""
+    key = (str(engine), str(period))
+    cached = _WORKER_PREPARED.get(key)
+    if cached is not None:
+        return cached
+    one = dict(spec)
+    one["engine"] = engine
+    one["timeframe"] = period
+    one["trail_timeframe"] = period
+    cached = prepare_screen_cfg(cfg, settings=one)
+    _WORKER_PREPARED[key] = cached
+    return cached
 
 
 def _cross_worker_run(
@@ -1233,7 +1262,12 @@ def _cross_worker_run(
         row = _empty_cross_row(code, product, label, engine, period)
         try:
             result, one_volume = _run_cross_backtest(
-                cfg, one, symbol=code, engine=engine, runner=runner
+                cfg,
+                one,
+                symbol=code,
+                engine=engine,
+                runner=runner,
+                prepared=_prepared_cross_cfg(cfg, spec, engine, period),
             )
             _fill_backtest_row(result, row)
             volume = max(volume, int(one_volume or 1))
@@ -1698,25 +1732,37 @@ def list_rows(result: dict[str, Any]) -> list[dict[str, str]]:
     return shown
 
 
-# 窗口里一行要画十几个小格子。一次画一千行，程序会在打开时卡住并自己退出。
-WINDOW_ROW_LIMIT = 60
+# 结果表一次画这么多行。一行有十几个小控件，一次建上千个窗口会卡住甚至打不开。
+BOARD_PAGE = 100
 
 
-def window_rows(rows: list[dict[str, str]] | None, limit: int = WINDOW_ROW_LIMIT) -> tuple[list[dict[str, str]], str]:
+def board_page(
+    rows: list[dict[str, str]] | None,
+    shown: int = 0,
+    page: int = BOARD_PAGE,
+) -> tuple[list[dict[str, str]], int, str]:
     """
-    决定窗口里实际画出的行。
+    结果表分批显示。
 
-    较好的已经排在前面。超过上限时只画前面这些，其余仍在导出的 Excel 里。
-    行数不多时原样返回，不额外加说明。
+    从 shown 这一行起取一页，返回（这一页、画完后的行数、剩余说明）。
+    较好的已经排在前面，先看到的总是这一轮里最值得看的那些。
+    数据仍全部留在内存和导出文件里，分批只影响一次建多少控件。
     """
     items = list(rows or [])
-    if len(items) <= limit:
-        return items, ""
-    note = (
-        f"这一轮一共 {len(items)} 行。窗口里先显示前 {limit} 行，较好的在前面。"
-        "要看全部，点「导出本次交叉测试」。"
-    )
-    return items[:limit], note
+    total = len(items)
+    size = max(1, int(page or BOARD_PAGE))
+    start = max(0, int(shown or 0))
+    end = min(total, start + size)
+    if end < total:
+        note = (
+            f"这一轮一共 {total} 行，已显示前 {end} 行，还有 {total - end} 行。"
+            "较好的在前面，点「显示更多」继续；全部都会导出。"
+        )
+    elif total > size:
+        note = f"这一轮一共 {total} 行，已全部显示。全部都会导出。"
+    else:
+        note = ""
+    return items[start:end], end, note
 
 
 def _cross_sort_key(row: dict[str, Any]) -> tuple[int, int]:
