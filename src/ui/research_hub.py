@@ -6,6 +6,12 @@ from src.ui import theme as T
 import customtkinter as ctk
 
 
+class _ResearchTabview(ctk.CTkTabview):
+    """二级页签。去掉默认标题上方那段留白，避免和一级页签隔得太远。"""
+
+    _outer_spacing = 0
+
+
 class ResearchHubMixin:
     """Methods mixed into AutoTradingApp; UI state remains on the app instance."""
 
@@ -17,7 +23,7 @@ class ResearchHubMixin:
         tab.grid_columnconfigure(0, weight=1)
         tab.grid_rowconfigure(0, weight=1)
 
-        sub = ctk.CTkTabview(
+        sub = _ResearchTabview(
             tab,
             fg_color="transparent",
             segmented_button_fg_color=T.BG_ELEVATED,
