@@ -3,13 +3,15 @@
 
 功能：密码/认证码只保存成引用（secret://...），真实值用当前 Windows 用户的 DPAPI 加密，
       落在 config/secrets.dpapi.json。解不开密文就按"环境变量 → secrets.local.yaml"回退。
-原理：DPAPI 不可用（非 Windows、缺 pywin32）时明确报错，不静默降级成明文写盘。
-      secrets.local.yaml 保持只读备份，既不删也不改。
+原理：优先用 pywin32 的 win32crypt；没装时直接用 ctypes 调系统 crypt32.dll，
+      同样走 Windows DPAPI，所以打包环境不需要额外依赖。非 Windows 明确报错，
+      不静默降级成明文写盘。secrets.local.yaml 保持只读备份，既不删也不改。
 """
 
 from __future__ import annotations
 
 import base64
+import ctypes
 import json
 import os
 from pathlib import Path
@@ -53,19 +55,116 @@ class SecretCipher(Protocol):
     def unprotect(self, token: str) -> str: ...
 
 
+class _DataBlob(ctypes.Structure):
+    """crypt32 的 DATA_BLOB。"""
+
+    _fields_ = [
+        ("cbData", ctypes.c_uint32),
+        ("pbData", ctypes.POINTER(ctypes.c_char)),
+    ]
+
+
+class _CtypesDpapi:
+    """不依赖 pywin32 的 DPAPI：直接调用 Windows crypt32.dll。"""
+
+    def __init__(self) -> None:
+        if os.name != "nt":
+            raise SecretStoreUnavailable("当前系统不是 Windows，无法使用 Windows DPAPI")
+        try:
+            self._crypt32 = ctypes.WinDLL("crypt32", use_last_error=True)
+            self._kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        except (AttributeError, OSError) as exc:  # pragma: no cover - 只在异常系统
+            raise SecretStoreUnavailable(f"无法加载 Windows DPAPI: {exc}") from exc
+        blob_ptr = ctypes.POINTER(_DataBlob)
+        self._crypt32.CryptProtectData.argtypes = [
+            blob_ptr,
+            ctypes.c_wchar_p,
+            blob_ptr,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            blob_ptr,
+        ]
+        self._crypt32.CryptProtectData.restype = ctypes.c_int
+        self._crypt32.CryptUnprotectData.argtypes = [
+            blob_ptr,
+            ctypes.POINTER(ctypes.c_wchar_p),
+            blob_ptr,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            blob_ptr,
+        ]
+        self._crypt32.CryptUnprotectData.restype = ctypes.c_int
+        self._kernel32.LocalFree.argtypes = [ctypes.c_void_p]
+        self._kernel32.LocalFree.restype = ctypes.c_void_p
+
+        # 先试一次，确认系统真的能加密（某些精简系统缺 crypt32 依赖）。
+        self.protect("selftest")
+
+    @staticmethod
+    def _blob(data: bytes) -> tuple[ctypes.Array[Any], _DataBlob]:
+        buffer = ctypes.create_string_buffer(data, max(len(data), 1))
+        return buffer, _DataBlob(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char)))
+
+    def _free(self, blob: _DataBlob) -> bytes:
+        try:
+            return ctypes.string_at(blob.pbData, blob.cbData)
+        finally:
+            self._kernel32.LocalFree(ctypes.cast(blob.pbData, ctypes.c_void_p))
+
+    def protect(self, text: str) -> bytes:
+        data = text.encode("utf-8")
+        _buffer, in_blob = self._blob(data)
+        out_blob = _DataBlob()
+        ok = self._crypt32.CryptProtectData(
+            ctypes.byref(in_blob),
+            "AutoTrading",
+            None,
+            None,
+            None,
+            0,
+            ctypes.byref(out_blob),
+        )
+        if not ok:
+            raise OSError(ctypes.get_last_error(), "CryptProtectData 失败")
+        return self._free(out_blob)
+
+    def unprotect(self, raw: bytes) -> bytes:
+        _buffer, in_blob = self._blob(raw)
+        out_blob = _DataBlob()
+        ok = self._crypt32.CryptUnprotectData(
+            ctypes.byref(in_blob),
+            None,
+            None,
+            None,
+            None,
+            0,
+            ctypes.byref(out_blob),
+        )
+        if not ok:
+            raise OSError(ctypes.get_last_error(), "CryptUnprotectData 失败")
+        return self._free(out_blob)
+
+
 class DpapiCipher:
     """Windows DPAPI：只有同一台机器的同一用户能解开。"""
 
     def __init__(self) -> None:
+        self._crypt: Any = None
+        self._ctypes: _CtypesDpapi | None = None
         try:
             import win32crypt  # type: ignore
-        except ImportError as exc:  # pragma: no cover - 只在缺 pywin32 时触发
-            raise SecretStoreUnavailable(
-                "缺少 pywin32（win32crypt），无法使用 Windows DPAPI 保存密钥"
-            ) from exc
-        self._crypt = win32crypt
+        except ImportError:
+            # 打包后没有 pywin32 也能用，直接走系统 crypt32。
+            self._ctypes = _CtypesDpapi()
+        else:
+            self._crypt = win32crypt
 
     def protect(self, text: str) -> str:
+        if self._ctypes is not None:
+            return base64.b64encode(self._ctypes.protect(text)).decode("ascii")
+        assert self._crypt is not None
         blob = self._crypt.CryptProtectData(
             text.encode("utf-8"), "AutoTrading", None, None, None, 0
         )
@@ -73,6 +172,9 @@ class DpapiCipher:
 
     def unprotect(self, token: str) -> str:
         raw = base64.b64decode(token.encode("ascii"))
+        if self._ctypes is not None:
+            return self._ctypes.unprotect(raw).decode("utf-8")
+        assert self._crypt is not None
         data, _desc = self._crypt.CryptUnprotectData(raw, None, None, None, 0)
         return bytes(data).decode("utf-8")
 

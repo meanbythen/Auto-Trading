@@ -25,6 +25,18 @@ def _store(tmp_path: Path) -> ss.SecretStore:
     return ss.SecretStore(tmp_path / "secrets.dpapi.json", cipher=_FakeCipher())
 
 
+def test_ctypes_dpapi_roundtrip_without_pywin32() -> None:
+    """打包环境没有 pywin32 时，ctypes 直接调 crypt32 也要能加解密。"""
+    import os
+
+    if os.name != "nt":
+        pytest.skip("只在 Windows 上验证 DPAPI")
+    backend = ss._CtypesDpapi()
+    token = backend.protect("ctp-secret-123")
+    assert b"ctp-secret-123" not in token
+    assert backend.unprotect(token) == b"ctp-secret-123"
+
+
 def test_set_and_resolve_dpapi(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("CTP_PASSWORD", raising=False)
     store = _store(tmp_path)
