@@ -14,6 +14,7 @@ from typing import Any
 from loguru import logger
 
 from src.kernel.risk_chain import TradeIntent, run_early_gates, run_send_gates
+from src.ops import journal
 from src.scheduler.fill_reconcile import FillReconcileMixin, ctp_fill_key as ctp_fill_key
 from src.scheduler.order_pricing import OrderPricingMixin, ctp_opponent_limit as ctp_opponent_limit
 from src.scheduler.order_state import OrderIntentMixin, OrderIntentWriteError as OrderIntentWriteError
@@ -924,6 +925,20 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
         trace_id = self._timeline_trace(decision)
         dispatch_started_at = now_iso()
         decision.meta = {**(decision.meta or {}), "dispatch_started_at": dispatch_started_at}
+        journal.record_audit(
+            "order_submitted",
+            trace_id=trace_id,
+            strategy_id=str(getattr(self.strategy, "name", "") or type(self.strategy).__name__),
+            symbol=decision.symbol,
+            message=str(decision.reason or ""),
+            payload={
+                "volume": int(vol),
+                "price": float(price or 0),
+                "side": decision.action.value,
+                "bar_time": str((decision.meta or {}).get("bar_id") or ""),
+            },
+            root=self.cfg.get("_project_root"),
+        )
         if not caps.orders_via_broker:
             decision.meta = {**(decision.meta or {}), "sent_at": dispatch_started_at}
             self._record_order_timeline(
@@ -976,6 +991,19 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
             else:
                 result = self.trader.close_position(decision.symbol, vol, price)
 
+        journal.record_audit(
+            "order_accepted" if bool(getattr(result, "ok", False)) else "order_rejected",
+            trace_id=trace_id,
+            strategy_id=str(getattr(self.strategy, "name", "") or type(self.strategy).__name__),
+            symbol=decision.symbol,
+            order_id=str(getattr(result, "order_id", "") or ""),
+            message=str(getattr(result, "message", "") or ""),
+            payload={
+                "assumed_fill": bool(getattr(result, "assumed_fill", False)),
+                "bar_time": str((decision.meta or {}).get("bar_id") or ""),
+            },
+            root=self.cfg.get("_project_root"),
+        )
         raw_value = getattr(result, "raw", None)
         raw = raw_value if isinstance(raw_value, dict) else {}
         channel_result_at = str(raw.get("channel_result_at") or "") or now_iso()

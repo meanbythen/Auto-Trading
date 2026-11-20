@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import threading
-import uuid
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from loguru import logger
+
+from src.kernel.trace import new_trace_id  # noqa: F401  旧调用方仍从这里导入
 
 
 FILE_NAME = "order_timeline.jsonl"
@@ -23,11 +24,6 @@ def set_record_listener(callback: Callable[[dict[str, Any]], None] | None) -> No
     """由启动方注册订单事件监听（发件箱），时间线本身不依赖存储实现。"""
     global _LISTENER
     _LISTENER = callback
-
-
-def new_trace_id() -> str:
-    """本地关联号；CTP 柜台号仍单独使用 order_ref/order_sys_id。"""
-    return f"OT-{uuid.uuid4().hex[:16]}"
 
 
 def now_iso() -> str:

@@ -250,6 +250,9 @@ class ResearchTabMixin:
                     bars_by_symbol,
                     require_cross_symbol=require_cross,
                     previous=previous,
+                    cfg=cfg,
+                    period=period,
+                    record=True,
                 )
                 # 只给倾向，不改开平仓。分段不稳的条不会拿来投票。
                 advice = advise_styles(items)

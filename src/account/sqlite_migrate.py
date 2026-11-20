@@ -258,6 +258,11 @@ def migrate(
                 "skip_auto_login": "INTEGER NOT NULL DEFAULT 1",
             },
         )
+        _ensure_columns(
+            conn,
+            "risk_decisions",
+            {"trace_id": "TEXT NOT NULL DEFAULT ''"},
+        )
         with conn:
             written = _upsert(
                 conn,

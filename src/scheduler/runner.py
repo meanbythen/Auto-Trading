@@ -22,7 +22,9 @@ from loguru import logger
 from src.data import KlineProvider
 from src.data.kline import bars_age_minutes, is_bars_stale
 from src.data.periods import drop_forming_bar, period_label, stale_after_minutes
+from src.kernel.trace import new_trace_id, set_trace_id
 from src.login import AppLoginManager
+from src.ops import journal
 from src.risk import PositionSizer, RiskService
 from src.scheduler.flatten_manager import FlattenManagerMixin
 from src.scheduler.login_flow import LoginFlowMixin
@@ -1663,6 +1665,44 @@ class TradingBot(
             "unprotected_resume": bool(getattr(self, "_unprotected_resume", False)),
         }
 
+    def _journal_signal(self, decision: StrategyDecision, bar_time: str) -> str:
+        """非 HOLD 决策落 signals + 审计，并让后续报单/成交复用同一个 trace_id。"""
+        trace_id = str((decision.meta or {}).get("trace_id") or "") or new_trace_id()
+        set_trace_id(trace_id)
+        decision.meta = {**(decision.meta or {}), "trace_id": trace_id}
+        strategy_id = str(
+            getattr(self.strategy, "name", "") or type(self.strategy).__name__
+        )
+        account_id = str(getattr(self, "account_id", "") or "")
+        price = float(decision.entry_price or 0)
+        try:
+            score = float((decision.meta or {}).get("score") or 0)
+        except (TypeError, ValueError):
+            score = 0.0
+        journal.record_signal(
+            trace_id=trace_id,
+            account_id=account_id,
+            strategy_id=strategy_id,
+            symbol=decision.symbol,
+            bar_time=str(bar_time or ""),
+            action=decision.action.value,
+            price=price,
+            score=score,
+            reason=str(decision.reason or ""),
+            payload={"stop_price": decision.stop_price},
+            root=self.cfg.get("_project_root"),
+        )
+        journal.record_audit(
+            "signal_generated",
+            trace_id=trace_id,
+            account_id=account_id,
+            strategy_id=strategy_id,
+            symbol=decision.symbol,
+            message=str(decision.reason or ""),
+            payload={"bar_time": str(bar_time or ""), "price": price},
+            root=self.cfg.get("_project_root"),
+        )
+        return trace_id
 
     def scan_symbol(self, symbol: str) -> None:
         """对单个品种：拉信号周期 + 止损周期K线 → 策略评估 → 执行。"""
@@ -1959,6 +1999,12 @@ class TradingBot(
         decision.meta = {**(decision.meta or {}), "market_health": dict(health)}
         self._store_market_health(health)
 
+        if decision.action != StrategyAction.HOLD:
+            self._journal_signal(
+                decision,
+                str((decision.meta or {}).get("bar_id") or signal_bar_time),
+            )
+
         if stale and decision.action in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN):
             logger.error(
                 "{} 的{}K线过期，拒绝开仓 | {}",
@@ -1973,6 +2019,14 @@ class TradingBot(
                 bar_id=health.get("bar_id", ""),
                 signal_bar_age_minutes=health.get("signal_bar_age_minutes"),
                 market_health=dict(health),
+            )
+            journal.record_audit(
+                "signal_blocked",
+                trace_id=str((decision.meta or {}).get("trace_id") or ""),
+                symbol=symbol,
+                message=str(decision.reason or ""),
+                payload={"gate": "stale", "bar_time": signal_bar_time},
+                root=self.cfg.get("_project_root"),
             )
             return
 
@@ -1997,6 +2051,14 @@ class TradingBot(
                 reason=decision.reason,
                 bar_id=health.get("bar_id", ""),
                 market_health=dict(health),
+            )
+            journal.record_audit(
+                "signal_blocked",
+                trace_id=str((decision.meta or {}).get("trace_id") or ""),
+                symbol=symbol,
+                message=str(decision.reason or ""),
+                payload={"gate": "fallback", "bar_time": signal_bar_time},
+                root=self.cfg.get("_project_root"),
             )
             return
 
@@ -2046,6 +2108,14 @@ class TradingBot(
                     limit_points,
                 )
                 self._record_event("slip_block_open", symbol=symbol, reason=decision.reason)
+                journal.record_audit(
+                    "signal_blocked",
+                    trace_id=str((decision.meta or {}).get("trace_id") or ""),
+                    symbol=symbol,
+                    message=str(decision.reason or ""),
+                    payload={"gate": "slippage", "bar_time": signal_bar_time, "chase": chase},
+                    root=self.cfg.get("_project_root"),
+                )
                 return
 
         sent = False

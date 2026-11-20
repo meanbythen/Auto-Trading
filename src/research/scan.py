@@ -281,6 +281,9 @@ def scan_regularities(
     *,
     require_cross_symbol: bool = True,
     previous: list[dict[str, Any]] | None = None,
+    cfg: dict[str, Any] | None = None,
+    period: str = "",
+    record: bool = False,
 ) -> list[Regularity]:
     """
     扫多个品种，把过关的规律收成列表。
@@ -288,7 +291,13 @@ def scan_regularities(
     require_cross_symbol 为真、并且给了两个及以上品种时：一条规律至少要在两个品种上过关。
     只扫一个品种时仍然可以进池，但会在证据里标明「仅单品种」。
     previous 用来保留你上次勾选过的编号。
+    record 为真且给了 cfg 时，把这次扫描的运行清单写进 research_runs。
     """
+    import time
+    from datetime import datetime
+
+    started_perf = time.perf_counter()
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
     selected_ids = {str(item.get("id")) for item in (previous or []) if item.get("selected")}
     per_key: dict[str, list[SymbolHit]] = {}
     for symbol, df in bars_by_symbol.items():
@@ -355,6 +364,24 @@ def scan_regularities(
         out.append(item)
 
     out.sort(key=lambda row: abs(float(row.details.get("t_first", 0))) + abs(float(row.details.get("t_second", 0))), reverse=True)
+    if record and cfg is not None:
+        from src.research.kernel import build_run_manifest, record_run
+
+        try:
+            manifest = build_run_manifest(
+                "regularity",
+                cfg,
+                symbols=scanned,
+                period=period,
+                started_at=started_at,
+                duration_ms=(time.perf_counter() - started_perf) * 1000.0,
+                metrics={"symbols": len(scanned), "regularities": len(out)},
+            )
+            record_run(manifest, root=cfg.get("_project_root"))
+        except Exception as exc:  # noqa: BLE001
+            from loguru import logger
+
+            logger.debug("规律扫描运行清单没写上: {}", exc)
     return out
 
 

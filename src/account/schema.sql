@@ -175,6 +175,7 @@ CREATE TABLE IF NOT EXISTS risk_decisions (
     allowed     INTEGER NOT NULL CHECK (allowed IN (0, 1)),
     code        TEXT NOT NULL DEFAULT '',
     reason      TEXT NOT NULL DEFAULT '',
+    trace_id    TEXT NOT NULL DEFAULT '',
     intent_json TEXT NOT NULL DEFAULT '{}',
     state_json  TEXT NOT NULL DEFAULT '{}'
 );
@@ -245,3 +246,60 @@ CREATE TABLE IF NOT EXISTS data_catalog (
 );
 
 CREATE INDEX IF NOT EXISTS ix_data_catalog_kind ON data_catalog(kind, symbol);
+
+-- P4 研究运行清单：回测/交叉/优化/复盘/规律共用的可回溯记录。
+CREATE TABLE IF NOT EXISTS research_runs (
+    run_id           TEXT PRIMARY KEY,
+    trace_id         TEXT NOT NULL DEFAULT '',
+    source           TEXT NOT NULL DEFAULT '',
+    status           TEXT NOT NULL DEFAULT '',
+    started_at       TEXT NOT NULL DEFAULT '',
+    finished_at      TEXT NOT NULL DEFAULT '',
+    duration_ms      REAL NOT NULL DEFAULT 0,
+    strategy_id      TEXT NOT NULL DEFAULT '',
+    strategy_version TEXT NOT NULL DEFAULT '',
+    params_sha256    TEXT NOT NULL DEFAULT '',
+    period           TEXT NOT NULL DEFAULT '',
+    symbols_json     TEXT NOT NULL DEFAULT '[]',
+    commit_hash      TEXT NOT NULL DEFAULT '',
+    message          TEXT NOT NULL DEFAULT '',
+    payload_json     TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS ix_research_runs_source
+    ON research_runs(source, started_at);
+
+-- P4 策略信号事实：一根K线一个动作，配合 trace_id 追到报单与成交。
+CREATE TABLE IF NOT EXISTS signals (
+    signal_id    TEXT PRIMARY KEY,
+    trace_id     TEXT NOT NULL DEFAULT '',
+    account_id   TEXT NOT NULL DEFAULT '',
+    strategy_id  TEXT NOT NULL DEFAULT '',
+    symbol       TEXT NOT NULL DEFAULT '',
+    bar_time     TEXT NOT NULL DEFAULT '',
+    action       TEXT NOT NULL DEFAULT '',
+    price        REAL NOT NULL DEFAULT 0,
+    score        REAL NOT NULL DEFAULT 0,
+    reason       TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS ix_signals_trace ON signals(trace_id);
+
+-- P4 审计流水：信号 -> 风控 -> 报单 -> 成交，只追加。
+CREATE TABLE IF NOT EXISTS audit_log (
+    audit_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts           TEXT NOT NULL,
+    trace_id     TEXT NOT NULL DEFAULT '',
+    account_id   TEXT NOT NULL DEFAULT '',
+    strategy_id  TEXT NOT NULL DEFAULT '',
+    symbol       TEXT NOT NULL DEFAULT '',
+    order_id     TEXT NOT NULL DEFAULT '',
+    event        TEXT NOT NULL,
+    message      TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS ix_audit_trace ON audit_log(trace_id);
+CREATE INDEX IF NOT EXISTS ix_audit_event ON audit_log(event, ts);

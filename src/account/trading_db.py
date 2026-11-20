@@ -11,7 +11,7 @@ from typing import Any
 
 import yaml
 
-from src.account.sqlite_migrate import SCHEMA_PATH
+from src.account.sqlite_migrate import SCHEMA_PATH, _ensure_columns
 
 DEFAULT_DB_REL = Path("data") / "trading.db"
 DB_LOCK = threading.RLock()
@@ -71,6 +71,8 @@ def connect(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("PRAGMA busy_timeout = 5000")
     conn.execute("PRAGMA journal_mode = WAL")
     conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    # 老库的 risk_decisions 没有 trace_id；建表语句不会补列，这里顺手补齐。
+    _ensure_columns(conn, "risk_decisions", {"trace_id": "TEXT NOT NULL DEFAULT ''"})
     return conn
 
 

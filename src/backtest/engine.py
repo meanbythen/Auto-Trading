@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import copy
+import time
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -1635,6 +1636,8 @@ def run_backtest(
     engine: str | None = None,
     chain_capital: bool | None = None,
     inherit_position: dict[str, Any] | None = None,
+    source: str = "backtest",
+    run_id: str | None = None,
 ) -> BacktestResult:
     """
     对单个品种跑完整回测。
@@ -1651,7 +1654,11 @@ def run_backtest(
             开=手数跟着剩余权益走；关=每一笔都按本段起始资金。
         inherit_position: 换月移仓。上一段结束时还拿着仓，就带
             {"side": "long"|"short", "volume": 手数}，新主力第一根按同方向开。
+        source: 研究来源，backtest/cross_test/optimizer，写进统一运行清单。
+        run_id: 外部指定的运行号；不传则本次生成一个。
     """
+    started_perf = time.perf_counter()
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
     setup = _prepare_backtest(
         cfg,
         symbol=symbol,
@@ -1775,15 +1782,18 @@ def run_backtest(
         perf.net_pnl,
     )
     from src.data.catalog import catalog_reference
+    from src.research.kernel import build_run_manifest
     from src.strategy.factory import strategy_identity
 
     project_root = str(cfg.get("_project_root") or ".")
+    strategy_info = strategy_identity(cfg)
+    data_catalog = catalog_reference(project_root, cfg)
     details = {
         "symbol": symbol,
         "engine": snap.get("engine", ""),
         # P3 留痕：策略版本 + 数据版本，配合 experiment manifest 可完整追溯。
-        "strategy": strategy_identity(cfg),
-        "data_catalog": catalog_reference(project_root, cfg),
+        "strategy": strategy_info,
+        "data_catalog": data_catalog,
         "timeframe": tf,
         "trail_timeframe": trail_tf,
         "data_source": snap.get("data_source", ""),
@@ -1803,6 +1813,24 @@ def run_backtest(
             "fill_note": snap.get("fill_note", ""),
         },
     }
+    ran_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    manifest = build_run_manifest(
+        source,
+        cfg,
+        symbols=[symbol],
+        period=tf,
+        started_at=started_at,
+        duration_ms=(time.perf_counter() - started_perf) * 1000.0,
+        run_id=run_id,
+        strategy=strategy_info,
+        data_catalog=data_catalog,
+        metrics={
+            "bars": max(0, n - int(trade_from)),
+            "trades": int(perf.trades),
+            "net_pnl": float(perf.net_pnl),
+        },
+        extra={"data_source": details.get("data_source"), "ran_at": ran_at},
+    )
     result = BacktestResult(
         symbol=symbol,
         timeframe=tf,
@@ -1816,8 +1844,9 @@ def run_backtest(
         rejected=run.rejected,
         ambiguities=run.ambiguities,
         # 记到秒。同一次回测的摘要和每一笔成交共用这个时间，再导出也不会变。
-        ran_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        ran_at=ran_at,
         experiment=new_experiment("backtest", cfg, details=details),
+        run=manifest,
         _experiment_data=snapshot_bars(signal=bars_signal, trail=bars_trail, trend=bars_trend),
     )
     if eval_thresholds.enabled:
@@ -1831,6 +1860,7 @@ def save_backtest_report(result: BacktestResult, out_path: Path | str) -> Path:
         "symbol": result.symbol,
         "timeframe": result.timeframe,
         "trail_timeframe": result.trail_timeframe,
+        "run": result.run,
         "execution_ambiguity": {
             "count": len(result.ambiguities),
             "pnl_impact_vs_optimistic": result.params_snapshot.get("ambiguity_pnl_impact", 0),

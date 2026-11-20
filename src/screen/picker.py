@@ -13,10 +13,13 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
+
+from loguru import logger
 
 from src.backtest.evaluation import verdict_text
 from src.strategy.factory import ENGINE_ALIASES, cross_engine_choices
@@ -632,19 +635,23 @@ def _fill_backtest_row(result: Any, row: dict[str, Any]) -> None:
 
     单品种优选、比策略、交叉测试都走这里，字段和口径保持一致。
     """
+    from src.research.kernel import result_summary
+
+    summary = result_summary(result)
     perf = result.performance
-    row["trades"] = int(perf.trades)
-    row["win_rate"] = float(perf.win_rate)
-    row["profit_factor"] = float(perf.profit_factor)
+    row["trades"] = int(summary["trades"])
+    row["win_rate"] = float(summary["win_rate"])
+    row["profit_factor"] = float(summary["profit_factor"])
     row["payoff"] = float(getattr(perf, "payoff", 0.0) or 0.0)
     row["avg_win"] = float(getattr(perf, "avg_win", 0.0) or 0.0)
     row["avg_loss"] = float(getattr(perf, "avg_loss", 0.0) or 0.0)
     row["losses"] = int(getattr(perf, "losses", 0) or 0)
     _exp = getattr(perf, "expectancy", None)
     row["expectancy"] = 0.0 if _exp is None else float(_exp)
-    row["max_drawdown"] = float(perf.max_drawdown)
-    row["net_pnl"] = float(getattr(perf, "net_pnl", 0.0) or 0.0)
+    row["max_drawdown"] = float(summary["max_drawdown"])
+    row["net_pnl"] = float(summary["net_pnl"])
     row["score"] = float(getattr(perf, "score", 0.0) or 0.0)
+    row["run_id"] = str((getattr(result, "run", {}) or {}).get("run_id") or "")
     snap = getattr(result, "params_snapshot", None) or {}
     margin_used = float(snap.get("margin_used") or 0)
     row["margin_used"] = margin_used
@@ -743,15 +750,49 @@ def _run_cross_backtest(
     call_volume: int | None = volume
     if risk_sizing and settings.get("apply_limits", True) and str(settings.get("sizing_mode") or "") == "risk_pct":
         call_volume = None
-    result = runner(
-        run_cfg,
-        symbol=symbol,
-        volume=call_volume,
-        start_date=settings.get("start_date") or None,
-        end_date=settings.get("end_date") or None,
-        engine=engine,
-    )
+    kwargs: dict[str, Any] = {
+        "symbol": symbol,
+        "volume": call_volume,
+        "start_date": settings.get("start_date") or None,
+        "end_date": settings.get("end_date") or None,
+        "engine": engine,
+    }
+    if _runner_accepts(runner, "source"):
+        kwargs["source"] = "cross_test"
+    result = runner(run_cfg, **kwargs)
     return result, volume
+
+
+def _runner_accepts(runner: Callable[..., Any], name: str) -> bool:
+    """测试替身可能只接受固定参数；能接才传 source，别为了留痕把回测打崩。"""
+    try:
+        params = inspect.signature(runner).parameters
+    except (TypeError, ValueError):
+        return False
+    if name in params:
+        return True
+    return any(item.kind == inspect.Parameter.VAR_KEYWORD for item in params.values())
+
+
+def _record_cross_manifest(cfg: dict[str, Any], rows: list[dict[str, Any]], periods: list[str]) -> None:
+    """交叉测试结束时记一份汇总运行清单；单行失败不影响落库。"""
+    from src.research.kernel import build_run_manifest, record_run
+
+    symbols = sorted({str(row.get("symbol") or "") for row in rows if row.get("symbol")})
+    errors = sum(1 for row in rows if row.get("error"))
+    trades = sum(int(row.get("trades") or 0) for row in rows)
+    try:
+        manifest = build_run_manifest(
+            "cross_test",
+            cfg,
+            symbols=symbols,
+            period=periods[0] if periods else "",
+            metrics={"rows": len(rows), "errors": errors, "trades": trades},
+            extra={"periods": list(periods)},
+        )
+        record_run(manifest, root=cfg.get("_project_root"))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("交叉测试运行清单没写上: {}", exc)
 
 
 def aligned_backtest_runner(cfg: dict[str, Any] | None = None) -> Callable[..., Any]:
@@ -1033,6 +1074,7 @@ def screen_cross(
     spec["periods"] = period_codes
     spec["timeframe"] = period_codes[0] if period_codes else spec.get("timeframe")
     spec["trail_timeframe"] = spec["timeframe"]
+    _record_cross_manifest(cfg, rows, period_codes)
     return {
         "baseline": {},
         "volume": volume,
@@ -1473,6 +1515,7 @@ def screen_cross_parallel(
     spec["periods"] = period_codes
     spec["timeframe"] = period_codes[0] if period_codes else spec.get("timeframe")
     spec["trail_timeframe"] = spec["timeframe"]
+    _record_cross_manifest(cfg, ordered, period_codes)
     return {
         "baseline": {},
         "volume": volume,

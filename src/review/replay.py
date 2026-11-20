@@ -11,8 +11,10 @@
 from __future__ import annotations
 
 import re
+import time
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime
 
 import pandas as pd
 from loguru import logger
@@ -63,6 +65,42 @@ class StrategyReplay:
     open_events: list = field(default_factory=list)
     close_events: list = field(default_factory=list)
     window_end: object | None = None
+    # P4 统一运行清单：复盘也留 run_id/trace_id/策略与数据版本。
+    run: dict = field(default_factory=dict)
+
+
+def _finish_replay(
+    result: StrategyReplay,
+    cfg: dict,
+    *,
+    symbol: str,
+    engine: str | None,
+    started_perf: float,
+    started_at: str,
+) -> StrategyReplay:
+    """补统一运行清单并落库；失败只记日志，不影响复盘结果。"""
+    from src.research.kernel import build_run_manifest, record_run
+
+    period = str((cfg.get("strategy") or {}).get("timeframe") or "")
+    try:
+        result.run = build_run_manifest(
+            "review",
+            cfg,
+            symbols=[symbol],
+            period=period,
+            started_at=started_at,
+            duration_ms=(time.perf_counter() - started_perf) * 1000.0,
+            metrics={
+                "events": len(result.open_events) + len(result.close_events),
+                "opened": bool(result.opened),
+                "direction": result.direction,
+            },
+            extra={"engine": engine},
+        )
+        record_run(result.run, root=cfg.get("_project_root"))
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("复盘运行清单没写上: {}", exc)
+    return result
 
 
 def coarse_reason(reason: str) -> str:
@@ -101,6 +139,8 @@ def replay_strategy(
     """
     label = label_for_engine(engine)
     result = StrategyReplay(label=label, engine=engine)
+    started_perf = time.perf_counter()
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
     if engine is not None:
         from src.strategy.profile import header_line
 
@@ -112,17 +152,26 @@ def replay_strategy(
         result.lines.append("上面的针形线、均线、关键位只是盘面现象。要不要做，对照你自己的交易计划，而不是对照某段代码。")
         if pin_count:
             result.lines.append(f"盘面上有 {pin_count} 根针形线。它们本身不是开仓指令。")
-        return result
+        return _finish_replay(
+            result, cfg, symbol=symbol, engine=engine,
+            started_perf=started_perf, started_at=started_at,
+        )
 
     if bars_signal is None or len(bars_signal) < 40:
         n = 0 if bars_signal is None else len(bars_signal)
         result.lines.append(f"K线只有 {n} 根，策略需要更多历史才能判断，这次没法重放。")
-        return result
+        return _finish_replay(
+            result, cfg, symbol=symbol, engine=engine,
+            started_perf=started_perf, started_at=started_at,
+        )
 
     covered = _bars_inside(bars_signal, windows)
     if covered == 0:
         result.lines.append("这段没有K线，策略没有可判断的收盘价。")
-        return result
+        return _finish_replay(
+            result, cfg, symbol=symbol, engine=engine,
+            started_perf=started_perf, started_at=started_at,
+        )
 
     opens, closes, watch, holding = _walk(
         cfg,
@@ -187,7 +236,10 @@ def replay_strategy(
     if holding and opens:
         reason, times = holding.most_common(1)[0]
         result.lines.append(f"开仓之后拿单时，说得最多的是：{reason}（{times} 根）。")
-    return result
+    return _finish_replay(
+        result, cfg, symbol=symbol, engine=engine,
+        started_perf=started_perf, started_at=started_at,
+    )
 
 
 def _bars_inside(bars: pd.DataFrame, windows: list[SessionWindow]) -> int:

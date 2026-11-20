@@ -143,8 +143,8 @@ class SQLiteRiskStateStore:
                     """
                     INSERT OR REPLACE INTO risk_decisions (
                         decision_id, account_id, trading_day, ts, gate, symbol, side, volume,
-                        allowed, code, reason, intent_json, state_json
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        allowed, code, reason, trace_id, intent_json, state_json
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         str(record.get("decision_id") or ""),
@@ -158,6 +158,7 @@ class SQLiteRiskStateStore:
                         int(bool(record.get("allowed"))),
                         str(record.get("code") or ""),
                         str(record.get("reason") or ""),
+                        str(record.get("trace_id") or ""),
                         json_text(record.get("intent") or {}),
                         json_text(record.get("state") or {}),
                     ),

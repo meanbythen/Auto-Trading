@@ -11,6 +11,7 @@ from uuid import uuid4
 from loguru import logger
 
 from src.domain.accounts import load_active_id
+from src.kernel.trace import get_trace_id
 from src.risk.guardian import RiskGuardian
 from src.risk.state_store import DualRiskStateStore, RiskStateStore
 from src.utils.trading_day import futures_trading_day
@@ -186,6 +187,7 @@ class RiskService:
             "allowed": ok,
             "code": code,
             "reason": reason,
+            "trace_id": get_trace_id(),
             "intent": payload,
             "state": self.snapshot(),
         }

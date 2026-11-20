@@ -609,6 +609,9 @@ class OptimizeTabMixin:
                 )
                 path = self.root_dir / "data" / "optimize_last.json"
                 save_optimization_report(result, path)
+                from src.research.kernel import record_run
+
+                record_run(result.run, root=cfg.get("_project_root"))
                 evolve_block: list[str] = []
                 evolve_can_apply = False
                 evolve_reason = ""

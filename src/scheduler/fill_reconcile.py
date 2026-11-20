@@ -12,6 +12,7 @@ from typing import Any
 
 from loguru import logger
 
+from src.ops import journal
 from src.strategy import StrategyAction, StrategyDecision
 from src.trader.order_timeline import elapsed_ms, now_iso
 
@@ -70,6 +71,22 @@ class FillReconcileMixin:
                     fill_key=fill_key,
                 )
                 return True
+
+        journal.record_audit(
+            "order_filled",
+            trace_id=str((decision.meta or {}).get("trace_id") or ""),
+            strategy_id=str(getattr(self.strategy, "name", "") or type(self.strategy).__name__),
+            symbol=symbol,
+            order_id=str((fill_evidence or {}).get("order_id") or ""),
+            message=str(decision.reason or ""),
+            payload={
+                "volume": int(vol),
+                "fill_price": float(fill_price or 0),
+                "fill_key": fill_key,
+                "action": decision.action.value,
+            },
+            root=self.cfg.get("_project_root"),
+        )
 
         pos_before = self._position_for(symbol)
         side_before = getattr(pos_before, "side", "flat") if pos_before else "flat"

@@ -50,6 +50,8 @@ class BacktestResult:
     ran_at: str = ""
     # 实验清单与归档前暂存的 K 线副本。老结果不填也能继续读取和导出。
     experiment: dict[str, Any] = field(default_factory=dict)
+    # P4 统一运行清单：run_id/trace_id/策略版本/数据版本/耗时。
+    run: dict[str, Any] = field(default_factory=dict)
     _experiment_data: dict[str, Any] = field(default_factory=dict, repr=False)
 
     def to_dict(self) -> dict[str, Any]:
@@ -67,4 +69,5 @@ class BacktestResult:
             "params_snapshot": self.params_snapshot,
             "evaluation": self.evaluation.to_dict() if self.evaluation else {},
             "experiment": self.experiment,
+            "run": self.run,
         }

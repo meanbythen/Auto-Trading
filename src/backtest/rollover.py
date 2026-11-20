@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import copy
 import math
+import time
 from dataclasses import dataclass, field, replace
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -311,6 +312,8 @@ def _fallback(
     end_date: str | None,
     engine: str | None,
     chain_capital: bool = False,
+    source: str = "backtest",
+    run_id: str | None = None,
 ) -> BacktestResult:
     """表里没有可用时段时，仍按原来的单合约方式回测，只补一句说明。"""
     result = run_backtest(
@@ -323,6 +326,8 @@ def _fallback(
         end_date=end_date,
         engine=engine,
         chain_capital=bool(chain_capital),
+        source=source,
+        run_id=run_id,
     )
     snap = dict(result.params_snapshot or {})
     snap["rollover"] = False
@@ -343,6 +348,8 @@ def run_backtest_rollover(
     engine: str | None = None,
     table_path: str | Path | None = None,
     chain_capital: bool = False,
+    source: str = "backtest",
+    run_id: str | None = None,
 ) -> BacktestResult:
     """
     按主力合约时段分段回测，换月时自动切换合约。
@@ -360,6 +367,8 @@ def run_backtest_rollover(
     trade = (cfg.get("trade") or {}) if isinstance(cfg, dict) else {}
     symbol = symbol or (st.get("symbols") or [trade.get("symbol", "bu2612")])[0]
     product = product_key(symbol)
+    started_perf = time.perf_counter()
+    started_at = datetime.now().astimezone().isoformat(timespec="seconds")
     common = dict(
         initial_capital=initial_capital,
         volume=volume,
@@ -368,6 +377,8 @@ def run_backtest_rollover(
         end_date=end_date,
         engine=engine,
         chain_capital=bool(chain_capital),
+        source=source,
+        run_id=run_id,
     )
 
     table = resolve_main_table(cfg, table_path)
@@ -456,6 +467,7 @@ def run_backtest_rollover(
                 end_date=seg_end,
                 engine=engine,
                 chain_capital=bool(chain_capital),
+                source=source,
             )
         except Exception as e:  # noqa: BLE001
             reason = str(e).strip() or type(e).__name__
@@ -618,6 +630,24 @@ def run_backtest_rollover(
     for index, item in enumerate(lasts, 1):
         for name, frame in (item._experiment_data or {}).items():
             experiment_data[f"segment_{index:03d}_{name}"] = frame
+    from src.research.kernel import build_run_manifest
+
+    manifest = build_run_manifest(
+        source,
+        cfg,
+        symbols=[f"{product}主力连续"],
+        period=lasts[-1].timeframe,
+        started_at=started_at,
+        duration_ms=(time.perf_counter() - started_perf) * 1000.0,
+        run_id=run_id,
+        metrics={
+            "bars": int(total_bars),
+            "trades": int(perf.trades),
+            "net_pnl": float(perf.net_pnl),
+            "segments": len(run.segments),
+        },
+        extra={"rollover": True},
+    )
     result = BacktestResult(
         symbol=f"{product}主力连续",
         timeframe=lasts[-1].timeframe,
@@ -632,6 +662,7 @@ def run_backtest_rollover(
         ambiguities=ambiguities,
         ran_at=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         experiment=experiment,
+        run=manifest,
         _experiment_data=experiment_data,
     )
     th = EvaluationThresholds.from_cfg(cfg)

@@ -918,6 +918,8 @@ class OptimizationResult:
     walk_steps: int = 0
     walk_folds: list[dict[str, Any]] = field(default_factory=list)
     cross_symbol_rows: list[dict[str, Any]] = field(default_factory=list)
+    # P4 统一运行清单：最终冠军那一次回测的 run manifest。
+    run: dict[str, Any] = field(default_factory=dict)
     # 公开渠道常用的稳健性数字：检验效率、滚动段赚钱比例、参数稳不稳说明。
     walk_efficiency: float = 0.0
     oos_win_rate: float = 0.0
@@ -1811,6 +1813,7 @@ def _walk_forward_search(
             bars_signal=train_signal,
             bars_trail=train_trail,
             engine=engine_name,
+            source="optimizer",
         )
         report(base + len(combos) + 1, total_steps, f"第{fold_i}段 冠军复跑")
 
@@ -1852,6 +1855,7 @@ def _walk_forward_search(
                 bars_signal=bars_signal.loc[bars_signal.index <= train_end_ts],
                 bars_trail=_slice_trail(bars_trail, train_end_ts),
                 engine=engine_name,
+                source="optimizer",
             )
             walk_train_net = float(train_full.performance.net_pnl)
         except Exception as exc:  # noqa: BLE001
@@ -1995,6 +1999,7 @@ def _once_cut_search(
             bars_signal=train_signal,
             bars_trail=train_trail,
             engine=engine_name,
+            source="optimizer",
         )
         hold_perf, hold_trades_list = _holdout_perf_for_params(
             cfg,
@@ -2307,6 +2312,7 @@ def optimize_strategy(
         walk_steps=actual_steps if mode == MODE_WALK else 0,
         walk_folds=walk_folds,
         cross_symbol_rows=cross_rows,
+        run=dict(best_result.run or {}) if best_result is not None else {},
         walk_efficiency=float(walk_metrics.get("walk_efficiency") or 0),
         oos_win_rate=float(walk_metrics.get("oos_win_rate") or 0),
         param_stability=str(walk_metrics.get("param_stability") or ""),

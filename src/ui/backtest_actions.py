@@ -248,7 +248,11 @@ class BacktestActionsMixin:
                         end_date=end,
                         engine=st["engine"],
                         chain_capital=chain,
+                        source="backtest",
                     )
+                from src.research.kernel import record_run
+
+                record_run(result.run, root=cfg.get("_project_root"))
                 p = result.performance
                 th = EvaluationThresholds.from_cfg(cfg)
 
