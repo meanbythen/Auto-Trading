@@ -710,9 +710,14 @@ def record_program_trade(
     """
     from src.version import read_version
 
+    path = book_path(root)
     with _LOCK:
         book = load_book(root)
         if book is None:
+            # 文件还在但读不出来时，绝不能当成「还没有账」新建一本盖上去，成交记录会丢。
+            if path.exists():
+                logger.warning("信号账本存在但读不出来，这一笔不记账，也不新建账本：{}", path)
+                return None
             book = new_book(initial_capital, version=read_version())
             logger.info(
                 "信号账户从版本 {} 开始记，初始资金 {} 元",

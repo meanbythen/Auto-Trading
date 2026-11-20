@@ -966,3 +966,37 @@ def test_order_intent_contains_market_health_evidence(tmp_path) -> None:
     bot._clear_order_intent()
 
 
+def test_broker_net_unknown_until_position_snapshot_ready() -> None:
+    """重连后持仓还没查回来时是「未知」，不能当成空仓；快照查全后才把查不到当成 0。"""
+    from src.trader.ctp_logic import symbol_key
+
+    gateway = type("_G", (), {"positions": {}, "positions_ready": False})()
+    bot = TradingBot.__new__(TradingBot)
+    bot.trader = type("_T", (), {"gateway": gateway})()
+
+    # 持仓快照还没查全：不知道，不是空仓。
+    assert bot._broker_net_for("fu2701") is None
+
+    # 查全后没有这个合约，才是真的空仓。
+    gateway.positions_ready = True
+    assert bot._broker_net_for("fu2701") == 0
+
+    gateway.positions[symbol_key("fu2701")] = type("_V", (), {"net": -2})()
+    assert bot._broker_net_for("fu2701") == -2
+
+
+def test_set_capital_updates_sizer_and_cfg_under_trade_lock() -> None:
+    """账户页改余额只经 set_capital，同时改手数基准和配置权益。"""
+    import threading
+
+    bot = TradingBot.__new__(TradingBot)
+    bot.cfg = {}
+    bot.sizer = type("_S", (), {"capital": 1000.0})()
+    bot._trade_lock = threading.RLock()
+
+    bot.set_capital(12345.5)
+
+    assert bot.sizer.capital == 12345.5
+    assert bot.cfg["risk"]["capital"] == 12345.5
+
+

@@ -1453,6 +1453,18 @@ class TradingBot(
         self.cfg.setdefault("risk", {})["max_daily_loss"] = max_daily_loss
         self.risk.set_max_daily_loss(float(max_daily_loss))
 
+    def set_capital(self, balance: float) -> None:
+        """
+        账户页或账本改了余额后，把这笔钱同步给算手数的一侧。
+
+        和下单共用交易锁：避免一轮下单正在按旧权益算手数时被改掉，
+        出现同一批单前后口径不一致。UI 不再直接改 sizer / cfg。
+        """
+        amount = float(balance)
+        with self._trade_lock:
+            self.sizer.capital = amount
+            self.cfg.setdefault("risk", {})["capital"] = amount
+
     def _record_event_throttled(
         self, event: str, key: str, *, cooldown_sec: float = 600.0, **kwargs: Any
     ) -> None:

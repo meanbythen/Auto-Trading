@@ -4,6 +4,7 @@ from src.account.signal_book import (
     add_cash,
     append_trade,
     balance_of,
+    book_path,
     describe,
     new_book,
     open_position_rows,
@@ -188,6 +189,27 @@ def test_legacy_book_gets_change_rows_without_changing_balance():
     }
     assert balance_of(book) == 11100
     assert [row["kind"] for row in book["changes"]] == ["initial", "deposit", "pnl"]
+
+
+def test_unreadable_book_is_not_overwritten(tmp_path):
+    """文件在但读不出来时，不新建账本把原文件盖掉。"""
+    path = book_path(tmp_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    original = "{坏了"
+    path.write_text(original, encoding="utf-8")
+    result = record_program_trade(
+        tmp_path,
+        initial_capital=20387,
+        symbol="bu2612",
+        offset="开仓",
+        direction="多",
+        price=4600,
+        volume=1,
+        multiplier=10,
+        bar_id="2026-10-22 21:05",
+    )
+    assert result is None
+    assert path.read_text(encoding="utf-8") == original
 
 
 def test_same_bar_is_not_recorded_twice(tmp_path):

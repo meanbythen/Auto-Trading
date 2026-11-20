@@ -521,27 +521,25 @@ class AccountTabMixin:
 
         配置页不能手改这个数。正在跑的程序下一笔按这个余额算手数。
         常驻已经连上 CTP 时，手数仍跟期货公司数字，不用账本里估的成交盈亏去改。
+        运行中的手数和权益只经 bot.set_capital 改，和下单共用交易锁。
         """
-        shown = str(int(balance)) if float(balance) == int(balance) else f"{float(balance):.2f}"
-        self.capital_var.set(shown)
-        self.cfg.setdefault("risk", {})["capital"] = float(balance)
+        target = float(balance)
         bot = getattr(self.worker, "bot", None)
-        if bot is None:
-            return
-        raw = getattr(getattr(bot, "trader", None), "last_broker_equity", None)
-        try:
-            broker = float(raw) if raw is not None else 0.0
-        except (TypeError, ValueError):
-            broker = 0.0
-        if broker > 0:
-            bot.sizer.capital = broker
-            bot.cfg.setdefault("risk", {})["capital"] = broker
-            shown = str(int(broker)) if float(broker) == int(broker) else f"{float(broker):.2f}"
-            self.capital_var.set(shown)
-            self.cfg.setdefault("risk", {})["capital"] = broker
-            return
-        bot.sizer.capital = float(balance)
-        bot.cfg.setdefault("risk", {})["capital"] = float(balance)
+        if bot is not None:
+            raw = getattr(getattr(bot, "trader", None), "last_broker_equity", None)
+            try:
+                broker = float(raw) if raw is not None else 0.0
+            except (TypeError, ValueError):
+                broker = 0.0
+            if broker > 0:
+                target = broker
+            bot.set_capital(target)
+            # bot.cfg 与配置页通常是同一个字典；不是同一个时，配置页自己留一份。
+            if self.cfg is not getattr(bot, "cfg", None):
+                self.cfg.setdefault("risk", {})["capital"] = target
+        else:
+            self.cfg.setdefault("risk", {})["capital"] = target
+        self.capital_var.set(str(int(target)) if target == int(target) else f"{target:.2f}")
 
 
     def _on_signal_initial(self) -> None:

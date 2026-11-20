@@ -1946,13 +1946,17 @@ class OrderExecutorMixin:
             return None
         from src.trader.ctp_logic import symbol_key
 
+        # 刚重连、持仓还没查回来时，快照是空的，但不是「真的空仓」。
+        # 只有确认这份快照已经查全，才能把「查不到这个合约」当成净仓 0。
+        if not getattr(gateway, "positions_ready", True):
+            return None
         view = positions.get(symbol_key(symbol))
         if view is None:
             return 0
         try:
             return int(getattr(view, "net", 0) or 0)
         except (TypeError, ValueError):
-            return 0
+            return None
 
     def _book_external_close(self, symbol: str, reason: str) -> bool:
         """柜台已经空了，只补记程序账，不再向柜台报平仓。"""
