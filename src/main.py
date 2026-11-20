@@ -94,6 +94,16 @@ def main() -> None:
     logger.info("项目目录: {}", root)
     logger.info("当前为【{}】模式", "模拟 dry_run" if cfg.get("dry_run") else "实盘相关")
 
+    # P3 数据目录：总表内容变了才生成新快照，失败不影响交易。
+    try:
+        from src.data.catalog import refresh_instruments
+
+        snapshot = refresh_instruments(root, cfg)
+        if snapshot:
+            logger.info("合约快照已就绪: {}", snapshot)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("合约快照导入失败（不影响交易）: {}", exc)
+
     if args.tick_status:
         _print_tick_status(cfg)
         return

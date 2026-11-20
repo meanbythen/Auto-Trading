@@ -200,3 +200,48 @@ CREATE TABLE IF NOT EXISTS event_outbox (
 );
 
 CREATE INDEX IF NOT EXISTS ix_outbox_status ON event_outbox(status, seq);
+
+-- P3 数据目录：合约总表按内容固化为不可变快照，研究/回测按 snapshot_id 回查。
+CREATE TABLE IF NOT EXISTS instrument_snapshots (
+    snapshot_id   TEXT PRIMARY KEY,
+    source_path   TEXT NOT NULL DEFAULT '',
+    source_sha256 TEXT NOT NULL DEFAULT '',
+    row_count     INTEGER NOT NULL DEFAULT 0,
+    created_at    TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS instruments (
+    snapshot_id            TEXT NOT NULL,
+    symbol                 TEXT NOT NULL,
+    product                TEXT NOT NULL DEFAULT '',
+    name                   TEXT NOT NULL DEFAULT '',
+    multiplier             REAL,
+    margin_rate_pct        REAL,
+    margin                 REAL,
+    commission             REAL,
+    commission_close       REAL,
+    commission_close_today REAL,
+    price_tick             REAL,
+    trading_sessions       TEXT NOT NULL DEFAULT '',
+    flatten_times          TEXT NOT NULL DEFAULT '',
+    enabled                INTEGER NOT NULL DEFAULT 1,
+    payload_json           TEXT NOT NULL DEFAULT '{}',
+    PRIMARY KEY (snapshot_id, symbol)
+);
+
+-- K 线/tick 库存目录：digest 只是行数+起止的目录指纹，逐行内容 hash 由实验清单负责。
+CREATE TABLE IF NOT EXISTS data_catalog (
+    catalog_id   TEXT PRIMARY KEY,
+    kind         TEXT NOT NULL,
+    source       TEXT NOT NULL DEFAULT '',
+    symbol       TEXT NOT NULL,
+    period       TEXT NOT NULL DEFAULT '',
+    rows         INTEGER NOT NULL DEFAULT 0,
+    ts_from      TEXT NOT NULL DEFAULT '',
+    ts_to        TEXT NOT NULL DEFAULT '',
+    digest       TEXT NOT NULL DEFAULT '',
+    updated_at   TEXT NOT NULL,
+    payload_json TEXT NOT NULL DEFAULT '{}'
+);
+
+CREATE INDEX IF NOT EXISTS ix_data_catalog_kind ON data_catalog(kind, symbol);

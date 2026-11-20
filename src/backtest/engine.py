@@ -1774,9 +1774,16 @@ def run_backtest(
         perf.payoff,
         perf.net_pnl,
     )
+    from src.data.catalog import catalog_reference
+    from src.strategy.factory import strategy_identity
+
+    project_root = str(cfg.get("_project_root") or ".")
     details = {
         "symbol": symbol,
         "engine": snap.get("engine", ""),
+        # P3 留痕：策略版本 + 数据版本，配合 experiment manifest 可完整追溯。
+        "strategy": strategy_identity(cfg),
+        "data_catalog": catalog_reference(project_root, cfg),
         "timeframe": tf,
         "trail_timeframe": trail_tf,
         "data_source": snap.get("data_source", ""),

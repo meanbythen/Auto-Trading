@@ -433,7 +433,8 @@ def sanitize_strategy_config(cfg: dict[str, Any]) -> dict[str, Any]:
     # rule_dsl:<文件名> 是配置页新增的自定义规则，原样保留，文件名由规则目录决定。
     raw_engine = str(st.get("engine") or DEFAULT_ENGINE).strip().lower()
     engine = raw_engine if rule_engine_stem(raw_engine) else _ENGINE_ALIASES.get(raw_engine, raw_engine)
-    if engine in _REMOVED_ENGINES or (engine not in REGISTRY and not rule_engine_stem(engine)):
+    # 插件引擎也算合法；已删除和认不出的仍回退默认，避免保存后行为漂移。
+    if engine in _REMOVED_ENGINES or not normalize_engine(engine):
         engine = DEFAULT_ENGINE
     st["engine"] = engine
 
@@ -459,17 +460,42 @@ def sanitize_strategy_config(cfg: dict[str, Any]) -> dict[str, Any]:
     return cfg
 
 
+def _plugins() -> Any:
+    """延迟取插件清单模块。
+
+    插件目录要读 REGISTRY，方向只能是 plugins → factory；这里用 importlib
+    而不是 import 语句，保持单向依赖，不引入模块环。
+    """
+    import importlib
+
+    return importlib.import_module(f"{__package__}.plugins")
+
+
+def _plugin_registered(key: str) -> bool:
+    """插件目录里是否有这个引擎；加载失败一律当作没有，不影响内置策略。"""
+    if not key:
+        return False
+    try:
+        return key in _plugins().discover_specs()
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("策略插件清单加载失败，按内置注册表处理: {}", exc)
+        return False
+
+
 def normalize_engine(name: Any) -> str:
     """把别名/大小写收成正式引擎名；认不出返回空串。
 
     rule_dsl:<文件名> 是配置页里新建的自定义规则，只要前缀对就原样返回，
     文件在不在由 create_strategy 加载时报错（缺文件会走 _BlockedStrategy）。
+    插件目录里的引擎也算正式名，保存配置时不会被重置。
     """
     key = str(name or "").strip().lower()
     if rule_engine_stem(key):
         return key
     key = _ENGINE_ALIASES.get(key, key)
-    return key if key in REGISTRY else ""
+    if key in REGISTRY:
+        return key
+    return key if _plugin_registered(key) else ""
 
 
 def param_section(name: Any) -> str:
@@ -483,7 +509,17 @@ def engine_label(name: Any, *, short: bool = False) -> str:
     table = ENGINE_SHORT_LABELS if short else ENGINE_LABELS
     raw = str(name or "").strip().lower()
     key = _ENGINE_ALIASES.get(raw, raw)
-    return table.get(key, str(name or ""))
+    label = table.get(key)
+    if label:
+        return label
+    # 插件策略的中文名不在静态表里，从插件清单补。
+    try:
+        spec = _plugins().spec_for(key)
+    except Exception:  # noqa: BLE001
+        spec = None
+    if spec is not None:
+        return spec.short_label if short else spec.label
+    return str(name or "")
 
 
 def engine_label_map(*, short: bool = False) -> dict[str, str]:
@@ -493,6 +529,12 @@ def engine_label_map(*, short: bool = False) -> dict[str, str]:
     for alias, target in _ENGINE_ALIASES.items():
         if target in table:
             labels[alias] = table[target]
+    try:
+        for code, spec in _plugins().discover_specs().items():
+            if spec.source == "plugin":
+                labels[code] = spec.short_label if short else spec.label
+    except Exception:  # noqa: BLE001
+        pass
     return labels
 
 
@@ -577,6 +619,26 @@ class _BlockedStrategy(StrategyBase):
         _ = (symbol, action, price, volume, initial_stop)
 
 
+def _create_plugin_strategy(
+    name: str, cfg: dict[str, Any]
+) -> StrategyLike | None:
+    """插件目录里找同名工厂；加载或参数检查失败都返回 None，让调用方回退。"""
+    try:
+        plugins = _plugins()
+        factory = plugins.plugin_factory(name, cfg)
+        if factory is None:
+            return None
+        strategy = factory(cfg)
+        section = param_section(name)
+        raw_params = (cfg.get("strategy") or {}).get(section)
+        for message in plugins.validate_params(name, raw_params if isinstance(raw_params, dict) else {}):
+            logger.warning("策略参数类型不匹配: {}", message)
+        return strategy  # type: ignore[no-any-return]
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("策略插件 {} 加载失败，回退到 {}: {}", name, DEFAULT_ENGINE, exc)
+        return None
+
+
 def create_strategy(cfg: dict[str, Any]) -> StrategyLike:
     """
     创建策略实例。
@@ -602,7 +664,10 @@ def create_strategy(cfg: dict[str, Any]) -> StrategyLike:
 
     stem = rule_engine_stem(name)
     factory = REGISTRY.get("rule_dsl" if stem else name)
-    if factory is None:
+    plugin_strategy: StrategyLike | None = None
+    if factory is None and not stem:
+        plugin_strategy = _create_plugin_strategy(name, cfg)
+    if factory is None and plugin_strategy is None:
         logger.warning(
             "未知 strategy.engine={}，可选: {}；回退到 {}",
             name,
@@ -613,20 +678,23 @@ def create_strategy(cfg: dict[str, Any]) -> StrategyLike:
         factory = REGISTRY[DEFAULT_ENGINE]
         stem = None
 
-    try:
-        strategy = RuleStrategy(cfg, rule_path=f"rules/{stem}.yaml") if stem else factory(cfg)
-    except RuleConfigError as exc:
-        # 规则写错时只停这一套策略，不换别的策略：用户以为在跑自己的规则，
-        # 实际跑成双均线比一天不交易更危险。
-        message = f"自定义规则加载失败，已停止开仓：{exc}"
-        logger.error("{}", message)
+    if plugin_strategy is not None:
+        strategy = plugin_strategy
+    else:
         try:
-            from src.ops.alerts import emit_alert
+            strategy = RuleStrategy(cfg, rule_path=f"rules/{stem}.yaml") if stem else factory(cfg)
+        except RuleConfigError as exc:
+            # 规则写错时只停这一套策略，不换别的策略：用户以为在跑自己的规则，
+            # 实际跑成双均线比一天不交易更危险。
+            message = f"自定义规则加载失败，已停止开仓：{exc}"
+            logger.error("{}", message)
+            try:
+                from src.ops.alerts import emit_alert
 
-            emit_alert("rule_dsl", message, level="error")
-        except Exception as alert_exc:  # noqa: BLE001
-            logger.warning("规则错误告警写入失败: {}", alert_exc)
-        strategy = _BlockedStrategy(cfg, str(exc))
+                emit_alert("rule_dsl", message, level="error")
+            except Exception as alert_exc:  # noqa: BLE001
+                logger.warning("规则错误告警写入失败: {}", alert_exc)
+            strategy = _BlockedStrategy(cfg, str(exc))
     # 两个全策略公共开关统一塞一份到实例上，避免每个策略再各自从 cfg 读一遍。
     # 个别策略也可以在 __init__ 里覆写（目前没有）。
     from .types import entry_mode_from_cfg, stop_mode_from_cfg
@@ -642,3 +710,9 @@ def create_strategy(cfg: dict[str, Any]) -> StrategyLike:
         strategy.entry_mode,
     )
     return strategy
+
+
+def strategy_identity(cfg: dict[str, Any]) -> dict[str, str]:
+    """回测/实验留痕用：策略代号、中文名、版本。插件清单不可用时版本留空。"""
+    identity: dict[str, str] = _plugins().strategy_identity(cfg)
+    return identity

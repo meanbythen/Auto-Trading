@@ -15,6 +15,22 @@ from src.strategy.factory import (
     REMOVED_ENGINES,
 )
 
+
+def _plugin_engine_entries() -> tuple[dict[str, str], list[str]]:
+    """插件目录里的策略；清单加载失败时返回空，界面继续用内置注册表。"""
+    try:
+        from src.strategy.plugins import discover_specs
+
+        specs = discover_specs()
+    except Exception:  # noqa: BLE001
+        return {}, []
+    labels = {code: spec.label for code, spec in specs.items() if spec.source == "plugin"}
+    codes = [code for code, spec in specs.items() if spec.source == "plugin"]
+    return labels, codes
+
+
+_PLUGIN_LABELS, _PLUGIN_CODES = _plugin_engine_entries()
+
 # 引擎显示名：正式名 + 别名都指向同一个中文名，统一由策略工厂提供。
 ENGINE_LABELS: dict[str, str] = {
     **dict(_CANONICAL_ENGINE_LABELS),
@@ -23,13 +39,15 @@ ENGINE_LABELS: dict[str, str] = {
         for alias, target in ENGINE_ALIASES.items()
         if target in _CANONICAL_ENGINE_LABELS
     },
+    **_PLUGIN_LABELS,
 }
 
-# 配置页下拉顺序：多因子放最前，其余按注册表顺序，别名不重复列。
+# 配置页下拉顺序：多因子放最前，其余按注册表顺序，别名不重复列，插件追加在后。
 _ALIAS_KEYS = set(ENGINE_ALIASES)
 ENGINE_CHOICES: list[str] = [
     "multi_factor",
     *[key for key in _STRATEGY_REGISTRY if key not in _ALIAS_KEYS and key != "multi_factor"],
+    *_PLUGIN_CODES,
 ]
 
 _ENGINE_ALIASES = dict(ENGINE_ALIASES)
