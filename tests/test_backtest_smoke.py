@@ -261,42 +261,51 @@ def test_backtest_archive_is_reproducible_and_does_not_change_live_config(tmp_pa
     assert len(index["experiments"]) == 2
 
 
-def test_bars_cache_keeps_sources_apart() -> None:
-    """换行情来源必须重新拉K线，不能把天勤那份表当成新浪。"""
+def test_bars_cache_keeps_sources_apart(tmp_path) -> None:
+    """换行情来源必须重新读K线，不能把天勤那份表当成新浪。"""
     import pandas as pd
 
-    from src.backtest.engine import _fetch_bars_cached, clear_bars_cache
+    from src.data.kline import KlineProvider, clear_fetch_cache
 
-    clear_bars_cache()
+    clear_fetch_cache()
+    calls = {"tq": 0, "akshare": 0}
 
-    class _FakeProvider:
-        def __init__(self, source: str, close: float) -> None:
-            self.source = source
-            self.close = close
-            self.calls = 0
-
-        def fetch(self, symbol, period, max_bars, keep_history, start, end):
-            self.calls += 1
+    def _impl_for(source: str, close: float):
+        def _impl(symbol, period, **_kwargs):
+            calls[source] += 1
             idx = pd.date_range("2026-01-05 09:05", periods=3, freq="5min")
             return pd.DataFrame(
                 {
-                    "open": self.close,
-                    "high": self.close,
-                    "low": self.close,
-                    "close": self.close,
+                    "open": close,
+                    "high": close,
+                    "low": close,
+                    "close": close,
                     "volume": 1,
                 },
                 index=idx,
             )
 
-    tq = _FakeProvider("tq", 100.0)
-    sina = _FakeProvider("akshare", 200.0)
-    tq_bars = _fetch_bars_cached(tq, "fu2701", "5", max_bars=10, start="2026-01-01", end="")
-    sina_bars = _fetch_bars_cached(sina, "fu2701", "5", max_bars=10, start="2026-01-01", end="")
-    assert tq.calls == 1
-    assert sina.calls == 1
+        return _impl
+
+    def _provider(source: str, close: float):
+        provider = KlineProvider(
+            {"_project_root": str(tmp_path), "data": {"cache_dir": "klines", "source": source}}
+        )
+        provider._fetch_impl = _impl_for(source, close)
+        return provider
+
+    tq = _provider("tq", 100.0)
+    sina = _provider("akshare", 200.0)
+    tq_bars = tq.fetch("fu2701", "5", keep_history=True, start="2026-01-01", end="2026-02-01")
+    sina_bars = sina.fetch("fu2701", "5", keep_history=True, start="2026-01-01", end="2026-02-01")
+    assert calls["tq"] == 1
+    assert calls["akshare"] == 1
     assert float(tq_bars["close"].iloc[0]) == 100.0
     assert float(sina_bars["close"].iloc[0]) == 200.0
-    _fetch_bars_cached(tq, "fu2701", "5", max_bars=10, start="2026-01-01", end="")
-    assert tq.calls == 1
-    clear_bars_cache()
+    # 同一来源、同一区间再要一次：直接拿缓存，不再读库。
+    tq.fetch("fu2701", "5", keep_history=True, start="2026-01-01", end="2026-02-01")
+    assert calls["tq"] == 1
+    # 实盘扫描（keep_history=False）要最新一根，不吃缓存。
+    tq.fetch("fu2701", "5", keep_history=False)
+    assert calls["tq"] == 2
+    clear_fetch_cache()

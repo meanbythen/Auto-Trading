@@ -8,6 +8,7 @@ from tkinter import messagebox
 
 import pytest
 
+from src.strategy.factory import ENGINE_LABELS
 from src.strategy.generic_stop import GENERIC_STOP_LABELS
 from src.utils import load_config, save_config
 
@@ -40,8 +41,8 @@ def test_real_app_builds_all_tabs_and_backtest_initial_state(real_app) -> None:
 def test_strategy_and_generic_stop_panels_switch_without_recreation(real_app) -> None:
     strategy_panels = real_app._strategy_detail_panels
     stop_panels = real_app._generic_stop_detail_panels
-    assert len(strategy_panels) == 14
-    assert len(stop_panels) == 5
+    assert len(strategy_panels) == len(ENGINE_LABELS)
+    assert len(stop_panels) == len(GENERIC_STOP_LABELS)
     assert "rule_dsl" in strategy_panels
     strategy_ids = {key: id(panel) for key, panel in strategy_panels.items()}
     stop_ids = {key: id(panel) for key, panel in stop_panels.items()}

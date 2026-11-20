@@ -723,13 +723,25 @@ class ConfigCollectMixin:
             risk_pre["margin_per_lot"] = max(0.0, float(self.margin_var.get() or 0))
         except ValueError:
             risk_pre["margin_per_lot"] = 0.0
-        # 关注合约+保证金只从总表读。
+        # 保证金和手续费从总表补；关注名单以界面上这份为准，这里不去读表覆盖。
+        # 在收集时重读总表会把用户刚改的名单和回测页选中的合约一起冲掉。
         table_rel = (
             str(self.margin_table_path_var.get() or "").strip() or "config/品种与合约.xlsx"
         )
         risk_pre["universe_table"] = table_rel
         risk_pre["margin_table"] = table_rel
-        self._reload_margin_table(silent=True)
+        try:
+            from src.risk.universe_table import apply_universe_table_to_cfg
+
+            apply_universe_table_to_cfg(
+                self.cfg, path=self._margin_table_abs_path(), create_if_missing=True
+            )
+            self.cfg.setdefault("strategy", {})["symbols"] = list(self._watch_symbols)
+            if self._watch_symbols:
+                self.cfg.setdefault("trade", {})["symbol"] = self._watch_symbols[0]
+        except Exception as exc:  # noqa: BLE001
+            # 读表失败不影响收集，保证金沿用配置里的值。
+            logger.warning("读取品种与合约表失败: {}", exc)
         # 「启用限制」只属于回测和优化这一次。留在这里的话，下次保存会把回测开关写进实盘配置。
         risk_pre.pop("apply_limits", None)
 

@@ -40,7 +40,7 @@ from src.backtest.metrics import MARGIN_RATE, TradeRecord, calc_performance, pea
 from src.backtest.models import BacktestResult, RejectedSignal
 from src.strategy.cta_factors import factor_fields_for_trade
 from src.strategy.market_state import adx_series
-from src.data.kline import KlineProvider
+from src.data.kline import KlineProvider, clear_fetch_cache
 from src.data.periods import canonical_period, drop_forming_bar, period_label, unique_ohlc_columns
 from src.risk.commission import fee_close, fee_open, is_close_today
 from src.strategy import StrategyAction, StrategyDecision, create_strategy
@@ -53,27 +53,12 @@ from src.utils.trading_day import EXCHANGE_HOLIDAYS, futures_trading_day
 if TYPE_CHECKING:
     from src.utils.holidays import HolidayCalendar
 
-# 同一进程内同一 (来源, 合约, 周期, 起止) 的 K 线只拉一次。
-# 钥匙必须带来源：新浪和天勤是两套库存，不能把上一把天勤的表拿去当新浪。
-# stress 评估 / 参数扰动 / 多次回测同区间会反复用，避免每轮都读 DB+CSV+upsert。
-_BARS_CACHE: dict[tuple[str, str, str, str, str], pd.DataFrame] = {}
-_MAX_BARS_CACHE = 64
-
-
-def _bars_cache_key(
-    symbol: str,
-    period: str,
-    start: str | None,
-    end: str | None,
-    source: str = "",
-) -> tuple[str, str, str, str, str]:
-    """缓存钥匙。来源放第一位，换下拉框必须重新拉。"""
-    return (str(source or ""), symbol, period, str(start or ""), str(end or ""))
-
-
+# 同一进程内同一 (来源, 合约, 周期, 起止) 的 K 线只读一次。缓存本体在 KlineProvider：
+# 读库、拼分钟线都在那一层，引擎这里不再另存一份，免得两套缓存各占内存。
+# stress 评估 / 参数扰动 / 多次回测同区间会反复用，读一次就能一直拷。
 def clear_bars_cache() -> None:
     """测试或换数据源排查时清空内存K线，避免上一把的表留在进程里。"""
-    _BARS_CACHE.clear()
+    clear_fetch_cache()
 
 
 def _fetch_bars_cached(
@@ -85,14 +70,8 @@ def _fetch_bars_cached(
     start: str | None,
     end: str | None,
 ) -> pd.DataFrame:
-    """带缓存的 provider.fetch。命中时秒级返回；miss 才走完整 I/O。"""
-    source = str(getattr(provider, "source", "") or "")
-    key = _bars_cache_key(symbol, period, start, end, source)
-    cached = _BARS_CACHE.get(key)
-    if cached is not None:
-        # 拷一份，避免回测后面删「还在走的那根」时改到缓存本体。
-        return cached.copy()
-    bars = provider.fetch(
+    """取回测用的 K 线。重复区间由 KlineProvider 的解析缓存直接返回。"""
+    return provider.fetch(
         symbol,
         period=period,
         max_bars=max_bars,
@@ -100,13 +79,6 @@ def _fetch_bars_cached(
         start=start,
         end=end,
     )
-    if bars is not None and len(bars) > 0 and len(_BARS_CACHE) >= _MAX_BARS_CACHE:
-        # 简单 LRU：超过上限就清一半。
-        for k in list(_BARS_CACHE.keys())[: _MAX_BARS_CACHE // 2]:
-            _BARS_CACHE.pop(k, None)
-    if bars is not None and len(bars) > 0:
-        _BARS_CACHE[key] = bars.copy()
-    return bars
 
 
 def _net_pnl_after_fees(

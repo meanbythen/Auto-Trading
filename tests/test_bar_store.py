@@ -13,7 +13,7 @@ from src.data.bar_store import (
     merge_local_and_download,
     rows_needing_write,
 )
-from src.data.kline import KlineProvider
+from src.data.kline import KlineProvider, clear_fetch_cache
 from src.data.tq_source import session_open_minutes
 
 
@@ -68,6 +68,8 @@ def test_fetch_keeps_older_bars_when_the_next_download_is_shorter(tmp_path) -> N
     second = _frame([("2026-10-16 22:00:00", 121), ("2026-10-16 22:05:00", 122)])
     provider._fetch_akshare = lambda *_args, **_kwargs: first  # type: ignore[method-assign]
     provider.fetch("bu2612", "5", keep_history=True)
+    # 模拟下一轮回测：清掉进程内解析缓存，才会重新下载并和库里旧K线接上。
+    clear_fetch_cache()
     provider._fetch_akshare = lambda *_args, **_kwargs: second  # type: ignore[method-assign]
     history = provider.fetch("bu2612", "5", keep_history=True)
     assert len(history) == 4
@@ -148,7 +150,8 @@ def test_backtest_fetch_skips_full_rewrite_when_history_is_unchanged(tmp_path) -
     assert written == []
     assert csv_path.stat().st_mtime_ns == csv_mtime
 
-    # 多一根新K线时，只写这一根。
+    # 多一根新K线时，只写这一根。先清缓存，模拟下一轮重新下载。
+    clear_fetch_cache()
     provider._fetch_akshare = lambda *_args, **_kwargs: _frame(  # type: ignore[method-assign]
         [*rows, ("2026-10-16 22:10:00", 103)]
     )

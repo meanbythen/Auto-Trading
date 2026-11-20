@@ -462,6 +462,8 @@ backtest:
   max_bars: 1200
   warmup: 40
   max_trials: 60
+  # 交叉测试并行进程数。0=按 CPU 自动（最多 4 个）；组合少时会自动退回单进程。
+  cross_workers: 0
   # 策略优化参数表：网格档位、参数中文名、取值说明。改完保存即生效，不用改代码。
   optimizer_table: "config/优化参数.xlsx"
   range_preset: "全部可用"

@@ -369,6 +369,8 @@ PARAM_LABELS_CN: dict[str, str] = {
     "lookback": "长线箱子回看根数",
     "height_atr": "箱子最矮几倍ATR",
     "adx_min": "ADX下限",
+    "trend_ema": "趋势过滤均线根数",
+    "trend_mode": "趋势过滤方式（ema/donchian）",
     "trail_atr": "长线跟踪ATR倍数",
     "trail_start_h": "几倍箱高才跟踪",
     # 日内实体配置页上的结构旋钮。

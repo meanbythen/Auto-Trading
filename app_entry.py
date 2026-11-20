@@ -78,4 +78,9 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    # Windows 打包后交叉测试用 spawn 起子进程，必须先接管
+    # --multiprocessing-fork，否则子进程会再开一次主界面。
+    import multiprocessing
+
+    multiprocessing.freeze_support()
     raise SystemExit(main())

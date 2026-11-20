@@ -801,14 +801,23 @@ class PickerTabMixin:
         self._render_pick_board("正在把勾选的策略、合约、周期交叉匹配，请稍候…", [])
 
         def _run() -> None:
-            from src.screen.picker import format_report, save_picks, screen_cross
+            from src.screen.picker import (
+                cross_worker_count,
+                format_report,
+                save_picks,
+                screen_cross_parallel,
+            )
 
             def on_progress(index: int, total: int, label: str) -> None:
                 # 每测一个组合刷新一次，让人知道没有卡住。
                 self._post_to_main(lambda i=index, n=total, name=label: self._show_pick_progress(i, n, name))
 
             try:
-                result = screen_cross(
+                workers = cross_worker_count(cfg)
+                self._post_to_main(
+                    lambda: self._append_log(f"交叉测试最多用 {workers} 个进程（组合少时自动单进程）")
+                )
+                result = screen_cross_parallel(
                     cfg,
                     settings,
                     universe=contracts,

@@ -1042,6 +1042,417 @@ def screen_cross(
     }
 
 
+# ---------------------------------------------------------------------------
+# 多进程交叉测试
+#
+# 组合数一多，单线程跑回测会和界面抢 GIL，画面就卡。这里把任务按
+# 「品种 × 周期」分块交给独立进程，主进程只收进度、拼表。Windows 用 spawn，
+# 子进程会重新导入本模块，所以 worker 状态放在模块级，由 initializer 初始化。
+# 分块的好处：同一块里的几套策略共用一个进程，这段K线只读一次，不必每个组合重开库。
+# ---------------------------------------------------------------------------
+
+_WORKER_CFG: dict[str, Any] | None = None
+_WORKER_SPEC: dict[str, Any] | None = None
+_WORKER_RUNNER: Callable[..., Any] | None = None
+_WORKER_CANCEL: Any = None
+_WORKER_PROGRESS: Any = None
+
+_CROSS_MAX_WORKERS = 4
+
+
+def cross_worker_count(cfg: dict[str, Any] | None = None) -> int:
+    """并行进程数：环境变量优先，其次配置，最后按 CPU 留一个核给界面。"""
+    import os
+
+    raw = str(os.environ.get("AUTO_TRADING_CROSS_WORKERS") or "").strip()
+    if raw:
+        try:
+            return max(1, int(raw))
+        except ValueError:
+            pass
+    box = (cfg or {}).get("backtest")
+    if isinstance(box, dict):
+        try:
+            wanted = int(box.get("cross_workers") or 0)
+            if wanted > 0:
+                return max(1, wanted)
+        except (TypeError, ValueError):
+            pass
+    cpu = os.cpu_count() or 2
+    if cpu <= 1:
+        return 1
+    # 上限 4 个：再多了行情源和内存都吃不消，收益也不线性。
+    return min(_CROSS_MAX_WORKERS, max(2, cpu - 1))
+
+
+def _cross_plan(
+    settings: dict[str, Any] | None,
+    universe: list[tuple] | None,
+    engines: list[tuple[str, str]] | None,
+    periods: list[str] | None,
+) -> tuple[
+    dict[str, Any],
+    list[tuple[str, str]],
+    list[str],
+    int,
+    list[tuple[int, str, str, str, list[tuple[int, str, str]]]],
+]:
+    """
+    把「策略 × 合约 × 周期」排成任务块，顺序和 screen_cross 完全一致。
+
+    同一品种、同一周期的几套策略放在一个块里，交给同一个进程连着跑：
+    这段K线只读一次，后面几套策略直接复用，不必每个组合重开一次库。
+    块是（块序号，代码，中文名，周期，[(全局序号, 引擎, 策略名), ...]）。
+    """
+    spec = dict(settings or {})
+    try:
+        spec["fixed_volume"] = max(1, int(spec.get("fixed_volume") or 1))
+    except (TypeError, ValueError):
+        spec["fixed_volume"] = 1
+    spec["fair_compare"] = True
+    spec["ignore_equity"] = True
+    spec.pop("engine", None)
+
+    strategies = list(engines or listed_cross_engines())
+    items, skipped_thin = _without_thin(list(universe or MAIN_UNIVERSE))
+    period_codes = normalize_cross_periods(periods)
+    if not period_codes:
+        fallback = str(spec.get("timeframe") or "5")
+        period_codes = normalize_cross_periods([fallback]) or ["5"]
+
+    chunks: list[tuple[int, str, str, str, list[tuple[int, str, str]]]] = []
+    index = 0
+    for period in period_codes:
+        for item in items:
+            code, product, _mult, _thin = _contract(item)
+            entries: list[tuple[int, str, str]] = []
+            for engine, label in strategies:
+                entries.append((index, engine, label))
+                index += 1
+            chunks.append((len(chunks), code, product, period, entries))
+    return spec, strategies, period_codes, skipped_thin, chunks
+
+
+def _empty_cross_row(code: str, product: str, label: str, engine: str, period: str) -> dict[str, Any]:
+    return {
+        "symbol": code,
+        "product": product,
+        "strategy": label,
+        "engine": engine,
+        "timeframe": period,
+        "trades": 0,
+        "win_rate": 0.0,
+        "profit_factor": 0.0,
+        "payoff": 0.0,
+        "expectancy": 0.0,
+        "max_drawdown": 0.0,
+        "net_pnl": 0.0,
+        "error": "",
+        "liquidity": liquidity_text(code),
+        "market_score": None,
+        "market_ok": None,
+        "market_note": "",
+    }
+
+
+def _prefetch_cross_bars(
+    cfg: dict[str, Any],
+    chunks: list[tuple[int, str, str, str, list[tuple[int, str, str]]]],
+    settings: dict[str, Any],
+) -> None:
+    """
+    子进程启动前先把要用的 K 线落到本地。
+
+    否则多个进程会同时补同一段历史，既重复下载，也可能让不同组合读到
+    不同版本的数据，排名就不可比。
+    """
+    from src.data.kline import KlineProvider
+
+    provider = KlineProvider(cfg)
+    start = str(settings.get("start_date") or "") or None
+    end = str(settings.get("end_date") or "") or None
+    seen: set[tuple[str, str]] = set()
+    for _index, code, _product, period, _entries in chunks:
+        key = (code, period)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            provider.fetch(code, period, start=start, end=end, keep_history=True)
+        except Exception:  # noqa: BLE001
+            # 预取失败不阻断，子进程还会按原逻辑再试一次。
+            continue
+
+
+def _cross_worker_init(
+    cfg: dict[str, Any],
+    spec: dict[str, Any],
+    cancel: Any = None,
+    progress: Any = None,
+) -> None:
+    """子进程初始化：配置、回测入口、取消信号和进度队列只建一次。"""
+    global _WORKER_CFG, _WORKER_SPEC, _WORKER_RUNNER, _WORKER_CANCEL, _WORKER_PROGRESS
+
+    _WORKER_CFG = cfg
+    _WORKER_SPEC = dict(spec)
+    _WORKER_CANCEL = cancel
+    _WORKER_PROGRESS = progress
+    _WORKER_RUNNER = aligned_backtest_runner(cfg)
+
+
+def _cross_worker_run(
+    chunk: tuple[int, str, str, str, list[tuple[int, str, str]]],
+) -> tuple[int, list[tuple[int, dict[str, Any]]], int]:
+    """
+    子进程里跑一个块：同一品种、同一周期，把几套策略连着跑完。
+
+    返回（块序号，[(全局序号, 表格行), ...], 手数）。取消在策略之间检查，
+    已经跑完的行照常交回去。
+    """
+    chunk_index, code, product, period, entries = chunk
+    if _WORKER_CANCEL is not None and _WORKER_CANCEL.is_set():
+        return chunk_index, [], 1
+    cfg = _WORKER_CFG
+    if cfg is None:
+        rows = [
+            (index, _cross_error_row(index, code, product, engine, label, period, "并行进程没有拿到配置"))
+            for index, engine, label in entries
+        ]
+        return chunk_index, rows, 1
+    runner = _WORKER_RUNNER or aligned_backtest_runner(cfg)
+    spec = _WORKER_SPEC or {}
+    rows: list[tuple[int, dict[str, Any]]] = []
+    volume = 1
+    for index, engine, label in entries:
+        if _WORKER_CANCEL is not None and _WORKER_CANCEL.is_set():
+            break
+        one = dict(spec)
+        one["engine"] = engine
+        one["timeframe"] = period
+        one["trail_timeframe"] = period
+        row = _empty_cross_row(code, product, label, engine, period)
+        try:
+            result, one_volume = _run_cross_backtest(
+                cfg, one, symbol=code, engine=engine, runner=runner
+            )
+            _fill_backtest_row(result, row)
+            volume = max(volume, int(one_volume or 1))
+        except Exception as exc:  # noqa: BLE001
+            row["error"] = str(exc)
+        row["frequency"] = trade_frequency(
+            int(row.get("trades") or 0),
+            str(row.get("data_from") or ""),
+            str(row.get("data_to") or ""),
+        )
+        # 当下行情统一由主进程补：多进程各自拉行情会重复登录、重复下载。
+        row["better"] = []
+        row["picked"] = "没测成" if row.get("error") else ""
+        rows.append((index, row))
+        if _WORKER_PROGRESS is not None:
+            try:
+                _WORKER_PROGRESS.put((index, code, product, label, period))
+            except Exception:  # noqa: BLE001
+                # 进度只是显示用，队列出问题不能把回测带崩。
+                pass
+    return chunk_index, rows, max(1, int(volume or 1))
+
+
+def _cross_error_row(
+    index: int,
+    code: str,
+    product: str,
+    engine: str,
+    label: str,
+    period: str,
+    message: str,
+) -> dict[str, Any]:
+    row = _empty_cross_row(code, product, label, engine, period)
+    row["error"] = message
+    row["picked"] = "没测成"
+    return row
+
+
+def screen_cross_parallel(
+    cfg: dict[str, Any],
+    settings: dict[str, Any] | None = None,
+    *,
+    universe: list[tuple] | None = None,
+    engines: list[tuple[str, str]] | None = None,
+    periods: list[str] | None = None,
+    workers: int | None = None,
+    on_progress: Callable[[int, int, str], None] | None = None,
+    cancel: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """
+    和 screen_cross 同样的交叉测试，只是把组合分给多个进程跑。
+
+    一个块 = 同一品种、同一周期下的几套策略。子进程把这一块连着跑完，
+    K 线只读一次；主进程只收结果、拼表。取消时最多等当前这一块跑完，
+    不会中途丢账本或写坏 K 线库。
+    """
+    from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+    import multiprocessing as mp
+    import queue as _queue
+
+    from src.data.periods import period_label
+
+    spec, strategies, period_codes, skipped_thin, chunks = _cross_plan(
+        settings, universe, engines, periods
+    )
+    total = sum(len(chunk[4]) for chunk in chunks)
+    if total == 0:
+        return {
+            "baseline": {},
+            "volume": int(spec.get("fixed_volume") or 1),
+            "rows": [],
+            "candidates": [],
+            "stopped": False,
+            "mode": "cross",
+            "settings": spec,
+            "skipped_thin": skipped_thin,
+            "ran_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        }
+    worker_count = max(1, int(workers or cross_worker_count(cfg)))
+    # 组合太少时，起进程、重新导入模块、各自连行情的开销比省下的时间还多。
+    # 实测 18 个组合时并行还略慢，30 个以上才开始明显赚。
+    if worker_count <= 1 or total < worker_count * 8:
+        result = screen_cross(
+            cfg,
+            settings,
+            universe=universe,
+            engines=engines,
+            periods=periods,
+            on_progress=on_progress,
+            cancel=cancel,
+        )
+        result["workers"] = 1
+        return result
+
+    if on_progress is not None:
+        on_progress(0, total, "预取K线")
+    _prefetch_cross_bars(cfg, chunks, spec)
+
+    ctx = mp.get_context("spawn")
+    stop_event = ctx.Event()
+    progress = ctx.Queue()
+    rows: dict[int, dict[str, Any]] = {}
+    reported: set[int] = set()
+    volume = int(spec.get("fixed_volume") or 1)
+    stopped = False
+    pending: dict[Any, tuple[int, str, str, str, list[tuple[int, str, str]]]] = {}
+    iterator = iter(chunks)
+
+    def _report(index: int, code: str, product: str, label: str, period: str) -> None:
+        if index in reported:
+            return
+        reported.add(index)
+        if on_progress is not None:
+            on_progress(len(reported), total, f"{product} · {label} · {period_label(period)}")
+
+    def _drain_progress() -> None:
+        """子进程每跑完一套策略就报一次，进度不用等整块结束。"""
+        while True:
+            try:
+                index, code, product, label, period = progress.get_nowait()
+            except _queue.Empty:
+                return
+            _report(index, code, product, label, period)
+
+    def _chunk_error_rows(chunk, message: str) -> list[tuple[int, dict[str, Any]]]:
+        _chunk_index, code, product, period, entries = chunk
+        return [
+            (index, _cross_error_row(index, code, product, engine, label, period, message))
+            for index, engine, label in entries
+        ]
+
+    executor = ProcessPoolExecutor(
+        max_workers=worker_count,
+        mp_context=ctx,
+        initializer=_cross_worker_init,
+        initargs=(cfg, spec, stop_event, progress),
+    )
+
+    def _submit_next() -> bool:
+        try:
+            chunk = next(iterator)
+        except StopIteration:
+            return False
+        future = executor.submit(_cross_worker_run, chunk)
+        pending[future] = chunk
+        return True
+
+    try:
+        # 只提前压 workers×2 个块，点停止时不会把剩下的全排进去。
+        for _ in range(min(len(chunks), worker_count * 2)):
+            _submit_next()
+        while pending:
+            if cancel is not None and cancel():
+                stopped = True
+                stop_event.set()
+                for future in list(pending):
+                    future.cancel()
+                break
+            done, _ = wait(list(pending), timeout=0.3, return_when=FIRST_COMPLETED)
+            _drain_progress()
+            for future in done:
+                chunk = pending.pop(future)
+                try:
+                    _chunk_index, chunk_rows, one_volume = future.result()
+                except Exception as exc:  # noqa: BLE001
+                    chunk_rows, one_volume = _chunk_error_rows(chunk, f"并行回测失败：{exc}"), 1
+                for index, row in chunk_rows:
+                    rows[index] = row
+                    _report(index, chunk[1], chunk[2], row.get("strategy", ""), chunk[3])
+                volume = max(1, int(one_volume or volume))
+                if not stopped:
+                    _submit_next()
+    finally:
+        executor.shutdown(wait=True, cancel_futures=True)
+        _drain_progress()
+        progress.close()
+        progress.join_thread()
+
+    ordered = [rows[index] for index in sorted(rows)]
+    # 回测在子进程，当下行情在主进程统一补：只登录一次、每个品种周期只拉一遍。
+    from src.strategy.session_audit import make_bars_provider
+
+    bars_fn = make_bars_provider(cfg)
+    for row in ordered:
+        if row.get("error"):
+            continue
+        try:
+            row.update(
+                _market_snapshot(
+                    cfg,
+                    bars_fn,
+                    str(row.get("symbol") or ""),
+                    str(row.get("timeframe") or ""),
+                    str(row.get("engine") or ""),
+                )
+            )
+        except Exception:  # noqa: BLE001
+            row["market_note"] = "取数失败"
+    mark_relative_better(ordered)
+    candidates = [row for row in ordered if row.get("picked") == "较好"]
+    candidates.sort(key=lambda row: int(row.get("rank") or 999))
+    spec["strategies"] = [engine for engine, _label in strategies]
+    spec["periods"] = period_codes
+    spec["timeframe"] = period_codes[0] if period_codes else spec.get("timeframe")
+    spec["trail_timeframe"] = spec["timeframe"]
+    return {
+        "baseline": {},
+        "volume": volume,
+        "rows": ordered,
+        "candidates": candidates,
+        "stopped": stopped,
+        "mode": "cross",
+        "settings": spec,
+        "skipped_thin": skipped_thin,
+        "ran_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "workers": worker_count,
+    }
+
+
 def _market_snapshot(
     cfg: dict[str, Any],
     bars_fn: Callable[[str, str, int], Any],

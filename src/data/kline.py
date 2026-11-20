@@ -12,7 +12,8 @@ import json
 import os
 import threading
 import time
-from collections.abc import Callable
+from collections import OrderedDict
+from collections.abc import Callable, Iterable
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,91 @@ def _rebuildable_minute_period(period: str) -> bool:
 _FETCH_LOCK = threading.Lock()
 # 连接最多等 5 秒，读数据最多等 20 秒。到点就失败，回测改用本地缓存，不再停在「请稍候」。
 _HTTP_TIMEOUT = (5, 20)
+
+# ---------------------------------------------------------------------------
+# K线解析缓存
+#
+# 交叉测试、换月回测、参数扰动会反复要同一段历史：策略不同、起点终点不同，但读的
+# 是同一个库、同一份K线。每读一次都要开库、查表、再把 1 分钟拼成 5/15 分钟，很贵。
+# 读出来的整张表按「库目录 + 来源 + 合约 + 周期 + 起止」进程内留一份，下次直接拷走。
+# 只缓存 keep_history=True（回测、优选）的结果；实盘扫描要最新一根，不能吃旧表。
+# 钥匙里带库文件时间戳：别的进程补了新K线，或本地库被重写，旧表自动作废。
+# ---------------------------------------------------------------------------
+_FETCH_CACHE_MAX_ENTRIES = 8
+_FETCH_CACHE_MAX_BYTES = 128 * 1024 * 1024
+_FETCH_CACHE: OrderedDict[tuple, pd.DataFrame] = OrderedDict()
+_FETCH_CACHE_BYTES = 0
+_FETCH_CACHE_LOCK = threading.Lock()
+
+
+def _frame_bytes(frame: pd.DataFrame) -> int:
+    """一张表大概占多少内存，用来给缓存封顶。"""
+    try:
+        return int(frame.memory_usage(index=True, deep=True).sum())
+    except Exception:  # noqa: BLE001
+        return 0
+
+
+def _files_stamp(paths: Iterable[Path]) -> tuple[tuple[int, int], ...]:
+    """库文件的修改时间和大小。任何一个变了，缓存就作废。"""
+    stamps: list[tuple[int, int]] = []
+    for path in paths:
+        try:
+            info = os.stat(path)
+            stamps.append((int(info.st_mtime_ns), int(info.st_size)))
+        except OSError:
+            stamps.append((0, 0))
+    return tuple(stamps)
+
+
+def clear_fetch_cache() -> None:
+    """清空进程内的K线解析缓存。测试、换数据源排查时用。"""
+    global _FETCH_CACHE_BYTES
+    with _FETCH_CACHE_LOCK:
+        _FETCH_CACHE.clear()
+        _FETCH_CACHE_BYTES = 0
+
+
+def fetch_cache_info() -> dict[str, Any]:
+    """缓存概况：几张表、占多少字节。日志和排查用。"""
+    with _FETCH_CACHE_LOCK:
+        return {
+            "entries": len(_FETCH_CACHE),
+            "bytes": _FETCH_CACHE_BYTES,
+            "max_entries": _FETCH_CACHE_MAX_ENTRIES,
+            "max_bytes": _FETCH_CACHE_MAX_BYTES,
+        }
+
+
+def _fetch_cache_get(key: tuple) -> pd.DataFrame | None:
+    """命中就拷一张出去。调用方后面删「正在走的那根」也不会改到缓存本体。"""
+    with _FETCH_CACHE_LOCK:
+        frame = _FETCH_CACHE.get(key)
+        if frame is None:
+            return None
+        _FETCH_CACHE.move_to_end(key)
+        return frame.copy()
+
+
+def _fetch_cache_put(key: tuple, bars: pd.DataFrame) -> None:
+    global _FETCH_CACHE_BYTES
+    stored = bars.copy()
+    size = _frame_bytes(stored)
+    if size > _FETCH_CACHE_MAX_BYTES:
+        return
+    with _FETCH_CACHE_LOCK:
+        old = _FETCH_CACHE.pop(key, None)
+        if old is not None:
+            _FETCH_CACHE_BYTES -= _frame_bytes(old)
+        _FETCH_CACHE[key] = stored
+        _FETCH_CACHE_BYTES += size
+        # 先按张数，再按内存：任何一个超了，就从最久没用的开始丢。
+        while _FETCH_CACHE and (
+            len(_FETCH_CACHE) > _FETCH_CACHE_MAX_ENTRIES
+            or _FETCH_CACHE_BYTES > _FETCH_CACHE_MAX_BYTES
+        ):
+            _old_key, dropped = _FETCH_CACHE.popitem(last=False)
+            _FETCH_CACHE_BYTES -= _frame_bytes(dropped)
 
 
 def bars_without_attrs(frame: pd.DataFrame | None) -> pd.DataFrame | None:
@@ -169,6 +255,24 @@ class KlineProvider:
         """取最近一次行情健康记录；断流没有 K 线可挂 attrs 时也能查到。"""
         return dict(self._market_health.get(self._market_health_key(symbol, period), {}))
 
+    def _fetch_cache_key(
+        self,
+        symbol: str,
+        period: str,
+        start: str | None,
+        end: str | None,
+    ) -> tuple:
+        """解析缓存的钥匙。带库目录和文件时间戳，换库或补了新K线就自动失效。"""
+        return (
+            str(self.cache_dir.resolve()),
+            self.source,
+            self._stored_symbol(symbol),
+            period,
+            str(start or ""),
+            str(end or ""),
+            _files_stamp((self.store.path, self.raw_store.path, self.tick_bar_store)),
+        )
+
     def fetch(
         self,
         symbol: str,
@@ -184,15 +288,31 @@ class KlineProvider:
         key = self._market_health_key(symbol, canonical)
         started_at = datetime.now().astimezone()
         started = time.perf_counter()
+        cache_key: tuple | None = None
         try:
-            bars = self._fetch_impl(
-                symbol,
-                canonical,
-                max_bars=max_bars,
-                keep_history=keep_history,
-                start=start,
-                end=end,
-            )
+            # 回测、优选会反复要同一段历史，整张表读完就留在内存里。
+            # 实盘扫描要的是最新一根，绝对不能吃旧表。
+            bars: pd.DataFrame | None = None
+            if keep_history and self.source != "demo":
+                cache_key = self._fetch_cache_key(symbol, canonical, start, end)
+                bars = _fetch_cache_get(cache_key)
+            if bars is None:
+                bars = self._fetch_impl(
+                    symbol,
+                    canonical,
+                    max_bars=max_bars,
+                    keep_history=keep_history,
+                    start=start,
+                    end=end,
+                )
+                if cache_key is not None and bars is not None and len(bars) > 0:
+                    # 读完再取一次钥匙：这次下载可能往库里补了新K线，时间戳已经变了。
+                    _fetch_cache_put(
+                        self._fetch_cache_key(symbol, canonical, start, end),
+                        bars,
+                    )
+            else:
+                bars.attrs["from_cache"] = True
         except Exception as exc:
             health = {
                 "symbol": symbol,
