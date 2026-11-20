@@ -1559,6 +1559,8 @@ def _params_snapshot(setup: _BacktestSetup, run: _BacktestRun) -> dict[str, Any]
         "end_date": setup.end_date or "",
         "available_from": setup.available_from,
         "available_to": setup.available_to,
+        # 单合约回测也要把实际参与交易的K线数写进快照，评审单不再只认结果对象。
+        "bars": max(0, len(bars_signal) - int(trade_from)),
         "data_from": str(bars_signal.index[trade_from]) if len(bars_signal) else "",
         "data_to": str(bars_signal.index[-1]) if len(bars_signal) else "",
         "lookback_bars": int(trade_from),

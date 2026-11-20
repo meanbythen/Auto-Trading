@@ -14,6 +14,7 @@ from __future__ import annotations
 import csv
 import json
 import math
+import os
 import statistics
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +39,43 @@ _FIELDS = [
 
 def _csv_path(root: Path | str) -> Path:
     return Path(root) / "data" / FILE_NAME
+
+
+def _migrate_header(path: Path) -> None:
+    """
+    老文件只有 10 列、没有 account。读或追加前先补成 11 列。
+
+    只补列，不改历史行语义；旧行的 account 留空，仍算「未分账」。
+    迁移失败不影响后续读写，最多继续按旧列追加。
+    """
+    if not path.exists():
+        return
+    try:
+        with path.open("r", newline="", encoding="utf-8") as fh:
+            reader = csv.reader(fh)
+            header = next(reader, None)
+            if not header:
+                return
+            if header == _FIELDS or "account" in header:
+                return
+            rows = list(reader)
+    except OSError:
+        return
+    temp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        with temp.open("w", newline="", encoding="utf-8") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(_FIELDS)
+            for row in rows:
+                data = dict(zip(header, row))
+                writer.writerow([data.get(name, "") for name in _FIELDS])
+        os.replace(temp, path)
+    except OSError:
+        try:
+            if temp.exists():
+                temp.unlink()
+        except OSError:
+            pass
 
 
 def record_fill(
@@ -81,6 +119,7 @@ def record_fill(
             slip = (theory - fill) / tick
     path = _csv_path(root)
     path.parent.mkdir(parents=True, exist_ok=True)
+    _migrate_header(path)
     new = not path.exists()
     with path.open("a", newline="", encoding="utf-8") as fh:
         writer = csv.writer(fh)
@@ -105,12 +144,14 @@ def record_fill(
 
 
 def load_rows(root: Path | str) -> list[dict[str, str]]:
-    """读出全部滑点记录。文件不存在时返回空。"""
+    """读出全部滑点记录。文件不存在时返回空；老表头先自动补 account 列。"""
     path = _csv_path(root)
     if not path.exists():
         return []
+    _migrate_header(path)
     with path.open("r", newline="", encoding="utf-8") as fh:
-        return list(csv.DictReader(fh))
+        rows = list(csv.DictReader(fh))
+    return [{name: row.get(name) or "" for name in _FIELDS} for row in rows]
 
 
 def _percentile(values: list[float], pct: float) -> float:

@@ -143,6 +143,32 @@ def _write_slip_row(root, ts: str, slip: int) -> None:
         writer.writerow([ts, "fu2701", "BUY_OPEN", 1, "3000", "3000", slip, "1", "ctp", "0"])
 
 
+def test_old_header_is_migrated_on_read(tmp_path):
+    """老文件的 10 列表头要先补成 11 列，否则新值会落到 None 键。"""
+    _write_slip_row(tmp_path, "2026-11-19T10:05:00", 2)
+    rows = load_rows(tmp_path)
+    assert rows[0]["account"] == ""
+    with (tmp_path / "data" / "slippage_log.csv").open(encoding="utf-8", newline="") as fh:
+        header = next(csv.reader(fh))
+    assert header == [
+        "ts", "symbol", "action", "volume", "theory_price",
+        "fill_price", "slip_ticks", "tick", "executor", "dry_run", "account",
+    ]
+
+
+def test_append_after_migration_keeps_account_column(tmp_path):
+    _write_slip_row(tmp_path, "2026-11-19T10:05:00", 2)
+    record_fill(
+        tmp_path, symbol="fu2701", action="BUY_OPEN", volume=1,
+        theory_price=3000, fill_price=3003, tick=1, executor="ctp",
+        dry_run=False, account="sim",
+    )
+    rows = load_rows(tmp_path)
+    assert rows[0]["account"] == ""
+    assert rows[1]["account"] == "sim"
+    assert rows[1]["slip_ticks"] == "3.00"
+
+
 def test_summarize_by_session_splits_day_and_night(tmp_path):
     for slip in (1, 2, 3, 4):
         _write_slip_row(tmp_path, "2026-11-19T10:05:00", slip)

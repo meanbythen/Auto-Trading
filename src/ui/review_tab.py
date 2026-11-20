@@ -274,13 +274,17 @@ class ReviewTabMixin:
                 parent=dialog,
             ):
                 return
-            sign_release_sheet(
-                self.root_dir,
-                sheet,
-                signed_by=name,
-                decision=decision_var.get(),
-                note=note_var.get(),
-            )
+            try:
+                sign_release_sheet(
+                    self.root_dir,
+                    sheet,
+                    signed_by=name,
+                    decision=decision_var.get(),
+                    note=note_var.get(),
+                )
+            except ValueError as exc:
+                messagebox.showwarning("证据未齐", str(exc), parent=dialog)
+                return
             refresh()
             self._append_log(
                 f"上线评审单已签字：{name} / {decision_var.get()}（只留档，不改配置）"

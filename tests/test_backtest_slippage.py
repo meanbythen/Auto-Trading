@@ -6,10 +6,8 @@ from src.backtest.slippage import build_ladder, ladder_lines
 
 def _cfg(base: float = 1.0, extra: float = 1.0) -> dict:
     return {
-        "backtest": {
-            "slippage_ticks": base,
-            "evaluation": {"slippage_extra_ticks": extra},
-        }
+        "backtest": {"slippage_ticks": base},
+        "evaluation": {"slippage_extra_ticks": extra},
     }
 
 
@@ -68,6 +66,14 @@ def test_ladder_default_extra_when_cfg_missing(tmp_path):
     assert ladder.extra == 1.0
     assert ladder.stress == 3.0
     assert build_ladder(None).baseline == 0.0
+
+
+def test_ladder_reads_root_level_evaluation(tmp_path):
+    """压力跳数配置在根级 evaluation，不在 backtest.evaluation。"""
+    cfg = {"backtest": {"slippage_ticks": 1}, "evaluation": {"slippage_extra_ticks": 4}}
+    ladder = build_ladder(cfg, symbol="", root=tmp_path)
+    assert ladder.extra == 4.0
+    assert ladder.stress == 5.0
 
 
 def test_ladder_lines_show_three_tiers_and_used(tmp_path):

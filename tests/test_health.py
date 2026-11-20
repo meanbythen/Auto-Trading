@@ -11,17 +11,17 @@ from src.ops.health import (
 )
 
 
-def _book(pnls: list[float]) -> dict:
+def _book(pnls: list[float], symbol: str = "fu2701", hour: int = 9) -> dict:
     trades: list[dict] = []
     for i, pnl in enumerate(pnls):
         trades.append(
             {
                 "offset": "开仓",
                 "direction": "多",
-                "symbol": "fu2701",
+                "symbol": symbol,
                 "volume": 1,
                 "price": 3000.0,
-                "time": f"2026-10-01 09:0{i}:00" if i < 10 else f"2026-10-01 10:{i:02d}:00",
+                "time": f"2026-10-01 {hour:02d}:{i:02d}:00",
                 "multiplier": 10,
             }
         )
@@ -30,10 +30,10 @@ def _book(pnls: list[float]) -> dict:
             {
                 "offset": "平仓",
                 "direction": "多",
-                "symbol": "fu2701",
+                "symbol": symbol,
                 "volume": 1,
                 "price": close_px,
-                "time": f"2026-10-01 11:{i:02d}:00",
+                "time": f"2026-10-01 {hour + 2:02d}:{i:02d}:00",
                 "multiplier": 10,
             }
         )
@@ -178,6 +178,55 @@ def test_entry_block_only_after_enough_watch_days() -> None:
     assert blocked is True
     assert "停开新仓" in reason
     assert entry_block_decision(cfg, HealthReport(status="ok", message="正常", watch_days=9)) == (False, "")
+
+
+def test_live_sample_filters_by_symbol(tmp_path) -> None:
+    """多品种账本混在一起时，健康对照只取当前品种的平仓。"""
+    (tmp_path / "data").mkdir()
+    book = _book([-50] * 10, symbol="lh2701", hour=9)
+    book["trades"].extend(_book([100] * 3, symbol="fu2701", hour=13)["trades"])
+    (tmp_path / "data" / "signal_account.json").write_text(
+        json.dumps(book), encoding="utf-8"
+    )
+
+    fu = evaluate_health(tmp_path, min_trades=3, symbol="fu2701")
+    lh = evaluate_health(tmp_path, min_trades=3, symbol="lh2701")
+    assert fu.live_n == 3
+    assert lh.live_n == 10
+
+
+def test_missing_engine_does_not_advance_watch_days(tmp_path) -> None:
+    """旧回测没记引擎时只作参考，不能拿它累计停开天数。"""
+    _watch_book(tmp_path)
+    path = tmp_path / "data" / "backtest_last.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["params_snapshot"].pop("engine")
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = maybe_emit_health(tmp_path, engine="trend", symbol="fu2701", timeframe="5")
+    assert report.status == "watch"
+    assert report.scope_recorded is False
+    assert report.watch_days == 0
+    assert not (tmp_path / "data" / "health_state.json").exists()
+
+
+def test_extra_scope_mismatch_is_not_compared(tmp_path) -> None:
+    """数据源都不同，胜率再像也不能当对照。"""
+    _watch_book(tmp_path)
+    path = tmp_path / "data" / "backtest_last.json"
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    payload["params_snapshot"]["data_source"] = "akshare"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+
+    report = evaluate_health(
+        tmp_path,
+        engine="trend",
+        symbol="fu2701",
+        timeframe="5",
+        cfg={"data": {"source": "tq"}},
+    )
+    assert report.scope_mismatch is True
+    assert "数据源" in report.message
 
 
 def test_health_gate_blocks_only_new_opens() -> None:

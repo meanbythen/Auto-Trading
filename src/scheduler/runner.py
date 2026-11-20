@@ -1424,6 +1424,7 @@ class TradingBot(
                 engine=str(strategy.get("engine") or ""),
                 symbol=symbol,
                 timeframe=str(strategy.get("timeframe") or ""),
+                cfg=self.cfg,
             )
             blocked, reason = entry_block_decision(self.cfg, report)
             self._health_blocked = blocked

@@ -57,9 +57,10 @@ def build_live_vs_backtest(root: Path | str, symbol: str, cfg: dict[str, Any]) -
             engine=str(strategy.get("engine") or ""),
             symbol=symbol,
             timeframe=str(strategy.get("timeframe") or ""),
+            cfg=cfg,
         )
         lines = ["—— 最近实盘 vs 最近回测 ——"]
-        lines.append(f"  对照品种  {symbol}（账本口径，暂不分品种）")
+        lines.append(f"  对照品种  {symbol}（只取同品种的账本平仓）")
         if health.scope_mismatch:
             lines.append("  " + health.message)
             return lines

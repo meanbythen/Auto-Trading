@@ -4,7 +4,7 @@
 功能：把「基线 / 压力 / 实测」三档滑点摆在一起，避免回测、压力测试、实盘各说各的。
 原理：
   - 基线：本次回测填的 backtest.slippage_ticks。
-  - 压力：基线 + backtest.evaluation.slippage_extra_ticks（默认 1 跳），评估里的滑点压力用这一档。
+  - 压力：基线 + 根级 evaluation.slippage_extra_ticks（默认 1 跳），评估里的滑点压力用这一档。
   - 实测：data/slippage_log.csv 里同品种真实成交的 70 分位，向上取 0.5 跳；满 3 笔才给。
 三档只拿来对照，不会自动写配置；要改仍由人在回测页点确认。
 """
@@ -93,7 +93,7 @@ def build_ladder(
     bt = _cfg_box(cfg, "backtest")
     raw_base = baseline if baseline is not None else _number(bt.get("slippage_ticks"))
     base = max(0.0, raw_base if raw_base is not None else 0.0)
-    evaluation = bt.get("evaluation") if isinstance(bt.get("evaluation"), dict) else {}
+    evaluation = _cfg_box(cfg, "evaluation")
     raw_extra = _number(evaluation.get("slippage_extra_ticks"))
     extra = max(0.0, raw_extra if raw_extra is not None else DEFAULT_EXTRA_TICKS)
     actual, actual_n, has_log = _actual_ticks(root, symbol)

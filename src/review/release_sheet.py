@@ -8,15 +8,17 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
-from src.account.slippage_log import load_rows, reject_summary, summarize
+from src.account.slippage_log import load_rows, product_of, reject_summary, summarize
 from src.backtest.audit import audit_results
 from src.data.periods import period_label
+from src.strategy.types import config_flag
 
 PASS = "通过"
 WATCH = "注意"
@@ -87,6 +89,49 @@ def _cfg_scope(cfg: dict[str, Any] | None) -> tuple[str, str, str]:
     )
 
 
+def _extra_scope_mismatches(cfg: dict[str, Any] | None, snap: dict[str, Any]) -> list[str]:
+    """数据源、滑点、成交方式、手数模式、换月链资金。两边都记录到才比较。"""
+    out: list[str] = []
+    data = _box((cfg or {}).get("data"))
+    bt = _box((cfg or {}).get("backtest"))
+    risk = _box((cfg or {}).get("risk"))
+
+    cur_source = str(data.get("source") or "").strip()
+    bt_source = str(snap.get("data_source") or "").strip()
+    if cur_source and bt_source and cur_source != bt_source:
+        out.append(f"数据源 {bt_source}≠{cur_source}")
+
+    if "slippage_ticks" in bt:
+        cur_slip = _number(bt.get("slippage_ticks"))
+        bt_slip = _number(snap.get("slippage_ticks"))
+        if cur_slip is not None and bt_slip is not None and abs(cur_slip - bt_slip) > 1e-9:
+            out.append(f"滑点 {bt_slip:g}≠{cur_slip:g}")
+
+    if "fill_on_next_open" in bt and snap.get("fill_on_next_open") is not None:
+        cur_fill = config_flag(bt.get("fill_on_next_open"), default=True)
+        bt_fill = config_flag(snap.get("fill_on_next_open"), default=True)
+        if cur_fill != bt_fill:
+            out.append(
+                "成交方式 "
+                f"{'下一根开盘' if bt_fill else '策略价'}≠{'下一根开盘' if cur_fill else '策略价'}"
+            )
+
+    cur_size = str(risk.get("sizing_mode") or "").strip()
+    bt_size = str(snap.get("sizing_mode") or "").strip()
+    if cur_size and bt_size and cur_size != bt_size:
+        out.append(f"手数模式 {bt_size}≠{cur_size}")
+
+    if "chain_capital" in bt and snap.get("chain_capital") is not None:
+        cur_chain = config_flag(bt.get("chain_capital"), default=False)
+        bt_chain = config_flag(snap.get("chain_capital"), default=False)
+        if cur_chain != bt_chain:
+            out.append(
+                "换月链资金 "
+                f"{'连续' if bt_chain else '每段独立'}≠{'连续' if cur_chain else '每段独立'}"
+            )
+    return out
+
+
 def _data_gate(
     root: Path,
     cfg: dict[str, Any] | None,
@@ -108,19 +153,33 @@ def _data_gate(
     mismatches: list[str] = []
     if engine and bt_engine and engine != bt_engine:
         mismatches.append(f"策略 {bt_engine}≠{engine}")
-    if symbol and bt_symbol and symbol != bt_symbol:
+    if symbol and bt_symbol and product_of(symbol) != product_of(bt_symbol):
         mismatches.append(f"品种 {bt_symbol}≠{symbol}")
     if timeframe and bt_timeframe and timeframe != bt_timeframe:
         mismatches.append(f"周期 {bt_timeframe}≠{timeframe}")
+    mismatches.extend(_extra_scope_mismatches(cfg, snap))
     data_from = str(snap.get("data_from") or "").strip()
     data_to = str(snap.get("data_to") or "").strip()
-    bars = int(_number(snap.get("bars")) or 0)
+    bars = int(_number(snap.get("bars")) or _number(backtest.get("bars")) or 0)
     trades = int(_number(_box(backtest.get("performance")).get("trades")) or 0)
     section.lines.append(
         f"回测  {bt_engine or '—'} / {bt_symbol or '—'} / "
         f"{period_label(bt_timeframe) if bt_timeframe else '—'}"
     )
     section.lines.append(f"数据  {data_from[:10] or '—'} → {data_to[:10] or '—'}，K线 {bars} 根，成交 {trades} 笔")
+    missing_scope = [
+        label
+        for key, label in (
+            ("data_source", "数据源"),
+            ("slippage_ticks", "滑点"),
+            ("fill_on_next_open", "成交方式"),
+            ("sizing_mode", "手数模式"),
+            ("chain_capital", "换月链资金"),
+        )
+        if key not in snap or snap.get(key) in (None, "")
+    ]
+    if missing_scope:
+        section.lines.append("口径  " + "、".join(missing_scope) + " 未记录，无法核对")
 
     audit = audit_results(backtest, _read_json(root / "data" / "optimize_last.json"), cfg or {})
     # 数据门禁只看回测自身的审计项；优化的样本外单独在第 2 节算，避免重复扣分。
@@ -232,7 +291,7 @@ def _sim_slippage(root: Path, cfg: dict[str, Any] | None) -> SheetSection:
     )
     bt = _box((cfg or {}).get("backtest"))
     base = _number(bt.get("slippage_ticks")) or 0.0
-    extra = _number(_box(bt.get("evaluation")).get("slippage_extra_ticks"))
+    extra = _number(_box((cfg or {}).get("evaluation")).get("slippage_extra_ticks"))
     stress = base + (extra if extra is not None else 1.0)
     section.lines.append(f"回测口径  基线 {base:g} 跳 / 压力 {stress:g} 跳")
     if suggested > stress:
@@ -245,16 +304,48 @@ def _sim_slippage(root: Path, cfg: dict[str, Any] | None) -> SheetSection:
     return section
 
 
-def _signature_section(signature: dict[str, Any]) -> SheetSection:
+def _evidence_sections(sections: list[SheetSection]) -> list[SheetSection]:
+    """签名字节以外的证据节。签字动作本身不能改变摘要。"""
+    return [item for item in sections if item.title != "人工签字"]
+
+
+def _evidence_digest(sections: list[SheetSection]) -> str:
+    """把证据内容压成摘要，签字时存下来，下次生成时比对。"""
+    payload = [
+        {"title": item.title, "status": item.status, "lines": list(item.lines)}
+        for item in _evidence_sections(sections)
+    ]
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+def _signature_section(signature: dict[str, Any], digest: str) -> SheetSection:
     section = SheetSection("人工签字", MISSING)
     if not signature:
         section.lines.append("还没有签字。签字只代表你看过以上证据，不会自动改配置或开仓。")
         return section
-    section.status = PASS
-    section.lines.append(
+    line = (
         f"{signature.get('signed_by') or '—'}  {signature.get('signed_at') or '—'}  "
         f"决定：{signature.get('decision') or '—'}"
     )
+    stored = str(signature.get("evidence_digest") or "")
+    if not stored:
+        section.status = WATCH
+        section.lines.append(line)
+        section.lines.append("旧版签字未绑定证据摘要，只能当历史记录；请重新生成评审单并签字。")
+    elif stored != digest:
+        section.status = FAIL
+        section.lines.append(line)
+        section.lines.append(
+            f"签字绑定证据 {stored[:8]}，当前证据 {digest[:8]}；"
+            "签字后证据已变化，需重新生成并签字。"
+        )
+    else:
+        section.status = PASS
+        section.lines.append(line)
+        section.lines.append(
+            f"证据摘要 {stored[:8]}  生成于 {signature.get('evidence_generated_at') or '—'}"
+        )
     note = str(signature.get("note") or "").strip()
     if note:
         section.lines.append(f"备注  {note}")
@@ -264,11 +355,15 @@ def _signature_section(signature: dict[str, Any]) -> SheetSection:
 def _verdict(sections: list[SheetSection], signature: dict[str, Any]) -> str:
     failed = [item.title for item in sections if item.status == FAIL]
     if failed:
+        if signature and "人工签字" in failed:
+            return "证据已变化，需重新签字"
         return "不通过（" + "、".join(failed) + "）"
     status = {item.title: item.status for item in sections}
     if status.get("数据门禁") == MISSING or status.get("样本外") == MISSING:
         return "证据不足：先补数据门禁和样本外"
     if signature:
+        if status.get("人工签字") == WATCH:
+            return "旧签字未绑定证据摘要，需重新签字"
         decision = str(signature.get("decision") or "")
         return f"已签字：{decision}" if decision else "已签字"
     return "证据已齐，待人工签字"
@@ -291,8 +386,8 @@ def build_release_sheet(
         _out_of_sample(base),
         _mirror_gate(backtest, base),
         _sim_slippage(base, cfg),
-        _signature_section(signature),
     ]
+    sections.append(_signature_section(signature, _evidence_digest(sections)))
     return ReleaseSheet(
         symbol=symbol or cfg_symbol,
         engine=engine or str(snap.get("engine") or ""),
@@ -335,7 +430,19 @@ def sign_release_sheet(
     decision: str,
     note: str = "",
 ) -> dict[str, Any]:
-    """写入签字记录，并同步更新正文。签字不改任何交易参数。"""
+    """
+    写入签字记录，并同步更新正文。签字不改任何交易参数。
+
+    证据有「未记录」时，拒绝签「允许小资金挂机」；签字会带上当时的证据摘要，
+    之后证据一变，评审单就会显示需要重新签字。
+    """
+    if decision == "允许小资金挂机":
+        missing = [
+            item.title for item in _evidence_sections(sheet.sections) if item.status == MISSING
+        ]
+        if missing:
+            raise ValueError("证据未齐，不能签「允许小资金挂机」：" + "、".join(missing))
+    digest = _evidence_digest(sheet.sections)
     payload = {
         "signed_by": signed_by.strip(),
         "signed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -345,6 +452,8 @@ def sign_release_sheet(
         "engine": sheet.engine,
         "verdict": sheet.verdict,
         "generated_at": sheet.generated_at,
+        "evidence_generated_at": sheet.generated_at,
+        "evidence_digest": digest,
     }
     path = Path(root) / "data" / SHEET_JSON
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -355,6 +464,7 @@ def sign_release_sheet(
         section.status = PASS
         section.lines = [
             f"{payload['signed_by']}  {payload['signed_at']}  决定：{payload['decision']}",
+            f"证据摘要 {digest[:8]}  生成于 {payload['evidence_generated_at']}",
             *([f"备注  {payload['note']}"] if payload["note"] else []),
         ]
     sheet.verdict = _verdict(sheet.sections, payload)

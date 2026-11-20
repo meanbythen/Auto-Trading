@@ -269,7 +269,17 @@ class DashboardMixin:
                 try:
                     from src.ops.health import evaluate_health
 
-                    health = evaluate_health(self.root_dir).as_dict()
+                    # 首页也按当前引擎 / 周期 / 品种核对口径，不能拿别的回测误报偏差。
+                    watch = self.watch_choice_var.get().strip()
+                    if not watch and self._watch_symbols:
+                        watch = self._watch_symbols[0]
+                    health = evaluate_health(
+                        self.root_dir,
+                        engine=str(self.engine_var.get() or ""),
+                        symbol=watch,
+                        timeframe=self._period_code(self.tf_var, self.tf_custom_var),
+                        cfg=self.cfg,
+                    ).as_dict()
                 except Exception:  # noqa: BLE001
                     health = None
             if isinstance(health, dict) and health.get("message"):

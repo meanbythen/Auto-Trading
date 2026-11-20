@@ -50,17 +50,24 @@ def build_consistency_lines(
     out = [f"—— 今日一致性（{symbol}） ——"]
     mirror_rows, enabled, note, compared = _mirror_snapshot(base, symbol, cfg)
     out.extend(note)
+    same_window = [row for row in mirror_rows if _hit_in_windows(row, windows)] if enabled else []
     if enabled:
-        mirror_lines = format_mirror_gate_lines(mirror_rows, enabled=True)
+        mirror_lines = format_mirror_gate_lines(same_window, enabled=True)
         if mirror_lines:
             # 同一份摘要文案在回测页叫「实盘镜像」，这里是回测侧，改叫「回测镜像」免得读反。
-            mirror_lines[0] = mirror_lines[0].replace("实盘镜像", "回测镜像", 1)
+            # 只拿落在本次复盘时段里的命中比，避免「全周期累计」对「今日一次」。
+            mirror_lines[0] = mirror_lines[0].replace("实盘镜像", "回测镜像（同窗口）", 1)
         out.extend("  " + row for row in mirror_lines)
+        if len(same_window) != len(mirror_rows):
+            out.append(
+                f"  回测镜像  全周期累计放弃 {len(mirror_rows)} 次；"
+                f"今日只对比同窗口 {len(same_window)} 次。"
+            )
 
     out.extend(_minute_lines(trades or [], minutes))
     gate_lines, gate_total = _live_gate_lines(base, symbol, windows)
     out.extend(gate_lines)
-    out.append(_verdict(mirror_rows, enabled, gate_total, compared))
+    out.append(_verdict(same_window, len(mirror_rows), enabled, gate_total, compared))
     return out
 
 
@@ -229,20 +236,47 @@ def _live_gate_lines(
     return [f"  实盘闸门  共 {total} 次（{parts}）", *samples], total
 
 
-def _verdict(rows: list[dict[str, Any]], enabled: bool, live_total: int, compared: bool) -> str:
-    """一句话比较回测镜像和实盘闸门，不替用户下结论。"""
+def _hit_in_windows(row: dict[str, Any], windows: list[SessionWindow]) -> bool:
+    """这条回测镜像命中是否落在本次复盘时段内。没有时间的旧记录不算进今日对比。"""
+    when = _parse_ts(row.get("time") or row.get("bar_id"))
+    return bool(when and any(window.contains(when) for window in windows))
+
+
+def _verdict(
+    rows: list[dict[str, Any]],
+    total: int,
+    enabled: bool,
+    live_total: int,
+    compared: bool,
+) -> str:
+    """
+    一句话比较同窗口的回测镜像和实盘闸门。
+
+    total 是回测全周期累计，只作背景；绝不和今日的 live_total 直接相减或下结论。
+    """
     if not compared:
         return "  结论  最近回测和今天不是同一口径，这一节先只看实盘闸门；跑一次同配置回测再比。"
     if not enabled:
         return "  结论  最近回测没开镜像闸门，今天先用实盘闸门明细看；下次回测勾上「实盘镜像」再比。"
     if not rows and not live_total:
+        if total:
+            return (
+                f"  结论  同一时间窗内两边都没有放弃记录；回测全周期累计 {total} 次，"
+                "不与今日互比。"
+            )
         return "  结论  回测镜像和实盘闸门都没有放弃记录，两边口径暂时一致。"
-    if not live_total:
-        return f"  结论  回测镜像放弃 {len(rows)} 次，实盘一次也没拦；先看实盘当时有没有挂机。"
     if not rows:
-        return f"  结论  实盘拦下 {live_total} 次，回测镜像没放弃；回测的对照价偏乐观，需要看分笔。"
+        return (
+            f"  结论  回测今天这个窗口没有放弃记录（全周期累计 {total} 次，不与今日互比），"
+            f"实盘拦下 {live_total} 次；先看实盘当时的分笔和挂机时间。"
+        )
+    if not live_total:
+        return (
+            f"  结论  同一时间窗内回测镜像放弃 {len(rows)} 次，实盘一次也没拦；"
+            "先看实盘当时有没有挂机。"
+        )
     return (
-        f"  结论  回测镜像放弃 {len(rows)} 次，实盘拦下 {live_total} 次；"
+        f"  结论  同一时间窗内回测镜像放弃 {len(rows)} 次，实盘拦下 {live_total} 次；"
         "差得多的那类，先查当时的分笔和挂机时间，再决定调不调闸门。"
     )
 

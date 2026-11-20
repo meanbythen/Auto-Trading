@@ -90,7 +90,7 @@ def test_consistency_combines_mirror_minute_and_live_gates(tmp_path) -> None:
         )
     )
     assert "今日一致性" in text
-    assert "回测镜像  开；放弃 2 次（追价1 过期1）" in text
+    assert "回测镜像（同窗口）  开；放弃 2 次（追价1 过期1）" in text
     assert "1分钟复核  成交 1 笔，其中更早碰到止损 1 笔" in text
     assert "原出场 2026-11-20 10:30 → 1分钟 2026-11-20 10:10" in text
     assert "实盘闸门  共 3 次" in text
@@ -106,6 +106,32 @@ def test_consistency_refuses_to_compare_other_scope(tmp_path) -> None:
     assert "未对照" in text
     assert "不是同一口径" in text
     assert "放弃 2 次" not in text
+
+
+def test_mirror_hits_outside_window_are_not_compared_with_today(tmp_path) -> None:
+    """回测区间不在今天时，全周期累计只作背景，不能和今日次数直接相减。"""
+    _write_events(tmp_path)
+    payload = {
+        "symbol": "fu2701",
+        "timeframe": "5",
+        "params_snapshot": {
+            "engine": "trend",
+            "mirror_live_gates": True,
+            "mirror_gate_hits": [
+                {"kind": "stale_block", "label": "K线过期", "time": "2026-11-19T10:05:00"},
+                {"kind": "slip_block", "label": "开仓滑点过大", "time": "2026-11-19T11:05:00"},
+            ],
+        },
+    }
+    (tmp_path / "data" / "backtest_last.json").write_text(
+        json.dumps(payload, ensure_ascii=False), encoding="utf-8"
+    )
+    text = "\n".join(
+        build_consistency_lines(tmp_path, symbol="fu2701", windows=_window(), cfg=_cfg())
+    )
+    assert "回测镜像（同窗口）  开；这段没有因过期或追价放弃的开仓" in text
+    assert "全周期累计放弃 2 次；今日只对比同窗口 0 次" in text
+    assert "不与今日互比" in text
 
 
 def test_consistency_explains_missing_inputs(tmp_path) -> None:
