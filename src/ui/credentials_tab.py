@@ -219,7 +219,6 @@ def _render_account_detail(app: AutoTradingApp) -> None:
 
     app.account_name_var.set(account.display_name)
     app.account_investor_var.set(account.investor_id)
-    app.account_risk_var.set(account.risk_policy_id)
     app.account_limit_var.set(str(account.max_order_volume or ""))
     app.account_notes_var.set(account.notes)
     app.account_captcha_var.set(account.captcha_mode)
@@ -291,7 +290,6 @@ def _render_account_detail(app: AutoTradingApp) -> None:
             list(choices),
             width=240,
         )
-    app._entry_row(holder, "风控策略", app.account_risk_var, width=200)
     app._entry_row(holder, "单笔上限", app.account_limit_var, hint="0=用连接默认值", width=200)
     app._entry_row(holder, "备注", app.account_notes_var, width=200)
 
@@ -323,13 +321,11 @@ def _render_account_detail(app: AutoTradingApp) -> None:
     buttons = ctk.CTkFrame(holder, fg_color="transparent")
     buttons.pack(fill="x", padx=8, pady=(8, 2))
     _small_button(buttons, "保存账号", lambda: _save_account_fields(app), accent=True)
-    _small_button(buttons, "设为当前账号", lambda: _switch_to_selected(app))
     _small_button(buttons, "复制", lambda: _duplicate_account(app))
     buttons2 = ctk.CTkFrame(holder, fg_color="transparent")
     buttons2.pack(fill="x", padx=8, pady=(0, 2))
     _small_button(buttons2, "停用/启用", lambda: _toggle_account_status(app))
-    _small_button(buttons2, "归档", lambda: _archive_account(app))
-    _small_button(buttons2, "删除", lambda: _delete_account(app))
+    _small_button(buttons2, "删除（归档）", lambda: _delete_account(app))
 
 
 def _small_button(parent, text: str, command, accent: bool = False) -> None:
@@ -487,7 +483,6 @@ def _save_account_fields(app: AutoTradingApp) -> None:
         limit = account.max_order_volume
     account.display_name = app.account_name_var.get().strip() or old_name
     account.investor_id = app.account_investor_var.get().strip()
-    account.risk_policy_id = app.account_risk_var.get().strip() or account.risk_policy_id
     account.max_order_volume = max(0, limit)
     account.notes = app.account_notes_var.get().strip()
     if account.channel == "ctp":
@@ -628,27 +623,13 @@ def _toggle_account_status(app: AutoTradingApp) -> None:
     _persist_accounts(app, registry, "status", account.account_id, f"{old_status}→{new_status}")
 
 
-def _archive_account(app: AutoTradingApp) -> None:
-    registry, account = _selected_account(app)
-    if registry is None or account is None:
-        return
-    if not messagebox.askyesno(
-        "归档账号",
-        f"归档后 {account.display_name} 只读，账本保留。继续吗？",
-        parent=app,
-    ):
-        return
-    registry.set_status(account.account_id, "archived")
-    _persist_accounts(app, registry, "status", account.account_id, "→archived")
-
-
 def _delete_account(app: AutoTradingApp) -> None:
     registry, account = _selected_account(app)
     if registry is None or account is None:
         return
     if not messagebox.askyesno(
         "删除账号",
-        f"删除 {account.display_name}？默认只做软删除：账号归档、账本保留。",
+        f"删除 {account.display_name}？账号会归档变只读，账本和交易记录都保留。",
         parent=app,
     ):
         return
@@ -728,28 +709,41 @@ def _pack_connection_section(app: AutoTradingApp, parent: ctk.CTkFrame) -> None:
         hint="柜台给的 BrokerID，例如 8080 / 9999",
         width=240,
     )
+    legacy = ctk.CTkFrame(parent, fg_color="transparent")
     app._entry_row(
-        parent,
+        legacy,
         "档案资金账号",
         app.ctp_profile_user_var,
         hint="旧档案兼容字段；新账号请到「账号」里填资金账号",
         width=240,
     )
     app._entry_row(
-        parent,
+        legacy,
         "档案密码变量",
         app.ctp_profile_pwd_env_var,
         hint="环境变量名，默认 CTP_PASSWORD；真实档案默认 CTP_LIVE_PASSWORD",
         width=240,
     )
     app._entry_row(
-        parent,
+        legacy,
         "档案认证码变量",
         app.ctp_profile_auth_env_var,
         hint="环境变量名，默认 CTP_AUTH_CODE；该柜台不需要认证码时留空",
         width=240,
     )
-    ctk.CTkButton(
+    toggle = ctk.CTkButton(
+        parent,
+        text="高级：旧档案兼容字段",
+        width=180,
+        height=30,
+        fg_color=T.BG_PANEL,
+        hover_color=T.BORDER,
+        border_width=1,
+        border_color=T.BORDER,
+        text_color=T.TEXT,
+    )
+    toggle.pack(anchor="w", pady=(2, 6))
+    test_btn = ctk.CTkButton(
         parent,
         text="测试交易前置连通",
         width=180,
@@ -757,7 +751,18 @@ def _pack_connection_section(app: AutoTradingApp, parent: ctk.CTkFrame) -> None:
         fg_color=T.ACCENT,
         hover_color=T.ACCENT_HOVER,
         text_color=T.TEXT,
-    ).pack(anchor="w", pady=(2, 8))
+    )
+    test_btn.pack(anchor="w", pady=(2, 8))
+
+    def _toggle_legacy() -> None:
+        if legacy.winfo_manager():
+            legacy.pack_forget()
+            toggle.configure(text="高级：旧档案兼容字段")
+        else:
+            legacy.pack(fill="x", before=test_btn)
+            toggle.configure(text="收起旧档案兼容字段")
+
+    toggle.configure(command=_toggle_legacy)
 
 
 def build_credentials_tab(app: AutoTradingApp, tab: ctk.CTkFrame) -> None:
@@ -798,7 +803,6 @@ def build_credentials_tab(app: AutoTradingApp, tab: ctk.CTkFrame) -> None:
     current_actions = ctk.CTkFrame(current, fg_color="transparent")
     current_actions.pack(fill="x")
     _small_button(current_actions, "设为当前账号", lambda: _switch_to_selected(app), accent=True)
-    _small_button(current_actions, "测试连接", lambda: app._test_ctp_front())
 
     # —— 账号 / 连接 ——
     app._section(scroll, "账号与连接")
@@ -830,7 +834,6 @@ def build_credentials_tab(app: AutoTradingApp, tab: ctk.CTkFrame) -> None:
         "account_selected_id",
         "account_name_var",
         "account_investor_var",
-        "account_risk_var",
         "account_limit_var",
         "account_notes_var",
         "account_connection_var",

@@ -290,6 +290,8 @@ class AccountRegistry:
         )
         account.password_ref = source.password_ref or account.password_ref
         account.auth_code_ref = source.auth_code_ref or account.auth_code_ref
+        account.captcha_mode = source.captcha_mode
+        account.skip_auto_login = source.skip_auto_login
         return account
 
     def update_account(self, account_id: str, **changes: Any) -> TradingAccount:
