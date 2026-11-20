@@ -60,6 +60,12 @@ def normalize_channel(value: Any) -> str:
     return CHANNEL_CTP
 
 
+def normalize_captcha_mode(value: Any) -> str:
+    """GUI 登录验证码模式：只认 pause / skip，其余按 pause。"""
+    text = str(value or "").strip().lower()
+    return text if text in ("pause", "skip") else "pause"
+
+
 def _split_fronts(value: Any) -> list[str]:
     """前置可能是字符串、分号/换行分隔的字符串或列表，统一成去空的列表。"""
     if value is None:
@@ -207,6 +213,8 @@ class TradingAccount:
     book_id: str = ""
     password_ref: str = ""
     auth_code_ref: str = ""
+    captcha_mode: str = "pause"
+    skip_auto_login: bool = True
     risk_policy_id: str = DEFAULT_RISK_POLICY
     max_order_volume: int = 0
     notes: str = ""
@@ -228,6 +236,8 @@ class TradingAccount:
             book_id=str(box.get("book_id") or "").strip(),
             password_ref=str(box.get("password_ref") or "").strip(),
             auth_code_ref=str(box.get("auth_code_ref") or "").strip(),
+            captcha_mode=normalize_captcha_mode(box.get("captcha_mode")),
+            skip_auto_login=_bool(box.get("skip_auto_login"), True),
             risk_policy_id=str(box.get("risk_policy_id") or DEFAULT_RISK_POLICY).strip(),
             max_order_volume=_int(box.get("max_order_volume"), 0),
             notes=str(box.get("notes") or ""),
@@ -353,6 +363,12 @@ def validate_registry(
                     f"{label}：账本 {account.book_id} 与 {book_used[account.book_id]} 重复（一个账号一本账）"
                 )
             book_used.setdefault(account.book_id, label)
+        if (
+            account.channel == CHANNEL_GUI
+            and account.status == STATUS_ENABLED
+            and not account.investor_id
+        ):
+            problems.append(f"{label}：启用中的 GUI 账号必须填资金账号")
         if account.channel != CHANNEL_CTP:
             continue
         profile = profile_map.get(account.profile_id)

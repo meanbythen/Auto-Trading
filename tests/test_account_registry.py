@@ -343,3 +343,160 @@ def test_set_active_account_rejects_disabled(tmp_path: Path) -> None:
     registry.save(tmp_path)
     with pytest.raises(ValueError, match="启用"):
         set_active_account(tmp_path, _cfg(), "acc_a_01", {})
+
+
+# —— GUI 账号：登录参数并入账号 ——
+
+
+def test_migrate_from_cfg_gui_keeps_gui_settings() -> None:
+    cfg = _cfg()
+    cfg["account"].update({"captcha_mode": "skip", "skip_auto_login": True})
+
+    registry = reg.migrate_from_cfg(cfg)
+    gui = registry.account("acc_gui_01")
+
+    assert gui is not None
+    assert gui.captcha_mode == "skip"
+    assert gui.skip_auto_login is True
+    assert gui.password_ref == "secret://gui/password"
+
+
+def test_ensure_registry_backfills_gui_settings_for_old_file(tmp_path: Path) -> None:
+    import yaml
+
+    path = tmp_path / "config" / "accounts.yaml"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        yaml.safe_dump(
+            {
+                "version": 2,
+                "connections": [],
+                "accounts": [
+                    {
+                        "account_id": "acc_gui_01",
+                        "display_name": "GUI实盘-20318052",
+                        "channel": "gui",
+                        "environment": "live",
+                        "status": "enabled",
+                        "investor_id": "20318052",
+                        "book_id": "live",
+                    }
+                ],
+            },
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    cfg = _cfg()
+    cfg["account"].update({"captcha_mode": "skip", "skip_auto_login": False})
+
+    registry = reg.ensure_registry(tmp_path, cfg)
+
+    assert registry is not None
+    gui = registry.account("acc_gui_01")
+    assert gui is not None
+    assert gui.captcha_mode == "skip"
+    assert gui.skip_auto_login is False
+    assert gui.password_ref == "secret://gui/password"
+    saved = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert saved["accounts"][0]["skip_auto_login"] is False
+
+
+def test_resolve_session_hydrates_gui_account_block(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from src.account.session import set_active_account
+
+    monkeypatch.setenv("TEST_GUI_PW", "pw-gui")
+    registry = reg.AccountRegistry(
+        accounts=[
+            _account(
+                "acc_gui_01",
+                channel="gui",
+                environment="live",
+                profile_id="",
+                book_id="live",
+                investor_id="20318052",
+                password_ref="env://TEST_GUI_PW",
+                captcha_mode="skip",
+                skip_auto_login=False,
+            )
+        ]
+    )
+    registry.save(tmp_path)
+    cfg = _cfg()
+    cfg["account"] = {"user_id": "old", "resolved_password": "old-pw"}
+
+    set_active_account(tmp_path, cfg, "acc_gui_01", {})
+
+    block = cfg["account"]
+    assert cfg["trade"]["executor"] == "gui"
+    assert block["user_id"] == "20318052"
+    assert block["resolved_password"] == "pw-gui"
+    assert block["captcha_mode"] == "skip"
+    assert block["skip_auto_login"] is False
+    assert block["_from_active_account"] is True
+
+
+def test_switch_gui_account_clears_previous_password(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from src.account.session import set_active_account
+
+    monkeypatch.delenv("FUTURES_PASSWORD", raising=False)
+    monkeypatch.setenv("TEST_GUI_A_PW", "pw-a")
+    registry = reg.AccountRegistry(
+        accounts=[
+            _account(
+                "acc_gui_a",
+                channel="gui",
+                environment="live",
+                profile_id="",
+                book_id="book_a",
+                investor_id="1001",
+                password_ref="env://TEST_GUI_A_PW",
+            ),
+            _account(
+                "acc_gui_b",
+                channel="gui",
+                environment="live",
+                profile_id="",
+                book_id="book_b",
+                investor_id="1002",
+            ),
+        ]
+    )
+    registry.save(tmp_path)
+    cfg = _cfg()
+
+    set_active_account(tmp_path, cfg, "acc_gui_a", {})
+    assert cfg["account"]["resolved_password"] == "pw-a"
+
+    set_active_account(tmp_path, cfg, "acc_gui_b", {})
+    assert cfg["account"]["user_id"] == "1002"
+    assert cfg["account"]["resolved_password"] == ""
+
+
+def test_inject_ctp_secrets_skips_registry_managed_password(monkeypatch) -> None:
+    from src.utils.config_loader import inject_ctp_secrets
+
+    monkeypatch.setenv("FUTURES_PASSWORD", "env-pw")
+    cfg = {"account": {"resolved_password": "", "_from_active_account": True}}
+
+    inject_ctp_secrets(cfg, {"password": "file-pw"})
+
+    assert cfg["account"]["resolved_password"] == ""
+
+
+def test_validate_requires_investor_for_gui() -> None:
+    account = _account(
+        "acc_gui_01",
+        channel="gui",
+        environment="live",
+        profile_id="",
+        investor_id="",
+        book_id="live",
+    )
+    problems = validate_registry([account], [])
+    assert any("GUI 账号必须填资金账号" in item for item in problems)

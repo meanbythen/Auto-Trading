@@ -120,8 +120,11 @@ def inject_ctp_secrets(cfg: dict[str, Any], secrets: dict[str, Any] | None = Non
     account = cfg.setdefault("account", {})
     if not isinstance(account, dict):
         return
-    # 已经有的不覆盖：单测会手填 resolved_*；保存清掉之后才是空的，这时再补。
-    if not str(account.get("resolved_password") or "").strip():
+    # 当前账号是 GUI 时，密码只认注册表里的账号；不再从旧环境变量/旧文件补，
+    # 否则切换账号后会残留上一个账号的密码。
+    if bool(account.get("_from_active_account")):
+        password = str(account.get("resolved_password") or "")
+    elif not str(account.get("resolved_password") or "").strip():
         account["resolved_password"] = password
     else:
         password = str(account.get("resolved_password") or "")
@@ -525,7 +528,11 @@ def save_config(cfg: dict[str, Any], config_path: str | Path | None = None) -> P
         risk_dump = dump["risk"]
     _drop_dead_keys(dump)
     if "account" in dump and isinstance(dump["account"], dict):
-        dump["account"] = {k: v for k, v in dump["account"].items() if k != "resolved_password"}
+        dump["account"] = {
+            k: v
+            for k, v in dump["account"].items()
+            if k not in {"resolved_password", "_from_active_account"}
+        }
     trade_dump = dump.get("trade")
     if isinstance(trade_dump, dict):
         trade_dump = dict(trade_dump)

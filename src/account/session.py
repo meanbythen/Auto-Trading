@@ -116,10 +116,23 @@ def resolve_session(
         ctp["ctp_profile"] = profile_name
         ctp["account_id"] = account.account_id
         ctp["environment"] = account.environment
-    if account.channel == ta.CHANNEL_GUI and account.investor_id:
+    if account.channel == ta.CHANNEL_GUI:
         block = cfg.setdefault("account", {})
-        if isinstance(block, dict) and not str(block.get("user_id") or "").strip():
+        if isinstance(block, dict):
+            # GUI 账号是唯一数据源：资金号、密码、登录行为全部按当前账号覆盖。
+            ref = account.password_ref
+            password = (
+                store.resolve(ref, secrets)
+                if ref
+                else store.resolve("secret://gui/password", secrets)
+            )
             block["user_id"] = account.investor_id
+            block["resolved_password"] = password
+            block["captcha_mode"] = account.captcha_mode
+            block["skip_auto_login"] = account.skip_auto_login
+            block["_from_active_account"] = True
+            if account.broker:
+                block["broker"] = account.broker
     return session
 
 
@@ -162,6 +175,8 @@ def set_active_account(
             raise ValueError(f"{account.display_name} 还没填资金账号")
         if not (account.password_ref or profile.password_ref or profile.password_env):
             raise ValueError(f"{account.display_name} 还没保存密码")
+    if account.channel == ta.CHANNEL_GUI and not account.investor_id:
+        raise ValueError(f"{account.display_name} 还没填资金账号")
     _write_active(root, account)
     session = resolve_session(root, cfg, secrets)
     assert session is not None  # 刚写进去的账号一定能解析

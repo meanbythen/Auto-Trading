@@ -65,6 +65,8 @@ ACCOUNT_COLUMNS = (
     "risk_policy_id",
     "password_ref",
     "auth_code_ref",
+    "captcha_mode",
+    "skip_auto_login",
     "max_order_volume",
     "notes",
     "created_at",
@@ -163,6 +165,8 @@ def _account_row(account: TradingAccount) -> dict[str, Any]:
         "risk_policy_id": account.risk_policy_id,
         "password_ref": account.password_ref,
         "auth_code_ref": account.auth_code_ref,
+        "captcha_mode": account.captcha_mode,
+        "skip_auto_login": 1 if account.skip_auto_login else 0,
         "max_order_volume": account.max_order_volume,
         "notes": account.notes,
         "created_at": account.created_at or now,
@@ -250,6 +254,8 @@ def migrate(
             {
                 "password_ref": "TEXT NOT NULL DEFAULT ''",
                 "auth_code_ref": "TEXT NOT NULL DEFAULT ''",
+                "captcha_mode": "TEXT NOT NULL DEFAULT 'pause'",
+                "skip_auto_login": "INTEGER NOT NULL DEFAULT 1",
             },
         )
         with conn:

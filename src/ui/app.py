@@ -152,7 +152,6 @@ class AutoTradingApp(
         self.events.subscribe(CROSS_TEST_STOPPED, self._on_cross_test_stopped)
         self.events.subscribe(CROSS_TEST_FAILED, self._on_cross_test_failed)
         self._status = "待命"
-        self._show_password = ctk.BooleanVar(value=False)
         self._show_tq_password = ctk.BooleanVar(value=False)
         self._show_ctp_sim_password = ctk.BooleanVar(value=False)
         self._show_ctp_auth = ctk.BooleanVar(value=False)

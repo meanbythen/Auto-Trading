@@ -49,6 +49,9 @@ CREATE TABLE IF NOT EXISTS accounts (
     risk_policy_id    TEXT    NOT NULL DEFAULT 'default',
     password_ref      TEXT    NOT NULL DEFAULT '',
     auth_code_ref     TEXT    NOT NULL DEFAULT '',
+    captcha_mode      TEXT    NOT NULL DEFAULT 'pause'
+                              CHECK (captcha_mode IN ('pause', 'skip')),
+    skip_auto_login   INTEGER NOT NULL DEFAULT 1 CHECK (skip_auto_login IN (0, 1)),
     max_order_volume  INTEGER NOT NULL DEFAULT 0,
     notes             TEXT    NOT NULL DEFAULT '',
     created_at        TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),

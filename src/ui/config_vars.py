@@ -20,7 +20,6 @@ class ConfigVarsMixin:
 
     def _init_vars(self) -> None:
         st = self.cfg.get("strategy", {})
-        acc = self.cfg.get("account", {})
         app = self.cfg.get("app", {})
         trade = self.cfg.get("trade", {})
         risk = self.cfg.get("risk", {})
@@ -362,11 +361,6 @@ class ConfigVarsMixin:
         rt = self.cfg.get("runtime") or {}
         self.auto_shutdown_var = ctk.BooleanVar(value=bool(rt.get("auto_shutdown_after_close", False)))
 
-        self.broker_var = ctk.StringVar(value=str(acc.get("broker", "")))
-        self.channel_var = ctk.StringVar(value=str(acc.get("channel", "")))
-        self.user_var = ctk.StringVar(value=str(acc.get("user_id", "")))
-        self.pwd_env_var = ctk.StringVar(value=str(acc.get("password_env", "FUTURES_PASSWORD")))
-        self.password_var = ctk.StringVar(value=str(secrets.get("password", "") or acc.get("resolved_password", "")))
         # 仿真号码写仿真档案；仿真密码和认证码只进密钥文件。
         from src.trader.ctp_profile import sim_profile_user_id
 
@@ -379,9 +373,6 @@ class ConfigVarsMixin:
         self.tq_password_var = ctk.StringVar(
             value=str(secrets.get("tq_password", "") or tq_cfg.get("password", "") or "")
         )
-        self.captcha_var = ctk.StringVar(value=str(acc.get("captcha_mode", "pause")))
-        # 配置里 skip_auto_login=true 表示不自动填密码。界面用「自动登录」开关，打开才去点登录。
-        self.auto_login_var = ctk.BooleanVar(value=not bool(acc.get("skip_auto_login", True)))
 
         self.app_path_var = ctk.StringVar(value=str(app.get("path", "")))
         self.app_title_var = ctk.StringVar(value=str(app.get("window_title", "期货通")))
@@ -824,7 +815,6 @@ class ConfigVarsMixin:
     def _reload_values_only(self) -> None:
         self.cfg = load_config()
         st = self.cfg.get("strategy", {})
-        acc = self.cfg.get("account", {})
         app = self.cfg.get("app", {})
         trade = self.cfg.get("trade", {})
         risk = self.cfg.get("risk", {})
@@ -1060,18 +1050,11 @@ class ConfigVarsMixin:
         self.flatten_at_close_var.set(bool(st.get("flatten_at_close", True)))
         rt = self.cfg.get("runtime") or {}
         self.auto_shutdown_var.set(bool(rt.get("auto_shutdown_after_close", False)))
-        self.broker_var.set(str(acc.get("broker", "")))
-        self.channel_var.set(str(acc.get("channel", "")))
-        self.user_var.set(str(acc.get("user_id", "")))
-        self.pwd_env_var.set(str(acc.get("password_env", "FUTURES_PASSWORD")))
-        self.password_var.set(str(secrets.get("password", "") or ""))
         from src.trader.ctp_profile import sim_profile_user_id as _sim_uid
 
         self.ctp_sim_user_var.set(_sim_uid(ctp_box))
         self.ctp_sim_password_var.set(str(secrets.get("ctp_password", "") or ""))
         self.ctp_auth_code_var.set(str(secrets.get("ctp_auth_code", "") or ""))
-        self.captcha_var.set(str(acc.get("captcha_mode", "pause")))
-        self.auto_login_var.set(not bool(acc.get("skip_auto_login", True)))
         self.app_path_var.set(str(app.get("path", "")))
         self.app_title_var.set(str(app.get("window_title", "期货通")))
         self.startup_wait_var.set(str(app.get("startup_wait_sec", 15)))

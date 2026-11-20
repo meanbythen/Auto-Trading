@@ -222,6 +222,9 @@ def _render_account_detail(app: AutoTradingApp) -> None:
     app.account_risk_var.set(account.risk_policy_id)
     app.account_limit_var.set(str(account.max_order_volume or ""))
     app.account_notes_var.set(account.notes)
+    app.account_captcha_var.set(account.captcha_mode)
+    app.account_auto_login_var.set(not account.skip_auto_login)
+    is_gui = account.channel == "gui"
     choices: dict[str, str] = {"（不绑定连接）": ""}
     for profile in registry.profiles:
         label = profile.label or profile.profile_id
@@ -240,7 +243,8 @@ def _render_account_detail(app: AutoTradingApp) -> None:
         holder,
         text=f"{account.account_id} · {_CHANNEL_LABELS.get(account.channel, account.channel)}"
         f" · {_ENV_LABELS.get(account.environment, account.environment)}"
-        f" · {_STATUS_LABELS.get(account.status, account.status)}",
+        f" · {_STATUS_LABELS.get(account.status, account.status)}"
+        + (f" · 期货公司 {account.broker}" if is_gui and account.broker else ""),
         font=T.FONT_SMALL,
         text_color=T.TEXT_DIM,
     ).pack(anchor="w", padx=8, pady=(6, 2))
@@ -253,13 +257,40 @@ def _render_account_detail(app: AutoTradingApp) -> None:
 
     app._entry_row(holder, "显示名", app.account_name_var, width=200)
     app._entry_row(holder, "资金账号", app.account_investor_var, width=200)
-    app._option_row(
-        holder,
-        "连接",
-        app.account_connection_var,
-        list(choices),
-        width=240,
-    )
+    if is_gui:
+        app._option_row(holder, "验证码模式", app.account_captcha_var, ["pause", "skip"], width=200)
+        login_row = ctk.CTkFrame(holder, fg_color="transparent")
+        login_row.pack(fill="x", padx=8, pady=4)
+        ctk.CTkLabel(
+            login_row,
+            text="自动登录",
+            font=T.FONT_BODY,
+            text_color=T.TEXT_DIM,
+            width=140,
+            anchor="w",
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkSwitch(
+            login_row,
+            text="",
+            variable=app.account_auto_login_var,
+            progress_color=T.OK,
+            fg_color=T.BORDER,
+        ).pack(side="left")
+        ctk.CTkLabel(
+            login_row,
+            text="开=启动时自动填密码并点登录；关=请先自己登录",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            anchor="w",
+        ).pack(side="left", padx=(10, 0))
+    else:
+        app._option_row(
+            holder,
+            "连接",
+            app.account_connection_var,
+            list(choices),
+            width=240,
+        )
     app._entry_row(holder, "风控策略", app.account_risk_var, width=200)
     app._entry_row(holder, "单笔上限", app.account_limit_var, hint="0=用连接默认值", width=200)
     app._entry_row(holder, "备注", app.account_notes_var, width=200)
@@ -287,6 +318,7 @@ def _render_account_detail(app: AutoTradingApp) -> None:
         text_color=T.TEXT,
         command=lambda: _update_password(app, registry, account),
     ).pack(side="left")
+    _note(holder, "密码只保存在本机加密文件（Windows 凭据加密），不会打进 exe。")
 
     buttons = ctk.CTkFrame(holder, fg_color="transparent")
     buttons.pack(fill="x", padx=8, pady=(8, 2))
@@ -328,8 +360,12 @@ def _update_password(app: AutoTradingApp, registry, account) -> None:
     if value is None or not value:
         return
     ref = account.password_ref
-    per_account = f"secret://ctp/{account.environment}/{account.account_id}/password"
-    if not ref.startswith(f"secret://ctp/{account.environment}/{account.account_id}/"):
+    per_account = (
+        f"secret://gui/{account.account_id}/password"
+        if account.channel == "gui"
+        else f"secret://ctp/{account.environment}/{account.account_id}/password"
+    )
+    if not ref.endswith(f"/{account.account_id}/password"):
         # 旧账号共用环境级引用；第一次改密码就换成这个账号自己的引用。
         ref = per_account
         account.password_ref = ref
@@ -396,7 +432,7 @@ def _template_from_ui(app: AutoTradingApp, name: str, environment: str):
     return BrokerProfileTemplate(
         profile_id="",
         label=name,
-        broker=str(app.broker_var.get() or "").strip(),
+        broker=str((app.cfg.get("account") or {}).get("broker") or "").strip(),
         environment=environment,
         broker_id=str(app.ctp_profile_broker_var.get() or "").strip(),
         td_fronts=split_fronts(app.ctp_profile_td_var.get()),
@@ -442,6 +478,7 @@ def _save_account_fields(app: AutoTradingApp) -> None:
         return
     old_name, old_investor = account.display_name, account.investor_id
     old_conn = account.profile_id
+    old_captcha, old_skip = account.captcha_mode, account.skip_auto_login
     choices = getattr(app, "_account_connection_choices", {})
     new_conn = choices.get(app.account_connection_var.get(), account.profile_id)
     try:
@@ -455,16 +492,25 @@ def _save_account_fields(app: AutoTradingApp) -> None:
     account.notes = app.account_notes_var.get().strip()
     if account.channel == "ctp":
         account.profile_id = new_conn
+    else:
+        account.captcha_mode = (
+            app.account_captcha_var.get()
+            if app.account_captcha_var.get() in ("pause", "skip")
+            else "pause"
+        )
+        account.skip_auto_login = not bool(app.account_auto_login_var.get())
     if account.environment == "live" and account.investor_id != old_investor:
         if not _confirm_live(app, account.investor_id):
             account.display_name, account.investor_id = old_name, old_investor
             account.profile_id = old_conn
+            account.captcha_mode, account.skip_auto_login = old_captcha, old_skip
             return
     account.touch()
     problems = registry.validate()
     if problems:
         account.display_name, account.investor_id = old_name, old_investor
         account.profile_id = old_conn
+        account.captcha_mode, account.skip_auto_login = old_captcha, old_skip
         _show_problems(app, problems)
         return
     _persist_accounts(app, registry, "update", account.account_id, f"{old_investor}→{account.investor_id}")
@@ -493,7 +539,7 @@ def _new_account(app: AutoTradingApp, environment: str) -> None:
         environment,
         investor,
         channel="ctp",
-        broker=str(app.broker_var.get() or "").strip(),
+        broker=str((app.cfg.get("account") or {}).get("broker") or "").strip(),
         template=_template_from_ui(app, name, environment),
     )
     problems = registry.validate()
@@ -630,8 +676,6 @@ def _switch_to_selected(app: AutoTradingApp) -> None:
         from src.trader.ctp_logic import ctp_kind_label
 
         app.ctp_kind_var.set(ctp_kind_label(session.environment))
-    if session.channel == "gui" and hasattr(app, "user_var"):
-        app.user_var.set(session.investor_id)
     fill = getattr(app, "_fill_ctp_profile_vars", None)
     if callable(fill):
         fill()
@@ -716,51 +760,6 @@ def _pack_connection_section(app: AutoTradingApp, parent: ctk.CTkFrame) -> None:
     ).pack(anchor="w", pady=(2, 8))
 
 
-def _pack_gui_login_section(app: AutoTradingApp, scroll: ctk.CTkFrame) -> None:
-    """同花顺 GUI 通道的登录参数（不是 CTP 连接）。"""
-    app._section(scroll, "同花顺登录（GUI 通道）")
-    live = app._card(scroll)
-    app._entry_row(live, "期货公司", app.broker_var)
-    app._entry_row(live, "通道名称", app.channel_var, hint="如：华泰期货_CTP主席")
-    app._entry_row(
-        live,
-        "资金账号",
-        app.user_var,
-        hint="同花顺登录号；选 GUI 账号时以「账号」里的资金账号为准",
-    )
-    app.pwd_entry = app._password_row(live, "交易密码", app.password_var, app._show_password)
-    _note(
-        live,
-        "只在执行通道为 GUI 时使用。CTP 账号的密码请到「账号」详情里更新，只存本机加密文件。",
-    )
-    app._option_row(live, "验证码模式", app.captcha_var, ["pause", "skip"], width=280)
-    login_row = ctk.CTkFrame(live, fg_color="transparent")
-    login_row.pack(fill="x", pady=8)
-    ctk.CTkLabel(
-        login_row,
-        text="自动登录",
-        font=T.FONT_BODY,
-        text_color=T.TEXT_DIM,
-        width=140,
-        anchor="w",
-    ).pack(side="left", padx=(0, 8))
-    ctk.CTkSwitch(
-        login_row,
-        text="",
-        variable=app.auto_login_var,
-        progress_color=T.OK,
-        fg_color=T.BORDER,
-    ).pack(side="left")
-    ctk.CTkLabel(
-        login_row,
-        text="开=启动时打开交易登录框，填入密码并点登录。关=请先自己登录",
-        font=T.FONT_SMALL,
-        text_color=T.TEXT_DIM,
-        anchor="w",
-    ).pack(side="left", padx=(10, 0))
-    app._entry_row(live, "密码环境变量名", app.pwd_env_var, hint="一般不用改，默认 FUTURES_PASSWORD")
-
-
 def build_credentials_tab(app: AutoTradingApp, tab: ctk.CTkFrame) -> None:
     """交易账号页：当前账号 + 账号/连接两个子区。保存按钮与交易配置同一套写盘。"""
     scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
@@ -843,9 +842,12 @@ def build_credentials_tab(app: AutoTradingApp, tab: ctk.CTkFrame) -> None:
                 "" if name == "account_selected_id" else ctk.StringVar(value=""),
             )
     app._account_connection_choices = {}
+    if not hasattr(app, "account_captcha_var"):
+        app.account_captcha_var = ctk.StringVar(value="pause")
+    if not hasattr(app, "account_auto_login_var"):
+        app.account_auto_login_var = ctk.BooleanVar(value=False)
 
     _pack_connection_section(app, connection_tab)
-    _pack_gui_login_section(app, scroll)
 
     actions = ctk.CTkFrame(scroll, fg_color="transparent")
     actions.pack(fill="x", pady=(16, 24))

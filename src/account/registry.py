@@ -503,15 +503,6 @@ class AccountRegistry:
                 except (TypeError, ValueError):
                     pass
             account.touch()
-        # GUI/模拟账号只同步资金号（同花顺登录号和真实资金号是同一个）
-        account_block = cfg.get("account") or {}
-        gui_user = str((account_block or {}).get("user_id") or "").strip()
-        if gui_user:
-            for account in self.accounts:
-                if account.channel != ta.CHANNEL_CTP and gui_user != account.investor_id:
-                    notes.append(f"{account.account_id}: 资金号 {account.investor_id or '空'}→{gui_user}")
-                    account.investor_id = gui_user
-                    account.touch()
         return notes
 
 
@@ -574,6 +565,7 @@ def migrate_from_cfg(cfg: dict[str, Any]) -> AccountRegistry:
         account_id = ta.new_account_id("gui", [item.account_id for item in registry.accounts])
         book_id = "live" if "live" not in used_books else f"book_{account_id}"
         used_books.add(book_id)
+        gui_password_env = str((account_block or {}).get("password_env") or "").strip()
         registry.accounts.append(
             TradingAccount(
                 account_id=account_id,
@@ -584,11 +576,50 @@ def migrate_from_cfg(cfg: dict[str, Any]) -> AccountRegistry:
                 status=ta.STATUS_ENABLED,
                 investor_id=gui_user,
                 book_id=book_id,
+                password_ref=ref_for_env(gui_password_env) if gui_password_env else "",
+                captcha_mode=ta.normalize_captcha_mode((account_block or {}).get("captcha_mode")),
+                skip_auto_login=bool((account_block or {}).get("skip_auto_login", True)),
             )
         )
     for account in registry.accounts:
         account.touch()
     return registry
+
+
+def _backfill_gui_settings(path: Path, registry: AccountRegistry, cfg: dict[str, Any]) -> bool:
+    """老 accounts.yaml 没有 GUI 登录参数时，从旧 account 块补一次。"""
+    block = cfg.get("account") or {}
+    if not isinstance(block, dict) or not block:
+        return False
+    try:
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError):
+        return False
+    boxes = raw.get("accounts") if isinstance(raw, dict) else None
+    if not isinstance(boxes, list):
+        return False
+    raw_by_id = {
+        str(box.get("account_id") or ""): box
+        for box in boxes
+        if isinstance(box, dict)
+    }
+    changed = False
+    for account in registry.accounts:
+        if account.channel != ta.CHANNEL_GUI:
+            continue
+        box = raw_by_id.get(account.account_id) or {}
+        if "captcha_mode" not in box:
+            account.captcha_mode = ta.normalize_captcha_mode(block.get("captcha_mode"))
+            changed = True
+        if "skip_auto_login" not in box:
+            account.skip_auto_login = bool(block.get("skip_auto_login", True))
+            changed = True
+        if "password_ref" not in box and not account.password_ref:
+            env_name = str(block.get("password_env") or "").strip()
+            if env_name:
+                account.password_ref = ref_for_env(env_name)
+                changed = True
+    return changed
 
 
 def ensure_registry(
@@ -603,7 +634,15 @@ def ensure_registry(
     """
     path = Path(root) / REGISTRY_REL
     if path.exists():
-        return AccountRegistry.load(root)
+        registry = AccountRegistry.load(root)
+        if registry is None:
+            return None
+        if _backfill_gui_settings(path, registry, cfg):
+            try:
+                registry.save(root)
+            except OSError as exc:
+                logger.warning("GUI 登录参数回填失败，继续用文件里的值: {}", exc)
+        return registry
     registry = migrate_from_cfg(cfg)
     if not registry.accounts and not registry.profiles:
         return None

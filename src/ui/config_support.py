@@ -247,10 +247,6 @@ class ConfigSupportMixin:
             pass
 
 
-    def _toggle_password(self) -> None:
-        self.pwd_entry.configure(show="" if self._show_password.get() else "*")
-
-
     def _toggle_tq_password(self) -> None:
         self.tq_pwd_entry.configure(show="" if self._show_tq_password.get() else "*")
 
@@ -357,8 +353,7 @@ class ConfigSupportMixin:
             except OSError as exc:
                 logger.debug("旧限额熔断告警没清掉: {}", exc)
         if (
-            self.password_var.get()
-            or self.tq_password_var.get()
+            self.tq_password_var.get()
             or self.ctp_sim_password_var.get()
             or self.ctp_auth_code_var.get()
         ):

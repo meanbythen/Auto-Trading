@@ -9,7 +9,6 @@ from src.strategy.factory import REMOVED_ENGINES
 from src.strategy.rule_dsl import rule_engine_stem
 from src.ui.app_common import _clock_text
 from src.utils import load_config
-from src.utils import load_secrets
 from src.utils import save_secrets
 import copy
 import os
@@ -763,14 +762,6 @@ class ConfigCollectMixin:
 
         sch["session_scope"] = scope_code(self.session_scope_var.get())
 
-        acc = self.cfg.setdefault("account", {})
-        acc["broker"] = self.broker_var.get().strip()
-        acc["channel"] = self.channel_var.get().strip()
-        acc["user_id"] = self.user_var.get().strip()
-        acc["password_env"] = self.pwd_env_var.get().strip() or "FUTURES_PASSWORD"
-        acc["captcha_mode"] = self.captcha_var.get()
-        acc["skip_auto_login"] = not bool(self.auto_login_var.get())
-
         app = self.cfg.setdefault("app", {})
         app["path"] = self.app_path_var.get().strip()
         app["window_title"] = self.app_title_var.get().strip() or "期货通"
@@ -795,8 +786,6 @@ class ConfigCollectMixin:
         risk["kelly"] = self._kelly_cfg_from_ui()
 
         # 密码：写入本地密钥 + 当前进程环境。某一格留空表示不改已经存过的值。
-        pwd = self.password_var.get()
-        pwd_env = acc["password_env"]
         tq_pwd = self.tq_password_var.get()
         sim_pwd = str(self.ctp_sim_password_var.get() or "")
         auth_code = str(self.ctp_auth_code_var.get() or "")
@@ -809,15 +798,8 @@ class ConfigCollectMixin:
         if auth_code:
             extra["ctp_auth_code"] = auth_code
             os.environ["CTP_AUTH_CODE"] = auth_code
-        if pwd or extra:
-            save_secrets(password=pwd if pwd else "", extra=extra)
-        if pwd:
-            os.environ[pwd_env] = pwd
-            acc["resolved_password"] = pwd
-        else:
-            # 保留已有 secrets，不覆盖为空
-            existing = str(load_secrets().get("password", "") or "")
-            acc["resolved_password"] = existing or os.environ.get(pwd_env, "")
+        if extra:
+            save_secrets(extra=extra)
 
         return self.cfg
 
