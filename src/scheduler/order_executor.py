@@ -971,6 +971,9 @@ class OrderExecutorMixin:
                 raw_ctp = trade_box.get("ctp")
                 ctp_box = raw_ctp if isinstance(raw_ctp, dict) else {}
                 tick_raw = ctp_box.get("price_tick", trade_box.get("price_tick", 1))
+            trade_cfg = self.cfg.get("trade") if isinstance(self.cfg.get("trade"), dict) else {}
+            raw_ctp = trade_cfg.get("ctp")
+            ctp_cfg = raw_ctp if isinstance(raw_ctp, dict) else {}
             slip = record_fill(
                 self.root,
                 symbol=symbol,
@@ -980,9 +983,10 @@ class OrderExecutorMixin:
                 fill_price=fill_price,
                 tick=float(tick_raw or 1),
                 side_before=side_before,
-                executor=str((self.cfg.get("trade") or {}).get("executor", "")),
+                executor=str(trade_cfg.get("executor", "")),
                 dry_run=bool(self.cfg.get("dry_run", True)),
                 assumed_fill=str((fill_evidence or {}).get("fill_kind") or "") == "assumed_fill",
+                account=str(ctp_cfg.get("account_kind") or ""),
             )
             if slip is not None:
                 logger.info("滑点记录 | {} {} 理论 {} 成交 {} | {:+.2f} 跳", symbol, decision.action.value, theory, fill_price, slip)

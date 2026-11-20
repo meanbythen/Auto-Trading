@@ -26,6 +26,7 @@ from src.review.replay import replay_strategy
 from src.review.report import render_report
 from src.review.scorecard import build_scorecard
 from src.review.session import SCOPE_BOTH, windows_for
+from src.review.shadow import format_shadow_lines, shadow_report
 from src.review.technical import _naive_index, analyze_window
 
 
@@ -148,6 +149,7 @@ def build_review(
         trades=quality.trades,
         minutes=_review_minutes(cfg, symbol, windows) if fetch_remote else None,
     )
+    shadow = format_shadow_lines(shadow_report(root_path, symbol=symbol))
 
     text = render_report(
         symbol=symbol,
@@ -166,6 +168,7 @@ def build_review(
         replay_eval=replay_eval,
         live_eval=live_eval,
         consistency=consistency,
+        shadow=shadow,
         now=now,
     )
     if save:

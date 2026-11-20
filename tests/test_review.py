@@ -131,7 +131,8 @@ def test_review_report_covers_tape_and_why_flat_or_open(tmp_path) -> None:
     assert "十、当日重放评估" in text
     assert "十一、最近实盘 vs 最近回测" in text
     assert "十二、今日一致性" in text
-    assert "十三、综合" in text
+    assert "十三、影子盘" in text
+    assert "十四、综合" in text
     assert ("会开仓" in text) or ("观望" in text)
     assert "日盘已收盘" in text
 

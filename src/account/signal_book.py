@@ -1064,6 +1064,7 @@ def _walk_matches(
                     "exit_time": str(row.get("time") or ""),
                     "entry_time": str(held.get("time") or ""),
                     "entry_price": float(held.get("price") or 0),
+                    "exit_price": price,
                     "pnl": round(part, 2),
                     "volume": take,
                     "multiplier": mult,

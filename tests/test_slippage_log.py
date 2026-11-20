@@ -191,6 +191,23 @@ def test_quality_text_reports_missing_samples(tmp_path):
     assert "拒单：近 30 天没有记录" in text
 
 
+def test_summarize_can_filter_by_account(tmp_path):
+    for slip in (1, 2, 3):
+        record_fill(tmp_path, symbol="fu2701", action="BUY_OPEN", volume=1,
+                    theory_price=3000, fill_price=3000 + slip, tick=1,
+                    executor="ctp", dry_run=False, account="sim")
+    for slip in (5, 6, 7):
+        record_fill(tmp_path, symbol="fu2701", action="BUY_OPEN", volume=1,
+                    theory_price=3000, fill_price=3000 + slip, tick=1,
+                    executor="ctp", dry_run=False, account="live")
+
+    sim = summarize(tmp_path, account="sim")
+    live = summarize(tmp_path, account="live")
+    assert sim["n"] == 3 and sim["suggested"] == 2.5
+    assert live["n"] == 3 and live["suggested"] == 6.5
+    assert summarize(tmp_path, account="missing")["n"] == 0
+
+
 def test_quality_text_lists_all_three_blocks(tmp_path):
     for slip in (1, 2, 3):
         record_fill(tmp_path, symbol="fu2701", action="BUY_OPEN", volume=1,

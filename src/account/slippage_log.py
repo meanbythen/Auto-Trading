@@ -32,6 +32,7 @@ _FIELDS = [
     "tick",
     "executor",
     "dry_run",
+    "account",
 ]
 
 
@@ -52,11 +53,13 @@ def record_fill(
     executor: str = "",
     dry_run: bool = True,
     assumed_fill: bool = False,
+    account: str = "",
 ) -> float | None:
     """
     追加一条成交的滑点记录。返回滑点跳数（算不出时返回 None）。
 
     side_before：平仓时用——平多是卖出，平空是买入。开仓不用传。
+    account：sim / live，用来分清仿真成交和真实成交；旧记录没有这一列，读的时候按「未分账」算。
     """
     fill = float(fill_price or 0)
     if fill <= 0:
@@ -95,6 +98,7 @@ def record_fill(
                 f"{tick:g}",
                 executor,
                 "1" if dry_run else "0",
+                account,
             ]
         )
     return slip
@@ -129,13 +133,21 @@ def _stat_line(values: list[float]) -> tuple[int, float, float, float]:
     return len(values), statistics.fmean(values), statistics.median(values), _percentile(values, 0.7)
 
 
-def summarize(root: Path | str, *, real_only: bool = True) -> dict[str, Any]:
+def summarize(
+    root: Path | str,
+    *,
+    real_only: bool = True,
+    account: str | None = None,
+) -> dict[str, Any]:
     """
     汇总滑点。默认只看真实成交（dry_run=0 且 executor=ctp 的行）；没有真实成交时退回全部记录。
 
+    account 传 sim / live 时只统计这一本柜台的记录；旧记录没有 account 列，不会被算进任何一本。
     返回 dict：rows 用到的记录数、overall=(n,均值,中位,p70)、suggested 建议滑点跳数（p70 向上取到 0.5）。
     """
     rows = load_rows(root)
+    if account is not None:
+        rows = [row for row in rows if str(row.get("account") or "") == account]
     slips: list[float] = []
     real_slips: list[float] = []
     for row in rows:
@@ -255,6 +267,8 @@ _REJECT_EVENTS = {
     "risk_block": "风控拦截",
     "symbol_frozen": "品种冻结",
     "strategy_health": "健康停开",
+    "stale_block_open": "K线过期",
+    "slip_block_open": "追价过大",
 }
 
 

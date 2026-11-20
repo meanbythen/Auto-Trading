@@ -37,6 +37,7 @@ def render_report(
     replay_eval: list[str] | None = None,
     live_eval: list[str] | None = None,
     consistency: list[str] | None = None,
+    shadow: list[str] | None = None,
     now: datetime | None = None,
 ) -> str:
     """拼出完整复盘正文。"""
@@ -117,7 +118,11 @@ def render_report(
     for row in consistency or ["（未生成）"]:
         lines.append(f"  {row}" if not row.startswith("  ") else row)
 
-    lines.extend(["", "十三、综合：开仓还是观望，为什么，以及今天信不信这套规则"])
+    lines.extend(["", "十三、影子盘（仿真 vs 实盘）"])
+    for row in shadow or ["（未生成）"]:
+        lines.append(f"  {row}" if not row.startswith("  ") else row)
+
+    lines.extend(["", "十四、综合：开仓还是观望，为什么，以及今天信不信这套规则"])
     for row in _conclusion(
         technicals,
         fundamental,

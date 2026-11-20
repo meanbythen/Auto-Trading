@@ -151,7 +151,8 @@ def test_scorecard_and_full_report_sections(tmp_path) -> None:
     assert "十、当日重放评估" in text
     assert "十一、最近实盘 vs 最近回测" in text
     assert "十二、今日一致性" in text
-    assert "十三、综合" in text
+    assert "十三、影子盘" in text
+    assert "十四、综合" in text
     summary = tmp_path / "data" / "reviews" / "2026-10-14_bu2612.json"
     assert summary.exists()
 

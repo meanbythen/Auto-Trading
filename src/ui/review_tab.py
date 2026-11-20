@@ -123,6 +123,25 @@ class ReviewTabMixin:
         ).pack(anchor="w", padx=4, pady=(0, 8))
         ctk.CTkButton(
             left,
+            text="生成上线评审单",
+            height=34,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_release_sheet,
+        ).pack(fill="x", padx=4, pady=(0, 4))
+        ctk.CTkLabel(
+            left,
+            text="一页看完数据门禁、样本外、镜像差异率、仿真滑点。签字只写「允许小资金挂机」或「继续观察」，不改配置，也不自动开仓。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=360,
+            justify="left",
+        ).pack(anchor="w", padx=4, pady=(0, 8))
+        ctk.CTkButton(
+            left,
             text="按配置页重新填入",
             height=34,
             fg_color=T.BG_ELEVATED,
@@ -166,6 +185,122 @@ class ReviewTabMixin:
         shown = self.rv_symbol_var.get().strip() or "（还没有）"
         self._refresh_review_sources_hint()
         self._append_log(f"已按配置页填好复盘的品种和周期，品种 {shown}")
+
+
+    def _review_symbol_now(self) -> str:
+        """复盘页当前品种；占位文字「（还没有）」当空处理。"""
+        symbol = str(self.rv_symbol_var.get() or "").strip()
+        return "" if symbol in {"", "（还没有）"} else symbol
+
+
+    def _on_release_sheet(self) -> None:
+        """生成上线评审单：五项证据一页，签字另存，不改任何交易参数。"""
+        from tkinter import messagebox
+
+        from src.review.release_sheet import build_release_sheet
+
+        try:
+            sheet = build_release_sheet(self.root_dir, self.cfg, symbol=self._review_symbol_now())
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("生成上线评审单失败")
+            messagebox.showerror("生成失败", f"评审单没生成出来：{exc}")
+            return
+        self._show_release_sheet_dialog(sheet)
+
+
+    def _show_release_sheet_dialog(self, sheet) -> None:
+        """预览评审单；只有填了签字人才写 release_sheet.json。"""
+        from tkinter import messagebox
+
+        from src.review.release_sheet import (
+            DECISIONS,
+            format_release_sheet,
+            save_release_sheet,
+            sign_release_sheet,
+        )
+
+        dialog = ctk.CTkToplevel(self)
+        dialog.title("上线评审单")
+        dialog.geometry("780x720")
+        dialog.minsize(640, 520)
+        dialog.transient(self)
+        dialog.grab_set()
+
+        preview = ctk.CTkTextbox(
+            dialog, font=T.FONT_MONO, fg_color=T.BG, text_color=T.TEXT, wrap="word"
+        )
+        preview.pack(fill="both", expand=True, padx=12, pady=(12, 6))
+        preview.insert("end", format_release_sheet(sheet))
+        preview.configure(state="disabled")
+
+        form = ctk.CTkFrame(dialog, fg_color="transparent")
+        form.pack(fill="x", padx=12)
+        name_var = ctk.StringVar()
+        decision_var = ctk.StringVar(value=DECISIONS[1])
+        note_var = ctk.StringVar()
+        ctk.CTkLabel(form, text="签字人", text_color=T.TEXT_DIM).pack(side="left")
+        ctk.CTkEntry(form, textvariable=name_var, width=120, placeholder_text="姓名").pack(
+            side="left", padx=(4, 14)
+        )
+        ctk.CTkLabel(form, text="决定", text_color=T.TEXT_DIM).pack(side="left")
+        ctk.CTkOptionMenu(
+            form, variable=decision_var, values=list(DECISIONS), width=150
+        ).pack(side="left", padx=(4, 14))
+        ctk.CTkEntry(form, textvariable=note_var, placeholder_text="备注（可空）").pack(
+            side="left", fill="x", expand=True
+        )
+
+        def refresh() -> None:
+            preview.configure(state="normal")
+            preview.delete("1.0", "end")
+            preview.insert("end", format_release_sheet(sheet))
+            preview.configure(state="disabled")
+            self.rv_result_box.delete("1.0", "end")
+            self.rv_result_box.insert("end", format_release_sheet(sheet))
+
+        def on_save() -> None:
+            path = save_release_sheet(self.root_dir, format_release_sheet(sheet))
+            self._append_log(f"上线评审单已保存：{path}")
+            messagebox.showinfo("已保存", f"评审单已写到：\n{path}", parent=dialog)
+
+        def on_sign() -> None:
+            name = name_var.get().strip()
+            if not name:
+                messagebox.showwarning("还差签字人", "请先填签字人名字。", parent=dialog)
+                return
+            if sheet.verdict.startswith("不通过") and not messagebox.askyesno(
+                "评审没通过",
+                "这份评审单有「不通过」项。仍要签字留档吗？签字不会改配置或放宽风控。",
+                parent=dialog,
+            ):
+                return
+            sign_release_sheet(
+                self.root_dir,
+                sheet,
+                signed_by=name,
+                decision=decision_var.get(),
+                note=note_var.get(),
+            )
+            refresh()
+            self._append_log(
+                f"上线评审单已签字：{name} / {decision_var.get()}（只留档，不改配置）"
+            )
+
+        buttons = ctk.CTkFrame(dialog, fg_color="transparent")
+        buttons.pack(fill="x", padx=12, pady=(8, 12))
+        ctk.CTkButton(buttons, text="只保存", height=34, command=on_save).pack(side="left")
+        ctk.CTkButton(
+            buttons,
+            text="签字并保存",
+            height=34,
+            fg_color=T.ACCENT,
+            hover_color=T.ACCENT_HOVER,
+            text_color=T.ACCENT_ON,
+            command=on_sign,
+        ).pack(side="left", padx=8)
+        ctk.CTkButton(
+            buttons, text="关闭", height=34, fg_color=T.BG_ELEVATED, command=dialog.destroy
+        ).pack(side="right")
 
 
     def _refresh_review_sources_hint(self) -> None:
