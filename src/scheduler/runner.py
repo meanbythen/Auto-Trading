@@ -27,6 +27,7 @@ from src.risk import PositionSizer, RiskGuardian
 from src.scheduler.flatten_manager import FlattenManagerMixin
 from src.scheduler.login_flow import LoginFlowMixin
 from src.scheduler.order_executor import OrderExecutorMixin
+from src.scheduler.order_pricing import entry_slip_blocked as entry_slip_blocked
 from src.scheduler.session_audit import SessionAuditMixin
 from src.strategy import StrategyAction, StrategyDecision, create_strategy
 from src.strategy.decision_guard import apply_delivery_gate, apply_generic_stop
@@ -95,34 +96,6 @@ def _bar_now_from_prefix(bars: Any) -> datetime | None:
         return None
 
 
-def entry_slip_blocked(
-    entry_price: float,
-    live_price: float,
-    atr: float,
-    *,
-    is_long: bool,
-    limit_atr: float,
-    limit_points: float = 0.0,
-) -> tuple[bool, float, float]:
-    """
-    开仓滑点闸门：信号价和现价差太多就不追。
-
-    返回 (是否拦下, 反向偏移点数, 允许的上限点数)。
-    上限有两种算法，同时开着就取更严的那个：limit_atr×ATR，或直接写死的点数。
-    追价成本只算「不利于持仓方向」的那一边：做多现价更高、做空现价更低才算。
-    数据不全（价格取不到）时一律放行，宁可漏拦也不要卡死下单。
-    """
-    if entry_price <= 0 or live_price <= 0:
-        return False, 0.0, 0.0
-    limit = 0.0
-    if limit_atr > 0 and atr > 0:
-        limit = float(limit_atr) * float(atr)
-    if limit_points > 0:
-        limit = min(limit, float(limit_points)) if limit > 0 else float(limit_points)
-    if limit <= 0:
-        return False, 0.0, 0.0
-    chase = (live_price - entry_price) if is_long else (entry_price - live_price)
-    return chase > limit, chase, limit
 
 
 def _last_close(bars: Any) -> float:
@@ -694,15 +667,7 @@ class TradingBot(
         self.risk.halt_reason = str(st.get("halt_reason", "") or "")
         self.risk.halt_kind = str(st.get("halt_kind", "") or "")
         # 从策略持仓重建风控净仓
-        for sym, pos in (getattr(self.strategy, "positions", {}) or {}).items():
-            side = getattr(pos, "side", "flat")
-            vol = int(getattr(pos, "volume", 0) or 0)
-            if side == "long":
-                self.risk.positions[str(sym)] = vol
-                self.risk.current_position += vol
-            elif side == "short":
-                self.risk.positions[str(sym)] = -vol
-                self.risk.current_position -= vol
+        self._rebuild_risk_positions()
         last_bars = st.get("last_entry_bars") or {}
         if isinstance(last_bars, dict) and last_bars:
             # 重启后通过公共接口恢复「哪根已经开过」。
@@ -874,17 +839,7 @@ class TradingBot(
             )
 
         # 风控净仓按策略持仓重建，避免两处再各记一套。
-        self.risk.positions = {}
-        self.risk.current_position = 0
-        for sym, pos in positions.items():
-            side = getattr(pos, "side", "flat")
-            vol = int(getattr(pos, "volume", 0) or 0)
-            if side == "long":
-                self.risk.positions[str(sym)] = vol
-                self.risk.current_position += vol
-            elif side == "short":
-                self.risk.positions[str(sym)] = -vol
-                self.risk.current_position -= vol
+        self._rebuild_risk_positions()
 
         old_daily = self.risk.daily_pnl
         # 柜台账的盈亏变动不记进 changes，用账本加总会把日亏打成 0，熔断会短暂失效。
@@ -1465,6 +1420,43 @@ class TradingBot(
         with self._trade_lock:
             self.sizer.capital = amount
             self.cfg.setdefault("risk", {})["capital"] = amount
+
+    def apply_runtime_config(self, cfg: dict[str, Any]) -> None:
+        """
+        配置页保存后，把运行中的扫描间隔、合约时段、合约表和日亏限额推给常驻机器人。
+
+        和下单共用交易锁：避免下一轮扫描按旧参数算手数或旧时段开仓。
+        UI 只发这一条命令，不再直接改 bot 的字段。
+        """
+        interval = int((cfg.get("schedule") or {}).get("scan_interval_sec") or 30)
+        sessions = list((cfg.get("schedule") or {}).get("trading_sessions") or [])
+        contracts = (cfg.get("risk") or {}).get("contracts")
+        limit = float((cfg.get("risk") or {}).get("max_daily_loss") or 0)
+        with self._trade_lock:
+            self.scan_interval = interval
+            self.cfg.setdefault("schedule", {})["trading_sessions"] = sessions
+            if isinstance(contracts, dict):
+                self.cfg.setdefault("risk", {})["contracts"] = contracts
+            self._refresh_sessions()
+            self.sync_risk_limits(limit)
+
+    def positions_snapshot(self) -> dict[str, dict[str, Any]]:
+        """程序账持仓的只读副本，供界面与报告展示；改返回值不影响运行状态。"""
+        with self._trade_lock:
+            rows = getattr(self.strategy, "positions", None) or {}
+            return {
+                str(symbol): {
+                    "side": str(getattr(pos, "side", "flat") or "flat"),
+                    "volume": int(getattr(pos, "volume", 0) or 0),
+                    "entry_price": float(getattr(pos, "entry_price", 0.0) or 0.0),
+                    "opened_at": str(getattr(pos, "opened_at", "") or ""),
+                }
+                for symbol, pos in rows.items()
+            }
+
+    def note_force_close(self) -> None:
+        """界面在后台线程未退出时强制关窗，记一条关键事件供复盘。"""
+        self._record_event("force_close")
 
     def _record_event_throttled(
         self, event: str, key: str, *, cooldown_sec: float = 600.0, **kwargs: Any

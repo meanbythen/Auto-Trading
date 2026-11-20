@@ -16,6 +16,8 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from src.account.signal_book import matched_closes
+from src.domain.contracts import DEFAULT_MULTIPLIER
+from src.domain.pnl_stats import summarize_pnl
 from src.utils.trading_day import futures_trading_day
 
 # 界面上的时间段。天数含今天。全部表示不截断。
@@ -187,7 +189,7 @@ def _ctp_broker_daily(book: dict[str, Any]) -> dict[date, float]:
                 continue
     snap = book.get("ctp_snapshot") if isinstance(book.get("ctp_snapshot"), dict) else {}
     if snap:
-        from src.account.ctp_sync import broker_day_pnl
+        from src.account.broker_pnl import broker_day_pnl
         from src.account.signal_book import broker_snapshot_day_pnl_usable
 
         # 结算后的空壳快照不要再盖日历；白天有效快照才覆盖。
@@ -224,22 +226,15 @@ def format_utilization(rate: float | None) -> str:
 
 def _slice_from_closes(rows: list[dict[str, Any]], equity_points: list[float]) -> SliceStat:
     """用已经平掉的几段，算出胜率、盈利因子、净盈亏和回撤。"""
-    wins = [float(row.get("pnl") or 0) for row in rows if float(row.get("pnl") or 0) > 0]
-    losses = [float(row.get("pnl") or 0) for row in rows if float(row.get("pnl") or 0) < 0]
-    decided = len(wins) + len(losses)
-    win_rate = (len(wins) / decided) if decided else None
-    gain = sum(wins)
-    loss = abs(sum(losses))
-    if loss > 0:
-        factor: float | None = gain / loss
-    elif gain > 0:
-        factor = math.inf
-    else:
-        factor = None
+    stats = summarize_pnl(
+        [float(row.get("pnl") or 0) for row in rows],
+        zero_as_loss=False,
+    )
+    decided = stats.wins + stats.losses
     return SliceStat(
         closed=len(rows),
-        win_rate=win_rate,
-        profit_factor=factor,
+        win_rate=(stats.wins / decided) if decided else None,
+        profit_factor=stats.profit_factor,
         max_drawdown=_drawdown(equity_points),
         net_pnl=round(sum(float(row.get("pnl") or 0) for row in rows), 2),
     )
@@ -349,7 +344,7 @@ def _margin_peaks(
                 symbol,
                 float(row.get("price") or 0),
                 int(row.get("volume") or 0),
-                float(row.get("multiplier") or 10),
+                float(row.get("multiplier") or DEFAULT_MULTIPLIER),
                 margins=margins,
                 default_margin=default_margin,
                 rate=margin_rate,

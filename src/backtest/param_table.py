@@ -264,7 +264,7 @@ def _read_grid_sheet(sheet: Any, table: ParamTable) -> None:
         logger.warning("优化参数表「{}」缺必要表头，回退内置默认", SHEET_GRID)
         return
 
-    from src.backtest.optimizer import PARAM_LABELS_CN
+    from src.backtest.param_meta import PARAM_LABELS_CN
 
     known_keys = set(PARAM_LABELS_CN)
 
@@ -365,7 +365,7 @@ def clear_param_table_cache() -> None:
 
 def _label_rows(labels: dict[str, str]) -> list[list[str]]:
     """按策略拆参数名称：一个策略用到的每个参数一行，方便在「策略名称」列筛选。"""
-    from src.backtest.optimizer import default_grid_for_engine
+    from src.backtest.param_meta import default_grid_for_engine
 
     rows: list[list[str]] = []
     used: set[str] = set()
@@ -395,7 +395,7 @@ def _values_text(values: list[Any]) -> str:
 
 def build_default_table(path: str | Path) -> Path:
     """按代码内置默认整表重写一次（会覆盖原文件的自定义内容）。"""
-    from src.backtest.optimizer import PARAM_LABELS_CN, PARAM_VALUE_LABELS_CN, default_grid_for_engine
+    from src.backtest.param_meta import PARAM_LABELS_CN, PARAM_VALUE_LABELS_CN, default_grid_for_engine
 
     file = Path(path)
     file.parent.mkdir(parents=True, exist_ok=True)

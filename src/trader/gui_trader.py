@@ -281,7 +281,7 @@ class GuiTrader(TraderBase):
         不再连试三次，也不要在已经是这个窗口时再激活，避免界面被切来切去。
         windows 传进来时直接用，避免调用方刚枚举过又枚举一遍。
         """
-        from src.login.app_login import force_foreground
+        from src.utils.winui import force_foreground
         from src.login.ths_login import looks_like_order_window
 
         windows = list(manager.find_windows() or []) if windows is None else list(windows)
@@ -474,7 +474,7 @@ class GuiTrader(TraderBase):
         """读价格坐标上的控件和它现在显示的字。读的时候不再去激活窗口。"""
         import uiautomation as auto
 
-        from src.trader.price_mode import _visible_text
+        from src.utils.winui import _visible_text
 
         auto.SetGlobalSearchTimeout(0.4)
         ctrl = auto.ControlFromPoint(int(point[0]), int(point[1]))

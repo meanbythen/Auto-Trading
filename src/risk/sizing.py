@@ -35,7 +35,7 @@ from typing import Any
 from loguru import logger
 
 from src.domain.contracts import DEFAULT_CONTRACTS as DEFAULT_CONTRACTS
-from src.domain.contracts import build_contracts
+from src.domain.contracts import DEFAULT_MULTIPLIER, build_contracts
 
 # 仓位上限默认 80%：权益里最多拿出这么多交保证金，其余留作缓冲。
 DEFAULT_MARGIN_USAGE_PCT = 80.0
@@ -113,7 +113,7 @@ class PositionSizer:
 
     def multiplier_for(self, symbol: str) -> float:
         key = self._product_key(symbol)
-        return float(self.contracts.get(key, {}).get("multiplier", 10))
+        return float(self.contracts.get(key, {}).get("multiplier", DEFAULT_MULTIPLIER))
 
     def margin_for(self, symbol: str, price: float | None = None) -> float:
         """
@@ -125,7 +125,7 @@ class PositionSizer:
         key = self._product_key(symbol)
         box = self.contracts.get(key, {})
         rate = float(box.get("margin_rate_pct", 0) or 0)
-        qty = float(box.get("multiplier", 10) or 10)
+        qty = float(box.get("multiplier", DEFAULT_MULTIPLIER) or DEFAULT_MULTIPLIER)
         if rate > 0 and price is not None:
             try:
                 px = float(price)

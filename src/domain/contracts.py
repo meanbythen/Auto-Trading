@@ -8,6 +8,9 @@ from __future__ import annotations
 
 from typing import Any
 
+# 配置没写乘数时的兜底值。全程序只认这一处，不在各页面再写 10。
+DEFAULT_MULTIPLIER: float = 10.0
+
 # 国内常见主力：报价「元/吨」，合约乘数「吨/手」→ 价格动1点，每手盈亏≈乘数 元
 DEFAULT_CONTRACTS: dict[str, dict[str, Any]] = {
     "bu": {"multiplier": 10, "name": "沥青"},
@@ -23,7 +26,7 @@ def build_contracts(cfg: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
     for key, value in (risk.get("contracts") or {}).items():
         if isinstance(value, dict):
             contracts[str(key).lower()] = {
-                "multiplier": float(value.get("multiplier", 10)),
+                "multiplier": float(value.get("multiplier", DEFAULT_MULTIPLIER)),
                 "name": str(value.get("name", key)),
                 "margin": float(value.get("margin", 0) or 0),
                 "margin_rate_pct": float(value.get("margin_rate_pct", 0) or 0),
@@ -37,4 +40,4 @@ def contract_multipliers(cfg: dict[str, Any] | None) -> dict[str, float]:
     """品种代码 → 一手多少吨。账户页算说明文字时用。"""
     if not cfg:
         return {}
-    return {key: float(info.get("multiplier", 10)) for key, info in build_contracts(cfg).items()}
+    return {key: float(info.get("multiplier", DEFAULT_MULTIPLIER)) for key, info in build_contracts(cfg).items()}

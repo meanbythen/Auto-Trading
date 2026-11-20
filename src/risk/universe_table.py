@@ -19,6 +19,8 @@ from typing import Any
 
 from loguru import logger
 
+from src.domain.contracts import DEFAULT_MULTIPLIER
+
 # 点「启动常驻」时界面会连着读配置、读总表、再存盘，几秒内同一张表会被问很多次。
 # 文件没改就复用刚读过的结果，避免重复打开 Excel，也不改开平仓规则。
 _UNIVERSE_CACHE: dict[str, tuple[float, float, list[str], dict[str, dict[str, Any]]]] = {}
@@ -248,7 +250,7 @@ def write_universe_table(path: Path | str, rows: list[dict[str, Any]]) -> Path:
         item = _normalize_row(row)
         rate = float(item.get("margin_rate_pct") or 0)
         margin = float(item.get("margin") or 0)
-        mult = float(item.get("multiplier") or 10)
+        mult = float(item.get("multiplier") or DEFAULT_MULTIPLIER)
         fee = float(item.get("commission") or 0)
         close_fee = item.get("commission_close")
         today = item.get("commission_close_today")
@@ -418,7 +420,7 @@ def _assert_product_margins_consistent(rows: list[dict[str, Any]]) -> None:
             continue
         rate = float(row.get("margin_rate_pct") or 0)
         margin = float(row.get("margin") or 0)
-        mult = float(row.get("multiplier") or 10)
+        mult = float(row.get("multiplier") or DEFAULT_MULTIPLIER)
         fees = _fee_signature(row)
         tick = _optional_tick(row)
         prev = seen.get(key)
@@ -470,7 +472,7 @@ def parse_universe_rows(rows: list[dict[str, Any]]) -> tuple[list[str], dict[str
             "name": str(item.get("name") or key),
             "margin_rate_pct": float(item.get("margin_rate_pct") or 0),
             "margin": float(item.get("margin") or 0),
-            "multiplier": float(item.get("multiplier") or 10),
+            "multiplier": float(item.get("multiplier") or DEFAULT_MULTIPLIER),
             "commission": float(item.get("commission") or 0),
         }
         if item.get("commission_close") is not None:
@@ -510,7 +512,7 @@ def _merge_legacy_margins_into_cfg(cfg: dict[str, Any], legacy_path: Path) -> No
         if float(box.get("margin") or 0) <= 0 and float(item.get("margin") or 0) > 0:
             box["margin"] = float(item["margin"])
         if float(box.get("multiplier") or 0) <= 0:
-            box["multiplier"] = float(item.get("multiplier") or 10)
+            box["multiplier"] = float(item.get("multiplier") or DEFAULT_MULTIPLIER)
         if not str(box.get("name") or "").strip() or str(box.get("name")) == code:
             if item.get("name"):
                 box["name"] = str(item["name"])
@@ -825,7 +827,7 @@ def sync_watch_symbols_to_table(
                         "name": str(box.get("name") or key or sym),
                         "margin_rate_pct": parse_margin_rate_pct(box.get("margin_rate_pct")),
                         "margin": float(box.get("margin") or 0),
-                        "multiplier": float(box.get("multiplier") or 10),
+                        "multiplier": float(box.get("multiplier") or DEFAULT_MULTIPLIER),
                         "commission": float(box.get("commission") or 0),
                         "commission_close": _optional_named(box, "commission_close"),
                         "commission_close_today": _optional_close_today(box),
@@ -910,7 +912,7 @@ def sync_ctp_contract_to_universe(
                     "name": str(fields.get("name") or key or symbol),
                     "margin_rate_pct": parse_margin_rate_pct(fields.get("margin_rate_pct")),
                     "margin": 0.0,
-                    "multiplier": float(fields.get("multiplier") or 10),
+                    "multiplier": float(fields.get("multiplier") or DEFAULT_MULTIPLIER),
                     "commission": float(fields.get("commission") or 0),
                     "commission_close": fields.get("commission_close"),
                     "commission_close_today": fields.get("commission_close_today"),

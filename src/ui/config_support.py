@@ -316,18 +316,7 @@ class ConfigSupportMixin:
         # 常驻正在跑时，把新间隔推给它：主循环每轮都读这个属性，不用重启就能生效。
         bot = getattr(self.worker, "bot", None)
         if bot is not None and bool(getattr(bot, "is_running", False)):
-            bot.scan_interval = int((cfg.get("schedule") or {}).get("scan_interval_sec") or 30)
-            if hasattr(bot, "cfg"):
-                bot.cfg.setdefault("schedule", {})["trading_sessions"] = list(
-                    (cfg.get("schedule") or {}).get("trading_sessions") or []
-                )
-                risk_box = (cfg.get("risk") or {}).get("contracts")
-                if isinstance(risk_box, dict):
-                    bot.cfg.setdefault("risk", {})["contracts"] = risk_box
-            if hasattr(bot, "_refresh_sessions"):
-                bot._refresh_sessions()
-            # 日亏限额也一起推给运行中的风控，否则它仍按启动时的旧限额熔断。
-            bot.sync_risk_limits(float((cfg.get("risk") or {}).get("max_daily_loss") or 0))
+            bot.apply_runtime_config(cfg)
             self._append_log(
                 f"扫描间隔已改为 {bot.scan_interval} 秒；当前合约时段已同步，下一轮扫描起生效。"
             )

@@ -41,6 +41,7 @@ from src.backtest.models import BacktestResult, RejectedSignal
 from src.strategy.cta_factors import factor_fields_for_trade
 from src.strategy.market_state import adx_series
 from src.data.kline import KlineProvider, clear_fetch_cache
+from src.data.sessions import session_bar_times as session_bar_times
 from src.data.periods import canonical_period, drop_forming_bar, period_label, unique_ohlc_columns
 from src.risk.commission import fee_close, fee_open, is_close_today
 from src.strategy import StrategyAction, StrategyDecision, create_strategy
@@ -48,7 +49,7 @@ from src.strategy.decision_guard import apply_delivery_gate, apply_generic_stop
 from src.strategy.generic_stop import GenericStopOverlay, generic_stop_snapshot
 from src.strategy.session_scope import session_kind
 from src.strategy.types import PositionState
-from src.utils.trading_day import EXCHANGE_HOLIDAYS, futures_trading_day
+from src.utils.trading_day import futures_trading_day
 
 if TYPE_CHECKING:
     from src.utils.holidays import HolidayCalendar
@@ -183,37 +184,6 @@ def _make_trade_record(
 
 
 # 交易所休市的工作日由交易日历统一给出（src.utils.trading_day），这里不再单独维护一份。
-_CLOSED_WEEKDAYS = EXCHANGE_HOLIDAYS
-
-
-def _closed_day(day: date, calendar: HolidayCalendar | None = None) -> bool:
-    """这一天是不是休市。传了外置日历时只认它，否则用内置 2026 表。"""
-    if calendar is not None:
-        return calendar.is_closed(day)
-    return day in _CLOSED_WEEKDAYS
-
-
-def session_bar_times(
-    day: date,
-    step_minutes: int,
-    *,
-    include_night: bool = True,
-    calendar: HolidayCalendar | None = None,
-) -> list[datetime]:
-    """
-    这一天按交易时段应该有的K线收盘时间。
-
-    只生成连续交易的那些分钟。午休和 10:15 之后的休息不生成，所以正常休盘不会被当成缺口。
-    """
-    if day.weekday() >= 5 or _closed_day(day, calendar):
-        return []
-    from src.data.periods import session_close_times
-
-    # 第二天休市时，前一天晚上通常没有夜盘。没有夜盘不算数据断开。
-    night_ok = include_night and not _closed_day(day + timedelta(days=1), calendar)
-    return session_close_times(day, step_minutes, include_night=night_ok)
-
-
 def describe_bar_gaps(
     df: pd.DataFrame | None,
     period: str,

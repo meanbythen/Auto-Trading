@@ -62,13 +62,13 @@ def _naive(value: datetime | pd.Timestamp) -> datetime:
 
 def _is_trading_day(day: date) -> bool:
     """这一天有没有交易时段。休市日返回 False。"""
-    from src.backtest.engine import session_bar_times
+    from src.data.sessions import session_bar_times
 
     return bool(session_bar_times(day, 60))
 
 
 def _session_times(day: date, step: int) -> list[datetime]:
-    from src.backtest.engine import session_bar_times
+    from src.data.sessions import session_bar_times
 
     return session_bar_times(day, step)
 

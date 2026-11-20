@@ -14,6 +14,8 @@ from typing import Any
 
 from loguru import logger
 
+from src.domain.contracts import DEFAULT_MULTIPLIER
+
 # 相对项目根目录。首次没有文件时，按当前配置里的 contracts 生成一张。
 DEFAULT_REL_PATH = "config/品种保证金.xlsx"
 SHEET_NAME = "品种保证金"
@@ -53,9 +55,9 @@ def contracts_from_cfg(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
             continue
         if isinstance(item, dict):
             try:
-                mult = float(item.get("multiplier", 10) or 10)
+                mult = float(item.get("multiplier", DEFAULT_MULTIPLIER) or DEFAULT_MULTIPLIER)
             except (TypeError, ValueError):
-                mult = 10.0
+                mult = DEFAULT_MULTIPLIER
             try:
                 margin = float(item.get("margin", 0) or 0)
             except (TypeError, ValueError):
@@ -69,7 +71,7 @@ def contracts_from_cfg(cfg: dict[str, Any]) -> dict[str, dict[str, Any]]:
             try:
                 mult = float(item)
             except (TypeError, ValueError):
-                mult = 10.0
+                mult = DEFAULT_MULTIPLIER
             out[code] = {"name": code, "margin": 0.0, "multiplier": max(0.1, mult)}
     return out
 
@@ -167,7 +169,7 @@ def write_margin_table(path: Path | str, contracts: dict[str, dict[str, Any]]) -
     for code in sorted(contracts.keys()):
         item = contracts.get(code) or {}
         margin = float(item.get("margin", 0) or 0)
-        mult = float(item.get("multiplier", 10) or 10)
+        mult = float(item.get("multiplier", DEFAULT_MULTIPLIER) or DEFAULT_MULTIPLIER)
         sheet.append(
             [
                 code,

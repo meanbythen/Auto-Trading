@@ -154,29 +154,9 @@ _OBSOLETE_STRATEGY_KEYS = {
     "max_opposite_wick_ratio",
 }
 
-# 已删策略留下的整节配置。保存时清掉。
-_OBSOLETE_STRATEGY_SECTIONS = {
-    "liquidity_exhaustion",
-    "liquidity_signs",
-    "macd_divergence",
-    "mean_reversion",
-    "reversal_pivot",
-    "ma20_trend",
-    "morning_gap_c",
-    "sar_flip",
-    "pinbar_sar",
-    "single_ma",
-    "morning_structure_b",
-    "ma20",
-    "rotation_scan",
-    "morning_box_a",
-    "jesse_casper",
-    "multi_factor_adapt",
-    "multi_hybrid",
-    "multi_vote",
-    "daily_body_expand",
-    "float_hold",
-}
+# 已删策略留在配置里的整节。除这份补充名单外，其余都来自 _REMOVED_ENGINES，不再各写一份。
+_EXTRA_OBSOLETE_SECTIONS = {"rotation_scan"}
+_OBSOLETE_STRATEGY_SECTIONS = set(_REMOVED_ENGINES) | _EXTRA_OBSOLETE_SECTIONS
 
 _ENGINE_ALIASES = {
     "st": "supertrend",
@@ -490,6 +470,12 @@ def normalize_engine(name: Any) -> str:
         return key
     key = _ENGINE_ALIASES.get(key, key)
     return key if key in REGISTRY else ""
+
+
+def param_section(name: Any) -> str:
+    """策略别名 → 参数小节名。未登记的名字原样返回，不额外造一节。"""
+    key = str(name or "").strip().lower()
+    return _ENGINE_ALIASES.get(key, key)
 
 
 def engine_label(name: Any, *, short: bool = False) -> str:

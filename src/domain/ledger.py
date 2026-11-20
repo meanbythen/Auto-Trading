@@ -15,6 +15,7 @@ from typing import Any
 from loguru import logger
 
 from src.domain.accounts import book_file
+from src.domain.contracts import DEFAULT_MULTIPLIER
 
 # 同一文件正在被另一线程替换时，Windows 会暂时 Permission denied。多试几次，不要当成账丢了。
 _READ_TRIES = 8
@@ -157,7 +158,7 @@ def legacy_changes(book: dict[str, Any]) -> list[dict[str, Any]]:
             diff = price - float(held.get("price") or 0)
             if row.get("direction") == "空":
                 diff = -diff
-            mult = float(held.get("multiplier") or 10)
+            mult = float(held.get("multiplier") or DEFAULT_MULTIPLIER)
             part_sum += diff * take * mult
             held["left"] = int(held["left"]) - take
             need -= take

@@ -296,8 +296,9 @@ def test_ready_trade_window_is_brought_forward_once_and_not_logged_in(monkeypatc
             raise AssertionError("交易窗口已经在，不应该登录")
 
     monkeypatch.setattr("src.login.AppLoginManager", _Manager)
+    monkeypatch.setattr("src.login.app_login.force_foreground", lambda _hwnd: True)
     monkeypatch.setattr(
-        "src.login.app_login.force_foreground",
+        "src.utils.winui.force_foreground",
         lambda _hwnd: calls.__setitem__("front", calls["front"] + 1) or True,
     )
     monkeypatch.setattr("src.login.app_login.pin_topmost", lambda _hwnd: None)

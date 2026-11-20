@@ -703,7 +703,8 @@ def _focus_chart(cfg: dict[str, Any], *, click: bool = True) -> int:
     """
     import ctypes
 
-    from src.login.app_login import AppLoginManager, force_foreground
+    from src.login.app_login import AppLoginManager
+    from src.utils.winui import force_foreground
 
     manager = AppLoginManager(cfg)
     windows = manager.find_windows()

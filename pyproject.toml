@@ -71,3 +71,68 @@ disable_error_code = ["attr-defined", "has-type"]
 module = ["src.scheduler.*"]
 ignore_errors = false
 disable_error_code = ["attr-defined", "has-type"]
+
+[tool.importlinter]
+root_packages = ["src"]
+
+[[tool.importlinter.contracts]]
+# 领域与内核是最底层：不得依赖任何业务、调度或界面模块。
+name = "领域/内核不依赖业务层"
+type = "forbidden"
+source_modules = [
+    "src.domain",
+    "src.kernel",
+]
+forbidden_modules = [
+    "src.utils",
+    "src.data",
+    "src.strategy",
+    "src.trader",
+    "src.risk",
+    "src.account",
+    "src.review",
+    "src.backtest",
+    "src.ops",
+    "src.export",
+    "src.screen",
+    "src.research",
+    "src.login",
+    "src.scheduler",
+    "src.ui",
+]
+
+[[tool.importlinter.contracts]]
+# 业务层可以互相引用（数据/策略/回测之间仍有历史反向依赖，见 R9 验收报告），
+# 但不能反过来依赖调度与界面。
+name = "业务层不依赖调度与界面"
+type = "forbidden"
+source_modules = [
+    "src.utils",
+    "src.data",
+    "src.strategy",
+    "src.trader",
+    "src.risk",
+    "src.account",
+    "src.review",
+    "src.backtest",
+    "src.ops",
+    "src.export",
+    "src.screen",
+    "src.research",
+    "src.login",
+]
+forbidden_modules = [
+    "src.scheduler",
+    "src.ui",
+]
+
+[[tool.importlinter.contracts]]
+# 常驻调度只向上给界面用，不能反过来 import 界面。
+name = "调度不依赖界面"
+type = "forbidden"
+source_modules = [
+    "src.scheduler",
+]
+forbidden_modules = [
+    "src.ui",
+]

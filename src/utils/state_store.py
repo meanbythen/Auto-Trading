@@ -17,6 +17,7 @@ from uuid import uuid4
 
 from loguru import logger
 
+from src.domain.contracts import DEFAULT_MULTIPLIER
 from src.domain.position import PositionState
 from src.utils.trading_day import futures_trading_day
 
@@ -419,7 +420,7 @@ def manual_close_without_bot(
             direction=direction,
             price=float(exit_price),
             volume=int(closed["volume"]),
-            multiplier=float(multiplier or 10),
+            multiplier=float(multiplier or DEFAULT_MULTIPLIER),
             reason=reason,
             bar_id=f"manual-{moment}",
             fill_key=f"manual-{moment}",
@@ -479,7 +480,7 @@ def manual_open_without_bot(
             direction=direction,
             price=float(entry_price),
             volume=int(volume),
-            multiplier=float(multiplier or 10),
+            multiplier=float(multiplier or DEFAULT_MULTIPLIER),
             reason=reason,
             bar_id=f"manual-open-{moment}",
             fill_key=f"manual-open-{moment}",

@@ -10,11 +10,13 @@
 from __future__ import annotations
 
 import json
+import math
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any
 
+from src.domain.pnl_stats import summarize_pnl
 from src.strategy.types import config_flag
 
 
@@ -72,19 +74,17 @@ class HealthReport:
         }
 
 
-def _profit_factor(pnls: list[float]) -> float:
-    """赚到的钱除以亏掉的钱。没亏过时，有盈利记一个很大的数，方便比较。"""
-    gain = sum(x for x in pnls if x > 0)
-    loss = abs(sum(x for x in pnls if x < 0))
-    if loss <= 1e-9:
-        return 99.0 if gain > 0 else 0.0
-    return gain / loss
-
-
-def _win_rate(pnls: list[float]) -> float:
-    if not pnls:
-        return 0.0
-    return sum(1 for x in pnls if x > 0) / len(pnls)
+def _live_wr_pf(pnls: list[float]) -> tuple[float, float]:
+    """账本平仓的胜率与盈利因子。没亏过时，有盈利记 99，完全没有盈亏记 0。"""
+    summary = summarize_pnl(pnls, zero_as_loss=True)
+    factor = summary.profit_factor
+    if factor is None:
+        pf = 0.0
+    elif math.isinf(factor):
+        pf = 99.0
+    else:
+        pf = factor
+    return summary.win_rate, pf
 
 
 def _live_pnls(
@@ -279,6 +279,7 @@ def evaluate_health(
     """
     base = Path(root)
     live = _live_pnls(base, lookback, symbol=str(symbol or ""), account=account)
+    live_wr, live_pf = _live_wr_pf(live)
     perf = _backtest_perf(base)
     scope = _backtest_scope(base)
     wanted: dict[str, Any] = {"engine": engine, "symbol": symbol, "timeframe": timeframe}
@@ -310,8 +311,8 @@ def evaluate_health(
                 f"（{diff}）。先跑一次同策略、同品种、同周期、同口径的回测再比。"
             ),
             live_n=len(live),
-            live_win_rate=_win_rate(live),
-            live_pf=_profit_factor(live),
+            live_win_rate=live_wr,
+            live_pf=live_pf,
             bt_n=0,
             watch_days=watch_days,
             scope_recorded=True,
@@ -362,15 +363,13 @@ def evaluate_health(
             "skip",
             "策略健康：还没有一次成交够数的历史回测，先跑一回再对照",
             live_n=len(live),
-            live_win_rate=_win_rate(live),
-            live_pf=_profit_factor(live),
+            live_win_rate=live_wr,
+            live_pf=live_pf,
             bt_n=bt_n,
             bt_win_rate=bt_wr,
             bt_pf=bt_pf,
         )
 
-    live_wr = _win_rate(live)
-    live_pf = _profit_factor(live)
     reasons: list[str] = []
     if live_wr + 1e-9 < bt_wr - winrate_drop:
         reasons.append(

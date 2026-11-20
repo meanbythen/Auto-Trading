@@ -121,9 +121,9 @@ def _engine_box(cfg: dict[str, Any], engine: str | None) -> dict[str, Any]:
         return {}
     # 引擎名和参数节不一定同名：macd_swing 的参数写在 ema_swing 这一节。
     # 以前拿引擎名直接找，找不到就返回空，压力测试直接跳过。
-    from src.backtest.optimizer import _ENGINE_PARAM_SECTION
+    from src.strategy.factory import param_section
 
-    section = _ENGINE_PARAM_SECTION.get(name, name)
+    section = param_section(name)
     box = st.get(section)
     return box if isinstance(box, dict) else {}
 

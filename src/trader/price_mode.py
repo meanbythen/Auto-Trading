@@ -20,7 +20,13 @@ from typing import Any
 from loguru import logger
 
 # 固定用这一项。排队价要排队，最新价经常挂不住，市价和超价在急涨急跌时滑得更多。
-OPPONENT_PRICE = "对手价"
+from src.utils.winui import (
+    OPPONENT_PRICE as OPPONENT_PRICE,
+    _PRICE_WORDS as _PRICE_WORDS,
+    _looks_like_price_number as _looks_like_price_number,
+    _visible_text as _visible_text,
+    choose_shown_price as choose_shown_price,
+)
 
 
 @dataclass
@@ -83,28 +89,6 @@ def text_is_opponent(text: str) -> bool:
     return value in {OPPONENT_PRICE, "对手"}
 
 
-# 价格下拉里会同时出现的几项。框里当前选中的那一项才算数。
-_PRICE_WORDS = {OPPONENT_PRICE, "对手", "最新价", "排队价", "市价", "超价"}
-
-
-def choose_shown_price(values: list[str], names: list[str]) -> str:
-    """
-    决定价格框上现在显示的是哪一个字。
-
-    输入框里的值是当前选项。控件名字里有时还会带上菜单中的「对手价」。
-    框里明明是「最新价」时，不能因为名字里出现过对手价，就当成已经设好。
-    """
-    shown_values = [str(item or "").strip() for item in values if str(item or "").strip()]
-    for text in shown_values:
-        if text in _PRICE_WORDS or _looks_like_price_number(text):
-            return OPPONENT_PRICE if text == "对手" else text
-    shown_names = [str(item or "").strip() for item in names if str(item or "").strip()]
-    for text in shown_names:
-        if text in _PRICE_WORDS:
-            return OPPONENT_PRICE if text == "对手" else text
-    if shown_values:
-        return shown_values[0]
-    return shown_names[0] if shown_names else ""
 
 
 def price_mode_blocks_order(text: str | None) -> str:
@@ -143,11 +127,6 @@ def format_limit_price(price: float) -> str:
     text = f"{number:.4f}".rstrip("0").rstrip(".")
     return text
 
-
-def _looks_like_price_number(text: str) -> bool:
-    """纯数字是限价，不是对手价。"""
-    body = str(text or "").strip().replace(".", "", 1)
-    return bool(body) and body.isdigit()
 
 
 def confirm_opponent_before_click(reader, setter) -> tuple[bool, str]:
@@ -432,34 +411,3 @@ def _rect_of(ctrl: Any) -> tuple[int, int, int, int] | None:
     return left, top, right, bottom
 
 
-def _visible_text(ctrl: Any) -> str:
-    """
-    读控件上给人看的字。
-
-    输入值是框里当前的选项。名字里再出现「对手价」，也不能把「最新价」说成已经设好。
-    """
-    chunks: list[str] = []
-    try:
-        name = str(ctrl.Name or "").strip()
-    except Exception:  # noqa: BLE001
-        name = ""
-    if name:
-        chunks.append(name)
-    for getter in ("GetValuePattern", "GetLegacyIAccessiblePattern"):
-        try:
-            pattern = getattr(ctrl, getter)()
-        except Exception:  # noqa: BLE001
-            continue
-        if pattern is None:
-            continue
-        for attr in ("Value", "Name"):
-            try:
-                text = str(getattr(pattern, attr, "") or "").strip()
-            except Exception:  # noqa: BLE001
-                continue
-            if text:
-                chunks.append(text)
-    values = [item for item in chunks[1:] if item]
-    names = [chunks[0]] if chunks else []
-    # 值是框里当前的选项。名字里夹着的「对手价」不能盖过「最新价」。
-    return choose_shown_price(values, names)

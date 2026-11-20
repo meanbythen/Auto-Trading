@@ -15,6 +15,7 @@ from typing import Any
 
 from src.account.signal_book import load_named_book, matched_closes, open_position_rows
 from src.account.workspace import CTP_LIVE, CTP_SIM, display_label
+from src.domain.pnl_stats import summarize_pnl
 
 
 @dataclass
@@ -55,14 +56,14 @@ def _side(root: Path, account_id: str, *, symbol: str = "") -> BookSide:
     side.rows = rows
     side.trades = len(rows)
     side.pnl = round(sum(float(row.get("pnl") or 0) for row in rows), 2)
-    side.wins = sum(1 for row in rows if float(row.get("pnl") or 0) > 0)
-    side.win_rate = (side.wins / side.trades * 100.0) if side.trades else 0.0
-    gains = sum(float(row.get("pnl") or 0) for row in rows if float(row.get("pnl") or 0) > 0)
-    losses = -sum(float(row.get("pnl") or 0) for row in rows if float(row.get("pnl") or 0) < 0)
-    if losses > 0:
-        side.profit_factor = round(gains / losses, 2)
-    elif gains > 0:
+    stats = summarize_pnl([float(row.get("pnl") or 0) for row in rows], zero_as_loss=True)
+    side.wins = stats.wins
+    side.win_rate = stats.win_rate * 100.0
+    factor = stats.profit_factor
+    if factor is None or factor == float("inf"):
         side.profit_factor = None  # 没有亏损样本，盈利因子没有意义，显示「—」
+    else:
+        side.profit_factor = round(factor, 2)
     opens = open_position_rows(book)
     if symbol:
         opens = [row for row in opens if str(row.get("symbol") or "") == symbol]

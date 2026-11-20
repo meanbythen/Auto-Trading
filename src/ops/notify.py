@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import threading
 import time
+from collections.abc import Callable
 from collections import deque
 from dataclasses import dataclass, field
 from queue import Empty, Full, Queue
@@ -123,6 +124,15 @@ def configure(cfg: dict[str, Any] | None) -> NotifyConfig:
 
 def current_config() -> NotifyConfig:
     return _state.cfg
+
+
+_failure_hook: Callable[[], None] | None = None
+
+
+def set_failure_hook(hook: Callable[[], None] | None) -> None:
+    """失败时补一条本地告警的回调；由 alerts 注册，避免 notify 反向导入。"""
+    global _failure_hook
+    _failure_hook = hook
 
 
 def notify(row: dict[str, Any]) -> bool:
@@ -255,9 +265,8 @@ def _deliver(item: dict[str, Any]) -> None:
     _state.failed += 1
     logger.warning("告警外发失败，已重试 {} 次，只保留本地记录", RETRY_TIMES)
     try:
-        from src.ops.alerts import emit_alert
-
-        emit_alert("notify_failed", "飞书告警外发失败，只保留本地记录", level="warning")
+        if _failure_hook is not None:
+            _failure_hook()
     except Exception:  # noqa: BLE001
         logger.exception("写 notify_failed 告警失败")
 

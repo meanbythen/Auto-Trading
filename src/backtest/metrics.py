@@ -5,9 +5,11 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any
 
+from src.domain.pnl_stats import summarize_pnl
 from src.domain.trade import TradeRecord
 
 
@@ -175,17 +177,19 @@ def calc_performance(
         return p
 
     pnls = [t.pnl for t in trades]
-    wins = [x for x in pnls if x > 0]
-    losses = [x for x in pnls if x <= 0]
-    p.wins = len(wins)
-    p.losses = len(losses)
-    p.win_rate = p.wins / p.trades if p.trades else 0.0
+    summary = summarize_pnl(pnls, zero_as_loss=True)
+    p.wins = summary.wins
+    p.losses = summary.losses
+    p.win_rate = summary.win_rate
     p.net_pnl = float(sum(pnls))
-    p.gross_profit = float(sum(wins)) if wins else 0.0
-    p.gross_loss = float(abs(sum(losses))) if losses else 0.0
-    p.profit_factor = (
-        p.gross_profit / p.gross_loss if p.gross_loss > 1e-9 else (99.0 if p.gross_profit > 0 else 0.0)
-    )
+    p.gross_profit = summary.gross_profit
+    p.gross_loss = summary.gross_loss
+    if summary.profit_factor is None:
+        p.profit_factor = 0.0
+    elif math.isinf(summary.profit_factor):
+        p.profit_factor = 99.0
+    else:
+        p.profit_factor = summary.profit_factor
     p.avg_win = p.gross_profit / p.wins if p.wins else 0.0
     p.avg_loss = p.gross_loss / p.losses if p.losses else 0.0
     p.payoff = payoff_ratio(p.avg_win, p.avg_loss)

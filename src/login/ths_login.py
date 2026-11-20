@@ -110,7 +110,7 @@ def _texts_at_points(points: list[tuple[int, int]]) -> list[str]:
     try:
         import uiautomation as auto
 
-        from src.trader.price_mode import _visible_text
+        from src.utils.winui import _visible_text
     except Exception as exc:  # noqa: BLE001
         logger.warning("无法读取下单坐标上的字: {}", exc)
         return []
@@ -755,7 +755,7 @@ def _click_control_center(ctrl: Any) -> bool:
     rect = _control_rect(ctrl)
     hwnd = _owning_hwnd(ctrl)
     if hwnd:
-        from src.login.app_login import force_foreground
+        from src.utils.winui import force_foreground
 
         force_foreground(hwnd)
         time.sleep(0.2)
@@ -862,7 +862,7 @@ def _click_settlement_window(window: Any) -> bool:
         return False
     hwnd = _owning_hwnd(window)
     if hwnd:
-        from src.login.app_login import force_foreground
+        from src.utils.winui import force_foreground
 
         force_foreground(hwnd)
         time.sleep(0.2)

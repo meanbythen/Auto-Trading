@@ -75,9 +75,12 @@ def emit_alert(
     logger.warning("告警 [{}] {}", code, message)
     # 外发只入队，失败由 notify 自己降级，不能影响告警写入。
     try:
-        from src.ops.notify import notify
+        from src.ops import notify as notify_mod
 
-        notify(row)
+        notify_mod.set_failure_hook(
+            lambda: emit_alert("notify_failed", "飞书告警外发失败，只保留本地记录", level="warning")
+        )
+        notify_mod.notify(row)
     except Exception:  # noqa: BLE001
         logger.debug("告警外发入队失败，忽略")
     return True

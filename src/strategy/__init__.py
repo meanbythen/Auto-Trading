@@ -13,6 +13,7 @@ from .factory import (
     engine_label,
     list_engines,
     normalize_engine,
+    param_section,
     sanitize_strategy_config,
 )
 from .supertrend import SuperTrendStrategy
@@ -32,6 +33,7 @@ __all__ = [
     "create_strategy",
     "engine_label",
     "normalize_engine",
+    "param_section",
     "cross_engine_choices",
     "list_engines",
     "sanitize_strategy_config",

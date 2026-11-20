@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from loguru import logger
+from src.strategy.factory import REMOVED_ENGINES
 from src.strategy.rule_dsl import rule_engine_stem
 from src.ui.app_common import _clock_text
 from src.utils import load_config
@@ -224,7 +225,9 @@ class ConfigCollectMixin:
         body.pop("reverse_atr_mult", None)
         # 止损触发方式已挪到 strategy 根，旧键顺手清掉。
         body.pop("stop_mode", None)
-        st.pop("float_hold", None)
+        # 已删引擎留下的整节配置，保存时统一清掉；名单只认策略工厂那一份。
+        for removed in REMOVED_ENGINES:
+            st.pop(removed, None)
 
         trend_box = st.setdefault("trend_follow", {})
         try:

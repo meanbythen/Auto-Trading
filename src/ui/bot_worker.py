@@ -84,8 +84,19 @@ class BotWorker:
         if self.bot:
             self.bot.sync_risk_limits(max_daily_loss)
 
+    def apply_runtime_config(self, cfg: dict[str, Any]) -> None:
+        """配置页保存后，把新参数推给正在跑的机器人。"""
+        if self.bot:
+            self.bot.apply_runtime_config(cfg)
+
+    def positions_snapshot(self) -> dict[str, dict[str, Any]]:
+        """程序账持仓只读副本。"""
+        if not self.bot:
+            return {}
+        return self.bot.positions_snapshot()
+
     def orders_paused(self) -> bool:
-        return bool(self.bot and getattr(self.bot, "_orders_paused", False))
+        return bool(self.bot and getattr(self.bot, "orders_paused", False))
 
     def status_snapshot(self) -> dict[str, Any]:
         if not self.bot:

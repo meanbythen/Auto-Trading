@@ -9,7 +9,7 @@
 
 from __future__ import annotations
 
-from src.review.fundamental import product_of
+from src.domain.products import product_of
 
 # 每个品种：常见看什么 + 推荐去哪看（公开渠道为主，不保证永远能打开）
 _SOURCES: dict[str, dict[str, object]] = {

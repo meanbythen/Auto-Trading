@@ -1089,16 +1089,7 @@ class RunTabMixin:
 
         # 先读程序当前账上的仓位，弹窗里会显示"程序已记的仓位：xxx"
         if bot is not None and getattr(bot, "strategy", None) is not None:
-            pos_rows = open_position_rows(
-                {
-                    sym: {
-                        "side": getattr(pos, "side", "flat"),
-                        "volume": getattr(pos, "volume", 0),
-                        "entry_price": getattr(pos, "entry_price", 0),
-                    }
-                    for sym, pos in (getattr(bot.strategy, "positions", {}) or {}).items()
-                }
-            )
+            pos_rows = open_position_rows(bot.positions_snapshot())
         else:
             state = load_state(default_state_path(self.root_dir))
             pos_rows = open_position_rows(state.get("positions") or {})
@@ -1549,9 +1540,9 @@ class RunTabMixin:
                     emit_alert("force_close", "关窗时后台线程未退出，用户选择强制关闭", level="error")
                 except Exception:  # noqa: BLE001
                     pass
-                if bot is not None and hasattr(bot, "_record_event"):
+                if bot is not None and hasattr(bot, "note_force_close"):
                     try:
-                        bot._record_event("force_close")
+                        bot.note_force_close()
                     except Exception:  # noqa: BLE001
                         pass
         self.destroy()

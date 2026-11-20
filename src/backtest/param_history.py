@@ -301,8 +301,8 @@ def strategy_display_name(engine: str | None) -> str:
     """配置里的策略代号换成界面上的中文，例如 daily_body → 日内实体。"""
     if not str(engine or "").strip():
         return "未填策略"
-    # 放在函数里引用，避免参数历史模块和复盘模块互相导入。
-    from src.review.replay import label_for_engine
+    # 标签表在策略层，参数历史不再绕到复盘模块。
+    from src.strategy.engine_labels import label_for_engine
 
     return label_for_engine(str(engine))
 

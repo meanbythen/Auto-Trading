@@ -21,6 +21,7 @@ from src.data.kline import bars_age_minutes
 from src.data.periods import canonical_period, is_session_open_stamp, period_label, stale_after_minutes
 from src.data.quote_check import normalize_source, source_label, storage_symbol
 from src.data.tq_source import session_open_minutes
+from src.domain.contracts import DEFAULT_MULTIPLIER
 
 
 LATEST_NAME = "行情质量.xlsx"
@@ -305,11 +306,11 @@ def resolve_tick_mult(cfg: dict[str, Any] | None, symbol: str) -> tuple[float, f
     if tick <= 0:
         tick = 1.0
     try:
-        mult = float((box or {}).get("multiplier") or 10)
+        mult = float((box or {}).get("multiplier") or DEFAULT_MULTIPLIER)
     except (TypeError, ValueError):
-        mult = 10.0
+        mult = DEFAULT_MULTIPLIER
     if mult <= 0:
-        mult = 10.0
+        mult = DEFAULT_MULTIPLIER
     return tick, mult
 
 

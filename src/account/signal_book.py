@@ -25,7 +25,7 @@ from typing import Any
 
 from loguru import logger
 
-from src.domain.contracts import contract_multipliers
+from src.domain.contracts import DEFAULT_MULTIPLIER, contract_multipliers
 from src.domain.ledger import (
     balance_of,
     ctp_history_equity as ctp_history_equity,
@@ -239,7 +239,7 @@ def day_pnl_from_ctp_history(
     day: date | str,
 ) -> float | None:
     """从柜台历史里，取某个交易日最后一笔「还没被结算清零」的当日盈亏。"""
-    from src.account.ctp_sync import broker_day_pnl
+    from src.account.broker_pnl import broker_day_pnl
 
     want = str(day)[:10]
     best: float | None = None
@@ -263,7 +263,7 @@ def day_pnl_from_ctp_history(
 
 def _store_ctp_day_pnl(book: dict[str, Any], snap: dict[str, Any]) -> None:
     """把这一笔快照写进 ctp_daily；结算空壳且已有非零记录时不动。"""
-    from src.account.ctp_sync import broker_day_pnl
+    from src.account.broker_pnl import broker_day_pnl
 
     day_key = str(futures_trading_day(snap.get("time")))
     days = dict(book.get("ctp_daily") or {})
@@ -511,7 +511,7 @@ def append_trade(
             "direction": direction,
             "price": px,
             "volume": vol,
-            "multiplier": float(multiplier or 10),
+            "multiplier": float(multiplier or DEFAULT_MULTIPLIER),
             "reason": str(reason or ""),
             "bar_id": str(bar_id or ""),
             "commission": fee,
@@ -1182,7 +1182,7 @@ def _lookup_multiplier(symbol: str, multipliers: dict[str, float]) -> float:
     letters = "".join(ch for ch in str(symbol) if ch.isalpha()).lower()
     if letters in multipliers:
         return float(multipliers[letters])
-    return 10.0
+    return DEFAULT_MULTIPLIER
 
 
 def _trade_key(symbol: Any, offset: Any, direction: Any, bar_id: Any) -> str:

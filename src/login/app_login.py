@@ -19,6 +19,8 @@ import psutil
 import pyautogui
 from loguru import logger
 
+from src.utils.winui import force_foreground as force_foreground
+
 try:
     import pygetwindow as gw
 except ImportError:  # pragma: no cover
@@ -33,42 +35,6 @@ _EXTRA_PROCESS_NAMES = {
     "qhtong.exe",
     "ths.exe",
 }
-
-
-def force_foreground(hwnd: int) -> bool:
-    """
-    把窗口放到最前。
-
-    Windows 不允许后台程序随便抢焦点。pygetwindow 一失败就报错，
-    错误码 0 的意思其实是「操作成功完成」，错误码 2 经常是上一步启动程序留下的旧错误。
-    这里先挂到当前前台窗口的输入队列上，再置顶，最后只看前台是不是已经变成这个窗口。
-    """
-    if not hwnd:
-        return False
-    user32 = ctypes.windll.user32
-    kernel32 = ctypes.windll.kernel32
-    if user32.IsIconic(hwnd):
-        user32.ShowWindow(hwnd, 9)  # SW_RESTORE，先从最小化还原
-    user32.ShowWindow(hwnd, 5)  # SW_SHOW
-    if user32.GetForegroundWindow() == hwnd:
-        return True
-
-    our_thread = kernel32.GetCurrentThreadId()
-    process_id = ctypes.c_ulong()
-    foreground = user32.GetForegroundWindow()
-    foreground_thread = user32.GetWindowThreadProcessId(foreground, ctypes.byref(process_id)) if foreground else 0
-    target_thread = user32.GetWindowThreadProcessId(hwnd, ctypes.byref(process_id))
-    attached: list[int] = []
-    for other in (int(foreground_thread or 0), int(target_thread or 0)):
-        if other and other != our_thread and other not in attached:
-            if user32.AttachThreadInput(our_thread, other, True):
-                attached.append(other)
-    user32.BringWindowToTop(hwnd)
-    kernel32.SetLastError(0)
-    user32.SetForegroundWindow(hwnd)
-    for other in attached:
-        user32.AttachThreadInput(our_thread, other, False)
-    return user32.GetForegroundWindow() == hwnd
 
 
 def pin_topmost(hwnd: int) -> None:
