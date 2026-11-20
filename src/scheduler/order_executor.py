@@ -1282,6 +1282,8 @@ class OrderExecutorMixin:
             books_note=str(getattr(trader, "_last_note", "") or "") if trader is not None else "",
             detail=detail,
             force=bool((decision.meta or {}).get("force")),
+            health_blocked=bool(getattr(self, "_health_blocked", False)),
+            health_block_reason=str(getattr(self, "_health_block_reason", "") or ""),
         )
 
     def _reject_gate(self, decision: StrategyDecision, code: str, reason: str, bar_key: str) -> None:
@@ -1304,6 +1306,8 @@ class OrderExecutorMixin:
             logger.warning(reason)
         elif code == "order_working":
             logger.warning("上一笔 {} 还没有最终回报，先不报新单", decision.symbol)
+        elif code == "strategy_health":
+            logger.warning("策略健康停开新仓 {}: {}", decision.symbol, reason)
         elif code == "risk_block":
             if "停止开新仓" in reason or "柜台" in reason or "对账" in reason:
                 logger.warning("停止开新仓 {}: {}", decision.symbol, reason)
@@ -1318,7 +1322,7 @@ class OrderExecutorMixin:
             extra = {"reason": decision.reason}
         elif code == "order_working":
             extra = {"reason": "等待上一笔回报"}
-        elif code in {"order_blocked_stage", "risk_block", "size_skip"}:
+        elif code in {"order_blocked_stage", "risk_block", "size_skip", "strategy_health"}:
             extra = {"reason": reason}
         self._record_event(code, symbol=decision.symbol, side=side, **extra)
         risk_at = now_iso()

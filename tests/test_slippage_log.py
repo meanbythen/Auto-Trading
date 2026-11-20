@@ -1,6 +1,20 @@
 # -*- coding: utf-8 -*-
 """滑点记录模块：符号约定、CSV 落盘、汇总统计。"""
-from src.account.slippage_log import load_rows, record_fill, summarize, summarize_text
+import csv
+import json
+from datetime import datetime, timedelta
+
+from src.account.slippage_log import (
+    load_rows,
+    quality_text,
+    reject_summary,
+    record_fill,
+    summarize,
+    summarize_by_side,
+    summarize_by_session,
+    summarize_by_symbol,
+    summarize_text,
+)
 
 
 def test_record_sign_convention(tmp_path):
@@ -70,3 +84,122 @@ def test_summarize_prefers_real_ctp(tmp_path):
 
 def test_summarize_empty(tmp_path):
     assert "还没有成交滑点记录" in summarize_text(tmp_path)
+
+
+def test_summarize_by_symbol_keeps_products_apart(tmp_path):
+    """生猪和燃油的滑点不能混成一个平均数。"""
+    for slip in (1, 2, 3):
+        record_fill(tmp_path, symbol="fu2701", action="BUY_OPEN", volume=1,
+                    theory_price=3000, fill_price=3000 + slip, tick=1,
+                    executor="ctp", dry_run=False)
+    for slip in (5, 6, 7):
+        record_fill(tmp_path, symbol="lh2701", action="BUY_OPEN", volume=1,
+                    theory_price=9000, fill_price=9000 + slip, tick=1,
+                    executor="ctp", dry_run=False)
+    # 样本不足 3 笔的品种不参与建议
+    record_fill(tmp_path, symbol="c2701", action="BUY_OPEN", volume=1,
+                theory_price=2300, fill_price=2301, tick=1, executor="ctp", dry_run=False)
+    rows = summarize_by_symbol(tmp_path)
+    assert [row["symbol"] for row in rows] == ["fu", "lh"]
+    by_symbol = {row["symbol"]: row for row in rows}
+    assert by_symbol["fu"]["suggested"] == 2.5
+    assert by_symbol["lh"]["p70"] > 5
+    assert by_symbol["fu"]["used_real"] is True
+
+    text = summarize_text(tmp_path)
+    assert "分品种建议" in text
+    assert "fu" in text and "lh" in text
+
+
+def test_summarize_by_side_separates_buy_and_sell(tmp_path):
+    for slip in (1, 2, 3):
+        record_fill(tmp_path, symbol="fu2701", action="BUY_OPEN", volume=1,
+                    theory_price=3000, fill_price=3000 + slip, tick=1,
+                    executor="ctp", dry_run=False)
+    for slip in (5, 6, 7):
+        record_fill(tmp_path, symbol="fu2701", action="SELL_OPEN", volume=1,
+                    theory_price=3000, fill_price=3000 - slip, tick=1,
+                    executor="ctp", dry_run=False)
+    # GUI 假定成交不能掺进来
+    record_fill(tmp_path, symbol="fu2701", action="BUY_OPEN", volume=1,
+                theory_price=3000, fill_price=3000, tick=1, executor="gui", dry_run=False)
+
+    by_side = {row["key"]: row for row in summarize_by_side(tmp_path)}
+    assert set(by_side) == {"买", "卖"}
+    assert by_side["买"]["n"] == 3
+    assert by_side["买"]["suggested"] == 2.5
+    assert by_side["卖"]["suggested"] == 6.5
+
+
+def _write_slip_row(root, ts: str, slip: int) -> None:
+    path = root / "data" / "slippage_log.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    new = not path.exists()
+    with path.open("a", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        if new:
+            writer.writerow(["ts", "symbol", "action", "volume", "theory_price",
+                             "fill_price", "slip_ticks", "tick", "executor", "dry_run"])
+        writer.writerow([ts, "fu2701", "BUY_OPEN", 1, "3000", "3000", slip, "1", "ctp", "0"])
+
+
+def test_summarize_by_session_splits_day_and_night(tmp_path):
+    for slip in (1, 2, 3, 4):
+        _write_slip_row(tmp_path, "2026-11-19T10:05:00", slip)
+    for slip in (5, 6, 7):
+        _write_slip_row(tmp_path, "2026-11-19T21:30:00", slip)
+
+    by_session = {row["key"]: row for row in summarize_by_session(tmp_path)}
+    assert by_session["日盘"]["n"] == 4
+    assert by_session["夜盘"]["n"] == 3
+    assert by_session["日盘"]["suggested"] < by_session["夜盘"]["suggested"]
+
+
+def _write_event(root, ts: str, event: str, symbol: str) -> None:
+    path = root / "data" / "events.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write(json.dumps({"ts": ts, "event": event, "symbol": symbol}) + "\n")
+
+
+def test_reject_summary_counts_symbols_and_reasons(tmp_path):
+    now = datetime.now().isoformat(timespec="seconds")
+    old = (datetime.now() - timedelta(days=60)).isoformat(timespec="seconds")
+    _write_event(tmp_path, now, "order_fail", "fu2701")
+    _write_event(tmp_path, now, "order_fail", "fu2705")
+    _write_event(tmp_path, now, "order_no_price", "lh2701")
+    _write_event(tmp_path, now, "risk_block", "SA2701")
+    _write_event(tmp_path, now, "strategy_health", "fu2701")
+    _write_event(tmp_path, now, "order_sent", "fu2701")
+    _write_event(tmp_path, old, "order_fail", "fu2701")
+
+    info = reject_summary(tmp_path)
+    assert info["total"] == 5
+    reasons = {item["key"]: item["n"] for item in info["by_reason"]}
+    assert reasons == {"柜台拒单": 2, "没有价格": 1, "风控拦截": 1, "健康停开": 1}
+    symbols = {item["key"]: item["n"] for item in info["by_symbol"]}
+    assert symbols["fu"] == 3
+    assert symbols["lh"] == 1
+    assert symbols["sa"] == 1
+
+
+def test_quality_text_reports_missing_samples(tmp_path):
+    text = quality_text(tmp_path)
+    assert "成交质量" in text
+    assert "按方向：真实样本不足 3 笔" in text
+    assert "按时段：真实样本不足 3 笔" in text
+    assert "拒单：近 30 天没有记录" in text
+
+
+def test_quality_text_lists_all_three_blocks(tmp_path):
+    for slip in (1, 2, 3):
+        record_fill(tmp_path, symbol="fu2701", action="BUY_OPEN", volume=1,
+                    theory_price=3000, fill_price=3000 + slip, tick=1,
+                    executor="ctp", dry_run=False)
+    _write_event(tmp_path, datetime.now().isoformat(timespec="seconds"), "order_fail", "fu2701")
+
+    text = quality_text(tmp_path)
+    assert "买 3笔" in text
+    assert "按时段：" in text
+    assert "近 30 天 1 次（柜台拒单 1 次）" in text
+    assert "分品种  fu 1 次" in text

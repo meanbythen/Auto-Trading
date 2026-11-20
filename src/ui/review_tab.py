@@ -240,9 +240,12 @@ class ReviewTabMixin:
                 )
                 # 尾部附上实盘滑点校准段：真实成交攒出来的滑点分布，回测该填几跳看它。
                 try:
-                    from src.account.slippage_log import summarize_text
+                    from src.account.slippage_log import quality_text, summarize_text
 
-                    text = f"{text}\n\n{summarize_text(self.root_dir)}"
+                    text = (
+                        f"{text}\n\n{summarize_text(self.root_dir)}"
+                        f"\n\n{quality_text(self.root_dir)}"
+                    )
                 except Exception:  # noqa: BLE001
                     logger.debug("滑点汇总失败，已忽略", exc_info=True)
                 try:

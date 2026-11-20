@@ -16,6 +16,7 @@ from loguru import logger
 from src.data.kline import KlineProvider
 from src.review.actual import actual_lines
 from src.review.baseline import build_baseline_report, save_review_summary
+from src.review.consistency import build_consistency_lines
 from src.review.diagnose import diagnose
 from src.review.fundamental import collect_fundamentals
 from src.review.gap import build_gap_report
@@ -139,6 +140,14 @@ def build_review(
 
     replay_eval = build_replay_eval(quality, cfg)
     live_eval = build_live_vs_backtest(root_path, symbol, cfg)
+    consistency = build_consistency_lines(
+        root_path,
+        symbol=symbol,
+        windows=windows,
+        cfg=cfg,
+        trades=quality.trades,
+        minutes=_review_minutes(cfg, symbol, windows) if fetch_remote else None,
+    )
 
     text = render_report(
         symbol=symbol,
@@ -156,6 +165,7 @@ def build_review(
         baseline=baseline,
         replay_eval=replay_eval,
         live_eval=live_eval,
+        consistency=consistency,
         now=now,
     )
     if save:
@@ -218,6 +228,25 @@ def _load_bars(
         except Exception as e:  # noqa: BLE001
             logger.info("复盘止损周期K线没有拉到，策略只使用信号周期: {}", e)
     return signal, trail
+
+
+def _review_minutes(
+    cfg: dict,
+    symbol: str,
+    windows: list,
+) -> pd.DataFrame | None:
+    """复盘当天 1 分钟K线。取不到就返回空，一致性一节会写明原因。"""
+    if not windows:
+        return None
+    try:
+        from src.backtest.minute_review import load_one_minute_bars
+
+        start = min(window.start for window in windows).isoformat(timespec="minutes")
+        end = max(window.end for window in windows).isoformat(timespec="minutes")
+        return load_one_minute_bars(cfg, symbol, start=start, end=end)
+    except Exception as exc:  # noqa: BLE001
+        logger.info("复盘1分钟K线没有取到: {}", exc)
+        return None
 
 
 def _save(root: Path, symbol: str, trade_date: date, text: str) -> Path:

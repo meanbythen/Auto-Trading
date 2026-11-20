@@ -78,11 +78,24 @@ class BacktestActionsMixin:
         from src.backtest.live_gates import format_mirror_gate_lines
         from src.backtest.metrics import format_expectancy_line, format_payoff_lines
         from src.backtest.rollover import format_rollover_lines
+        from src.backtest.slippage import build_ladder, ladder_lines
         from src.screen.picker import format_cover_lines
+        from src.strategy.profile import header_line
 
         p = result.performance
         snap = result.params_snapshot or {}
+        profile_note = header_line(
+            str(snap.get("engine", engine_fallback)),
+            {"strategy": {"flatten_at_close": snap.get("flatten_at_close", True)}},
+        )
         rollover_text = format_rollover_lines(snap)
+        used_slip = snap.get("slippage_ticks")
+        ladder = build_ladder(
+            getattr(self, "cfg", None),
+            symbol=str(result.symbol or ""),
+            root=getattr(self, "root_dir", None),
+            baseline=used_slip,
+        )
         note = ""
         if p.trades < 3:
             note = (
@@ -93,6 +106,7 @@ class BacktestActionsMixin:
             f"{header}  {result.symbol}",
             f"跑完时间  {result.ran_at}",
             f"策略      {snap.get('engine', engine_fallback)}",
+            *([profile_note] if profile_note else []),
             "收盘清仓  开（到点强平）"
             if snap.get("flatten_at_close", True)
             else "收盘清仓  关（可留过收盘；区间最后一根仍会按收盘价结算未平的仓）",
@@ -105,6 +119,10 @@ class BacktestActionsMixin:
             str(snap.get("coverage_note") or "").strip(),
             *([rollover_text] if rollover_text else []),
             str(snap.get("fill_note") or "").strip(),
+            *ladder_lines(
+                ladder,
+                used=float(used_slip) if isinstance(used_slip, (int, float)) else None,
+            ),
             *format_mirror_gate_lines(
                 snap.get("mirror_gate_hits") or [],
                 enabled=bool(snap.get("mirror_live_gates")),
@@ -390,22 +408,30 @@ class BacktestActionsMixin:
         from tkinter import messagebox
 
         from src.account.slippage_log import summarize
+        from src.backtest.slippage import build_ladder, ladder_lines
 
+        symbol = ""
+        if hasattr(self, "bt_symbol_var"):
+            symbol = str(self.bt_symbol_var.get() or "").strip()
         info = summarize(self.root_dir)
-        if not info["n"]:
+        ladder = build_ladder(self.cfg, symbol=symbol, root=self.root_dir)
+        if ladder.actual is None and not info["n"]:
             messagebox.showinfo(
                 "实盘滑点",
                 "还没有滑点记录。有真实成交（尤其是 CTP 回报）之后才会给出建议。",
             )
             return
-        suggested = float(info["suggested"] or 0)
-        scope = "真实成交" if info["used_real"] else "全部记录（含点击假定成交，仅供参考）"
+        if ladder.actual is not None:
+            suggested = float(ladder.actual)
+            scope = f"同品种真实成交 {ladder.actual_n} 笔"
+        else:
+            suggested = float(info["suggested"] or 0)
+            scope = "真实成交" if info["used_real"] else "全部记录（含点击假定成交，仅供参考）"
         if not messagebox.askyesno(
             "填入回测滑点",
-            f"样本 {info['n']} 笔（{scope}）。\n"
-            f"中位 {info['median']:+.2f} 跳，70分位 {info['p70']:+.2f} 跳。\n"
-            f"建议回测填 {suggested:g} 跳。\n\n"
-            "只改历史回测页这个数字，不改开平仓规则。要填入吗？",
+            "\n".join(ladder_lines(ladder))
+            + f"\n\n建议回测填 {suggested:g} 跳（{scope}）。\n\n"
+            "只改历史回测页这个数字，不改开平仓规则，也不自动保存配置文件。要填入吗？",
         ):
             return
         self.bt_slippage_var.set(str(suggested))

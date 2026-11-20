@@ -147,6 +147,12 @@ def replay_strategy(
     """
     label = label_for_engine(engine)
     result = StrategyReplay(label=label, engine=engine)
+    if engine is not None:
+        from src.strategy.profile import header_line
+
+        profile = header_line(engine, cfg)
+        if profile:
+            result.lines.append(profile)
     if engine is None:
         result.lines.append("这次没有套用程序里的任何策略，所以不会出现「策略开仓」或「策略观望」。")
         result.lines.append("上面的针形线、均线、关键位只是盘面现象。要不要做，对照你自己的交易计划，而不是对照某段代码。")

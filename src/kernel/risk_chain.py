@@ -36,6 +36,9 @@ class TradeIntent:
     books_note: str = ""
     detail: str = ""
     force: bool = False
+    # 策略连续多日偏离回测。只在配置打开停开闸时由调度器置真，只拦开新仓。
+    health_blocked: bool = False
+    health_block_reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -55,6 +58,17 @@ def _paused(intent: TradeIntent, _risk: Any) -> GateResult | None:
     # 暂停只拦开新仓。止损、反手平仓、收盘清仓仍要能发。
     if intent.orders_paused and _is_open(intent.side):
         return GateResult(False, "order_paused", "已暂停报单，本笔没有发出")
+    return None
+
+
+def _health(intent: TradeIntent, _risk: Any) -> GateResult | None:
+    # 策略健康只停开新仓。已有仓的止损、反手和收盘清仓必须照常发出去。
+    if intent.health_blocked and _is_open(intent.side):
+        return GateResult(
+            False,
+            "strategy_health",
+            intent.health_block_reason or "策略连续偏离最近回测，按配置停开新仓",
+        )
     return None
 
 
@@ -139,6 +153,7 @@ def _guardian(intent: TradeIntent, risk: Any) -> GateResult | None:
 # 顺序必须和常驻原来的判断一致，不能对调。
 EARLY_RULES: tuple[Callable[[TradeIntent, Any], GateResult | None], ...] = (
     _paused,
+    _health,
     _ledger,
     _dedup,
 )

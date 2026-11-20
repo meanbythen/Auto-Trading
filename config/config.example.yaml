@@ -659,6 +659,10 @@ risk:
 runtime:
   keep_display_awake: true
   watchdog_enabled: true  # 主循环心跳看门狗；阈值 max(3×扫描间隔, 180 秒)
+  # 策略健康停开（默认关）：连续 health_block_days 个交易日偏离最近回测时，只停开新仓。
+  # 止损、反手平仓和收盘清仓不受影响。默认只在界面上提醒，不停手。
+  health_block_entry: false
+  health_block_days: 5
   # 收盘后自动关机（默认关）。有夜盘时等到夜盘最后清仓之后，不会在下午 14:55 就关
   auto_shutdown_after_close: false
   shutdown_grace_minutes: 5   # 过了最后收盘时刻后再等几分钟

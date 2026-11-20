@@ -221,6 +221,9 @@ class TradingBot(
         self.last_scan_at: str = ""
         self.last_error: str = ""
         self._health_report: dict[str, Any] | None = None
+        # 只有 runtime.health_block_entry 打开且连续偏离达标时为真，只停开新仓。
+        self._health_blocked = False
+        self._health_block_reason = ""
         # 行情健康按「合约|周期」保留；完整延迟逐轮写独立日志，异常事件/告警限流。
         self._market_health: dict[str, dict[str, Any]] = {}
         self._market_scan_at: dict[str, float] = {}
@@ -1401,13 +1404,36 @@ class TradingBot(
         )
 
     def _maybe_check_health(self) -> None:
-        """近 N 笔对照最近回测。只报警，不改变这一轮开平仓。"""
+        """
+        近 N 笔对照最近回测，先核对策略、品种、周期是否同一口径。
+
+        默认只报警。只有 runtime.health_block_entry 打开、且连续偏离达标时，
+        才把「停开新仓」的标志交给风控闸门；止损和清仓不受影响。
+        """
         try:
-            from src.ops.health import maybe_emit_health
+            from src.ops.health import entry_block_decision, maybe_emit_health
             from src.utils.paths import project_root
 
-            report = maybe_emit_health(project_root())
-            self._health_report = report.as_dict()
+            strategy = self.cfg.get("strategy")
+            strategy = strategy if isinstance(strategy, dict) else {}
+            trade = self.cfg.get("trade")
+            trade = trade if isinstance(trade, dict) else {}
+            symbol = str(trade.get("symbol") or (self.symbols[0] if self.symbols else ""))
+            report = maybe_emit_health(
+                project_root(),
+                engine=str(strategy.get("engine") or ""),
+                symbol=symbol,
+                timeframe=str(strategy.get("timeframe") or ""),
+            )
+            blocked, reason = entry_block_decision(self.cfg, report)
+            self._health_blocked = blocked
+            self._health_block_reason = reason
+            data = report.as_dict()
+            data["entry_blocked"] = blocked
+            if blocked:
+                data["message"] = reason
+                logger.warning("策略健康停开新仓：{}", reason)
+            self._health_report = data
         except Exception as exc:  # noqa: BLE001
             logger.debug("策略健康检查跳过：{}", exc)
 

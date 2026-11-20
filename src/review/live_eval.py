@@ -50,9 +50,19 @@ def build_live_vs_backtest(root: Path | str, symbol: str, cfg: dict[str, Any]) -
     """最近实盘和最近回测的对照，外加最近回测的评估结论。"""
     try:
         base = Path(root)
-        health = evaluate_health(base)
+        strategy = cfg.get("strategy")
+        strategy = strategy if isinstance(strategy, dict) else {}
+        health = evaluate_health(
+            base,
+            engine=str(strategy.get("engine") or ""),
+            symbol=symbol,
+            timeframe=str(strategy.get("timeframe") or ""),
+        )
         lines = ["—— 最近实盘 vs 最近回测 ——"]
         lines.append(f"  对照品种  {symbol}（账本口径，暂不分品种）")
+        if health.scope_mismatch:
+            lines.append("  " + health.message)
+            return lines
         if health.status == "skip" and health.live_n == 0 and not health.bt_n:
             lines.append("  " + health.message)
             return lines
@@ -68,6 +78,8 @@ def build_live_vs_backtest(root: Path | str, symbol: str, cfg: dict[str, Any]) -
         if health.live_pf is not None and health.bt_pf:
             lines.append(f"  盈利因子比值  {health.live_pf / health.bt_pf:.2f}")
         lines.append("  判定  " + health.message)
+        if health.watch_days:
+            lines.append(f"  连续偏离  第 {health.watch_days} 个交易日")
         verdict = _backtest_verdict(base)
         if verdict:
             lines.append("  最近回测评估  " + verdict)
