@@ -20,6 +20,9 @@ dry_run: true
 # 关闭 sqlite_enabled 后只读写 JSON/JSONL，不创建 trading.db。
 storage:
   sqlite_enabled: true
+  # P2 发件箱：订单/成交先落 trading.db，再由后台线程补账本投影。
+  # 关掉后回到直接调用，已写入的记录保留不删。
+  outbox_enabled: true
   database: "data/trading.db"
 
 app:

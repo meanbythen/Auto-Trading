@@ -21,6 +21,7 @@ DB_LOCK = threading.RLock()
 class StorageSettings:
     sqlite_enabled: bool
     db_path: Path
+    outbox_enabled: bool = True
 
 
 def _bool(value: Any, default: bool = True) -> bool:
@@ -49,6 +50,7 @@ def storage_settings(root: str | Path, cfg: dict[str, Any] | None = None) -> Sto
     return StorageSettings(
         sqlite_enabled=_bool(storage.get("sqlite_enabled"), True),
         db_path=db_path,
+        outbox_enabled=_bool(storage.get("outbox_enabled"), True),
     )
 
 

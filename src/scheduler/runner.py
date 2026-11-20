@@ -2245,6 +2245,21 @@ class TradingBot(
         self._check_holiday_calendar()
         self.setup_schedule()
         self._stopped.clear()
+        # P2 发件箱：先把上次没入账的成交补进账本，再启动异步消费线程。
+        # 失败只记日志，不拦住交易；下次启动会继续补。
+        try:
+            from src.account.outbox import enqueue_order_stage, recover_pending, start_dispatcher
+            from src.account.signal_book import apply_outbox_event
+            from src.trader.order_timeline import set_record_listener
+
+            def _record_order(row: dict[str, Any]) -> None:
+                enqueue_order_stage(self.root, row)
+
+            set_record_listener(_record_order)
+            recover_pending(self.root, lambda event: apply_outbox_event(self.root, event))
+            start_dispatcher(self.root, lambda event: apply_outbox_event(self.root, event))
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("发件箱启动失败，继续直接记账: {}", exc)
         self._running = True
         # 第一轮扫描才允许回溯补开仓；上次退出留下持仓时先不补，等对账恢复后再按需开。
         self._catch_up_pending = not bool(getattr(self, "_unprotected_resume", False))
@@ -2354,6 +2369,14 @@ class TradingBot(
                 self._write_unprotected_flag("clean_exit")
             except Exception:  # noqa: BLE001
                 logger.exception("写退出保护标记失败")
+            try:
+                from src.account.outbox import stop_dispatcher
+                from src.trader.order_timeline import set_record_listener
+
+                stop_dispatcher(self.root)
+                set_record_listener(None)
+            except Exception:  # noqa: BLE001
+                logger.exception("停止发件箱消费线程失败")
             try:
                 if hasattr(self.trader, "shutdown"):
                     self.trader.shutdown()

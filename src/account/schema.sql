@@ -181,3 +181,22 @@ CREATE TABLE IF NOT EXISTS risk_decisions (
 
 CREATE INDEX IF NOT EXISTS ix_risk_decisions_query
     ON risk_decisions(account_id, trading_day, ts);
+
+-- P2 发件箱：订单/成交事实先落这里，再由后台线程补账本投影。
+-- 状态：pending=已落库待入账；ready=可投递；done=消费完成；failed=重试耗尽。
+CREATE TABLE IF NOT EXISTS event_outbox (
+    seq          INTEGER PRIMARY KEY AUTOINCREMENT,
+    event_id     TEXT NOT NULL UNIQUE,
+    type         TEXT NOT NULL,
+    account_id   TEXT NOT NULL DEFAULT '',
+    book_id      TEXT NOT NULL DEFAULT '',
+    payload_json TEXT NOT NULL DEFAULT '{}',
+    status       TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending', 'ready', 'done', 'failed')),
+    attempts     INTEGER NOT NULL DEFAULT 0,
+    last_error   TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL,
+    updated_at   TEXT NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_outbox_status ON event_outbox(status, seq);

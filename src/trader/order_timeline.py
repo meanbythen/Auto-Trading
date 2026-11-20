@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import threading
 import uuid
+from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,13 @@ from loguru import logger
 FILE_NAME = "order_timeline.jsonl"
 MAX_BYTES = 20 * 1024 * 1024
 _WRITE_LOCK = threading.RLock()
+_LISTENER: Callable[[dict[str, Any]], None] | None = None
+
+
+def set_record_listener(callback: Callable[[dict[str, Any]], None] | None) -> None:
+    """由启动方注册订单事件监听（发件箱），时间线本身不依赖存储实现。"""
+    global _LISTENER
+    _LISTENER = callback
 
 
 def new_trace_id() -> str:
@@ -78,6 +86,12 @@ class OrderTimeline:
             except Exception as exc:  # noqa: BLE001
                 # SQLite 是可重建投影，异常不改变 JSONL 和交易结果。
                 logger.warning("订单 SQLite 投影失败: {}", exc)
+            listener = _LISTENER
+            if listener is not None:
+                try:
+                    listener(row)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("订单发件箱写入失败: {}", exc)
         return row
 
 

@@ -770,6 +770,46 @@ def record_program_trade(
         return bal
 
 
+def apply_outbox_event(root: str | Path, event: dict[str, Any]) -> None:
+    """发件箱消费者：把 pending/ready 的成交补进账本，其余事件只留日志。
+
+    已存在同一 fill_key 时直接返回，所以崩溃后重复投递不会重复入账。
+    """
+    if event.get("type") != "OrderFilled":
+        logger.debug("发件箱事件 {} {} {}", event.get("seq"), event.get("type"), event.get("event_id"))
+        return
+    payload = event.get("payload") or {}
+    from src.account.workspace import load_active_id
+
+    current = str(load_active_id(root) or "")
+    recorded_book = str(event.get("book_id") or payload.get("book_id") or "")
+    if recorded_book and current and recorded_book != current:
+        raise RuntimeError(f"成交属于账本 {recorded_book}，当前账本是 {current}，需人工核对")
+    book = load_book(root)
+    if book is None:
+        raise RuntimeError("账本还不存在，保留发件箱记录待下次启动补记")
+    fill_key = str(payload.get("fill_key") or "").strip()
+    if fill_key and any(
+        str(row.get("fill_key") or "") == fill_key for row in book.get("trades") or []
+    ):
+        return
+    record_program_trade(
+        root,
+        initial_capital=float(payload.get("initial_capital") or 0),
+        symbol=str(payload.get("symbol") or ""),
+        offset=str(payload.get("offset") or ""),
+        direction=str(payload.get("direction") or ""),
+        price=float(payload.get("price") or 0),
+        volume=int(payload.get("volume") or 0),
+        multiplier=float(payload.get("multiplier") or 1),
+        reason=str(payload.get("reason") or ""),
+        bar_id=str(payload.get("bar_id") or ""),
+        commission=float(payload.get("commission") or 0),
+        fill_key=fill_key,
+        stop_price=payload.get("stop_price"),
+    )
+
+
 def save_manual(root: str | Path, book: dict[str, Any]) -> float:
     """界面上改初始资金、出入金、结算后保存，并返回新余额。"""
     with _LOCK:

@@ -92,7 +92,52 @@ class FillReconcileMixin:
             today = is_close_today(opened_at, datetime.now())
             fee = fee_close(contracts, symbol, vol, close_today=today)
 
-        # 1) 先写信号账户。实盘以这本账为准；dry_run 只看信号，不写账。
+        # 1) 先写发件箱：成交事实先落库，账本写成功后再置 ready。
+        # 这样程序在「柜台已成交、账本还没写」之间崩溃时，下次启动能补记。
+        fill_event_id = ""
+        book_id = ""
+        if not self.cfg.get("dry_run", True):
+            if decision.action == StrategyAction.CLOSE:
+                direction = "多" if side_before == "long" else "空" if side_before == "short" else ""
+                offset = "平仓"
+            elif decision.action == StrategyAction.BUY_OPEN:
+                direction, offset = "多", "开仓"
+            elif decision.action == StrategyAction.SELL_OPEN:
+                direction, offset = "空", "开仓"
+            else:
+                direction, offset = "", ""
+            if direction and fill_key:
+                from src.account.outbox import ORDER_FILLED, enqueue
+                from src.domain.accounts import load_active_id
+
+                book_id = str(load_active_id(self.root) or "")
+                fill_event_id = f"fill:{book_id}:{fill_key}" if fill_key else ""
+                payload = {
+                    "symbol": symbol,
+                    "offset": offset,
+                    "direction": direction,
+                    "price": float(fill_price),
+                    "volume": int(vol),
+                    "multiplier": float(self._contract_multiplier(symbol)),
+                    "commission": float(fee),
+                    "reason": str(decision.reason or ""),
+                    "bar_id": str((decision.meta or {}).get("bar_id") or ""),
+                    "fill_key": str(fill_key or ""),
+                    "side_before": str(side_before or ""),
+                    "account_id": book_id,
+                    "book_id": book_id,
+                }
+                enqueue(
+                    self.root,
+                    ORDER_FILLED,
+                    payload,
+                    event_id=fill_event_id,
+                    account_id=book_id,
+                    book_id=book_id,
+                    status="pending",
+                )
+
+        # 2) 再写信号账户。实盘以这本账为准；dry_run 只看信号，不写账。
         balance = None
         if not self.cfg.get("dry_run", True):
             balance = self._record_signal_account(
@@ -105,6 +150,10 @@ class FillReconcileMixin:
                 fill_key=fill_key,
                 stop_price=stop_price,
             )
+            if fill_event_id and balance is not None:
+                from src.account.outbox import mark_ready
+
+                mark_ready(self.root, fill_event_id)
 
         # 账本没记上时不能改策略/风控仓位：否则真实仓还在，程序却以为已平，
         # 重启后按账本恢复会得到「幽灵仓」。先停止开新仓，等人工处理。
@@ -191,6 +240,26 @@ class FillReconcileMixin:
             self.risk.on_order_filled(decision.action.value, vol, symbol=symbol)
         except Exception as exc:  # noqa: BLE001
             logger.exception("风控净仓同步失败: {}", exc)
+
+        if fill_event_id and direction:
+            from src.account.outbox import POSITION_CHANGED, enqueue
+
+            enqueue(
+                self.root,
+                POSITION_CHANGED,
+                {
+                    "symbol": symbol,
+                    "direction": direction,
+                    "offset": offset,
+                    "volume": int(vol),
+                    "fill_key": str(fill_key or ""),
+                    "book_id": book_id,
+                },
+                event_id=f"position:{book_id}:{fill_key}:{symbol}",
+                account_id=book_id,
+                book_id=book_id,
+                status="ready",
+            )
 
         # 滑点记录：优先用发单时保存的理论价，避免 CTP 回报里的成交价覆盖信号价。
         # 只记录，不参与任何决策；出错不能影响记账。
