@@ -63,6 +63,8 @@ ACCOUNT_COLUMNS = (
     "investor_id",
     "book_id",
     "risk_policy_id",
+    "password_ref",
+    "auth_code_ref",
     "max_order_volume",
     "notes",
     "created_at",
@@ -159,6 +161,8 @@ def _account_row(account: TradingAccount) -> dict[str, Any]:
         "investor_id": account.investor_id,
         "book_id": _text_or_none(account.book_id),
         "risk_policy_id": account.risk_policy_id,
+        "password_ref": account.password_ref,
+        "auth_code_ref": account.auth_code_ref,
         "max_order_volume": account.max_order_volume,
         "notes": account.notes,
         "created_at": account.created_at or now,
@@ -199,6 +203,16 @@ def _connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def _ensure_columns(
+    conn: sqlite3.Connection, table: str, columns: dict[str, str]
+) -> None:
+    """老库补列：CREATE TABLE IF NOT EXISTS 不会给已存在的表加字段。"""
+    existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, ddl in columns.items():
+        if name not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+
+
 def migrate(
     root: str | Path,
     db_path: str | Path | None = None,
@@ -230,6 +244,14 @@ def migrate(
     conn_path = ":memory:" if dry_run else str(target)
     with closing(_connect(conn_path)) as conn:
         conn.executescript(load_schema())
+        _ensure_columns(
+            conn,
+            "accounts",
+            {
+                "password_ref": "TEXT NOT NULL DEFAULT ''",
+                "auth_code_ref": "TEXT NOT NULL DEFAULT ''",
+            },
+        )
         with conn:
             written = _upsert(
                 conn,

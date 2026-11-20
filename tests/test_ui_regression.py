@@ -15,7 +15,7 @@ from src.utils import load_config, save_config
 
 TAB_NAMES = [
     "运行",
-    "账号",
+    "交易账号",
     "交易配置",
     "策略编辑器",
     "历史回测",

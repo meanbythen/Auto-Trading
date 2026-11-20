@@ -122,6 +122,32 @@ class RunTabMixin:
         pause_hint.pack(anchor="w", padx=8, pady=(0, 8))
         bind_wrap_to_parent(pause_hint)
 
+        # 当前账号只读展示：执行通道/柜台/账本由「交易账号」页统一决定。
+        session_row = ctk.CTkFrame(left, fg_color="transparent")
+        session_row.pack(fill="x", padx=8, pady=(0, 4))
+        self.session_summary_var = ctk.StringVar(value=self._session_summary_text())
+        ctk.CTkLabel(
+            session_row,
+            textvariable=self.session_summary_var,
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            anchor="w",
+            wraplength=300,
+            justify="left",
+        ).pack(side="left", fill="x", expand=True)
+        ctk.CTkButton(
+            session_row,
+            text="去交易账号",
+            width=86,
+            height=28,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=lambda: self.tabs.set("交易账号"),
+        ).pack(side="right")
+
         self.go_live_menu = ctk.CTkOptionMenu(
             left,
             variable=self.go_live_var,
@@ -328,6 +354,21 @@ class RunTabMixin:
 
         open_ctp_probe(self)
 
+
+    def _session_summary_text(self) -> str:
+        """运行页只读：当前账号 / 连接 / 适配器 / 账本。"""
+        try:
+            from src.account.session import resolve_session
+
+            session = resolve_session(self.root_dir, self.cfg, apply=False)
+            if session is not None:
+                return session.summary
+            from src.domain.accounts import load_active_id, profile_of
+
+            info = profile_of(load_active_id(self.root_dir), root=self.root_dir)
+            return f"旧账本 · {info['label']}（未绑定账号）"
+        except Exception:  # noqa: BLE001 - 只是展示
+            return "当前账号读取失败"
 
     def _on_go_live_change(self) -> None:
         """换上线阶段。没走完前一步时退回原来的选择。"""

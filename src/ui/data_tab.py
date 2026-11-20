@@ -270,6 +270,41 @@ class DataTabMixin:
         ).pack(anchor="w", padx=4, pady=(0, 8))
 
         ctk.CTkLabel(
+            left,
+            text="行情数据源",
+            font=T.FONT_TITLE,
+            text_color=T.TEXT,
+        ).pack(anchor="w", padx=4, pady=(8, 4))
+        quote_box = self._card(left)
+        self._entry_row(
+            quote_box,
+            "天勤行情账号",
+            self.tq_user_var,
+            hint="TqSdk 手机号/账号；只拉行情，和交易账号无关",
+            width=210,
+        )
+        self.tq_pwd_entry = self._password_row(
+            quote_box, "天勤行情密码", self.tq_password_var, self._show_tq_password
+        )
+        ctk.CTkLabel(
+            quote_box,
+            text=(
+                "数据源与交易账号完全解耦：换行情源不影响下单。"
+                "「交易配置」里行情来源选天勤时才会登录天勤。"
+            ),
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=340,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 8))
+        ctk.CTkButton(
+            quote_box,
+            text="保存行情源",
+            height=34,
+            command=self._on_save,
+        ).pack(fill="x", pady=(0, 4))
+
+        ctk.CTkLabel(
             left, text="本地库存", font=T.FONT_TITLE, text_color=T.TEXT
         ).pack(anchor="w", padx=4, pady=(8, 4))
         inv_row = ctk.CTkFrame(left, fg_color="transparent")

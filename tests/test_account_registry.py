@@ -197,14 +197,15 @@ def test_validate_rejects_real_investor_id_in_sim_account() -> None:
     assert any("仿真账号填了真实资金号" in item for item in problems)
 
 
-def test_validate_rejects_shared_profile_and_book() -> None:
+def test_validate_allows_shared_connection_but_rejects_shared_book() -> None:
     profile = _profile("p_sim", "sim")
     accounts = [
         _account("acc_a_01", profile_id="p_sim", investor_id="1", book_id="book_a"),
         _account("acc_b_01", profile_id="p_sim", investor_id="2", book_id="book_a"),
     ]
     problems = validate_registry(accounts, [profile])
-    assert any("共用模板" in item for item in problems)
+    # 一条连接可以被多个账号引用（资金号在账号上），只有账本不能重复。
+    assert not any("共用" in item for item in problems)
     assert any("账本 book_a" in item for item in problems)
 
 
@@ -229,9 +230,10 @@ def test_add_and_duplicate_account(tmp_path: Path) -> None:
         template=registry.profile(source.profile_id),
     )
     assert added.account_id.startswith("acc_")
-    assert added.profile_id == added.account_id
-    assert registry.profile(added.account_id) is not None
-    assert added.book_id not in {"ctp_sim", "ctp_live", "live"}
+    # 传入现有连接表示复用，不再复制一条连接。
+    assert added.profile_id == source.profile_id
+    assert len([item for item in registry.profiles if item.profile_id == source.profile_id]) == 1
+    assert added.book_id == added.account_id
 
     dup = registry.duplicate_account(added.account_id, "华泰仿真-3号", "28100")
     assert dup.account_id != added.account_id
@@ -265,8 +267,9 @@ def test_new_sim_account_is_selectable_and_resolves(tmp_path: Path) -> None:
 
     from src.trader.ctp_profile import resolve_ctp_profile
 
-    assert added.profile_id in cfg["trade"]["ctp"]["ctp_profiles"]
-    cfg["trade"]["ctp"]["ctp_profile"] = added.profile_id
+    key = registry.runtime_profile_key(added.account_id)
+    assert key in cfg["trade"]["ctp"]["ctp_profiles"]
+    cfg["trade"]["ctp"]["ctp_profile"] = key
     resolved = resolve_ctp_profile(cfg["trade"]["ctp"], account=cfg["account"], kind="sim")
     assert resolved.get("user_id") == "28099"
     assert resolved.get("td_front") == "tcp://sim-td:41205"
@@ -276,3 +279,67 @@ def test_new_account_id_is_stable_and_unique() -> None:
     assert new_account_id("huatai_sim", []) == "acc_huatai_sim_01"
     assert new_account_id("huatai_sim", ["acc_huatai_sim_01"]) == "acc_huatai_sim_02"
     assert new_account_id("acc_x", []) == "acc_x_01"
+
+
+# —— 连接 / 账号 / 账本 v2 ——
+
+
+def test_shared_connection_resolves_books_by_account(tmp_path: Path) -> None:
+    registry = reg.AccountRegistry(
+        profiles=[_profile("conn_sim", password_env="CTP_PASSWORD")],
+        accounts=[
+            _account("acc_a_01", profile_id="conn_sim", book_id="acc_a_01", investor_id="1"),
+            _account("acc_b_01", profile_id="conn_sim", book_id="acc_b_01", investor_id="2"),
+        ],
+    )
+    registry.save(tmp_path)
+
+    from src.domain.accounts import book_file, profile_of
+
+    assert profile_of("acc_b_01", root=tmp_path)["book_name"] == "signal_account_b_01.json"
+    assert book_file(tmp_path, "acc_b_01").name == "signal_account_b_01.json"
+    # 旧账号沿用旧账本 id 时仍落在旧文件上。
+    registry.accounts[0].book_id = "ctp_sim"
+    registry.save(tmp_path)
+    assert book_file(tmp_path, "acc_a_01").name == profile_of("ctp_sim", root=tmp_path)["book_name"]
+
+
+def test_set_active_account_switches_executor_profile_and_book(tmp_path: Path) -> None:
+    from src.account.session import set_active_account
+    from src.domain.accounts import load_active_id
+
+    registry = reg.AccountRegistry(
+        profiles=[_profile("conn_sim", password_env="CTP_PASSWORD")],
+        accounts=[
+            _account("acc_a_01", profile_id="conn_sim", book_id="acc_a_01", investor_id="1"),
+            _account("acc_b_01", profile_id="conn_sim", book_id="acc_b_01", investor_id="2"),
+        ],
+    )
+    registry.save(tmp_path)
+    cfg = _cfg()
+    cfg["trade"]["executor"] = "gui"
+
+    session = set_active_account(tmp_path, cfg, "acc_b_01", {})
+
+    assert session.book_id == "acc_b_01"
+    assert cfg["trade"]["executor"] == "ctp"
+    assert cfg["trade"]["ctp"]["account_kind"] == "sim"
+    assert cfg["trade"]["ctp"]["ctp_profile"] == "conn_sim__b_01"
+    assert load_active_id(tmp_path) == "acc_b_01"
+    assert cfg["trade"]["ctp"]["ctp_profiles"]["conn_sim__b_01"]["user_id"] == "2"
+
+
+def test_set_active_account_rejects_disabled(tmp_path: Path) -> None:
+    import pytest
+
+    from src.account.session import set_active_account
+
+    registry = reg.AccountRegistry(
+        profiles=[_profile("conn_sim", password_env="CTP_PASSWORD")],
+        accounts=[
+            _account("acc_a_01", profile_id="conn_sim", status="disabled", investor_id="1"),
+        ],
+    )
+    registry.save(tmp_path)
+    with pytest.raises(ValueError, match="启用"):
+        set_active_account(tmp_path, _cfg(), "acc_a_01", {})

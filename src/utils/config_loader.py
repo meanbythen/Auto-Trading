@@ -433,6 +433,10 @@ def load_config(
         from src.account.registry import apply_account_registry
 
         apply_account_registry(root, cfg, secrets)
+        # 选过账号时，执行通道 / 柜台 / 账本都跟当前账号走（单一入口）。
+        from src.account.session import apply_active_session
+
+        apply_active_session(root, cfg, secrets)
     except Exception as exc:  # noqa: BLE001 - 注册表不能拦住启动
         logger.warning("账号注册表接入失败，继续用旧 ctp_profiles: {}", exc)
     pwd_env = cfg.get("account", {}).get("password_env", "FUTURES_PASSWORD")

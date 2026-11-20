@@ -10,9 +10,11 @@
 from __future__ import annotations
 
 import json
+import re
 from pathlib import Path
 from typing import Any
 
+import yaml
 from loguru import logger
 
 # 实盘账：原来那一套文件，GUI 点真实资金时用这一本。
@@ -80,10 +82,10 @@ PROFILES: dict[str, dict[str, str]] = {
 }
 
 
-def is_ctp_book(account_id: Any) -> bool:
+def is_ctp_book(account_id: Any, *, root: str | Path | None = None) -> bool:
     """这本账的余额是否以柜台资金查询为准。"""
-    aid = normalize_id(account_id)
-    return str((PROFILES.get(aid) or {}).get("funding") or "") == "ctp"
+    info = profile_of(account_id, root=root)
+    return str(info.get("funding") or "") == "ctp"
 
 
 def book_id_for_ctp_kind(kind: Any) -> str:
@@ -92,6 +94,10 @@ def book_id_for_ctp_kind(kind: Any) -> str:
     if text in {"live", "real", "prod", "真实", "真实账号"}:
         return CTP_LIVE
     return CTP_SIM
+
+
+_REGISTRY_BOOK_RE = re.compile(r"^(?:acc_[a-z0-9_]+|book_[a-z0-9_]+)$")
+_REGISTRY_CACHE: dict[str, tuple[float, dict[str, dict[str, str]]]] = {}
 
 
 def normalize_id(raw: Any) -> str:
@@ -114,6 +120,9 @@ def normalize_id(raw: Any) -> str:
         return PAPER
     if "同花顺模拟" in shown or "gui模拟" in text or shown.strip() == "模拟账":
         return PAPER
+    # 新账号账本（acc_xxx / book_xxx）原样保留，不能再回退到 live 混记。
+    if _REGISTRY_BOOK_RE.match(text):
+        return text
     return LIVE
 
 
@@ -122,13 +131,102 @@ def id_from_label(label: Any) -> str:
     return normalize_id(label)
 
 
+def _default_root() -> Path:
+    """没传 root 时按项目根解析注册表；界面里不少老调用都没带 root。
+
+    领域层不能依赖 src.utils，所以这里内联一份与 paths.project_root 相同的规则。
+    """
+    import sys
+
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parents[2]
+
+
+def _registry_book_meta(root: str | Path) -> dict[str, dict[str, str]]:
+    """读 accounts.yaml 的账本归属：book_id → 账号 / 渠道 / 环境。失败返回空。"""
+    path = Path(root) / "config" / "accounts.yaml"
+    if not path.exists():
+        return {}
+    try:
+        stamp = path.stat().st_mtime
+    except OSError:
+        return {}
+    cached = _REGISTRY_CACHE.get(str(path))
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, yaml.YAMLError) as exc:
+        logger.warning("账本归属读不出来，按旧四本账处理: {}", exc)
+        return {}
+    result: dict[str, dict[str, str]] = {}
+    for item in (data.get("accounts") or []) if isinstance(data, dict) else []:
+        if not isinstance(item, dict):
+            continue
+        book_id = str(item.get("book_id") or item.get("account_id") or "").strip().lower()
+        if not book_id:
+            continue
+        result[book_id] = {
+            "account_id": str(item.get("account_id") or "").strip().lower(),
+            "display_name": str(item.get("display_name") or "").strip(),
+            "channel": str(item.get("channel") or "ctp").strip().lower(),
+            "environment": str(item.get("environment") or "sim").strip().lower(),
+        }
+    _REGISTRY_CACHE[str(path)] = (stamp, result)
+    return result
+
+
+def invalidate_registry_cache(root: str | Path) -> None:
+    """注册表写盘后调用，避免同一秒内 mtime 没变导致账本解析用旧归属。"""
+    _REGISTRY_CACHE.pop(str(Path(root) / "config" / "accounts.yaml"), None)
+
+
+def _derived_profile(book_id: str, meta: dict[str, str]) -> dict[str, str]:
+    """按账号账本派生文件名。book_acc_x 也去掉 acc_ 前缀，和 account_id 一致。"""
+    slug = book_id
+    if slug.startswith("book_"):
+        slug = slug[5:]
+    if slug.startswith("acc_"):
+        slug = slug[4:]
+    slug = re.sub(r"[^a-z0-9_]+", "_", slug).strip("_") or "account"
+    is_ctp = meta.get("channel") == "ctp"
+    label = meta.get("display_name") or book_id
+    return {
+        "id": book_id,
+        "label": label,
+        "short": label,
+        "book_name": f"signal_account_{slug}.json",
+        "periods_dir": f"signal_periods_{slug}",
+        "state_name": f"bot_state_{slug}.json",
+        "intent_name": f"order_intent_{slug}.json",
+        "hint": f"这一本属于账号 {meta.get('account_id') or book_id}，成交、持仓和资金互相独立。",
+        "banner": f"记账：{label}",
+        "funding": "ctp" if is_ctp else "manual",
+        **({"ctp_kind": meta.get("environment") or "sim"} if is_ctp else {}),
+    }
+
+
 def profile_of(account_id: Any = None, *, root: str | Path | None = None) -> dict[str, str]:
-    """一本账的名字和文件名。没指定就用当前选中的那本。"""
+    """一本账的名字和文件名。旧四本账走固定表，新账号账本按 book_id 派生。"""
+    base = Path(root) if root is not None else _default_root()
     if account_id is None:
-        aid = load_active_id(root or ".")
+        aid = load_active_id(base)
     else:
         aid = normalize_id(account_id)
-    return dict(PROFILES.get(aid) or PROFILES[LIVE])
+    if aid in PROFILES:
+        return dict(PROFILES[aid])
+    meta = _registry_book_meta(base)
+    if aid in meta:
+        return _derived_profile(aid, meta[aid])
+    # active_account.json 存的是 account_id；旧账号的 book_id 可能仍是 ctp_sim / live。
+    for book_id, item in meta.items():
+        if item.get("account_id") == aid:
+            if book_id in PROFILES:
+                return dict(PROFILES[book_id])
+            return _derived_profile(book_id, item)
+    logger.warning("账本 {} 不在注册表里，临时按 GUI 实盘账处理；请在交易账号页重新选择", aid)
+    return dict(PROFILES[LIVE])
 
 
 def active_file(root: str | Path) -> Path:
@@ -147,7 +245,8 @@ def load_active_id(root: str | Path) -> str:
         logger.warning("当前账记号读不出来，按实盘账: {}", exc)
         return LIVE
     if isinstance(data, dict):
-        return normalize_id(data.get("id"))
+        # v2 写 account_id；v1 写 id（账本 id）。两种都能读。
+        return normalize_id(data.get("account_id") or data.get("id"))
     return normalize_id(data)
 
 

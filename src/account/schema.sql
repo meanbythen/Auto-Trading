@@ -3,9 +3,10 @@
 -- 与 config/accounts.yaml 字段一一对应，由 tools/migrate_accounts_to_sqlite.py 建表并导入。
 -- 约定：
 --   1. 密码/认证码只存环境变量名和引用（secret://...），明文永不入库；
---   2. 「没填」统一存 NULL，避免唯一索引把空值判成重复（GUI 账号没有连接模板和账本）；
---   3. 时间沿用注册表的 ISO 8601 本地时间字符串；
---   4. P0 的 YAML 注册表仍是权威来源，这张表是 P1 的落点，随时可以删掉重建。
+--   2. broker_profiles 存的是「连接」（期货公司接入点），不含资金号与密码明文；
+--   3. 账号通过 profile_id 引用连接，一条连接可被多个账号共用；
+--   4. 时间沿用注册表的 ISO 8601 本地时间字符串；
+--   5. P0 的 YAML 注册表仍是权威来源，这张表是 P1 的落点，随时可以删掉重建。
 
 CREATE TABLE IF NOT EXISTS broker_profiles (
     profile_id              TEXT PRIMARY KEY,
@@ -46,15 +47,16 @@ CREATE TABLE IF NOT EXISTS accounts (
     investor_id       TEXT    NOT NULL DEFAULT '',
     book_id           TEXT,
     risk_policy_id    TEXT    NOT NULL DEFAULT 'default',
+    password_ref      TEXT    NOT NULL DEFAULT '',
+    auth_code_ref     TEXT    NOT NULL DEFAULT '',
     max_order_volume  INTEGER NOT NULL DEFAULT 0,
     notes             TEXT    NOT NULL DEFAULT '',
     created_at        TEXT    NOT NULL DEFAULT (datetime('now', 'localtime')),
     updated_at        TEXT    NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 
--- 一个账号一份模板：CTP 账号共用模板会互相覆盖资金号。
-CREATE UNIQUE INDEX IF NOT EXISTS ux_accounts_profile
-    ON accounts(profile_id) WHERE profile_id IS NOT NULL;
+-- 一条连接可被多个账号引用（资金号只存在账号上），旧的唯一约束不再使用。
+DROP INDEX IF EXISTS ux_accounts_profile;
 
 -- 一个账号一本账。
 CREATE UNIQUE INDEX IF NOT EXISTS ux_accounts_book

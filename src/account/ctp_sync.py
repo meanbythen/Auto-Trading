@@ -21,10 +21,11 @@ from src.account.signal_book import (
     save_named_book,
 )
 from src.account.workspace import (
-    book_id_for_ctp_kind,
+    ctp_kind_of_book,
     display_label,
     is_ctp_book,
     load_active_id,
+    resolve_ctp_book,
     set_active_id,
 )
 from src.version import read_version
@@ -136,7 +137,7 @@ def push_gateway_account(root: str | Path, gateway: Any) -> str:
         snapshot["balance"] = float(available)
     user_id = str(getattr(settings, "user_id", "") or "")
     kind = str(getattr(settings, "account_kind", "") or "sim")
-    book_id = book_id_for_ctp_kind(kind)
+    book_id = resolve_ctp_book(root, kind)
     # 读-改-写要和成交记账共用一把锁，否则会拿旧账本把刚追加的成交行盖掉。
     from src.account.signal_book import book_lock
     from src.account.workspace import book_file as named_book_path
@@ -198,7 +199,7 @@ def align_active_book_to_ctp(
         trade.get("ctp") if isinstance(trade.get("ctp"), dict) else {},
         account=(cfg or {}).get("account") if isinstance((cfg or {}).get("account"), dict) else {},
     )
-    needed = book_id_for_ctp_kind(normalize_ctp_kind(overlaid.get("account_kind")))
+    needed = resolve_ctp_book(root, normalize_ctp_kind(overlaid.get("account_kind")))
     active = load_active_id(root)
     if active == needed:
         return ""
@@ -230,7 +231,7 @@ def resident_book_guard(root: str | Path, cfg: dict[str, Any] | None) -> str:
         account=(cfg or {}).get("account") if isinstance((cfg or {}).get("account"), dict) else {},
     )
     kind = normalize_ctp_kind(overlaid.get("account_kind"))
-    needed = book_id_for_ctp_kind(kind)
+    needed = resolve_ctp_book(root, kind)
     active = load_active_id(root)
     if active != needed:
         return (
@@ -267,4 +268,6 @@ def can_pull_from_trader(trader: Any, account_id: str) -> bool:
         return False
     if not getattr(getattr(gateway, "session", None), "ready", False):
         return False
-    return book_id_for_ctp_kind(getattr(settings, "account_kind", "")) == account_id
+    return ctp_kind_of_book(account_id) == str(
+        getattr(settings, "account_kind", "") or "sim"
+    ).strip().lower().replace("ctp_", "")

@@ -28,7 +28,8 @@ from src.utils.secret_store import default_store, ref_for_env
 
 REGISTRY_REL = Path("config") / "accounts.yaml"
 AUDIT_REL = Path("data") / "accounts_audit.jsonl"
-REGISTRY_VERSION = 1
+# v2：连接与账号分离。连接不含资金号和密码，一条连接可被多个账号引用。
+REGISTRY_VERSION = 2
 
 # 迁移时沿用现有两本 CTP 账，保证账本文件不用搬家。
 _LEGACY_BOOKS = {ta.ENV_SIM: "ctp_sim", ta.ENV_LIVE: "ctp_live"}
@@ -95,9 +96,12 @@ class AccountRegistry:
             for item in (box.get("accounts") or [])
             if isinstance(item, dict)
         ]
+        raw_connections = box.get("connections")
+        if raw_connections is None:
+            raw_connections = box.get("broker_profiles")
         profiles = [
             BrokerProfileTemplate.from_mapping(item)
-            for item in (box.get("broker_profiles") or [])
+            for item in (raw_connections or [])
             if isinstance(item, dict)
         ]
         return cls(
@@ -108,9 +112,9 @@ class AccountRegistry:
 
     def to_mapping(self) -> dict[str, Any]:
         return {
-            "version": self.version,
+            "version": REGISTRY_VERSION,
+            "connections": [item.to_mapping() for item in self.profiles],
             "accounts": [item.to_mapping() for item in self.accounts],
-            "broker_profiles": [item.to_mapping() for item in self.profiles],
         }
 
     @classmethod
@@ -137,6 +141,9 @@ class AccountRegistry:
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(text, encoding="utf-8")
         tmp.replace(path)
+        from src.domain.accounts import invalidate_registry_cache
+
+        invalidate_registry_cache(root)
         return path
 
     # —— 查询 ——
@@ -151,6 +158,19 @@ class AccountRegistry:
 
     def ctp_accounts(self) -> list[TradingAccount]:
         return [item for item in self.accounts if item.channel == ta.CHANNEL_CTP]
+
+    def accounts_for_connection(self, connection_id: str) -> list[TradingAccount]:
+        key = str(connection_id or "").strip().lower()
+        return [item for item in self.accounts if item.profile_id == key]
+
+    def runtime_profile_key(self, account_id: str) -> str:
+        """账号在运行时 ctp_profiles 里的键；与 materialize 的分配规则一致。"""
+        account = self.account(account_id)
+        if account is None or not account.profile_id:
+            return ""
+        siblings = self.accounts_for_connection(account.profile_id)
+        shared = bool(siblings) and siblings[0].account_id != account.account_id
+        return ta.runtime_profile_key(account, shared=shared)
 
     def validate(self) -> list[str]:
         return ta.validate_registry(self.accounts, self.profiles)
@@ -171,29 +191,53 @@ class AccountRegistry:
         notes: str = "",
         status: str | None = None,
     ) -> TradingAccount:
-        """新建一个账号；CTP 账号会复制一份连接模板，模板 id 跟着 account_id。"""
+        """新建一个账号。
+
+        传入 template 表示复用已有连接（一条连接可被多个账号引用），不再复制连接；
+        不传时才按账号新建一条连接。账本默认等于 account_id。
+        """
         env = ta.normalize_environment(environment)
         channel = ta.normalize_channel(channel)
         base = f"{broker or 'ctp'}_{env}"
         account_id = ta.new_account_id(base, [item.account_id for item in self.accounts])
-        status = status or (ta.STATUS_ENABLED if investor_id or channel != ta.CHANNEL_CTP else ta.STATUS_DISABLED)
+        status = status or (
+            ta.STATUS_ENABLED if investor_id or channel != ta.CHANNEL_CTP else ta.STATUS_DISABLED
+        )
         profile_id = ""
+        password_ref = ""
+        auth_code_ref = ""
         if channel == ta.CHANNEL_CTP:
-            source = template or BrokerProfileTemplate(profile_id=account_id, label=display_name or account_id)
-            profile = BrokerProfileTemplate.from_mapping({**source.to_mapping(), "profile_id": account_id})
-            profile.environment = env
-            profile.label = profile.label or display_name or account_id
-            profile.password_env = profile.password_env or _DEFAULT_PASSWORD_ENV[env]
-            profile.password_ref = profile.password_ref or ref_for_env(profile.password_env)
-            if profile.auth_code_env:
-                profile.auth_code_ref = profile.auth_code_ref or ref_for_env(profile.auth_code_env)
-            self.profiles.append(profile)
-            profile_id = account_id
-        used_books = {item.book_id for item in self.accounts if item.book_id}
+            reusable = self.profile(template.profile_id) if template is not None else None
+            if reusable is not None:
+                # 复用已有连接：一条连接可被多个账号引用。
+                profile_id = reusable.profile_id
+            else:
+                source = template or BrokerProfileTemplate(
+                    profile_id=account_id, label=display_name or account_id
+                )
+                profile = BrokerProfileTemplate.from_mapping(
+                    {**source.to_mapping(), "connection_id": account_id}
+                )
+                profile.environment = env
+                profile.label = profile.label or display_name or account_id
+                profile.password_env = profile.password_env or _DEFAULT_PASSWORD_ENV[env]
+                profile.password_ref = profile.password_ref or ref_for_env(profile.password_env)
+                if profile.auth_code_env:
+                    profile.auth_code_ref = profile.auth_code_ref or ref_for_env(
+                        profile.auth_code_env
+                    )
+                self.profiles.append(profile)
+                profile_id = account_id
+            connection = self.profile(profile_id)
+            # 账号自己的密钥引用：同一连接下不同资金号各有各的密码。
+            password_ref = f"secret://ctp/{env}/{account_id}/password"
+            auth_code_ref = (
+                f"secret://ctp/{env}/{account_id}/auth_code"
+                if connection is not None and connection.auth_code_env
+                else ""
+            )
         if not book_id:
-            book_id = _LEGACY_BOOKS.get(env, "") if channel == ta.CHANNEL_CTP else ""
-            if not book_id or book_id in used_books:
-                book_id = f"book_{account_id}"
+            book_id = account_id
         account = TradingAccount(
             account_id=account_id,
             display_name=str(display_name or "").strip() or account_id,
@@ -204,6 +248,8 @@ class AccountRegistry:
             profile_id=profile_id,
             investor_id=str(investor_id or "").strip(),
             book_id=book_id,
+            password_ref=password_ref,
+            auth_code_ref=auth_code_ref,
             max_order_volume=int(max_order_volume or 0),
             notes=str(notes or ""),
         )
@@ -226,8 +272,13 @@ class AccountRegistry:
         new_investor = str(investor_id or source.investor_id).strip()
         if env == ta.ENV_LIVE and source.environment == ta.ENV_SIM and new_investor == source.investor_id:
             raise ValueError("仿真账号复制到真实环境时，必须填写新的真实资金账号")
-        template = self.profile(source.profile_id)
-        return self.add_account(
+        template = self.profile(source.profile_id) if source.profile_id else None
+        if template is not None and env != source.environment:
+            # 换环境要单独一条连接，不能把仿真前置复用给真实账号。
+            template = BrokerProfileTemplate.from_mapping(
+                {**template.to_mapping(), "connection_id": ""}
+            )
+        account = self.add_account(
             display_name or f"{source.display_name} 副本",
             env,
             new_investor,
@@ -237,13 +288,25 @@ class AccountRegistry:
             max_order_volume=source.max_order_volume,
             notes=source.notes,
         )
+        account.password_ref = source.password_ref or account.password_ref
+        account.auth_code_ref = source.auth_code_ref or account.auth_code_ref
+        return account
 
     def update_account(self, account_id: str, **changes: Any) -> TradingAccount:
         """改显示名/资金号/上限/备注；环境变更请显式传 environment。"""
         account = self.account(account_id)
         if account is None:
             raise KeyError(f"账号不存在: {account_id}")
-        for key in ("display_name", "investor_id", "notes", "book_id", "risk_policy_id"):
+        for key in (
+            "display_name",
+            "investor_id",
+            "notes",
+            "book_id",
+            "risk_policy_id",
+            "password_ref",
+            "auth_code_ref",
+            "connection_id",
+        ):
             if key in changes:
                 setattr(account, key, str(changes[key] or "").strip())
         if "max_order_volume" in changes:
@@ -252,10 +315,17 @@ class AccountRegistry:
             env = ta.normalize_environment(changes["environment"])
             account.environment = env
             profile = self.profile(account.profile_id)
-            if profile is not None:
+            if profile is not None and not self._profile_shared(account):
                 profile.environment = env
         account.touch()
         return account
+
+    def _profile_shared(self, account: TradingAccount) -> bool:
+        """这条连接是否已被别的账号引用。共用连接不能跟着单个账号改环境。"""
+        return any(
+            item.account_id != account.account_id and item.profile_id == account.profile_id
+            for item in self.accounts
+        )
 
     def set_status(self, account_id: str, status: str) -> TradingAccount:
         account = self.account(account_id)
@@ -292,7 +362,8 @@ class AccountRegistry:
         """
         把账号写进 cfg["trade"]["ctp"]["ctp_profiles"]。
 
-        名字沿用 profile_id（迁移时就是旧档案名），所以档案下拉、登录、下单都不用改。
+        第一条使用某条连接的账号沿用连接 id（旧档案、旧代码继续可用）；
+        共用同一连接的后续账号写成「连接__账号」，资金号互不覆盖。
         返回给日志用的差异说明。
         """
         store = store or default_store()
@@ -308,12 +379,16 @@ class AccountRegistry:
             profiles = {}
             ctp["ctp_profiles"] = profiles
         notes: list[str] = []
+        first_for_connection: dict[str, str] = {}
         for account in self.ctp_accounts():
             profile = self.profile(account.profile_id)
             if profile is None:
-                notes.append(f"{account.account_id} 找不到连接模板 {account.profile_id}，按旧配置处理")
+                notes.append(f"{account.account_id} 找不到连接 {account.profile_id}，按旧配置处理")
                 continue
-            current = profiles.get(profile.profile_id)
+            key = first_for_connection.setdefault(account.profile_id, account.account_id)
+            shared = key != account.account_id
+            runtime_key = ta.runtime_profile_key(account, shared=shared)
+            current = profiles.get(runtime_key)
             item = dict(current) if isinstance(current, dict) else {}
             before = (str(item.get("user_id") or ""), ta.normalize_environment(item.get("kind")))
             item.update(
@@ -328,8 +403,8 @@ class AccountRegistry:
                     "password_env": profile.password_env
                     or _DEFAULT_PASSWORD_ENV[account.environment],
                     "auth_code_env": profile.auth_code_env,
-                    "password_ref": profile.password_ref,
-                    "auth_code_ref": profile.auth_code_ref,
+                    "password_ref": account.password_ref or profile.password_ref,
+                    "auth_code_ref": account.auth_code_ref or profile.auth_code_ref,
                     "query_interval_sec": profile.query_interval_sec,
                     "login_timeout_sec": profile.login_timeout_sec,
                     "order_wait_sec": profile.order_wait_sec,
@@ -342,23 +417,34 @@ class AccountRegistry:
                     "auto_cancel_on_timeout": profile.auto_cancel_on_timeout,
                     "user_id": account.investor_id,
                     "account_id": account.account_id,
+                    "connection_id": profile.profile_id,
                     "environment": account.environment,
                     "status": account.status,
                 }
             )
             item.pop("td_fronts", None)
             item.pop("md_fronts", None)
-            password = store.resolve(profile.password_ref, legacy_secrets) if profile.password_ref else ""
+            password = ""
+            for ref in (account.password_ref, profile.password_ref):
+                if ref:
+                    password = store.resolve(ref, legacy_secrets)
+                    if password:
+                        break
             if password:
                 item["resolved_password"] = password
-            auth_code = store.resolve(profile.auth_code_ref, legacy_secrets) if profile.auth_code_ref else ""
+            auth_code = ""
+            for ref in (account.auth_code_ref, profile.auth_code_ref):
+                if ref:
+                    auth_code = store.resolve(ref, legacy_secrets)
+                    if auth_code:
+                        break
             if auth_code:
                 item["resolved_auth_code"] = auth_code
-            profiles[profile.profile_id] = item
+            profiles[runtime_key] = item
             after = (account.investor_id, account.environment)
             if before != after and (before[0] or before[1] in ta.ENVIRONMENTS):
                 notes.append(
-                    f"注册表覆盖旧档案 {profile.profile_id}: 资金号 {before[0] or '空'}→{after[0] or '空'}，"
+                    f"注册表覆盖旧档案 {runtime_key}: 资金号 {before[0] or '空'}→{after[0] or '空'}，"
                     f"环境 {before[1]}→{after[1]}"
                 )
         if notes:
@@ -372,8 +458,12 @@ class AccountRegistry:
         profiles = (ctp.get("ctp_profiles") or {}) if isinstance(ctp, dict) else {}
         notes: list[str] = []
         for account in self.ctp_accounts():
-            item = profiles.get(account.profile_id)
             profile = self.profile(account.profile_id)
+            base_item = profiles.get(account.profile_id)
+            runtime_key = self.runtime_profile_key(account.account_id)
+            item = profiles.get(runtime_key)
+            if not isinstance(item, dict) or profile is None:
+                item = base_item
             if not isinstance(item, dict) or profile is None:
                 continue
             investor = str(item.get("user_id") or "").strip()
@@ -381,32 +471,37 @@ class AccountRegistry:
                 notes.append(f"{account.account_id}: 资金号 {account.investor_id or '空'}→{investor}")
                 account.investor_id = investor
             kind = ta.normalize_environment(item.get("kind") or account.environment)
-            if kind != account.environment:
+            if kind != account.environment and not self._profile_shared(account):
                 notes.append(f"{account.account_id}: 环境 {account.environment}→{kind}")
                 account.environment = kind
                 profile.environment = kind
-            broker_id = str(item.get("broker_id") or "").strip()
+            # 连接级字段只从基础键回写；共用连接时不要被第二个账号的表单覆盖。
+            source = base_item if isinstance(base_item, dict) else item
+            broker_id = str(source.get("broker_id") or "").strip()
             if broker_id:
                 profile.broker_id = broker_id
-            td = _split_fronts(item.get("td_front") or item.get("td_fronts"))
-            md = _split_fronts(item.get("md_front") or item.get("md_fronts"))
+            td = _split_fronts(source.get("td_front") or source.get("td_fronts"))
+            md = _split_fronts(source.get("md_front") or source.get("md_fronts"))
             if td:
                 profile.td_fronts = td
             if md:
                 profile.md_fronts = md
-            env_name = str(item.get("password_env") or profile.password_env).strip()
+            env_name = str(source.get("password_env") or profile.password_env).strip()
             if env_name and env_name != profile.password_env:
                 profile.password_env = env_name
                 profile.password_ref = ref_for_env(env_name)
-            auth_env = str(item.get("auth_code_env") or "").strip()
+            auth_env = str(source.get("auth_code_env") or "").strip()
             if auth_env != profile.auth_code_env:
                 profile.auth_code_env = auth_env
                 profile.auth_code_ref = ref_for_env(auth_env) if auth_env else ""
-            try:
-                limit = int(float(item.get("max_order_volume") or profile.max_order_volume))
-            except (TypeError, ValueError):
-                limit = profile.max_order_volume
-            profile.max_order_volume = max(1, limit)
+            if "max_order_volume" in item:
+                try:
+                    raw = item.get("max_order_volume")
+                    account.max_order_volume = (
+                        max(0, int(float(str(raw)))) if raw not in (None, "") else 0
+                    )
+                except (TypeError, ValueError):
+                    pass
             account.touch()
         # GUI/模拟账号只同步资金号（同花顺登录号和真实资金号是同一个）
         account_block = cfg.get("account") or {}
@@ -468,6 +563,8 @@ def migrate_from_cfg(cfg: dict[str, Any]) -> AccountRegistry:
                 profile_id=profile_id,
                 investor_id=investor,
                 book_id=book_id,
+                password_ref=template.password_ref,
+                auth_code_ref=template.auth_code_ref,
                 notes="" if investor else "迁移时没有资金账号，先停用，填好后启用",
             )
         )

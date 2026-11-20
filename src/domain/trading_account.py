@@ -105,7 +105,7 @@ def _now() -> str:
 
 @dataclass
 class BrokerProfileTemplate:
-    """同一券商可复用的连接模板；密码只存引用，不存明文。"""
+    """一条柜台连接：期货公司接入点，可被多个账号复用；不含资金号和密码。"""
 
     profile_id: str
     label: str = ""
@@ -137,8 +137,15 @@ class BrokerProfileTemplate:
         box = dict(data or {})
         env = normalize_environment(box.get("environment") or box.get("kind"))
         return cls(
-            profile_id=str(box.get("profile_id") or box.get("name") or "").strip().lower(),
-            label=str(box.get("label") or box.get("profile_id") or "").strip(),
+            profile_id=str(
+                box.get("connection_id") or box.get("profile_id") or box.get("name") or ""
+            ).strip().lower(),
+            label=str(
+                box.get("label")
+                or box.get("connection_id")
+                or box.get("profile_id")
+                or ""
+            ).strip(),
             broker=str(box.get("broker") or "").strip(),
             environment=env,
             broker_id=str(box.get("broker_id") or "").strip(),
@@ -166,9 +173,19 @@ class BrokerProfileTemplate:
             auto_cancel_on_timeout=_bool(box.get("auto_cancel_on_timeout"), True),
         )
 
+    @property
+    def connection_id(self) -> str:
+        """v2 的叫法；内部仍沿用 profile_id，旧代码不用改。"""
+        return self.profile_id
+
+    @connection_id.setter
+    def connection_id(self, value: str) -> None:
+        self.profile_id = str(value or "")
+
     def to_mapping(self) -> dict[str, Any]:
-        """写 YAML 用；字段顺序与 from_mapping 一致。"""
+        """写 YAML 用；连接条目统一写 connection_id。"""
         data = asdict(self)
+        data["connection_id"] = data.pop("profile_id")
         data["td_fronts"] = list(self.td_fronts)
         data["md_fronts"] = list(self.md_fronts)
         data["close_split_products"] = list(self.close_split_products)
@@ -188,6 +205,8 @@ class TradingAccount:
     profile_id: str = ""
     investor_id: str = ""
     book_id: str = ""
+    password_ref: str = ""
+    auth_code_ref: str = ""
     risk_policy_id: str = DEFAULT_RISK_POLICY
     max_order_volume: int = 0
     notes: str = ""
@@ -204,9 +223,11 @@ class TradingAccount:
             channel=normalize_channel(box.get("channel")),
             environment=normalize_environment(box.get("environment")),
             status=normalize_status(box.get("status") or STATUS_ENABLED),
-            profile_id=str(box.get("profile_id") or "").strip().lower(),
+            profile_id=str(box.get("connection_id") or box.get("profile_id") or "").strip().lower(),
             investor_id=str(box.get("investor_id") or "").strip(),
             book_id=str(box.get("book_id") or "").strip(),
+            password_ref=str(box.get("password_ref") or "").strip(),
+            auth_code_ref=str(box.get("auth_code_ref") or "").strip(),
             risk_policy_id=str(box.get("risk_policy_id") or DEFAULT_RISK_POLICY).strip(),
             max_order_volume=_int(box.get("max_order_volume"), 0),
             notes=str(box.get("notes") or ""),
@@ -214,8 +235,18 @@ class TradingAccount:
             updated_at=str(box.get("updated_at") or _now()),
         )
 
+    @property
+    def connection_id(self) -> str:
+        return self.profile_id
+
+    @connection_id.setter
+    def connection_id(self, value: str) -> None:
+        self.profile_id = str(value or "")
+
     def to_mapping(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        data["connection_id"] = data.pop("profile_id")
+        return data
 
     def touch(self) -> None:
         self.updated_at = _now()
@@ -241,12 +272,34 @@ def new_account_id(base: str, existing: Iterable[str]) -> str:
         index += 1
 
 
+def account_slug(account_id: str) -> str:
+    """账号 → 文件名用的短名：去掉 acc_ 前缀，非法字符转下划线。"""
+    slug = str(account_id or "").strip().lower()
+    if slug.startswith("acc_"):
+        slug = slug[4:]
+    slug = re.sub(r"[^a-z0-9_]+", "_", slug).strip("_")
+    return slug or "account"
+
+
+def runtime_profile_key(account: TradingAccount, shared: bool = False) -> str:
+    """账号在运行时 ctp_profiles 里的键。
+
+    第一条使用该连接的账号沿用连接 id（旧代码和旧档案继续可用）；
+    共用同一条连接的后续账号加后缀，避免资金号互相覆盖。
+    """
+    if not account.profile_id:
+        return ""
+    if not shared:
+        return account.profile_id
+    return f"{account.profile_id}__{account_slug(account.account_id)}"
+
+
 def _profile_problems(profile: BrokerProfileTemplate) -> list[str]:
     problems: list[str] = []
     if not _PROFILE_ID_RE.match(profile.profile_id):
-        problems.append(f"连接模板 id 不合法：{profile.profile_id or '（空）'}")
+        problems.append(f"连接 id 不合法：{profile.profile_id or '（空）'}")
     if profile.environment not in ENVIRONMENTS:
-        problems.append(f"模板 {profile.profile_id} 的环境不合法：{profile.environment}")
+        problems.append(f"连接 {profile.profile_id} 的环境不合法：{profile.environment}")
     return problems
 
 
@@ -277,10 +330,9 @@ def validate_registry(
     for template in profile_list:
         problems.extend(_profile_problems(template))
     if len(profile_map) != len(profile_list):
-        problems.append("连接模板 id 有重复")
+        problems.append("连接 id 有重复")
 
     account_ids: set[str] = set()
-    profile_used: dict[str, str] = {}
     book_used: dict[str, str] = {}
     for account in account_list:
         label = account.display_name or account.account_id or "（未命名账号）"
@@ -305,17 +357,11 @@ def validate_registry(
             continue
         profile = profile_map.get(account.profile_id)
         if profile is None:
-            problems.append(f"{label}：找不到连接模板 {account.profile_id or '（空）'}")
+            problems.append(f"{label}：找不到连接 {account.profile_id or '（空）'}")
         else:
-            if account.profile_id in profile_used:
-                problems.append(
-                    f"{label}：与 {profile_used[account.profile_id]} 共用模板 {account.profile_id}，"
-                    "资金号会互相覆盖，请复制一份模板"
-                )
-            profile_used.setdefault(account.profile_id, label)
             if profile.environment != account.environment:
                 problems.append(
-                    f"{label}：账号环境是 {account.environment}，模板 {profile.profile_id} 却是 {profile.environment}"
+                    f"{label}：账号环境是 {account.environment}，连接 {profile.profile_id} 却是 {profile.environment}"
                 )
             if account.environment == ENV_LIVE:
                 hits = _sim_front_hits(profile)
@@ -326,9 +372,14 @@ def validate_registry(
                     )
         if account.status == STATUS_ENABLED:
             if not account.profile_id:
-                problems.append(f"{label}：启用中的 CTP 账号必须绑定连接模板")
+                problems.append(f"{label}：启用中的 CTP 账号必须绑定连接")
             if not account.investor_id:
                 problems.append(f"{label}：启用中的 CTP 账号必须填资金账号")
+            if not (
+                account.password_ref
+                or (profile is not None and (profile.password_ref or profile.password_env))
+            ):
+                problems.append(f"{label}：启用中的 CTP 账号必须保存密码")
 
     live_ids = {
         item.investor_id

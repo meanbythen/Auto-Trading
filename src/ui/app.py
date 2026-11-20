@@ -249,7 +249,7 @@ class AutoTradingApp(
         )
         self.tabs.pack(fill="both", expand=True, padx=28, pady=(6, 22))
         self.tabs.add("运行")
-        self.tabs.add("账号")
+        self.tabs.add("交易账号")
         self.tabs.add("交易配置")
         self.tabs.add("策略编辑器")
         self.tabs.add("历史回测")
@@ -261,7 +261,7 @@ class AutoTradingApp(
         self.tabs.add("规律候选")
 
         self._build_run_tab(self.tabs.tab("运行"))
-        self._build_credentials_tab(self.tabs.tab("账号"))
+        self._build_credentials_tab(self.tabs.tab("交易账号"))
         self._build_config_tab(self.tabs.tab("交易配置"))
         self._build_rule_editor_tab(self.tabs.tab("策略编辑器"))
         self._build_backtest_tab(self.tabs.tab("历史回测"))

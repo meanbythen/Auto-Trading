@@ -1,9 +1,9 @@
 """
-账号页：号码、密码、执行通道和柜台前置。
+交易账号页：账号（身份）、连接（期货公司接入点）和当前使用账号。
 
-功能：登录与连柜台的设置集中在这一页；策略开平仓在「交易配置」。
-原理：号码写进 config.yaml（仿真号码写仿真档案）；密码只写 secrets.local.yaml。
-打包 exe 时密钥文件不会带走，换电脑后到这一页再填一次即可。
+功能：一个账号一本账；账号只引用连接，换期货公司 = 新增连接 + 账号改绑。
+原理：账号写 config/accounts.yaml（YAML 权威），密码只写本机 DPAPI 密钥库；
+      当前使用账号写 data/active_account.json，执行通道 / 柜台 / 账本一起切换。
 """
 
 from __future__ import annotations
@@ -19,6 +19,11 @@ if TYPE_CHECKING:
     from src.ui.app import AutoTradingApp
 
 
+_STATUS_LABELS = {"enabled": "启用", "disabled": "停用", "archived": "归档"}
+_ENV_LABELS = {"sim": "仿真", "live": "真实"}
+_CHANNEL_LABELS = {"ctp": "CTP", "gui": "GUI", "sim": "SIM"}
+
+
 def _note(parent: ctk.CTkFrame, text: str) -> None:
     """卡片底下的灰色说明，给不懂代码的人看。"""
     ctk.CTkLabel(
@@ -29,102 +34,6 @@ def _note(parent: ctk.CTkFrame, text: str) -> None:
         wraplength=520,
         justify="left",
     ).pack(anchor="w", pady=(4, 8))
-
-
-def _pack_channel_section(app: AutoTradingApp, scroll: ctk.CTkFrame) -> None:
-    """执行通道、仿真/真实、券商前置。原来在配置页左列，整段搬到这里。"""
-    from src.trader.factory import list_executors
-
-    app._section(scroll, "下单通道与柜台")
-    box = app._card(scroll)
-    app._option_row(box, "执行通道", app.exec_var, list_executors(), width=220)
-    _note(
-        box,
-        "sim=只算账不下真单；gui=点同花顺；ctp=华泰柜台。选 ctp 后下面填仿真或真实。",
-    )
-    app._option_row(
-        box,
-        "CTP操作账",
-        app.ctp_kind_var,
-        getattr(app, "ctp_kind_choices", ["仿真账号", "真实账号"]),
-        width=220,
-    )
-    _note(
-        box,
-        "和交易台一样只换账号：仿真=上面的仿真账号，真实=资金账号。策略同一套。"
-        "选完请保存，账户分析会自动跟到同一本账。",
-    )
-    app._option_row(
-        box,
-        "券商档案",
-        app.ctp_profile_var,
-        getattr(app, "ctp_profile_choices", ["default"]),
-        width=220,
-    )
-    _note(box, "换期货公司只改档案，不改代码。没有档案时这里显示 default。")
-    ctk.CTkLabel(
-        box,
-        textvariable=app.ctp_profile_note_var,
-        font=T.FONT_SMALL,
-        text_color=T.WARN,
-        wraplength=520,
-        justify="left",
-    ).pack(anchor="w", pady=(0, 4))
-    app._entry_row(
-        box,
-        "档案交易前置",
-        app.ctp_profile_td_var,
-        hint="可填多台，用分号隔开。连接时全部登记，断线由柜台自动换",
-        width=220,
-    )
-    app._entry_row(
-        box,
-        "档案行情前置",
-        app.ctp_profile_md_var,
-        hint="行情也可填多台备用，端口通常和交易前置不同",
-        width=220,
-    )
-    app._entry_row(
-        box,
-        "档案BrokerID",
-        app.ctp_profile_broker_var,
-        hint="柜台给的 BrokerID，例如 8080 / 9999",
-        width=220,
-    )
-    app._entry_row(
-        box,
-        "档案资金账号",
-        app.ctp_profile_user_var,
-        hint="当前档案号码。仿真请改下面「仿真账号」；真实档案留空则用真实资金账号",
-        width=220,
-    )
-    app._entry_row(
-        box,
-        "档案密码变量",
-        app.ctp_profile_pwd_env_var,
-        hint="环境变量名，默认 CTP_PASSWORD；真实档案默认 CTP_LIVE_PASSWORD",
-        width=220,
-    )
-    app._entry_row(
-        box,
-        "档案认证码变量",
-        app.ctp_profile_auth_env_var,
-        hint="环境变量名，默认 CTP_AUTH_CODE；该柜台不需要认证码时留空",
-        width=220,
-    )
-    ctk.CTkButton(
-        box,
-        text="测试交易前置连通",
-        width=180,
-        command=app._test_ctp_front,
-        fg_color=T.ACCENT,
-        hover_color=T.ACCENT_HOVER,
-        text_color=T.TEXT,
-    ).pack(anchor="w", pady=(2, 8))
-
-
-_STATUS_LABELS = {"enabled": "启用", "disabled": "停用", "archived": "归档"}
-_ENV_LABELS = {"sim": "仿真", "live": "真实"}
 
 
 def _load_registry(app: AutoTradingApp):
@@ -141,14 +50,27 @@ def _load_registry(app: AutoTradingApp):
 
 
 def _selected_account(app: AutoTradingApp):
+    """当前在左栏选中的账号；没有选中就取第一个。"""
     registry = _load_registry(app)
     if registry is None:
         return None, None
-    labels = getattr(app, "_account_labels", {})
-    account_id = labels.get(app.account_pick_var.get(), "")
-    if account_id:
-        return registry, registry.account(account_id)
-    return registry, (registry.accounts[0] if registry.accounts else None)
+    account = registry.account(getattr(app, "account_selected_id", ""))
+    if account is None and registry.accounts:
+        account = registry.accounts[0]
+        app.account_selected_id = account.account_id
+    return registry, account
+
+
+def _active_account(app: AutoTradingApp, registry):
+    """当前真正在用的账号（data/active_account.json）。"""
+    from src.account.session import active_account_id
+
+    account_id = active_account_id(app.root_dir)
+    if account_id and registry is not None:
+        account = registry.account(account_id)
+        if account is not None:
+            return account
+    return None
 
 
 def _apply_registry(app: AutoTradingApp, registry) -> None:
@@ -164,52 +86,284 @@ def _apply_registry(app: AutoTradingApp, registry) -> None:
         fill()
 
 
+def _account_title(account) -> str:
+    env = _ENV_LABELS.get(account.environment, account.environment)
+    status = _STATUS_LABELS.get(account.status, account.status)
+    return f"{account.display_name} · {env} · {status}"
+
+
+def _pick_account(app: AutoTradingApp, account_id: str) -> None:
+    app.account_selected_id = account_id
+    _refresh_accounts(app)
+
+
 def _refresh_accounts(app: AutoTradingApp) -> None:
-    """重画账号下拉；标签里带环境与状态，选中后回填显示名/资金号。"""
+    """重画当前账号卡片、左栏列表和右侧详情。"""
+    menu = getattr(app, "ctp_profile_menu", None)
+    choices = getattr(app, "ctp_profile_choices", None)
+    if menu is not None and choices:
+        try:
+            menu.configure(values=list(choices))
+        except Exception:  # noqa: BLE001 - 控件已销毁
+            pass
+    _refresh_current_card(app)
+    _render_account_list(app)
+    _render_account_detail(app)
+
+
+def _refresh_current_card(app: AutoTradingApp) -> None:
+    """顶部只读卡片：当前用哪个账号、哪条连接、哪本账。"""
     registry = _load_registry(app)
-    labels: list[str] = []
-    mapping: dict[str, str] = {}
-    if registry is not None:
-        for account in registry.accounts:
-            label = (
-                f"{account.display_name} · {_ENV_LABELS.get(account.environment, account.environment)}"
-                f" · {_STATUS_LABELS.get(account.status, account.status)}"
-            )
-            if label in mapping:
-                label = f"{label} ({account.account_id})"
-            labels.append(label)
-            mapping[label] = account.account_id
-    app._account_labels = mapping
-    values = labels or ["（还没有账号）"]
-    app.account_menu.configure(values=values)
-    current = app.account_pick_var.get()
-    app.account_pick_var.set(current if current in values else values[0])
-    _on_account_pick(app)
-
-
-def _on_account_pick(app: AutoTradingApp) -> None:
-    _registry, account = _selected_account(app)
-    if account is None:
-        app.account_name_var.set("")
-        app.account_investor_var.set("")
-        app.account_meta_var.set("还没有账号。先在配置页保存一次，会自动迁移现有券商档案。")
+    account = _active_account(app, registry) if registry is not None else None
+    if account is not None:
+        env = "LIVE" if account.environment == "live" else "SIM"
+        channel = _CHANNEL_LABELS.get(account.channel, account.channel.upper())
+        parts = [account.display_name, env, channel]
+        if account.profile_id:
+            profile = registry.profile(account.profile_id)
+            parts.append(f"连接 {(profile.label if profile else account.profile_id)}")
+        if account.book_id:
+            parts.append(f"账本 {account.book_id}")
+        app.current_account_var.set(" · ".join(parts))
+        app.current_note_var.set(
+            "当前使用（只读）。切换账号会同时切换执行通道、柜台、账本和风控，"
+            "不会搬动已有成交。"
+        )
         return
+    from src.domain.accounts import load_active_id, profile_of
+
+    active = load_active_id(app.root_dir)
+    info = profile_of(active, root=app.root_dir)
+    app.current_account_var.set(f"{info['label']} · 旧账本 {active}（尚未绑定账号）")
+    app.current_note_var.set(
+        "还在用旧的四本账。选中左侧账号后点「设为当前账号」，之后执行通道、柜台和账本会跟着账号走。"
+    )
+
+
+def _render_account_list(app: AutoTradingApp) -> None:
+    holder = getattr(app, "account_list_frame", None)
+    if holder is None:
+        return
+    for child in holder.winfo_children():
+        child.destroy()
+    registry = _load_registry(app)
+    accounts = list(registry.accounts) if registry is not None else []
+    if not accounts:
+        ctk.CTkLabel(
+            holder,
+            text="还没有账号。点下面「新增仿真」或「新增真实」。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=220,
+            justify="left",
+        ).pack(anchor="w", padx=6, pady=8)
+        return
+    active = _active_account(app, registry)
+    selected = getattr(app, "account_selected_id", "")
+    for account in accounts:
+        is_active = active is not None and active.account_id == account.account_id
+        is_selected = account.account_id == selected
+        env = _ENV_LABELS.get(account.environment, account.environment)
+        status = _STATUS_LABELS.get(account.status, account.status)
+        mention = " ●" if is_active else ""
+        ctk.CTkButton(
+            holder,
+            text=f"{account.display_name}{mention}\n{env} · {status} · {account.book_id or '—'}",
+            anchor="w",
+            height=54,
+            corner_radius=6,
+            fg_color=T.ACCENT if is_selected else T.BG_PANEL,
+            hover_color=T.ACCENT_HOVER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.ACCENT_ON if is_selected else T.TEXT,
+            font=T.FONT_SMALL,
+            command=lambda aid=account.account_id: _pick_account(app, aid),
+        ).pack(fill="x", padx=4, pady=3)
+
+
+def _ref_has_value(ref: str) -> bool:
+    if not ref:
+        return False
+    try:
+        from src.utils.secret_store import default_store
+
+        return bool(default_store().resolve(ref))
+    except Exception:  # noqa: BLE001 - 只是显示状态
+        return False
+
+
+def _password_saved(app: AutoTradingApp, registry, account) -> bool:
+    profile = registry.profile(account.profile_id) if account.profile_id else None
+    refs = [account.password_ref]
+    if profile is not None:
+        refs.append(profile.password_ref)
+    return any(_ref_has_value(ref) for ref in refs if ref)
+
+
+def _render_account_detail(app: AutoTradingApp) -> None:
+    holder = getattr(app, "account_detail_frame", None)
+    if holder is None:
+        return
+    for child in holder.winfo_children():
+        child.destroy()
+    registry, account = _selected_account(app)
+    if registry is None or account is None:
+        ctk.CTkLabel(
+            holder,
+            text="选中左侧账号后，这里显示详情。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+        ).pack(anchor="w", padx=8, pady=8)
+        return
+
     app.account_name_var.set(account.display_name)
     app.account_investor_var.set(account.investor_id)
-    parts = [
-        f"ID {account.account_id}",
-        f"渠道 {account.channel}",
-        f"环境 {_ENV_LABELS.get(account.environment, account.environment)}",
-        f"状态 {_STATUS_LABELS.get(account.status, account.status)}",
-    ]
-    if account.profile_id:
-        parts.append(f"模板 {account.profile_id}")
-    if account.book_id:
-        parts.append(f"账本 {account.book_id}")
-    app.account_meta_var.set(" · ".join(parts))
+    app.account_risk_var.set(account.risk_policy_id)
+    app.account_limit_var.set(str(account.max_order_volume or ""))
+    app.account_notes_var.set(account.notes)
+    choices: dict[str, str] = {"（不绑定连接）": ""}
+    for profile in registry.profiles:
+        label = profile.label or profile.profile_id
+        choices[f"{label} · {_ENV_LABELS.get(profile.environment, profile.environment)}"] = (
+            profile.profile_id
+        )
+    current_conn = ""
+    for text, pid in choices.items():
+        if pid and pid == account.profile_id:
+            current_conn = text
+            break
+    app.account_connection_var.set(current_conn or "（不绑定连接）")
+    app._account_connection_choices = choices
+
+    ctk.CTkLabel(
+        holder,
+        text=f"{account.account_id} · {_CHANNEL_LABELS.get(account.channel, account.channel)}"
+        f" · {_ENV_LABELS.get(account.environment, account.environment)}"
+        f" · {_STATUS_LABELS.get(account.status, account.status)}",
+        font=T.FONT_SMALL,
+        text_color=T.TEXT_DIM,
+    ).pack(anchor="w", padx=8, pady=(6, 2))
+    ctk.CTkLabel(
+        holder,
+        text=f"账本 {account.book_id or account.account_id}（一个账号一本，只读）",
+        font=T.FONT_SMALL,
+        text_color=T.TEXT_DIM,
+    ).pack(anchor="w", padx=8, pady=(0, 6))
+
+    app._entry_row(holder, "显示名", app.account_name_var, width=200)
+    app._entry_row(holder, "资金账号", app.account_investor_var, width=200)
+    app._option_row(
+        holder,
+        "连接",
+        app.account_connection_var,
+        list(choices),
+        width=240,
+    )
+    app._entry_row(holder, "风控策略", app.account_risk_var, width=200)
+    app._entry_row(holder, "单笔上限", app.account_limit_var, hint="0=用连接默认值", width=200)
+    app._entry_row(holder, "备注", app.account_notes_var, width=200)
+
+    pwd_row = ctk.CTkFrame(holder, fg_color="transparent")
+    pwd_row.pack(fill="x", padx=8, pady=(4, 4))
+    saved = _password_saved(app, registry, account)
+    ctk.CTkLabel(
+        pwd_row,
+        text=f"密码：{'已保存' if saved else '未保存'}",
+        font=T.FONT_BODY,
+        text_color=T.OK if saved else T.WARN,
+        width=200,
+        anchor="w",
+    ).pack(side="left", padx=(0, 8))
+    ctk.CTkButton(
+        pwd_row,
+        text="更新密码",
+        width=96,
+        height=30,
+        fg_color=T.BG_PANEL,
+        hover_color=T.BORDER,
+        border_width=1,
+        border_color=T.BORDER,
+        text_color=T.TEXT,
+        command=lambda: _update_password(app, registry, account),
+    ).pack(side="left")
+
+    buttons = ctk.CTkFrame(holder, fg_color="transparent")
+    buttons.pack(fill="x", padx=8, pady=(8, 2))
+    _small_button(buttons, "保存账号", lambda: _save_account_fields(app), accent=True)
+    _small_button(buttons, "设为当前账号", lambda: _switch_to_selected(app))
+    _small_button(buttons, "复制", lambda: _duplicate_account(app))
+    buttons2 = ctk.CTkFrame(holder, fg_color="transparent")
+    buttons2.pack(fill="x", padx=8, pady=(0, 2))
+    _small_button(buttons2, "停用/启用", lambda: _toggle_account_status(app))
+    _small_button(buttons2, "归档", lambda: _archive_account(app))
+    _small_button(buttons2, "删除", lambda: _delete_account(app))
 
 
-def _persist_accounts(app: AutoTradingApp, registry, action: str, account_id: str, detail: str = "") -> bool:
+def _small_button(parent, text: str, command, accent: bool = False) -> None:
+    ctk.CTkButton(
+        parent,
+        text=text,
+        width=96,
+        height=30,
+        fg_color=T.ACCENT if accent else T.BG_PANEL,
+        hover_color=T.ACCENT_HOVER,
+        border_width=1,
+        border_color=T.BORDER,
+        text_color=T.ACCENT_ON if accent else T.TEXT,
+        command=command,
+    ).pack(side="left", padx=(0, 6))
+
+
+def _update_password(app: AutoTradingApp, registry, account) -> None:
+    """密码只进本机 DPAPI 密钥库，界面不回显明文。"""
+    from src.utils.secret_store import SecretStoreUnavailable, default_store
+
+    value = simpledialog.askstring(
+        "更新密码",
+        f"给 {account.display_name} 设置新密码：\n（只保存在本机加密文件里）",
+        parent=app,
+        show="*",
+    )
+    if value is None or not value:
+        return
+    ref = account.password_ref
+    per_account = f"secret://ctp/{account.environment}/{account.account_id}/password"
+    if not ref.startswith(f"secret://ctp/{account.environment}/{account.account_id}/"):
+        # 旧账号共用环境级引用；第一次改密码就换成这个账号自己的引用。
+        ref = per_account
+        account.password_ref = ref
+    try:
+        default_store().set(ref, value)
+    except SecretStoreUnavailable as exc:
+        messagebox.showerror("不能保存密码", str(exc), parent=app)
+        return
+    except (OSError, ValueError) as exc:
+        messagebox.showerror("保存密码失败", str(exc), parent=app)
+        return
+    registry.save(app.root_dir)
+    _apply_registry(app, registry)
+    _sync_projection(app)
+    app._append_log(f"已更新 {account.display_name} 的密码（本机加密）")
+    _refresh_accounts(app)
+
+
+def _sync_projection(app: AutoTradingApp) -> None:
+    """YAML 仍是权威；已有 SQLite 账本时顺手投影一份，失败不影响账号与交易。"""
+    db = app.root_dir / "data" / "trading.db"
+    if not db.exists():
+        return
+    try:
+        from src.account.sqlite_migrate import migrate
+
+        migrate(app.root_dir, db)
+    except Exception as exc:  # noqa: BLE001
+        app._append_log(f"账号 SQLite 投影失败（不影响交易）：{exc}")
+
+
+def _persist_accounts(
+    app: AutoTradingApp, registry, action: str, account_id: str, detail: str = ""
+) -> bool:
     """写注册表 + 审计 + 刷新界面。返回是否成功。"""
     from src.account.registry import record_audit
 
@@ -220,13 +374,14 @@ def _persist_accounts(app: AutoTradingApp, registry, action: str, account_id: st
         return False
     record_audit(app.root_dir, action, account_id=account_id, detail=detail)
     _apply_registry(app, registry)
+    _sync_projection(app)
     _refresh_accounts(app)
     app._append_log(f"账号注册表已更新：{action} {account_id}")
     return True
 
 
 def _template_from_ui(app: AutoTradingApp, name: str, environment: str):
-    """把当前「券商档案」输入框的内容复制成新账号的连接模板。"""
+    """把「连接」页当前输入框复制成一条新连接。"""
     from src.domain.trading_account import BrokerProfileTemplate
     from src.trader.ctp_fronts import split_fronts
 
@@ -239,7 +394,7 @@ def _template_from_ui(app: AutoTradingApp, name: str, environment: str):
     if not env_name:
         env_name = "CTP_LIVE_PASSWORD" if environment == "live" else "CTP_PASSWORD"
     return BrokerProfileTemplate(
-        profile_id="placeholder",
+        profile_id="",
         label=name,
         broker=str(app.broker_var.get() or "").strip(),
         environment=environment,
@@ -286,12 +441,30 @@ def _save_account_fields(app: AutoTradingApp) -> None:
         messagebox.showwarning("还没有账号", "请先在配置页保存一次配置，生成账号注册表。", parent=app)
         return
     old_name, old_investor = account.display_name, account.investor_id
+    old_conn = account.profile_id
+    choices = getattr(app, "_account_connection_choices", {})
+    new_conn = choices.get(app.account_connection_var.get(), account.profile_id)
+    try:
+        limit = int(float(app.account_limit_var.get() or 0))
+    except (TypeError, ValueError):
+        limit = account.max_order_volume
     account.display_name = app.account_name_var.get().strip() or old_name
     account.investor_id = app.account_investor_var.get().strip()
+    account.risk_policy_id = app.account_risk_var.get().strip() or account.risk_policy_id
+    account.max_order_volume = max(0, limit)
+    account.notes = app.account_notes_var.get().strip()
+    if account.channel == "ctp":
+        account.profile_id = new_conn
+    if account.environment == "live" and account.investor_id != old_investor:
+        if not _confirm_live(app, account.investor_id):
+            account.display_name, account.investor_id = old_name, old_investor
+            account.profile_id = old_conn
+            return
     account.touch()
     problems = registry.validate()
     if problems:
         account.display_name, account.investor_id = old_name, old_investor
+        account.profile_id = old_conn
         _show_problems(app, problems)
         return
     _persist_accounts(app, registry, "update", account.account_id, f"{old_investor}→{account.investor_id}")
@@ -331,8 +504,15 @@ def _new_account(app: AutoTradingApp, environment: str) -> None:
 
     if _persist_accounts(app, registry, "add", account.account_id, f"{environment}:{name}"):
         if environment == "live":
-            record_audit(app.root_dir, "env_change", account_id=account.account_id, detail="新建真实账号，已确认后四位")
-        app._append_log(f"已新增账号 {name}（{account.account_id}），可在「券商档案」里选中")
+            record_audit(
+                app.root_dir,
+                "env_change",
+                account_id=account.account_id,
+                detail="新建真实账号，已确认后四位",
+            )
+        app.account_selected_id = account.account_id
+        _refresh_accounts(app)
+        app._append_log(f"已新增账号 {name}（{account.account_id}），账本 {account.book_id}")
 
 
 def _duplicate_account(app: AutoTradingApp) -> None:
@@ -376,7 +556,14 @@ def _duplicate_account(app: AutoTradingApp) -> None:
 
     if _persist_accounts(app, registry, "duplicate", account.account_id, f"源 {source.account_id}"):
         if source.environment == "live":
-            record_audit(app.root_dir, "env_change", account_id=account.account_id, detail="复制真实账号，已确认后四位")
+            record_audit(
+                app.root_dir,
+                "env_change",
+                account_id=account.account_id,
+                detail="复制真实账号，已确认后四位",
+            )
+        app.account_selected_id = account.account_id
+        _refresh_accounts(app)
 
 
 def _toggle_account_status(app: AutoTradingApp) -> None:
@@ -423,81 +610,115 @@ def _delete_account(app: AutoTradingApp) -> None:
     _persist_accounts(app, registry, "delete", account.account_id, "软删除")
 
 
-def _pack_account_registry_section(app: AutoTradingApp, scroll: ctk.CTkFrame) -> None:
-    """账号注册表：一个账号一本账，新增/复制/停用/归档不用改代码。"""
-    app._section(scroll, "账号注册表")
-    box = app._card(scroll)
-    _note(
-        box,
-        "账号是身份，渠道只是属性。新增账号后会自动生成一份连接模板，"
-        "保存后出现在上面的「券商档案」里；停用只影响新开仓，归档只读，删除默认保留账本。",
-    )
-    if not hasattr(app, "account_pick_var"):
-        app.account_pick_var = ctk.StringVar(value="")
-        app.account_name_var = ctk.StringVar(value="")
-        app.account_investor_var = ctk.StringVar(value="")
-        app.account_meta_var = ctk.StringVar(value="")
-    app.account_menu = app._option_row(
-        box, "选择账号", app.account_pick_var, ["（还没有账号）"], width=320
-    )
-    app.account_menu.configure(command=lambda _value: _on_account_pick(app))
-    app._entry_row(box, "显示名", app.account_name_var, width=220)
-    app._entry_row(box, "资金账号", app.account_investor_var, width=220)
-    ctk.CTkLabel(
-        box,
-        textvariable=app.account_meta_var,
-        font=T.FONT_SMALL,
-        text_color=T.TEXT_DIM,
-        wraplength=520,
-        justify="left",
-    ).pack(anchor="w", pady=(0, 4))
+def _switch_to_selected(app: AutoTradingApp) -> None:
+    """把选中账号设为当前使用：执行通道、柜台、账本一起切换。"""
+    registry, account = _selected_account(app)
+    if registry is None or account is None:
+        return
+    from src.account.session import set_active_account
+    from src.utils.config_loader import load_secrets
 
-    buttons = ctk.CTkFrame(box, fg_color="transparent")
-    buttons.pack(fill="x", pady=(6, 4))
+    try:
+        session = set_active_account(app.root_dir, app.cfg, account.account_id, load_secrets())
+    except (KeyError, ValueError) as exc:
+        messagebox.showerror("不能切换账号", str(exc), parent=app)
+        return
+    app._append_log(f"当前交易账号：{session.summary}")
+    if hasattr(app, "exec_var"):
+        app.exec_var.set(session.channel)
+    if hasattr(app, "ctp_kind_var") and session.channel == "ctp":
+        from src.trader.ctp_logic import ctp_kind_label
 
-    def _btn(text: str, command, accent: bool = False) -> None:
-        ctk.CTkButton(
-            buttons,
-            text=text,
-            width=102,
-            height=32,
-            fg_color=T.ACCENT if accent else T.BG_PANEL,
-            hover_color=T.ACCENT_HOVER,
-            border_width=1,
-            border_color=T.BORDER,
-            text_color=T.ACCENT_ON if accent else T.TEXT,
-            command=command,
-        ).pack(side="left", padx=(0, 6))
-
-    _btn("保存账号", lambda: _save_account_fields(app), accent=True)
-    _btn("新增仿真", lambda: _new_account(app, "sim"))
-    _btn("新增真实", lambda: _new_account(app, "live"))
-    _btn("复制当前", lambda: _duplicate_account(app))
-    _btn("停用/启用", lambda: _toggle_account_status(app))
-    _btn("归档", lambda: _archive_account(app))
-    _btn("删除", lambda: _delete_account(app))
+        app.ctp_kind_var.set(ctp_kind_label(session.environment))
+    if session.channel == "gui" and hasattr(app, "user_var"):
+        app.user_var.set(session.investor_id)
+    fill = getattr(app, "_fill_ctp_profile_vars", None)
+    if callable(fill):
+        fill()
+    refresh = getattr(app, "_refresh_status_cards", None)
+    if callable(refresh):
+        refresh()
     _refresh_accounts(app)
 
 
-def build_credentials_tab(app: AutoTradingApp, tab: ctk.CTkFrame) -> None:
-    """账号页：号码密码 + 通道前置。保存按钮与交易配置同一套写盘。"""
-    scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
-    scroll.pack(fill="both", expand=True, padx=8, pady=8)
-
-    app._section(scroll, "怎么用")
-    intro = app._card(scroll)
+def _pack_connection_section(app: AutoTradingApp, parent: ctk.CTkFrame) -> None:
+    """连接 = 期货公司接入点：前置、BrokerID、AppID、超时。资金号在账号上。"""
     _note(
-        intro,
-        "这一页管「用哪个号、走哪条通道、连哪台柜台」。策略、品种、开仓止损在「交易配置」。"
-        "密码只保存在本机密钥文件（Windows 凭据加密），不会打进 exe。"
-        "某一格密码留空再保存，表示不改已经存过的密码。",
+        parent,
+        "连接只描述「怎么连柜台」，不含资金号和密码。换期货公司 = 新增连接 + 账号改绑，"
+        "同一条连接可以被多个账号引用。",
     )
+    app.ctp_profile_menu = app._option_row(
+        parent,
+        "连接",
+        app.ctp_profile_var,
+        getattr(app, "ctp_profile_choices", ["default"]),
+        width=240,
+    )
+    ctk.CTkLabel(
+        parent,
+        textvariable=app.ctp_profile_note_var,
+        font=T.FONT_SMALL,
+        text_color=T.WARN,
+        wraplength=520,
+        justify="left",
+    ).pack(anchor="w", pady=(0, 4))
+    app._entry_row(
+        parent,
+        "档案交易前置",
+        app.ctp_profile_td_var,
+        hint="可填多台，用分号隔开。连接时全部登记，断线由柜台自动换",
+        width=240,
+    )
+    app._entry_row(
+        parent,
+        "档案行情前置",
+        app.ctp_profile_md_var,
+        hint="行情也可填多台备用，端口通常和交易前置不同",
+        width=240,
+    )
+    app._entry_row(
+        parent,
+        "档案BrokerID",
+        app.ctp_profile_broker_var,
+        hint="柜台给的 BrokerID，例如 8080 / 9999",
+        width=240,
+    )
+    app._entry_row(
+        parent,
+        "档案资金账号",
+        app.ctp_profile_user_var,
+        hint="旧档案兼容字段；新账号请到「账号」里填资金账号",
+        width=240,
+    )
+    app._entry_row(
+        parent,
+        "档案密码变量",
+        app.ctp_profile_pwd_env_var,
+        hint="环境变量名，默认 CTP_PASSWORD；真实档案默认 CTP_LIVE_PASSWORD",
+        width=240,
+    )
+    app._entry_row(
+        parent,
+        "档案认证码变量",
+        app.ctp_profile_auth_env_var,
+        hint="环境变量名，默认 CTP_AUTH_CODE；该柜台不需要认证码时留空",
+        width=240,
+    )
+    ctk.CTkButton(
+        parent,
+        text="测试交易前置连通",
+        width=180,
+        command=app._test_ctp_front,
+        fg_color=T.ACCENT,
+        hover_color=T.ACCENT_HOVER,
+        text_color=T.TEXT,
+    ).pack(anchor="w", pady=(2, 8))
 
-    _pack_channel_section(app, scroll)
-    _pack_account_registry_section(app, scroll)
 
-    # —— 同花顺登录 + 华泰真实资金 ——
-    app._section(scroll, "同花顺 / 真实柜台")
+def _pack_gui_login_section(app: AutoTradingApp, scroll: ctk.CTkFrame) -> None:
+    """同花顺 GUI 通道的登录参数（不是 CTP 连接）。"""
+    app._section(scroll, "同花顺登录（GUI 通道）")
     live = app._card(scroll)
     app._entry_row(live, "期货公司", app.broker_var)
     app._entry_row(live, "通道名称", app.channel_var, hint="如：华泰期货_CTP主席")
@@ -505,13 +726,12 @@ def build_credentials_tab(app: AutoTradingApp, tab: ctk.CTkFrame) -> None:
         live,
         "资金账号",
         app.user_var,
-        hint="华泰真实资金账号。同花顺登录和 CTP 真实通道都用这一号",
+        hint="同花顺登录号；选 GUI 账号时以「账号」里的资金账号为准",
     )
     app.pwd_entry = app._password_row(live, "交易密码", app.password_var, app._show_password)
     _note(
         live,
-        "交易密码给同花顺自动登录用，CTP 真实通道默认也用这一份。"
-        "若柜台密码和同花顺不一样，请在密钥文件里另写 ctp_live_password。",
+        "只在执行通道为 GUI 时使用。CTP 账号的密码请到「账号」详情里更新，只存本机加密文件。",
     )
     app._option_row(live, "验证码模式", app.captcha_var, ["pause", "skip"], width=280)
     login_row = ctk.CTkFrame(live, fg_color="transparent")
@@ -540,40 +760,92 @@ def build_credentials_tab(app: AutoTradingApp, tab: ctk.CTkFrame) -> None:
     ).pack(side="left", padx=(10, 0))
     app._entry_row(live, "密码环境变量名", app.pwd_env_var, hint="一般不用改，默认 FUTURES_PASSWORD")
 
-    # —— 华泰仿真：号码和密码以前只能手改文件 ——
-    app._section(scroll, "华泰仿真")
-    sim = app._card(scroll)
-    app._entry_row(
-        sim,
-        "仿真账号",
-        app.ctp_sim_user_var,
-        hint="例如 28077，写进券商档案 huatai_sim，不是上面的真实资金号",
-    )
-    app.ctp_sim_pwd_entry = app._password_row(
-        sim, "仿真密码", app.ctp_sim_password_var, app._show_ctp_sim_password
-    )
-    app.ctp_auth_entry = app._password_row(
-        sim, "认证码", app.ctp_auth_code_var, app._show_ctp_auth
+
+def build_credentials_tab(app: AutoTradingApp, tab: ctk.CTkFrame) -> None:
+    """交易账号页：当前账号 + 账号/连接两个子区。保存按钮与交易配置同一套写盘。"""
+    scroll = ctk.CTkScrollableFrame(tab, fg_color="transparent")
+    scroll.pack(fill="both", expand=True, padx=8, pady=8)
+
+    ctk.CTkLabel(scroll, text="交易账号", font=T.FONT_TITLE, text_color=T.TEXT).pack(
+        anchor="w", padx=4, pady=(4, 2)
     )
     _note(
-        sim,
-        "仿真密码写密钥文件的 ctp_password，认证码写 ctp_auth_code。"
-        "上面「CTP操作账」选仿真后，用的就是这一号。真实资金号不要填到这里。",
+        scroll,
+        "这一页管「用哪个号、走哪条通道、连哪台柜台」。策略、品种、开仓止损在「交易配置」；"
+        "行情数据源在「数据管理」。密码只保存在本机密钥文件（Windows 凭据加密），不会打进 exe。",
     )
 
-    # —— 天勤只拉行情，和下单账号分开 ——
-    app._section(scroll, "天勤行情")
-    tq = app._card(scroll)
-    app._entry_row(
-        tq,
-        "天勤行情账号",
-        app.tq_user_var,
-        hint="选「天勤」行情时用；TqSdk 手机号/账号",
+    # —— 当前使用：唯一运行入口 ——
+    app.current_account_var = ctk.StringVar(value="正在读取…")
+    app.current_note_var = ctk.StringVar(value="")
+    app._section(scroll, "当前使用")
+    current = app._card(scroll)
+    ctk.CTkLabel(
+        current,
+        textvariable=app.current_account_var,
+        font=T.FONT_BODY,
+        text_color=T.TEXT,
+        wraplength=560,
+        justify="left",
+    ).pack(anchor="w", pady=(2, 2))
+    ctk.CTkLabel(
+        current,
+        textvariable=app.current_note_var,
+        font=T.FONT_SMALL,
+        text_color=T.TEXT_DIM,
+        wraplength=560,
+        justify="left",
+    ).pack(anchor="w", pady=(0, 8))
+    current_actions = ctk.CTkFrame(current, fg_color="transparent")
+    current_actions.pack(fill="x")
+    _small_button(current_actions, "设为当前账号", lambda: _switch_to_selected(app), accent=True)
+    _small_button(current_actions, "测试连接", lambda: app._test_ctp_front())
+
+    # —— 账号 / 连接 ——
+    app._section(scroll, "账号与连接")
+    area = app._card(scroll)
+    sub = ctk.CTkTabview(
+        area,
+        fg_color="transparent",
+        segmented_button_selected_color=T.ACCENT,
+        segmented_button_selected_hover_color=T.ACCENT_HOVER,
     )
-    app.tq_pwd_entry = app._password_row(
-        tq, "天勤行情密码", app.tq_password_var, app._show_tq_password
-    )
-    _note(tq, "和下单无关。「交易配置」里行情来源选天勤时才会登录天勤。")
+    sub.pack(fill="both", expand=True, pady=(4, 8))
+    account_tab = sub.add("账号")
+    connection_tab = sub.add("连接")
+
+    split = ctk.CTkFrame(account_tab, fg_color="transparent")
+    split.pack(fill="both", expand=True)
+    left = ctk.CTkFrame(split, fg_color="transparent", width=250)
+    left.pack(side="left", fill="y", padx=(0, 10))
+    app.account_list_frame = ctk.CTkScrollableFrame(left, fg_color="transparent", height=330)
+    app.account_list_frame.pack(fill="both", expand=True)
+    new_row = ctk.CTkFrame(left, fg_color="transparent")
+    new_row.pack(fill="x", pady=(6, 0))
+    _small_button(new_row, "新增仿真", lambda: _new_account(app, "sim"))
+    _small_button(new_row, "新增真实", lambda: _new_account(app, "live"))
+    right = ctk.CTkFrame(split, fg_color="transparent")
+    right.pack(side="left", fill="both", expand=True)
+    app.account_detail_frame = right
+    for name in (
+        "account_selected_id",
+        "account_name_var",
+        "account_investor_var",
+        "account_risk_var",
+        "account_limit_var",
+        "account_notes_var",
+        "account_connection_var",
+    ):
+        if not hasattr(app, name):
+            setattr(
+                app,
+                name,
+                "" if name == "account_selected_id" else ctk.StringVar(value=""),
+            )
+    app._account_connection_choices = {}
+
+    _pack_connection_section(app, connection_tab)
+    _pack_gui_login_section(app, scroll)
 
     actions = ctk.CTkFrame(scroll, fg_color="transparent")
     actions.pack(fill="x", pady=(16, 24))
@@ -598,3 +870,5 @@ def build_credentials_tab(app: AutoTradingApp, tab: ctk.CTkFrame) -> None:
         text_color=T.TEXT,
         command=app._on_reload,
     ).pack(side="left")
+
+    _refresh_accounts(app)
