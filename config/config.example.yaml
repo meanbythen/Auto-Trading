@@ -597,6 +597,21 @@ trade:
         user_id: ""
         password_env: "CTP_LIVE_PASSWORD"
         auth_code_env: "CTP_AUTH_CODE"
+        # 以下是每份档案都可覆盖的可选项，不写就用默认值：
+        # app_id: ""
+        # flow_dir: "data/ctp_flow"
+        # query_interval_sec: 30       # 资金/持仓查询间隔
+        # login_timeout_sec: 20        # 登录超时
+        # order_wait_sec: 8            # 等委托回报
+        # cancel_wait_sec: 3           # 等撤单回报
+        # order_count_warn: 8          # 当日委托笔数提醒线
+        # cancel_count_warn: 8         # 当日撤单笔数提醒线
+        # auto_cancel_on_timeout: true # 超时自动撤单
+        # close_split_products: ["bu", "c"]  # 平今/平昨需要拆开的品种
+        # price_tick: 1.0
+        # max_order_volume: 20
+        # password_ref: ""             # 账号页保存密码后自动写入，一般不用手填
+        # auth_code_ref: ""            # 认证码引用，同上
 
     # 旧写法（trade.ctp.sim / live、顶层 td_front/md_front/broker_id/user_id）已删除，
     # 程序只读 ctp_profiles。仿真与实盘用同一套字段，换柜台时改档案里的前置和 kind 即可。

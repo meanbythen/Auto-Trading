@@ -42,6 +42,11 @@ _CTP_RUNTIME_KEYS = {
     "resolved_password",
     "resolved_sim_password",
     "resolved_live_password",
+    # 账号注册表每次启动会重新物化，不写回配置文件。
+    "account_id",
+    "connection_id",
+    "environment",
+    "status",
 }
 
 
@@ -303,12 +308,22 @@ def _mapping_paths(data: Any, prefix: str = "") -> set[str]:
 
 
 # 键由用户或品种表动态决定的小节，天然和示例配置不同，不参与键名比对。
-_DYNAMIC_KEY_PREFIXES = ("data.symbol_map", "risk.contracts")
+_DYNAMIC_KEY_PREFIXES = (
+    "data.symbol_map",
+    "risk.contracts",
+    # 档案由账号注册表物化，档案名和字段都是程序生成的，不参与键名比对。
+    "trade.ctp.ctp_profiles",
+)
+
+# 启动时写入的运行时键：不在示例里，也不该算用户拼错。
+_RUNTIME_KEY_PATHS = {"trade.ctp.account_id", "trade.ctp.environment"}
 
 
 def _is_ignored_path(path: str) -> bool:
     """运行时字段（下划线开头）和动态小节跳过。"""
     if path.split(".", 1)[0].startswith("_"):
+        return True
+    if path in _RUNTIME_KEY_PATHS:
         return True
     return any(path == prefix or path.startswith(f"{prefix}.") for prefix in _DYNAMIC_KEY_PREFIXES)
 
