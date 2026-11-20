@@ -101,6 +101,9 @@ class ConfigVarsMixin:
         self._pick_baseline: dict[str, Any] | None = None
         self._pick_running = False
         self._pick_cancel = threading.Event()
+        # 交叉测试进度先攒着，最多每 100 毫秒重画一次，别让每套策略都清空重建控件。
+        self._pick_progress_pending: tuple[int, int, str] | None = None
+        self._pick_progress_after_id: str | None = None
         self.volume_var = ctk.StringVar(value=str(trade.get("volume", 1)))
         self.max_slip_var = ctk.StringVar(value=str(trade.get("max_entry_slip_atr", 0.5)))
         self.max_slip_points_var = ctk.StringVar(value=str(trade.get("max_entry_slip_points", 0)))

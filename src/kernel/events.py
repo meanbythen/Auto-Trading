@@ -18,6 +18,9 @@ from typing import Any, Callable, Mapping
 SIGNAL = "signal"
 ORDER_REQUEST = "order_request"
 RISK_BLOCK = "risk_block"
+# 完成类事件只带汇总数字，不带结果对象。界面自己决定怎么显示。
+BACKTEST_DONE = "backtest_done"
+CROSS_TEST_DONE = "cross_test_done"
 
 
 @dataclass(frozen=True)

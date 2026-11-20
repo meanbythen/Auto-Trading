@@ -7,6 +7,7 @@ from datetime import datetime
 from loguru import logger
 from pathlib import Path
 from src.data.periods import period_label
+from src.kernel.events import BACKTEST_DONE
 from tkinter import messagebox
 import os
 import subprocess
@@ -281,11 +282,19 @@ class BacktestActionsMixin:
                     engine_fallback=st["engine"],
                     header=f"{header}完成",
                 )
-                self._post_to_main(lambda: self._append_log(
-                    f"{header}完成 {result.symbol} | {result.bars}根 | "
-                    f"{p.trades}笔 胜率{p.win_rate:.0%} 盈亏比{p.payoff:.2f} "
-                    f"期望{p.expectancy:.2f} 净盈亏{p.net_pnl:.0f}"
-                ))
+                self.events.publish(
+                    BACKTEST_DONE,
+                    {
+                        "header": header,
+                        "symbol": result.symbol,
+                        "bars": result.bars,
+                        "trades": p.trades,
+                        "win_rate": p.win_rate,
+                        "payoff": p.payoff,
+                        "expectancy": p.expectancy,
+                        "net_pnl": p.net_pnl,
+                    },
+                )
                 if box is not None:
                     self._post_to_main(lambda t=text: self._set_result_text(box, t))
             except Exception as e:  # noqa: BLE001

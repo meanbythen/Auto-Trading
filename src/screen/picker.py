@@ -1616,6 +1616,9 @@ def list_rows(result: dict[str, Any]) -> list[dict[str, str]]:
             period,
         )
         base_shown["strategy"] = "—"
+        # 双击看K线要用原始合约代码和周期代码，显示列里已经拼成中文了。
+        base_shown["code"] = str(base.get("symbol") or "")
+        base_shown["timeframe"] = str(base.get("timeframe") or period or "")
         shown.append(base_shown)
     tested = list(result.get("rows") or [])
     if by_cross:
@@ -1647,6 +1650,7 @@ def list_rows(result: dict[str, Any]) -> list[dict[str, str]]:
                 "strategy": strategy_text,
                 "period": period_label(str(row.get("timeframe") or period or "")) or "—",
                 "timeframe": str(row.get("timeframe") or period or ""),
+                "code": str(row.get("symbol") or ""),
                 "win_rate": "—",
                 "profit_factor": "—",
                 "payoff": "—",
@@ -1689,6 +1693,7 @@ def list_rows(result: dict[str, Any]) -> list[dict[str, str]]:
         tf = str(row.get("timeframe") or period or "")
         item["timeframe"] = tf
         item["period"] = period_label(tf) if tf else "—"
+        item["code"] = str(row.get("symbol") or "")
         shown.append(item)
     return shown
 

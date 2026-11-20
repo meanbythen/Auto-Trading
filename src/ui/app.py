@@ -23,6 +23,7 @@ if str(_FALLBACK_ROOT) not in sys.path:
 
 from loguru import logger
 
+from src.kernel.events import BACKTEST_DONE, CROSS_TEST_DONE, Event, EventBus
 from src.ui import theme as T
 from src.ui.bot_worker import BotWorker
 from src.utils import load_config, setup_logger
@@ -133,6 +134,10 @@ class AutoTradingApp(
         except (OSError, TypeError, ValueError) as exc:
             logger.debug("启动时清理旧限额熔断告警跳过: {}", exc)
         self.worker = BotWorker()
+        # 各层只发事件，界面在这里订阅；后台线程发来的事件由处理函数切回主线程。
+        self.events = EventBus()
+        self.events.subscribe(BACKTEST_DONE, self._on_backtest_done)
+        self.events.subscribe(CROSS_TEST_DONE, self._on_cross_test_done)
         self._status = "待命"
         self._show_password = ctk.BooleanVar(value=False)
         self._show_tq_password = ctk.BooleanVar(value=False)
@@ -267,6 +272,25 @@ class AutoTradingApp(
             return
         if name == "交叉测试" and not getattr(self, "_pick_running", False):
             self._refresh_cross_lists()
+
+
+    def _on_backtest_done(self, event: Event) -> None:
+        """历史回测完成。摘要仍写进运行日志，界面更新切回 Tk 主线程。"""
+        d = event.data
+        text = (
+            f"{d.get('header') or '历史回测'}完成 {d.get('symbol')} | {d.get('bars')}根 | "
+            f"{d.get('trades')}笔 胜率{float(d.get('win_rate') or 0):.0%} "
+            f"盈亏比{float(d.get('payoff') or 0):.2f} 期望{float(d.get('expectancy') or 0):.2f} "
+            f"净盈亏{float(d.get('net_pnl') or 0):.0f}"
+        )
+        self._post_to_main(lambda: self._append_log(text))
+
+
+    def _on_cross_test_done(self, event: Event) -> None:
+        """交叉测试完成。只报测了多少组、其中较好多少组。"""
+        d = event.data
+        text = f"交叉测试完成，测了 {int(d.get('rows') or 0)} 个组合，较好 {int(d.get('better') or 0)} 个"
+        self._post_to_main(lambda: self._append_log(text))
 
 
 def main() -> None:

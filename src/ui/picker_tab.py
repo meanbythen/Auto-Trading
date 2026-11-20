@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger
+from src.kernel.events import CROSS_TEST_DONE
 from src.ui import theme as T
 import customtkinter as ctk
 import threading
@@ -287,6 +288,13 @@ class PickerTabMixin:
             width=table_width,
         )
         self.pick_table_body.pack(fill="both", expand=True)
+        ctk.CTkLabel(
+            right,
+            text="提示：双击一行，看这个合约、这个周期的K线。",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            anchor="w",
+        ).grid(row=3, column=0, sticky="w", padx=12, pady=(0, 10))
 
 
     def _picks_path(self) -> Path:
@@ -301,15 +309,18 @@ class PickerTabMixin:
         *,
         header: bool = False,
         picked: str = "",
+        on_open: Callable[[], None] | None = None,
     ) -> None:
         """
         结果表的一行。
 
         各列用固定宽度，表头和每一行同一套数字，品种再多也不会左右错开。
         结果这一列按文字上色：入选和第 1 名用绿色，没测成用黄色，基准用蓝色。
+        给了 on_open 时，双击这一行打开对应合约、周期的K线。
         """
         line = ctk.CTkFrame(parent, fg_color="transparent")
         line.pack(fill="x")
+        widgets: list[Any] = [line]
         if str(picked).startswith("第"):
             picked_color = T.OK if picked == "第1名" else T.TEXT
         else:
@@ -344,8 +355,12 @@ class PickerTabMixin:
                 text_color=color,
             )
             label.pack(side="left", padx=(8 if index == 0 else 4, 0), pady=5)
+            widgets.append(label)
             if header:
                 self._pick_header_labels.append(label)
+        if on_open is not None and not header:
+            for widget in widgets:
+                widget.bind("<Double-Button-1>", lambda _event, callback=on_open: callback())
 
 
     def _render_pick_board(self, summary: str, rows: list[dict[str, str]], *, empty_text: str = "") -> None:
@@ -404,6 +419,7 @@ class PickerTabMixin:
                     item.get("picked") or "—",
                 ],
                 picked=str(item.get("picked") or ""),
+                on_open=lambda row=item: self._open_pick_chart(row),
             )
         if extra:
             ctk.CTkLabel(
@@ -415,6 +431,20 @@ class PickerTabMixin:
                 justify="left",
                 wraplength=640,
             ).pack(anchor="w", padx=8, pady=8)
+
+
+    def _open_pick_chart(self, row: dict[str, str]) -> None:
+        """双击结果行：按这一行的合约和周期打开K线窗口。"""
+        symbol = str(row.get("code") or "").strip()
+        period = str(row.get("timeframe") or "").strip()
+        if not symbol or not period:
+            self._append_log("这一行没有记下合约或周期，看不了K线")
+            return
+        from src.ui.kline_chart import open_kline_chart
+
+        cfg = dict(self.cfg)
+        cfg.setdefault("_project_root", str(self.root_dir))
+        open_kline_chart(self, cfg, symbol, period)
 
 
     def _show_pick_result(self, result: dict[str, Any]) -> None:
@@ -798,6 +828,7 @@ class PickerTabMixin:
         cfg.setdefault("data", {})["source"] = normalize_source(self.pk_source_var.get())
         self._pick_running = True
         self._pick_cancel.clear()
+        self._reset_pick_progress()
         self._render_pick_board("正在把勾选的策略、合约、周期交叉匹配，请稍候…", [])
 
         def _run() -> None:
@@ -809,8 +840,8 @@ class PickerTabMixin:
             )
 
             def on_progress(index: int, total: int, label: str) -> None:
-                # 每测一个组合刷新一次，让人知道没有卡住。
-                self._post_to_main(lambda i=index, n=total, name=label: self._show_pick_progress(i, n, name))
+                # 每测一个组合记一条日志；进度文案交给主线程合并刷新。
+                self._post_to_main(lambda i=index, n=total, name=label: self._note_pick_progress(i, n, name))
 
             try:
                 workers = cross_worker_count(cfg)
@@ -842,11 +873,13 @@ class PickerTabMixin:
                     },
                 )
                 def _done() -> None:
+                    self._reset_pick_progress()
                     self._pick_running = False
                     self._show_pick_result(result)
                     better = sum(1 for row in result.get("rows") or [] if row.get("picked") == "较好")
-                    self._append_log(
-                        f"交叉测试完成，测了 {len(result.get('rows') or [])} 个组合，较好 {better} 个"
+                    self.events.publish(
+                        CROSS_TEST_DONE,
+                        {"rows": len(result.get("rows") or []), "better": better},
                     )
 
                 self._post_to_main(_done)
@@ -855,6 +888,7 @@ class PickerTabMixin:
                 err = str(exc)
 
                 def _fail() -> None:
+                    self._reset_pick_progress()
                     self._pick_running = False
                     self._append_log(f"交叉测试失败: {err}")
                     self._render_pick_board(f"交叉测试失败：{err}", [])
@@ -869,11 +903,42 @@ class PickerTabMixin:
         """优选进行中时，右边只留当前进度，测完再换成完整成绩。"""
         if not self._pick_running:
             return
-        self._append_log(f"交叉测试 {index}/{total} {label}")
         self._render_pick_board(
             f"正在测 {index}/{total}：{label}\n拉过的K线会留在电脑里，下一次会快一些。",
             [],
         )
+
+
+    def _note_pick_progress(self, index: int, total: int, label: str) -> None:
+        """记一条进度日志，并把最新的进度攒着；界面最多每 100 毫秒重画一次。"""
+        if not self._pick_running:
+            return
+        self._append_log(f"交叉测试 {index}/{total} {label}")
+        self._pick_progress_pending = (index, total, label)
+        if self._pick_progress_after_id is None:
+            self._pick_progress_after_id = self.after(100, self._flush_pick_progress)
+
+
+    def _flush_pick_progress(self) -> None:
+        """把攒着的最后一条进度画出来。中间那些已经被后一条盖掉了。"""
+        self._pick_progress_after_id = None
+        pending = self._pick_progress_pending
+        self._pick_progress_pending = None
+        if pending is None:
+            return
+        self._show_pick_progress(*pending)
+
+
+    def _reset_pick_progress(self) -> None:
+        """停掉挂起的刷新。开跑、完成、失败、停止都要调，免得旧进度盖住新结果。"""
+        if self._pick_progress_after_id is not None:
+            try:
+                self.after_cancel(self._pick_progress_after_id)
+            except Exception:  # noqa: BLE001
+                # 窗口已经在关的时候 after_cancel 会抛 TclError，忽略即可。
+                pass
+        self._pick_progress_after_id = None
+        self._pick_progress_pending = None
 
 
     def _on_pick_stop(self) -> None:

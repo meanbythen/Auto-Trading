@@ -1029,3 +1029,36 @@ def test_cross_list_rows_show_expectancy() -> None:
     empty["payoff"] = 0
     blank = list_rows({"mode": "cross", "rows": [empty], "settings": {"timeframe": "5"}})
     assert blank[0]["expectancy"] == "—"
+
+
+def test_rows_keep_raw_code_and_timeframe_for_chart() -> None:
+    """双击看K线要用原始代码。显示列里已拼成「螺纹 rb0」「5分钟」，行里另留 code / timeframe。"""
+    row = {
+        "symbol": "rb0",
+        "product": "螺纹",
+        "strategy": "日内实体",
+        "timeframe": "15",
+        "trades": 8,
+        "win_rate": 0.5,
+        "profit_factor": 1.2,
+        "max_drawdown": 100,
+        "net_pnl": 500,
+        "picked": "较好",
+        "liquidity": "正常",
+    }
+    shown = list_rows({"mode": "cross", "rows": [row], "settings": {"timeframe": "5"}})
+    assert shown[0]["symbol"] == "螺纹 rb0"
+    assert shown[0]["code"] == "rb0"
+    assert shown[0]["timeframe"] == "15"
+
+    base = list_rows(
+        {
+            "mode": "baseline",
+            "baseline": {"symbol": "bu0", "timeframe": "5", "trades": 3},
+            "rows": [],
+            "settings": {"timeframe": "5"},
+        }
+    )[0]
+    assert base["symbol"] == "bu0"
+    assert base["code"] == "bu0"
+    assert base["timeframe"] == "5"
