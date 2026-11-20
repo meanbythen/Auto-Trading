@@ -43,6 +43,7 @@ def _real_app_module(tmp_path_factory):
         "watch_symbols": list(app._watch_symbols),
         "watch_choice": app.watch_choice_var.get(),
         "tab": app.tabs.get(),
+        "research_tab": app.research_tabs.get(),
         "result": app.bt_result_box.get("1.0", "end"),
     }
     try:
@@ -80,6 +81,7 @@ def real_app(_real_app_module):
     app._main_table_busy = False
     app._closing = False
     app.tabs.set(_real_app_module["tab"])
+    app.research_tabs.set(_real_app_module["research_tab"])
     app._set_result_text(app.bt_result_box, _real_app_module["result"])
     app.update_idletasks()
     return app

@@ -18,24 +18,32 @@ TAB_NAMES = [
     "交易账号",
     "交易配置",
     "策略编辑器",
-    "历史回测",
+    "策略研究",
     "数据管理",
-    "交叉测试",
-    "策略优化",
-    "复盘",
     "账户分析",
-    "规律候选",
 ]
+
+RESEARCH_TAB_NAMES = ["历史回测", "交叉测试", "策略优化", "复盘", "规律候选"]
 
 
 def test_real_app_builds_all_tabs_and_backtest_initial_state(real_app) -> None:
     assert list(real_app.tabs._tab_dict) == TAB_NAMES
+    assert list(real_app.research_tabs._tab_dict) == RESEARCH_TAB_NAMES
     assert real_app.bt_result_box.get("1.0", "end").strip() == (
         "点左侧「开始历史回测」后，这里显示胜率、盈亏和成交明细摘要。"
     )
     assert real_app.bt_engine_var.get()
     assert real_app.bt_symbol_var.get()
     assert real_app.bt_start_var.get()
+
+
+def test_open_tab_routes_research_pages_through_the_hub(real_app) -> None:
+    real_app._open_tab("复盘")
+    assert real_app.tabs.get() == "策略研究"
+    assert real_app.research_tabs.get() == "复盘"
+
+    real_app._open_tab("交易配置")
+    assert real_app.tabs.get() == "交易配置"
 
 
 def test_strategy_and_generic_stop_panels_switch_without_recreation(real_app) -> None:

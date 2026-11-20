@@ -558,7 +558,7 @@ class OptimizeTabMixin:
             f"限制={'开' if limit_snap['apply_limits'] else '关'} "
             f"trials<={max_trials} 区间={start or '起'}~{end or '止'}"
         )
-        self.tabs.set("策略优化")
+        self._open_tab("策略优化")
         self._opt_started_at = time.monotonic()
         self._opt_progress_at = 0.0
         self._show_opt_progress(0, 1, "准备行情", force=True)

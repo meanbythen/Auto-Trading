@@ -357,7 +357,7 @@ class ReviewTabMixin:
         if engine:
             st["engine"] = engine
 
-        self.tabs.set("复盘")
+        self._open_tab("复盘")
         self._set_result_text(
             self.rv_result_box,
             "正在生成复盘…\n需要拉取行情，如果还查库存和快讯，可能要半分钟。\n",

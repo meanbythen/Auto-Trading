@@ -69,6 +69,7 @@ from src.ui.dashboard import DashboardMixin
 from src.ui.data_tab import DataTabMixin
 from src.ui.optimize_tab import OptimizeTabMixin
 from src.ui.picker_tab import PickerTabMixin
+from src.ui.research_hub import ResearchHubMixin
 from src.ui.research_tab import ResearchTabMixin
 from src.ui.review_tab import ReviewTabMixin
 from src.ui.run_tab import RunTabMixin
@@ -104,6 +105,7 @@ class AutoTradingApp(
     AccountTabMixin,
     OptimizeTabMixin,
     PickerTabMixin,
+    ResearchHubMixin,
     ctk.CTk,
 ):
     """主窗口：运行台 + 配置选项卡。"""
@@ -251,39 +253,31 @@ class AutoTradingApp(
         self.tabs.add("交易账号")
         self.tabs.add("交易配置")
         self.tabs.add("策略编辑器")
-        self.tabs.add("历史回测")
+        self.tabs.add("策略研究")
         self.tabs.add("数据管理")
-        self.tabs.add("交叉测试")
-        self.tabs.add("策略优化")
-        self.tabs.add("复盘")
         self.tabs.add("账户分析")
-        self.tabs.add("规律候选")
 
         self._build_run_tab(self.tabs.tab("运行"))
         self._build_credentials_tab(self.tabs.tab("交易账号"))
         self._build_config_tab(self.tabs.tab("交易配置"))
         self._build_rule_editor_tab(self.tabs.tab("策略编辑器"))
-        self._build_backtest_tab(self.tabs.tab("历史回测"))
+        self._build_research_hub(self.tabs.tab("策略研究"))
         self._build_data_tab(self.tabs.tab("数据管理"))
-        self._build_picker_tab(self.tabs.tab("交叉测试"))
-        self._build_optimize_tab(self.tabs.tab("策略优化"))
-        self._build_review_tab(self.tabs.tab("复盘"))
         self._build_account_tab(self.tabs.tab("账户分析"))
-        self._build_research_tab(self.tabs.tab("规律候选"))
         self._load_saved_picks()
-        # 切到交叉测试时重画策略名单，避免还停在启动那一份。
+        # 切到“策略研究”时按内层页签重画名单，避免还停在启动那一份。
         self.tabs.configure(command=self._on_main_tab_change)
         # 打开程序先看一眼当前关注合约是不是主力，非主力时在配置页亮提示。
         self.after(300, self._refresh_main_contract_hint)
 
     def _on_main_tab_change(self) -> None:
-        """顶部分页切换。交叉测试名单跟当前程序策略走，每次点开都刷新。"""
+        """顶部分页切换。研究页内部跟着当前选中的二级页签刷新。"""
         try:
             name = self.tabs.get()
         except Exception:
             return
-        if name == "交叉测试" and not getattr(self, "_pick_running", False):
-            self._refresh_cross_lists()
+        if name == "策略研究":
+            self._on_research_tab_change()
 
 
     def _on_backtest_done(self, event: Event) -> None:

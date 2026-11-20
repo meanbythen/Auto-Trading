@@ -215,7 +215,7 @@ class BacktestActionsMixin:
             f"口径={'真实账户' if self.bt_rollover_chain_var.get() else '固定起始资金'}"
         )
         if switch_tab:
-            self.tabs.set("历史回测")
+            self._open_tab("历史回测")
         if box is not None:
             self._set_result_text(
                 box,
@@ -498,7 +498,7 @@ class BacktestActionsMixin:
 
         self._mark_research_busy("滑点灵敏度")
         self._append_log(f"开始滑点灵敏度… {symbol} 区间={start or '起'}~{end or '止'}")
-        self.tabs.set("历史回测")
+        self._open_tab("历史回测")
         if hasattr(self, "bt_result_box"):
             self._set_result_text(
                 self.bt_result_box,
