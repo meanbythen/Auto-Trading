@@ -286,7 +286,9 @@ class TrendStrategyBase(StrategyBase):
         stop = self.trail_stop(bars, bar, pos, ind)
         # 本根K线自己算出的移动止损只从下一根生效；判定和成交都用上一根已知的止损，
         # 否则大阳线把止损推上去的同时，会把这根自己的影线判成已止损。
-        judge_stop = prev_stop or stop
+        # 没有已知止损（柜台认领 / 账本重建）时也不拿新算的线判这一根，
+        # 否则认领后第一根就可能按开仓价自触发平仓。
+        judge_stop = prev_stop
         # 开仓那根自己的高低点是进场前就印出来的，不能拿来判已经被止损打掉。
         if not self._is_entry_bar(symbol, bar_id) and stop_triggered(
             side=pos.side, stop=judge_stop, close=close, high=high, low=low, mode=self.stop_mode

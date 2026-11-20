@@ -157,3 +157,161 @@ def test_block_when_daily_loss_halted() -> None:
     g.halted = True
     ok_close, _ = g.allow("close", 1)
     assert ok_close is True
+
+
+def test_pure_rules_use_explicit_time_and_do_not_mutate_state() -> None:
+    from src.risk.rules import (
+        RiskPolicy,
+        RiskRuleState,
+        apply_fill,
+        daily_loss_reason,
+        evaluate_order,
+    )
+
+    policy = RiskPolicy(max_daily_loss=100, min_order_interval_sec=60, max_orders_per_day=3)
+    state = RiskRuleState(
+        current_position=2,
+        positions={"bu2612": 2},
+        orders_today=1,
+        open_orders_today=1,
+        last_order_ts=100,
+        last_open_ts=100,
+    )
+
+    blocked, _ = evaluate_order(policy, state, "buy_open", 1, symbol="bu2612", now=120)
+    allowed, _ = evaluate_order(policy, state, "buy_open", 1, symbol="bu2612", now=160)
+    changed = apply_fill(state, "buy_open", 1, symbol="bu2612", now=160)
+
+    assert blocked is False
+    assert allowed is True
+    assert state.current_position == 2
+    assert state.positions == {"bu2612": 2}
+    assert state.orders_today == 1
+    assert changed.current_position == 3
+    assert changed.positions == {"bu2612": 3}
+    assert changed.orders_today == 2
+    assert changed.open_orders_today == 2
+    assert changed.last_order_ts == 160
+    assert "当日亏损" in daily_loss_reason(policy, RiskRuleState(daily_pnl=-100))
+
+
+def test_risk_service_restart_restores_daily_counters_loss_and_timestamps(tmp_path) -> None:
+    from contextlib import closing
+
+    from src.account.trading_db import connect
+    from src.risk.service import RiskService
+
+    cfg = {
+        "risk": {"min_order_interval_sec": 0, "max_daily_loss": 100},
+        "storage": {"sqlite_enabled": True},
+    }
+    service = RiskService.from_config(cfg, root=tmp_path, account_id="acc_restart")
+    service.write_alerts = False
+    service.trading_day = "2026-11-20"
+    service.on_order_filled("buy_open", 2, "bu2612", now=1000)
+    service.update_pnl(-125)
+
+    restored = RiskService.from_config(cfg, root=tmp_path, account_id="acc_restart")
+    assert restored.restore({"trading_day": "2026-11-19"}) == "2026-11-20"
+    assert restored.daily_pnl == -125
+    assert restored.orders_today == 1
+    assert restored.open_orders_today == 1
+    assert restored.last_order_ts == 1000
+    assert restored.last_open_ts == 1000
+    assert restored.current_position == 2
+    assert restored.positions == {"bu2612": 2}
+    assert restored.halted is True
+    assert restored.halt_kind == "daily_loss"
+
+    with closing(connect(tmp_path / "data" / "trading.db")) as conn:
+        row = conn.execute(
+            "SELECT trading_day, payload_json FROM risk_state WHERE account_id = 'acc_restart'"
+        ).fetchone()
+    assert row is not None
+    assert row["trading_day"] == "2026-11-20"
+    assert '"daily_pnl":-125.0' in row["payload_json"]
+
+
+def test_risk_decisions_are_queryable_in_jsonl_and_sqlite(tmp_path) -> None:
+    import json
+    from contextlib import closing
+
+    from src.account.trading_db import connect
+    from src.kernel.risk_chain import TradeIntent, run_pretrade_gates
+    from src.risk.service import RiskService
+
+    service = RiskService.from_config(
+        {"risk": {"min_order_interval_sec": 0}, "storage": {"sqlite_enabled": True}},
+        root=tmp_path,
+        account_id="acc_audit",
+    )
+    service.trading_day = "2026-11-20"
+    blocked = run_pretrade_gates(
+        TradeIntent(symbol="bu2612", side="buy_open", volume=1, orders_paused=True),
+        service,
+    )
+    passed = run_pretrade_gates(
+        TradeIntent(symbol="bu2612", side="buy_open", volume=1, bar_id="bar-1"),
+        service,
+    )
+
+    assert blocked.ok is False
+    assert passed.ok is True
+    rows = service.decisions(trading_day="2026-11-20")
+    assert [(row["gate"], row["code"]) for row in rows] == [("early", "order_paused"), ("send", "pass")]
+    assert rows[1]["intent"]["bar_id"] == "bar-1"
+    assert rows[1]["allowed"] is True
+
+    lines = (tmp_path / "data" / "risk_decisions.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    assert json.loads(lines[0])["code"] == "order_paused"
+    with closing(connect(tmp_path / "data" / "trading.db")) as conn:
+        count = conn.execute(
+            "SELECT COUNT(*) FROM risk_decisions WHERE account_id = 'acc_audit'"
+        ).fetchone()[0]
+    assert count == 2
+
+
+def test_risk_sqlite_failure_preserves_json_and_trade_result(tmp_path, monkeypatch) -> None:
+    from src.risk.service import RiskService
+    from src.risk.state_store import JsonRiskStateStore
+
+    service = RiskService.from_config(
+        {"risk": {"min_order_interval_sec": 0}, "storage": {"sqlite_enabled": True}},
+        root=tmp_path,
+        account_id="acc_failure",
+    )
+
+    def _broken(*_args, **_kwargs) -> None:
+        raise RuntimeError("sqlite unavailable")
+
+    monkeypatch.setattr(service.store.sqlite, "save", _broken)
+    monkeypatch.setattr(service.store.sqlite, "append_decision", _broken)
+    ok, _ = service.allow("buy_open", 2, symbol="bu2612", now=100)
+    service.on_order_filled("buy_open", 2, "bu2612", now=100)
+
+    assert ok is True
+    saved = JsonRiskStateStore(tmp_path).load("acc_failure")
+    assert saved is not None
+    assert saved["open_orders_today"] == 1
+    assert saved["positions"] == {"bu2612": 2}
+    lines = (tmp_path / "data" / "risk_decisions.jsonl").read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 1
+
+
+def test_risk_sqlite_disabled_keeps_json_authoritative(tmp_path) -> None:
+    from src.risk.service import RiskService
+
+    cfg = {"risk": {"min_order_interval_sec": 0}, "storage": {"sqlite_enabled": False}}
+    service = RiskService.from_config(cfg, root=tmp_path, account_id="acc_json")
+    service.trading_day = "2026-11-20"
+    ok, _ = service.allow("buy_open", 1, symbol="bu2612", now=100)
+    service.on_order_filled("buy_open", 1, "bu2612", now=100)
+
+    restored = RiskService.from_config(cfg, root=tmp_path, account_id="acc_json")
+    restored.restore()
+    assert ok is True
+    assert restored.open_orders_today == 1
+    assert restored.last_order_ts == 100
+    assert len(restored.decisions(trading_day="2026-11-20")) == 1
+    assert not (tmp_path / "data" / "trading.db").exists()

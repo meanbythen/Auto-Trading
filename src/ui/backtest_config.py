@@ -39,6 +39,25 @@ class BacktestConfigMixin:
         return s, e
 
 
+    def _extend_end_for_night(self, end: str | None, include_night: bool) -> str | None:
+        """
+        勾了「含当晚夜盘」时，把这一次回测/优化的结束日推到下一个交易日。
+
+        结束日只算到当天 20:59，当晚 21:00 的夜盘属于下一交易日，所以要往后推一格。
+        只改这一次的入参，不回写日期框，免得每跑一次就往后多推一天。
+        """
+        if not end or not include_night:
+            return end
+        from src.utils.holidays import calendar_from_config
+        from src.utils.trading_day import next_trading_day
+
+        effective = next_trading_day(
+            end, calendar=calendar_from_config(self.cfg, self.cfg.get("_project_root"))
+        ).isoformat()
+        self._append_log(f"含结束日当晚夜盘：结束日 {end} → 实际按 {effective} 取K线")
+        return effective
+
+
     @staticmethod
     def _initial_start_date(saved: object) -> str:
         """
@@ -82,6 +101,7 @@ class BacktestConfigMixin:
         self.opt_range_var.set(self.bt_range_var.get())
         self.opt_start_var.set(self.bt_start_var.get())
         self.opt_end_var.set(self.bt_end_var.get())
+        self.opt_include_night_var.set(bool(self.bt_include_night_var.get()))
         from src.data.quote_check import is_ths_source
 
         if is_ths_source(self.bt_source_var.get()):
@@ -468,4 +488,7 @@ class BacktestConfigMixin:
             self.bt_start_var.set(start)
         if end:
             self.bt_end_var.set(end)
+        # 勾了「含当晚夜盘」：结束日只算到当天 20:59，21:00 的夜盘属于下一交易日，
+        # 把这次回测的结束日往后推一个交易日。只改这一把，不回写日期框，免得越跑越靠后。
+        end = self._extend_end_for_night(end, self.bt_include_night_var.get())
         return cfg, symbol, start, end

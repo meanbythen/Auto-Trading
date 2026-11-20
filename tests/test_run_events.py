@@ -57,6 +57,30 @@ def test_events_snapshot_and_state_carry_run_id(tmp_path) -> None:
     assert int(state["pid"]) > 0
 
 
+def test_trading_bot_restart_uses_dedicated_risk_state(tmp_path) -> None:
+    bot = TradingBot(_cfg(tmp_path))
+    bot.trading_day = "2026-11-20"
+    bot.risk.daily_pnl = -250.0
+    bot.risk.orders_today = 3
+    bot.risk.open_orders_today = 2
+    bot.risk.last_order_ts = 1234.0
+    bot.risk.last_open_ts = 1200.0
+    bot.risk.halted = True
+    bot.risk.halt_kind = "daily_loss"
+    bot.risk.halt_reason = "测试日亏熔断"
+    bot._persist_state()
+
+    restored = TradingBot(_cfg(tmp_path))
+    assert restored.trading_day == "2026-11-20"
+    assert restored.risk.daily_pnl == -250.0
+    assert restored.risk.orders_today == 3
+    assert restored.risk.open_orders_today == 2
+    assert restored.risk.last_order_ts == 1234.0
+    assert restored.risk.last_open_ts == 1200.0
+    assert restored.risk.halted is True
+    assert restored.risk.halt_kind == "daily_loss"
+
+
 def test_ctp_card_ready_when_session_logged_in(tmp_path) -> None:
     """柜台已就绪时，快照必须把 ctp_ready 设为真，否则顶栏会一直显示未连接。"""
     from types import SimpleNamespace

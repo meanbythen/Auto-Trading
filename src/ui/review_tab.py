@@ -383,7 +383,7 @@ class ReviewTabMixin:
 
                     text = (
                         f"{text}\n\n{summarize_text(self.root_dir)}"
-                        f"\n\n{quality_text(self.root_dir)}"
+                        f"\n\n{quality_text(self.root_dir, self.cfg)}"
                     )
                 except Exception:  # noqa: BLE001
                     logger.debug("滑点汇总失败，已忽略", exc_info=True)

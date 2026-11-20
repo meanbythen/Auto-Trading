@@ -16,6 +16,12 @@
 
 dry_run: true
 
+# 交易账本与风控：JSON 仍是权威来源；SQLite 是可删除、可重建的同步投影。
+# 关闭 sqlite_enabled 后只读写 JSON/JSONL，不创建 trading.db。
+storage:
+  sqlite_enabled: true
+  database: "data/trading.db"
+
 app:
   path: "D:\\同花顺期货通\\bin\\hexinlauncher.exe"
   window_title: "期货通"
@@ -474,12 +480,14 @@ backtest:
   slippage_ticks: 1.0
   # 打开后回测开仓再套挂机的过期K和追价上限。默认关，不改原来的回测成绩。
   mirror_live_gates: false
-  # 涨跌停/流动性近似（默认关闭，打开后会改变回测结果）：
+  # 涨跌停/部分成交/挂单超时（默认开启，会改变回测成绩；要复现旧成绩就改成 false/0）：
   #   block_limit_locked: 成交这根最高=最低（一字板）时不开仓，平仓顺延到下一根。
-  #   max_volume_pct: 单根新开仓手数不超过该根成交量的比例，0=不限。
+  #   max_volume_pct: 单根新开仓手数不超过该根成交量的比例，超出算部分成交、余量当根撤单，0=不限。
+  #   entry_timeout_bars: 开仓挂单最多等几根可成交K线，等到超时按撤单处理。
   liquidity:
-    block_limit_locked: false
-    max_volume_pct: 0
+    block_limit_locked: true
+    max_volume_pct: 0.1
+    entry_timeout_bars: 1
   # 策略优化：搜索深度、防过拟合方式（一次性留出 / 滚动验证）。
   optimize_depth: "标准"
   optimize_mode: "一次切断"
@@ -537,6 +545,8 @@ trade:
     app_id: "client_AutoTrading_1.0"
     flow_dir: "data/ctp_flow"
     price_tick: 1
+    # 本机单笔最大手数：算仓时直接按它取小，超过不会发单；不是柜台上限。
+    # 配置页「风控与资金管理」可改，回测不受影响。
     max_order_volume: 2
     order_count_warn: 8
     cancel_count_warn: 8

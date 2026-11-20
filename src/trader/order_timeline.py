@@ -70,6 +70,14 @@ class OrderTimeline:
         except OSError as exc:
             # 取证日志写坏不能拦住平仓保护；内存里仍保留这一条。
             logger.warning("订单时间线写盘失败: {}", exc)
+        if self.root is not None:
+            try:
+                from src.account.sqlite_ledger import mirror_order_to_sqlite
+
+                mirror_order_to_sqlite(self.root, row)
+            except Exception as exc:  # noqa: BLE001
+                # SQLite 是可重建投影，异常不改变 JSONL 和交易结果。
+                logger.warning("订单 SQLite 投影失败: {}", exc)
         return row
 
 

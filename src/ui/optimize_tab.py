@@ -68,7 +68,8 @@ class OptimizeTabMixin:
             width=160,
         )
         self._date_row(box, "开始日期", self.opt_start_var, hint="点日历选择，默认当年1月1日", allow_empty=False)
-        self._date_row(box, "结束日期", self.opt_end_var, hint="点日历；清空=到最新")
+        self._date_row(box, "结束日期", self.opt_end_var, hint="点日历；清空=到最新。只算到当天 20:59")
+        self._pick_switch_row(box, "含当晚夜盘", self.opt_include_night_var)
         self._option_row(
             box,
             "搜索深度",
@@ -497,6 +498,8 @@ class OptimizeTabMixin:
             self.opt_start_var.set(start)
         if end:
             self.opt_end_var.set(end)
+        # 勾了「含当晚夜盘」：只把这一次优化的结束日往后推一个交易日，日期框不回写。
+        end = self._extend_end_for_night(end, self.opt_include_night_var.get())
         try:
             max_trials = max(5, int(float(self.opt_trials_var.get() or 80)))
         except ValueError:

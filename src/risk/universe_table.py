@@ -703,7 +703,8 @@ def upgrade_universe_session_columns(path: Path | str, rows: list[dict[str, Any]
     """
     旧表缺「交易时段」「清仓时刻」时补上。
 
-    空单元格按品种填出厂值：白银/黄金夜盘到 02:30、清仓 02:25；其它到 23:00、清仓 22:55。
+    空单元格按品种填出厂值：时段看品种有没有夜盘、夜盘收到几点；
+    清仓时刻由时段推「收盘前 5 分钟」，不再单独维护一张钟点表。
     表正在被 Excel 打开写不进去时，只记一句日志，不让启动失败。
     """
     from src.utils.session_clock import (

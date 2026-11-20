@@ -132,6 +132,19 @@ def _extra_scope_mismatches(cfg: dict[str, Any] | None, snap: dict[str, Any]) ->
     return out
 
 
+def _zero_fee_symbols(cfg: dict[str, Any] | None, symbol: str) -> list[str]:
+    """评审单要提示：这些品种手续费是 0，回测净盈亏没扣成本。"""
+    from src.risk.commission import zero_fee_products
+
+    contracts = ((cfg or {}).get("risk") or {}).get("contracts")
+    strategy = ((cfg or {}).get("strategy") or {})
+    symbols: list[str] = [symbol] if symbol else []
+    extra = strategy.get("symbols") if isinstance(strategy, dict) else None
+    if isinstance(extra, list):
+        symbols.extend(str(item) for item in extra)
+    return zero_fee_products(contracts, symbols)
+
+
 def _data_gate(
     root: Path,
     cfg: dict[str, Any] | None,
@@ -186,6 +199,11 @@ def _data_gate(
     findings = [finding for finding in audit.findings if finding.source == "backtest"]
     n_critical = sum(1 for finding in findings if finding.severity == "critical")
     n_warning = sum(1 for finding in findings if finding.severity == "warning")
+    zero_fee = _zero_fee_symbols(cfg, bt_symbol or symbol)
+    if zero_fee:
+        section.lines.append(
+            "成本  " + "、".join(zero_fee) + " 手续费为 0，回测净盈亏没扣这笔钱；按期货公司结算单核对"
+        )
     if n_critical:
         section.lines.append(f"审计  严重 {n_critical} 条，先处理")
         for finding in findings:
@@ -207,7 +225,7 @@ def _data_gate(
         section.lines.insert(0, "回测没记录实际数据区间，不能证明用了真实历史。")
     elif n_critical:
         section.status = FAIL
-    elif n_warning or bars < 100:
+    elif n_warning or zero_fee or bars < 100:
         section.status = WATCH
     else:
         section.status = PASS

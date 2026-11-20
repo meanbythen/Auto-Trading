@@ -1,6 +1,6 @@
 """品种手续费计算。"""
 
-from src.risk.commission import fee_close, fee_open, is_close_today
+from src.risk.commission import fee_close, fee_open, is_close_today, zero_fee_products
 
 
 def test_open_and_close_today_fees() -> None:
@@ -29,6 +29,14 @@ def test_close_yesterday_can_differ_from_open() -> None:
 def test_blank_close_today_follows_per_lot() -> None:
     contracts = {"rb": {"commission": 1.5}}
     assert fee_close(contracts, "rb2701", 2, close_today=True) == 3.0
+
+
+def test_zero_fee_products_lists_running_symbols_without_fee() -> None:
+    """手续费为 0 的在跑品种要单独列出来，评审单不能当成「已含成本」。"""
+    contracts = {"fu": {"commission": 2.63}, "lh": {"commission": 0.0}, "jd": {}}
+    assert zero_fee_products(contracts, ["fu2701", "lh2701", "jd2612"]) == ["lh", "jd"]
+    assert zero_fee_products(contracts, ["fu2701"]) == []
+    assert zero_fee_products(None, ["fu2701"]) == ["fu"]
 
 
 def test_same_trading_day_is_close_today() -> None:

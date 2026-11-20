@@ -70,6 +70,23 @@ def fee_close(
     return round(close_commission_per_lot(contracts, symbol, close_today=close_today) * lots, 2)
 
 
+def zero_fee_products(contracts: dict[str, Any] | None, symbols: list[Any] | None) -> list[str]:
+    """
+    手续费为 0 的在跑品种。
+
+    回测净盈亏和实盘记账都按每手手续费扣钱，费率是 0 就等于假设免费交易。
+    评审单要把这层假设说清楚，不能直接判「通过」。
+    """
+    out: list[str] = []
+    for symbol in symbols or []:
+        key = product_key(str(symbol or ""))
+        if not key or key in out:
+            continue
+        if open_commission_per_lot(contracts, str(symbol)) <= 0:
+            out.append(key)
+    return out
+
+
 def is_close_today(opened_at: str | datetime | None, closed_at: str | datetime | None) -> bool:
     """
     是不是平今：开仓和平仓属于同一个期货交易日（夜盘 21:00 起算，以日盘日期为准）。

@@ -1,6 +1,9 @@
 # 本地配置（含账号信息，勿提交）
 config/config.yaml
 config/secrets.local.yaml
+# 账号注册表与 DPAPI 密文凭据库：都是本机运行态数据
+config/accounts.yaml
+config/secrets.dpapi.json
 .env
 
 # 虚拟环境与缓存

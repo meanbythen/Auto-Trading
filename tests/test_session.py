@@ -64,6 +64,31 @@ def test_overnight_session_covers_evening_and_early_morning() -> None:
     assert in_trading_session(sessions, datetime(2026, 11, 10, 3, 0)) is False
 
 
+def test_flatten_times_follow_the_session_table() -> None:
+    """清仓时刻由品种时段推出来：日盘 15:00 → 14:55，夜盘收到几点就提前 5 分钟。"""
+    from src.utils.session_clock import flatten_times_for_symbol
+
+    assert flatten_times_for_symbol({}, "lh2701") == ["14:55"]
+    assert flatten_times_for_symbol({}, "jd2612") == ["14:55"]
+    assert flatten_times_for_symbol({}, "fu2701") == ["14:55", "22:55"]
+    assert flatten_times_for_symbol({}, "ag2702") == ["14:55", "02:25"]
+    assert flatten_times_for_symbol({}, "sc2701") == ["14:55", "02:25"]
+    assert flatten_times_for_symbol({}, "IF2612") == ["14:55"]
+    # 低硫燃料油夜盘只到 23:00，不能跟着原油算成 02:25。
+    assert flatten_times_for_symbol({}, "lu2701") == ["14:55", "22:55"]
+
+
+def test_flatten_times_prefer_the_contract_row() -> None:
+    """品种表写了清仓时刻就以表为准，回测和实盘读同一处。"""
+    from src.utils.session_clock import flatten_times_for_symbol
+
+    cfg = {
+        "risk": {"contracts": {"lh": {"flatten_times": "14:50"}}},
+        "strategy": {"flatten_times": ["14:55", "23:55"]},
+    }
+    assert flatten_times_for_symbol(cfg, "lh2701") == ["14:50"]
+
+
 def test_last_open_at_uses_yesterday_after_midnight() -> None:
     """凌晨看夜盘开盘，应该是昨天 21:00。"""
     now = datetime(2026, 11, 10, 1, 5)

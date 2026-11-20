@@ -55,6 +55,10 @@ class ConfigVarsMixin:
         self.ctp_profile_pwd_env_var = ctk.StringVar(value="")
         self.ctp_profile_auth_env_var = ctk.StringVar(value="")
         self.ctp_profile_note_var = ctk.StringVar(value="")
+        # 本机单笔最大手数：风控与资金管理块里改，存 trade.ctp.max_order_volume。
+        self.ctp_max_volume_var = ctk.StringVar(
+            value=str(ctp_box.get("max_order_volume") or 20)
+        )
         self._ctp_profile_syncing = False
         self._fill_ctp_profile_vars()
         try:
@@ -402,6 +406,8 @@ class ConfigVarsMixin:
         default_start = self._initial_start_date(bt.get("start_date", ""))
         self.bt_start_var = ctk.StringVar(value=default_start)
         self.bt_end_var = ctk.StringVar(value=str(bt.get("end_date", "")))
+        # 勾上才把结束日之后的那个交易日也取进来，专门看「结束日当晚夜盘」。
+        self.bt_include_night_var = ctk.BooleanVar(value=bool(bt.get("include_end_night", False)))
         ths_chart = ((self.cfg.get("data") or {}).get("ths_chart") or {})
         self.bt_ths_bars_var = ctk.StringVar(value=str(ths_chart.get("max_bars", 800)))
         # —— 数据管理页：本地K线库的建立与管理 ——
@@ -475,6 +481,7 @@ class ConfigVarsMixin:
         self.pk_range_var = ctk.StringVar(value=self.bt_range_var.get())
         self.pk_start_var = ctk.StringVar(value=default_start)
         self.pk_end_var = ctk.StringVar(value=self.bt_end_var.get())
+        self.pk_include_night_var = ctk.BooleanVar(value=bool(bt.get("include_end_night", False)))
         self.pk_flatten_var = ctk.BooleanVar(value=bool(self.bt_flatten_var.get()))
         self.pk_limits_on_var = ctk.BooleanVar(value=True)
         self.pk_sizing_var = ctk.StringVar(value="fixed")
@@ -497,6 +504,7 @@ class ConfigVarsMixin:
         self.opt_range_var = ctk.StringVar(value=str(bt.get("range_preset", "全部可用")))
         self.opt_start_var = ctk.StringVar(value=default_start)
         self.opt_end_var = ctk.StringVar(value=str(bt.get("end_date", "")))
+        self.opt_include_night_var = ctk.BooleanVar(value=bool(bt.get("include_end_night", False)))
         self.opt_trials_var = ctk.StringVar(value=str(bt.get("max_trials", 80)))
         self.opt_depth_var = ctk.StringVar(value=str(bt.get("optimize_depth", "标准")))
         # 检验比例默认 30%，和优化器里的默认切断一致。可在 10～50 之间手调。
@@ -576,6 +584,7 @@ class ConfigVarsMixin:
         self.rs_range_var = ctk.StringVar(value=str(bt.get("range_preset", "全部可用")))
         self.rs_start_var = ctk.StringVar(value=default_start)
         self.rs_end_var = ctk.StringVar(value=str(bt.get("end_date", "")))
+        self.rs_include_night_var = ctk.BooleanVar(value=bool(bt.get("include_end_night", False)))
         self.rs_scope_var = ctk.StringVar(value="扫关注名单全部")
         self.rs_cross_var = ctk.BooleanVar(value=True)
         self._rs_busy = False
@@ -772,6 +781,8 @@ class ConfigVarsMixin:
         self.ctp_profile_pwd_env_var.set(str(resolved.get("password_env") or "CTP_PASSWORD"))
         self.ctp_profile_auth_env_var.set(str(resolved.get("auth_code_env") or ""))
         self.ctp_profile_note_var.set("；".join(profile_validation_notes(ctp_box, account)))
+        # 档案没写就用公共默认；这里显示的是实际生效值。
+        self.ctp_max_volume_var.set(str(resolved.get("max_order_volume") or 20))
 
     def _on_ctp_kind_changed(self, *_args: object) -> None:
         """配置页切仿真/真实，和交易台一样只换账号和前置。"""

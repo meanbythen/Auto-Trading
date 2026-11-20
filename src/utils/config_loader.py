@@ -70,7 +70,7 @@ def _strip_ctp_runtime(ctp: dict[str, Any]) -> dict[str, Any]:
 
 def _read_ctp_secret(env_name: str, secrets: dict[str, Any], *fallbacks: str) -> str:
     """
-    密码/认证码：先读环境变量，再读 secrets.local.yaml 同名小写键。
+    密码/认证码：环境变量 > Windows 凭据库（DPAPI）> secrets.local.yaml 同名小写键。
 
     找不到时返回空串。读到了就同步进环境变量，方便其它模块直接读。
     """
@@ -78,6 +78,18 @@ def _read_ctp_secret(env_name: str, secrets: dict[str, Any], *fallbacks: str) ->
     if name:
         value = os.environ.get(name, "")
         if value:
+            return value
+        # 迁移到凭据库的密钥：只查 DPAPI 和推导出的环境变量名，
+        # 旧文件里的别名（例如把 GUI 密码借给实盘）仍交给下面的旧逻辑判断。
+        try:
+            from src.utils.secret_store import default_store, ref_for_env
+
+            value = default_store().resolve(ref_for_env(name))
+        except Exception as exc:  # noqa: BLE001 - 密钥库坏不能拦住启动
+            logger.warning("凭据库读取失败，继续用环境变量/本地密钥: {}", exc)
+            value = ""
+        if value:
+            os.environ[name] = value
             return value
     for key in (name.lower(), *fallbacks):
         if not key:
@@ -415,6 +427,14 @@ def load_config(
     cfg.setdefault("dry_run", True)
 
     secrets = load_secrets()
+    # 账号注册表（config/accounts.yaml）：首次缺失时从旧 ctp_profiles 迁移，之后物化成
+    # trade.ctp.ctp_profiles。注册表坏或不存在时原样返回，旧配置照样能启动。
+    try:
+        from src.account.registry import apply_account_registry
+
+        apply_account_registry(root, cfg, secrets)
+    except Exception as exc:  # noqa: BLE001 - 注册表不能拦住启动
+        logger.warning("账号注册表接入失败，继续用旧 ctp_profiles: {}", exc)
     pwd_env = cfg.get("account", {}).get("password_env", "FUTURES_PASSWORD")
     inject_ctp_secrets(cfg, secrets)
     password = str((cfg.get("account") or {}).get("resolved_password") or "")

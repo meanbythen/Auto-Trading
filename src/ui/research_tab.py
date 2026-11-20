@@ -62,7 +62,8 @@ class ResearchTabMixin:
             width=160,
         )
         self._date_row(box, "开始日期", self.rs_start_var, hint="点日历选择，默认当年1月1日", allow_empty=False)
-        self._date_row(box, "结束日期", self.rs_end_var, hint="点日历；清空=到最新")
+        self._date_row(box, "结束日期", self.rs_end_var, hint="点日历；清空=到最新。只算到当天 20:59")
+        self._pick_switch_row(box, "含当晚夜盘", self.rs_include_night_var)
         ctk.CTkCheckBox(
             box,
             text="多个品种时，至少两个合约都过关才进池",
@@ -198,6 +199,8 @@ class ResearchTabMixin:
             return
         if self.rs_range_var.get() == "全部可用" and (start or end):
             self.rs_range_var.set("自定义")
+        # 勾了「含当晚夜盘」：只把这一次扫描的结束日往后推一个交易日，日期框不回写。
+        end = self._extend_end_for_night(end, self.rs_include_night_var.get())
         period = self._period_code(self.rs_tf_var, self.rs_tf_custom_var)
         from src.data.quote_check import normalize_source
 

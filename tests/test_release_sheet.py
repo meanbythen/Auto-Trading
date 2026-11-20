@@ -20,6 +20,7 @@ def _cfg(engine: str = "supertrend") -> dict:
     return {
         "strategy": {"engine": engine, "timeframe": "15m"},
         "trade": {"symbol": "fu2701"},
+        "risk": {"contracts": {"fu": {"commission": 2.63}}},
         "backtest": {"slippage_ticks": 3},
         "evaluation": {"slippage_extra_ticks": 1},
     }
@@ -71,6 +72,17 @@ def test_data_gate_passes_when_scope_and_range_match(tmp_path):
     gate = sheet.section("数据门禁")
     assert gate is not None and gate.status == PASS
     assert "2025-01-01 → 2026-05-31" in "\n".join(gate.lines)
+
+
+def test_data_gate_warns_when_a_running_product_has_no_fee(tmp_path):
+    """手续费为 0 等于假设免费交易，数据门禁只能给「注意」，不能判通过。"""
+    _write(tmp_path, "backtest_last.json", _backtest())
+    cfg = _cfg()
+    cfg["risk"] = {"contracts": {"fu": {"commission": 0.0}}}
+    sheet = build_release_sheet(tmp_path, cfg)
+    gate = sheet.section("数据门禁")
+    assert gate is not None and gate.status == WATCH
+    assert "手续费为 0" in "\n".join(gate.lines)
 
 
 def test_data_gate_fails_on_engine_mismatch(tmp_path):

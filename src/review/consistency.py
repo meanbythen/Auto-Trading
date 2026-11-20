@@ -23,6 +23,7 @@ from src.backtest.minute_review import MinuteReviewReport, review_trades_on_minu
 from src.domain.trade import TradeRecord
 from src.review.session import SessionWindow
 from src.review.technical import as_naive_datetime
+from src.utils.session_clock import flatten_times_for_symbol
 
 # 实盘事件名 → 复盘里的一句话。只列会被当成「闸门」的事件，普通扫描不进这一页。
 _GATE_EVENTS = {
@@ -48,6 +49,7 @@ def build_consistency_lines(
     """拼出「今日一致性」一节。任何一块缺数据都写人话原因，不猜。"""
     base = Path(root)
     out = [f"—— 今日一致性（{symbol}） ——"]
+    out.extend(_flatten_window_lines(cfg, symbol))
     mirror_rows, enabled, note, compared = _mirror_snapshot(base, symbol, cfg)
     out.extend(note)
     same_window = [row for row in mirror_rows if _hit_in_windows(row, windows)] if enabled else []
@@ -69,6 +71,23 @@ def build_consistency_lines(
     out.extend(gate_lines)
     out.append(_verdict(same_window, len(mirror_rows), enabled, gate_total, compared))
     return out
+
+
+def _flatten_window_lines(cfg: dict[str, Any] | None, symbol: str) -> list[str]:
+    """
+    把收盘清仓口径写出来：回测和实盘都读品种与合约表里的清仓时刻。
+
+    清仓之后的成交只用于平仓，不再和开仓闸门对比，避免拿最后 5 分钟去比。
+    """
+    try:
+        clocks = flatten_times_for_symbol(cfg, symbol)
+    except Exception:  # noqa: BLE001
+        clocks = []
+    if not clocks:
+        return []
+    day = [clock for clock in clocks if "09:00" <= clock <= "16:00"]
+    shown = day[0] if day else clocks[0]
+    return [f"  收盘口径  按品种与合约表清仓 {shown}，之后只平不开，不进开仓对照。"]
 
 
 def _mirror_snapshot(

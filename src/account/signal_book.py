@@ -126,6 +126,7 @@ def save_named_book(root: str | Path, account_id: Any, book: dict[str, Any]) -> 
     path = book_file(root, account_id)
     book["account_id"] = str(account_id)
     _write_json(path, book)
+    _mirror_sqlite(root, book)
     return path
 
 
@@ -351,7 +352,18 @@ def save_book(root: str | Path, book: dict[str, Any]) -> Path:
     book["account_id"] = profile_of(root=root)["id"]
     _write_json(path, book)
     _mirror_period(root, book)
+    _mirror_sqlite(root, book)
     return path
+
+
+def _mirror_sqlite(root: str | Path, book: dict[str, Any]) -> None:
+    """JSON 成功后再同步投影；SQLite 故障不得把已入账的成交改成失败。"""
+    try:
+        from src.account.sqlite_ledger import mirror_book_to_sqlite
+
+        mirror_book_to_sqlite(root, book, position_rows=open_position_rows)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("账本 SQLite 投影失败（JSON 已保存）: {}", exc)
 
 
 def begin_period(initial_capital: float, *, version: str, when: str | None = None) -> dict[str, Any]:

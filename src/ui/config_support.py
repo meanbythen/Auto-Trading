@@ -306,7 +306,32 @@ class ConfigSupportMixin:
         # 扫描间隔夹到 5~600 秒，并把夹过的值显示回输入框，避免界面和配置对不上。
         self.scan_var.set(str(self._scan_interval_value()))
         cfg = self._merge_disk_gui_coords(self._apply_ui_to_cfg())
+        # 账号注册表：先预检（环境/前置/资金号），有错就不写盘；通过后再把档案字段回写。
+        from src.account.registry import check_cfg_with_registry, sync_registry_from_cfg
+
+        problems = check_cfg_with_registry(self.root_dir, cfg)
+        if problems:
+            from tkinter import messagebox
+
+            messagebox.showerror(
+                "账号配置有问题",
+                "下面这些必须先改好再保存：\n\n" + "\n".join(f"· {item}" for item in problems[:8]),
+            )
+            self._append_log("账号配置校验未通过，本次没有保存：" + problems[0])
+            return
+        for note in sync_registry_from_cfg(self.root_dir, cfg):
+            self._append_log(f"账号注册表：{note}")
         path = save_config(cfg)
+        # 首次保存时把 secrets.local.yaml 的明文搬进 Windows 凭据库；原文件保留做只读备份。
+        try:
+            from src.utils.config_loader import load_secrets
+            from src.utils.secret_store import default_store
+
+            migrated = default_store().migrate_legacy(load_secrets())
+            if migrated:
+                self._append_log(f"密钥已迁移到 Windows 凭据库：{len(migrated)} 条（原文件保留）")
+        except Exception as exc:  # noqa: BLE001 - 迁移失败不影响配置保存
+            self._append_log(f"密钥迁移跳过：{exc}")
         self._status = "已保存"
         self._append_log(f"配置已保存: {path}")
         from src.account.ctp_sync import align_active_book_to_ctp

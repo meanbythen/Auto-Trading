@@ -23,6 +23,23 @@ from src.trader.ctp_orders import ctp_order
 from src.trader.order_timeline import elapsed_ms, now_iso
 
 
+def order_volume_cap(trader: Any) -> int | None:
+    """
+    交易对象的单笔最大手数。算仓时就按这个数压，避免到柜台前才被拦成废单。
+
+    柜台渠道在 ctp_trader 发单前还会再查一次，这里读的是同一个 settings 值。
+    GUI 渠道没有 settings，返回 None，不影响原来的手数。
+    """
+    settings = getattr(trader, "settings", None)
+    if settings is None:
+        return None
+    try:
+        value = int(getattr(settings, "max_order_volume", 0) or 0)
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
 class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin):
     """订单编排与人工命令入口；共享运行状态仍保存在 TradingBot 实例上。"""
 
@@ -443,6 +460,7 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
             decision.stop_price,
             current_abs_position=self.risk.total_abs_position(),
             positions=self.risk.positions,
+            max_per_order=order_volume_cap(getattr(self, "trader", None)),
         )
         raw = meta.get("volume")
         if raw is None:

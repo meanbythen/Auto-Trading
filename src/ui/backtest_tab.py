@@ -71,7 +71,23 @@ class BacktestTabMixin(BacktestConfigMixin, BacktestActionsMixin):
             width=160,
         )
         self._date_row(box, "开始日期", self.bt_start_var, hint="点日历选择，默认当年1月1日", allow_empty=False)
-        self._date_row(box, "结束日期", self.bt_end_var, hint="点日历；清空=到最新")
+        self._date_row(box, "结束日期", self.bt_end_var, hint="点日历；清空=到最新。只算到当天 20:59")
+        night_row = ctk.CTkFrame(box, fg_color="transparent")
+        night_row.pack(fill="x", pady=(0, 2))
+        ctk.CTkLabel(
+            night_row,
+            text="含当晚夜盘",
+            font=T.FONT_BODY,
+            text_color=T.TEXT_DIM,
+            width=140,
+            anchor="w",
+        ).pack(side="left", padx=(0, 8))
+        ctk.CTkSwitch(
+            night_row,
+            text="",
+            variable=self.bt_include_night_var,
+            progress_color=T.OK,
+        ).pack(side="left")
         flat_row = ctk.CTkFrame(box, fg_color="transparent")
         flat_row.pack(fill="x", pady=4)
         ctk.CTkLabel(

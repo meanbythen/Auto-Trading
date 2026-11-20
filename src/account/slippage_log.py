@@ -283,11 +283,51 @@ def summarize_by_side(root: Path | str) -> list[dict[str, Any]]:
     return _group_stats(load_rows(root), key_of)
 
 
-def summarize_by_session(root: Path | str) -> list[dict[str, Any]]:
-    """按日盘 / 夜盘给建议。夜盘流动性差时，滑点常比日盘大。"""
+def _session_from_table(cfg: dict[str, Any], stamp: str, symbol: str) -> str:
+    """按品种与合约表的时段判断这笔成交属于日盘还是夜盘；判不出返回空串。"""
+    if not stamp or not symbol:
+        return ""
+    try:
+        when = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return ""
+    if when.tzinfo is not None:
+        when = when.astimezone().replace(tzinfo=None)
+    try:
+        from src.utils.session_clock import (
+            in_clock_window,
+            parse_hhmm,
+            sessions_for_symbol,
+            split_day_night_sessions,
+        )
+
+        day, night = split_day_night_sessions(sessions_for_symbol(cfg, symbol))
+    except Exception:  # noqa: BLE001
+        return ""
+    if any(in_clock_window(parse_hhmm(start), parse_hhmm(end), when) for start, end in night):
+        return "夜盘"
+    if any(in_clock_window(parse_hhmm(start), parse_hhmm(end), when) for start, end in day):
+        return "日盘"
+    return "其他"
+
+
+def summarize_by_session(
+    root: Path | str,
+    cfg: dict[str, Any] | None = None,
+) -> list[dict[str, Any]]:
+    """
+    按日盘 / 夜盘给建议。夜盘流动性差时，滑点常比日盘大。
+
+    给了 cfg 就按品种与合约表的时段判：生猪、鸡蛋这些没有夜盘的品种，
+    22 点的记录不会被算进夜盘；没给 cfg 才退回按钟点粗分。
+    """
 
     def key_of(row: dict[str, Any]) -> str:
         stamp = str(row.get("ts") or "")
+        if cfg is not None:
+            label = _session_from_table(cfg, stamp, str(row.get("symbol") or ""))
+            if label:
+                return label
         try:
             hour = int(stamp[11:13])
         except (TypeError, ValueError):
@@ -365,7 +405,7 @@ def _event_ts(value: Any) -> float | None:
         return None
 
 
-def quality_text(root: Path | str) -> str:
+def quality_text(root: Path | str, cfg: dict[str, Any] | None = None) -> str:
     """复盘尾部「成交质量」：方向、时段、拒单三块。样本不足时直说。"""
     lines = ["—— 成交质量（滑点与拒单） ——"]
     side = summarize_by_side(root)
@@ -376,7 +416,7 @@ def quality_text(root: Path | str) -> str:
     else:
         lines.append("按方向：真实样本不足 3 笔，先不改方向参数。")
 
-    session = summarize_by_session(root)
+    session = summarize_by_session(root, cfg)
     if session:
         lines.append("按时段：" + "；".join(
             f"{item['key']} {item['n']}笔 → 建议 {item['suggested']:g} 跳" for item in session

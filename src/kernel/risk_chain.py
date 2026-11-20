@@ -12,6 +12,8 @@ import inspect
 from dataclasses import dataclass
 from typing import Any, Callable
 
+from loguru import logger
+
 
 @dataclass(frozen=True)
 class TradeIntent:
@@ -133,17 +135,21 @@ def _books(intent: TradeIntent, _risk: Any) -> GateResult | None:
 
 
 def _guardian(intent: TradeIntent, risk: Any) -> GateResult | None:
-    allow = getattr(risk, "allow", None)
-    if allow is None:
-        return None
-    kwargs: dict[str, Any] = {"symbol": intent.symbol}
-    try:
-        params = inspect.signature(allow).parameters
-        if "force" in params:
-            kwargs["force"] = bool(intent.force)
-    except (TypeError, ValueError):
-        pass
-    ok, reason = allow(intent.side, int(intent.volume), **kwargs)
+    evaluate = getattr(risk, "evaluate", None)
+    if callable(evaluate):
+        ok, reason = evaluate(intent)
+    else:
+        allow = getattr(risk, "allow", None)
+        if allow is None:
+            return None
+        kwargs: dict[str, Any] = {"symbol": intent.symbol}
+        try:
+            params = inspect.signature(allow).parameters
+            if "force" in params:
+                kwargs["force"] = bool(intent.force)
+        except (TypeError, ValueError):
+            pass
+        ok, reason = allow(intent.side, int(intent.volume), **kwargs)
     if not ok:
         return GateResult(False, "risk_block", str(reason or "风控拒绝"))
     return None
@@ -174,14 +180,30 @@ def _run(intent: TradeIntent, risk: Any, rules: tuple[Callable[..., GateResult |
     return GateResult(True, "pass", "通过")
 
 
+def _audit(risk: Any, gate: str, intent: TradeIntent, result: GateResult) -> None:
+    recorder = getattr(risk, "record_decision", None)
+    if not callable(recorder):
+        return
+    try:
+        recorder(gate, intent, result)
+    except Exception as exc:  # noqa: BLE001
+        # 决策留痕是同步旁路，写坏也不能把原本的放行/拒绝结果反过来。
+        logger.warning("风控决策留痕失败: {}", exc)
+
+
 def run_early_gates(intent: TradeIntent, risk: Any) -> GateResult:
     """暂停开新仓、记账失败、同一根 K 线重复开仓。平仓不看暂停。还没算手数、也还没反手。"""
-    return _run(intent, risk, EARLY_RULES)
+    result = _run(intent, risk, EARLY_RULES)
+    if not result.ok:
+        _audit(risk, "early", intent, result)
+    return result
 
 
 def run_send_gates(intent: TradeIntent, risk: Any) -> GateResult:
     """手数、上线阶段、未完成委托、持仓对账、日亏损与频率。通过后才允许真正发单。"""
-    return _run(intent, risk, SEND_RULES)
+    result = _run(intent, risk, SEND_RULES)
+    _audit(risk, "send", intent, result)
+    return result
 
 
 def run_pretrade_gates(intent: TradeIntent, risk: Any) -> GateResult:

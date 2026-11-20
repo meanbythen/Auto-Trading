@@ -143,7 +143,8 @@ class PickerTabMixin:
             width=160,
         )
         self._date_row(box, "开始日期", self.pk_start_var, hint="点日历选择，默认当年1月1日", allow_empty=False)
-        self._date_row(box, "结束日期", self.pk_end_var, hint="点日历；清空=到最新")
+        self._date_row(box, "结束日期", self.pk_end_var, hint="点日历；清空=到最新。只算到当天 20:59")
+        self._pick_switch_row(box, "含当晚夜盘", self.pk_include_night_var)
         self._pick_switch_row(box, "收盘清仓", self.pk_flatten_var)
         ctk.CTkLabel(
             box,
@@ -582,6 +583,8 @@ class PickerTabMixin:
             self.pk_start_var.set(start)
         if end:
             self.pk_end_var.set(end)
+        # 勾了「含当晚夜盘」：只把这一轮交叉测试的结束日往后推一个交易日，日期框不回写。
+        end = self._extend_end_for_night(end, self.pk_include_night_var.get())
         try:
             volume = int(float(self.pk_volume_var.get()))
             risk_pct = float(self.pk_risk_pct_var.get())

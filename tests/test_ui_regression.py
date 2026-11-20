@@ -434,6 +434,7 @@ def test_config_mapping_save_and_reload_round_trip(real_app) -> None:
     real_app.max_loss_var.set("4321")
     real_app.min_interval_var.set("65")
     real_app.max_orders_var.set("7")
+    real_app.ctp_max_volume_var.set("4")
     real_app.margin_var.set("8888")
 
     strategy = real_app.cfg.setdefault("strategy", {})
@@ -466,6 +467,8 @@ def test_config_mapping_save_and_reload_round_trip(real_app) -> None:
     assert cfg["risk"]["max_daily_loss"] == 4321
     assert cfg["risk"]["min_order_interval_sec"] == 65
     assert cfg["risk"]["max_orders_per_day"] == 7
+    # 单笔最大手数是本机保护上限，配置页改完要落到 trade.ctp。
+    assert cfg["trade"]["ctp"]["max_order_volume"] == 4
     for key in ("skip_gap_ticks", "max_box_ticks", "max_chase_ticks", "initial_atr_mult", "reverse_atr_mult", "stop_mode"):
         assert key not in cfg["strategy"]["daily_body"]
     assert "market_filter" not in cfg["strategy"]

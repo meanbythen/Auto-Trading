@@ -95,14 +95,14 @@ def in_session_windows(
 
 
 # 贵金属、原油夜盘收到次日凌晨。品种表没填时段时用这一套。
-LATE_NIGHT_PRODUCTS = frozenset({"ag", "au", "sc", "lu"})
-# 沪铜等有色夜盘到 01:00。
-NIGHT_0100_PRODUCTS = frozenset("cu al zn pb ni sn ss".split())
+LATE_NIGHT_PRODUCTS = frozenset({"ag", "au", "sc"})
+# 沪铜等有色、国际铜夜盘到 01:00。
+NIGHT_0100_PRODUCTS = frozenset("cu al zn pb ni sn ss bc".split())
 # 中金所：日盘 09:30～11:30、13:00～15:00，没有上午休息、没有夜盘。
 CFFEX_PRODUCTS = frozenset({"if", "ih", "ic", "im", "t", "tf", "ts", "tl"})
-# 生猪、鸡蛋、广期所工业硅等没有夜盘（股指国债走 CFFEX，不走这里的日盘骨架）。
+# 生猪、鸡蛋、广期所工业硅、集运指数等没有夜盘（股指国债走 CFFEX，不走这里的日盘骨架）。
 NO_NIGHT_PRODUCTS = frozenset(
-    {"lh", "jd", "fb", "bb", "rr", "si", "lc", "ps", "ap", "cj"}
+    {"lh", "jd", "fb", "bb", "rr", "si", "lc", "ps", "ap", "cj", "ec"}
 )
 _DAY_WINDOWS = (("09:00", "11:30"), ("13:30", "15:00"))
 _CFFEX_DAY_WINDOWS = (("09:30", "11:30"), ("13:00", "15:00"))
@@ -179,16 +179,30 @@ def default_sessions_for_product(code: Any) -> list[list[str]]:
     return day + [["21:00", "23:00"]]
 
 
+def _minus_minutes(clock: str, minutes: int) -> str:
+    """15:00 往前 5 分钟 → 14:55。"""
+    stamp = datetime.combine(datetime(2000, 1, 1).date(), parse_hhmm(clock)) - timedelta(minutes=minutes)
+    return stamp.strftime("%H:%M")
+
+
+def flatten_times_from_sessions(sessions: list[list[str]] | None) -> list[str]:
+    """
+    按交易时段推清仓钟点：日盘收 15:00 就 14:55 清，夜盘收到几点就提前 5 分钟。
+
+    这样做是为了让「清仓时刻」只跟品种时段走，代码里不再另存一套 14:55/22:55/02:25 的硬编码表。
+    """
+    day, night = split_day_night_sessions(sessions)
+    out: list[str] = []
+    if day:
+        out.append(_minus_minutes(day[-1][1], 5))
+    if night:
+        out.append(_minus_minutes(night[-1][1], 5))
+    return out
+
+
 def default_flatten_for_product(code: Any) -> list[str]:
-    """品种没填清仓时刻时的出厂值。"""
-    key = product_code(code)
-    if key in NO_NIGHT_PRODUCTS or key in CFFEX_PRODUCTS:
-        return ["14:55"]
-    if key in LATE_NIGHT_PRODUCTS:
-        return ["14:55", "02:25"]
-    if key in NIGHT_0100_PRODUCTS:
-        return ["14:55", "00:55"]
-    return ["14:55", "22:55"]
+    """品种没填清仓时刻时的出厂值：由这个品种的出厂时段推出来。"""
+    return flatten_times_from_sessions(default_sessions_for_product(code))
 
 
 def sessions_for_symbol(cfg: dict[str, Any] | None, symbol: Any) -> list[list[str]]:
@@ -213,17 +227,22 @@ def sessions_for_symbol(cfg: dict[str, Any] | None, symbol: Any) -> list[list[st
 
 
 def flatten_times_for_symbol(cfg: dict[str, Any] | None, symbol: Any) -> list[str]:
-    """当前合约实际用的清仓钟点。品种表优先，白银黄金默认 02:25。"""
+    """
+    当前合约实际用的清仓钟点。
+
+    品种表这一行有值就以它为准（回测、实盘、复盘对照都读这一处）；
+    没填时才看策略页的旧字段，再没有就按这个品种的交易时段推「收盘前 5 分钟」。
+    """
     key = product_code(symbol)
     box = (((cfg or {}).get("risk") or {}).get("contracts") or {}).get(key) or {}
     parsed = parse_clock_list(box.get("flatten_times") if isinstance(box, dict) else "")
     if parsed:
         return parsed
-    if key in LATE_NIGHT_PRODUCTS:
-        return default_flatten_for_product(key)
     raw = ((cfg or {}).get("strategy") or {}).get("flatten_times") or []
     out = [str(x).strip()[:5] for x in raw if str(x).strip()]
-    return out or default_flatten_for_product(key)
+    if out:
+        return out
+    return flatten_times_from_sessions(sessions_for_symbol(cfg, symbol))
 
 
 def extend_night_close(sessions: list[Any] | None) -> list[list[str]]:

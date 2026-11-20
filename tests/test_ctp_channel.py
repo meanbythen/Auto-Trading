@@ -1480,6 +1480,19 @@ def test_strategy_volume_cannot_exceed_risk_sized_lots() -> None:
     assert vol == 0
 
 
+def test_order_volume_cap_reads_the_ctp_settings() -> None:
+    """算仓前先读交易对象的单笔上限；GUI 没有 settings 时不压手数。"""
+    from types import SimpleNamespace
+
+    from src.scheduler.order_executor import order_volume_cap
+
+    ctp = SimpleNamespace(settings=SimpleNamespace(max_order_volume=2))
+    assert order_volume_cap(ctp) == 2
+
+    gui = SimpleNamespace()
+    assert order_volume_cap(gui) is None
+
+
 def test_runner_accounts_the_partial_fill_left_over_by_the_broker() -> None:
     """柜台回调没记账时，调度层要按成交手数补记，而不是整笔当没成交。"""
     from src.scheduler.runner import TradingBot

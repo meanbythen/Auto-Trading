@@ -11,9 +11,17 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from loguru import logger
+
+from src.risk.rules import (
+    RiskPolicy,
+    RiskRuleState,
+    apply_fill,
+    daily_loss_reason,
+    evaluate_order,
+)
 
 
 @dataclass
@@ -42,6 +50,8 @@ class RiskGuardian:
     extra: dict[str, Any] = field(default_factory=dict)
     # 实盘熔断才写运行台告警。回测/测试关掉，避免把模拟里的「限额 50」刷到界面上。
     write_alerts: bool = True
+    # 纯规则由调用方注入时钟；默认行为仍是墙上时钟。
+    clock: Callable[[], float] = field(default=time.time, repr=False, compare=False)
 
     @classmethod
     def from_config(cls, cfg: dict[str, Any]) -> "RiskGuardian":
@@ -51,6 +61,39 @@ class RiskGuardian:
             min_order_interval_sec=int(risk.get("min_order_interval_sec", 60)),
             max_orders_per_day=int(risk.get("max_orders_per_day", 20)),
         )
+
+    def _policy(self) -> RiskPolicy:
+        return RiskPolicy(
+            max_daily_loss=self.max_daily_loss,
+            min_order_interval_sec=self.min_order_interval_sec,
+            max_orders_per_day=self.max_orders_per_day,
+        )
+
+    def _rule_state(self) -> RiskRuleState:
+        return RiskRuleState(
+            current_position=self.current_position,
+            positions=dict(self.positions),
+            daily_pnl=self.daily_pnl,
+            orders_today=self.orders_today,
+            open_orders_today=self.open_orders_today,
+            last_order_ts=self.last_order_ts,
+            last_open_ts=self.last_open_ts,
+            halted=self.halted,
+            halt_reason=self.halt_reason,
+            halt_kind=self.halt_kind,
+        )
+
+    def _apply_rule_state(self, state: RiskRuleState) -> None:
+        self.current_position = state.current_position
+        self.positions = dict(state.positions)
+        self.daily_pnl = state.daily_pnl
+        self.orders_today = state.orders_today
+        self.open_orders_today = state.open_orders_today
+        self.last_order_ts = state.last_order_ts
+        self.last_open_ts = state.last_open_ts
+        self.halted = state.halted
+        self.halt_reason = state.halt_reason
+        self.halt_kind = state.halt_kind
 
     def total_abs_position(self) -> int:
         if self.positions:
@@ -78,9 +121,9 @@ class RiskGuardian:
 
     def _check_daily_loss(self) -> None:
         """当日亏损是否已触发熔断。同一段熔断只写一条告警。"""
-        if self.daily_pnl > -abs(self.max_daily_loss):
+        reason = daily_loss_reason(self._policy(), self._rule_state())
+        if not reason:
             return
-        reason = f"当日亏损 {self.daily_pnl:.2f} 已超过限额 {self.max_daily_loss}"
         if self.halted and self.halt_kind == "daily_loss":
             self.halt_reason = reason
             return
@@ -167,78 +210,36 @@ class RiskGuardian:
         *,
         symbol: str | None = None,
         force: bool = False,
+        now: float | None = None,
     ) -> tuple[bool, str]:
-        if volume <= 0:
-            return False, "手数必须大于 0"
+        # 熔断不拦平仓；其它判断全部在纯函数里，测试可显式给 now。
+        return evaluate_order(
+            self._policy(),
+            self._rule_state(),
+            side,
+            volume,
+            symbol=symbol,
+            force=force,
+            now=self.clock() if now is None else float(now),
+        )
 
-        # 强制平仓始终放行（收盘清仓等场景使用 force=True）
-        if force and side == "close":
-            return True, "强制平仓"
-
-        # 平仓：只看这一品种自己有没有仓。别的品种有仓，不能把空仓品种也放行。
-        # 熔断不拦平仓。
-        if side == "close":
-            if symbol and self.positions:
-                lots = abs(int(self.positions.get(symbol, 0) or 0))
-                if lots <= 0:
-                    key = next(
-                        (name for name in self.positions if str(name).lower() == str(symbol).lower()),
-                        None,
-                    )
-                    lots = abs(int(self.positions.get(key, 0) or 0)) if key is not None else 0
-                if lots <= 0:
-                    return False, f"{symbol} 无持仓，无需平仓"
-                return True, "通过"
-            if self.current_position == 0 and self.total_abs_position() <= 0:
-                return False, "当前无持仓，无需平仓"
-            return True, "通过"
-
-        if self.halted:
-            return False, f"已熔断: {self.halt_reason}"
-
-        now = time.time()
-        need = int(self.min_order_interval_sec or 0)
-        # 配置页写的是「下单」间隔：上一笔开仓或平仓（含手机平仓记进账本）之后，
-        # 再开新仓都要等够。止损/收盘清仓走上面的平仓分支，不会被挡住。
-        last = max(float(self.last_order_ts or 0), float(self.last_open_ts or 0))
-        if need > 0 and last and (now - last) < need:
-            wait = max(1, int(need - (now - last)))
-            return False, f"距上一笔下单不足 {need} 秒，请再等 {wait} 秒"
-
-        if self.open_orders_today >= self.max_orders_per_day:
-            return False, f"今日开仓次数已达上限 {self.max_orders_per_day}"
-
-        return True, "通过"
-
-    def on_order_filled(self, side: str, volume: int, symbol: str | None = None) -> None:
-        """下单成功后更新内部状态。"""
-        self.last_order_ts = time.time()
-        self.orders_today += 1
-        sym = symbol or "_default"
-
-        if side == "buy_open":
-            self.current_position += volume
-            self.positions[sym] = self.positions.get(sym, 0) + volume
-            self.open_orders_today += 1
-            self.last_open_ts = self.last_order_ts
-        elif side == "sell_open":
-            self.current_position -= volume
-            self.positions[sym] = self.positions.get(sym, 0) - volume
-            self.open_orders_today += 1
-            self.last_open_ts = self.last_order_ts
-        elif side == "close":
-            # 向 0 靠拢（优先按品种）
-            if sym in self.positions and self.positions[sym] != 0:
-                cur = self.positions[sym]
-                if cur > 0:
-                    self.positions[sym] = max(0, cur - volume)
-                else:
-                    self.positions[sym] = min(0, cur + volume)
-            if self.current_position > 0:
-                self.current_position = max(0, self.current_position - volume)
-            elif self.current_position < 0:
-                self.current_position = min(0, self.current_position + volume)
-
+    def on_order_filled(
+        self,
+        side: str,
+        volume: int,
+        symbol: str | None = None,
+        *,
+        now: float | None = None,
+    ) -> None:
+        """下单成功后用纯状态迁移更新内部状态。"""
+        state = apply_fill(
+            self._rule_state(),
+            side,
+            volume,
+            symbol=symbol,
+            now=self.clock() if now is None else float(now),
+        )
+        self._apply_rule_state(state)
         logger.info(
             "风控状态更新: 净仓={} 分品种={} 今日开仓={} 今日盈亏={:.2f}",
             self.current_position,

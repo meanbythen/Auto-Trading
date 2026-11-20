@@ -181,6 +181,22 @@ def test_summarize_by_session_splits_day_and_night(tmp_path):
     assert by_session["日盘"]["suggested"] < by_session["夜盘"]["suggested"]
 
 
+def test_session_stats_respect_product_night_table(tmp_path):
+    """生猪没有夜盘，22 点的记录不能算进夜盘。"""
+    path = tmp_path / "data" / "slippage_log.csv"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(["ts", "symbol", "action", "volume", "theory_price",
+                         "fill_price", "slip_ticks", "tick", "executor", "dry_run", "account"])
+        for slip in (2, 3, 4):
+            writer.writerow(["2026-11-19T22:10:00", "lh2701", "BUY_OPEN", 1,
+                             "15000", "15010", slip, "5", "ctp", "0", "real"])
+    cfg = {"risk": {"contracts": {"lh": {"trading_sessions": "09:00-11:30,13:30-15:00"}}}}
+    rows = summarize_by_session(tmp_path, cfg)
+    assert [row["key"] for row in rows] == ["其他"]
+
+
 def _write_event(root, ts: str, event: str, symbol: str) -> None:
     path = root / "data" / "events.jsonl"
     path.parent.mkdir(parents=True, exist_ok=True)

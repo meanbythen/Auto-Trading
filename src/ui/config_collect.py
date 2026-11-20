@@ -639,6 +639,13 @@ class ConfigCollectMixin:
         if not isinstance(ctp_box, dict):
             ctp_box = {}
             trade["ctp"] = ctp_box
+        # 单笔最大手数只在本机拦单，不是柜台上限；夹到 1~1000，非法值退回默认 20。
+        # 先取值再改 ctp_kind：改种类会重灌档案控件，别把刚输入的数冲掉。
+        try:
+            max_order_volume = max(1, min(1000, int(float(self.ctp_max_volume_var.get()))))
+        except (TypeError, ValueError):
+            max_order_volume = 20
+        ctp_box["max_order_volume"] = max_order_volume
         self.ctp_kind_var.set(ctp_kind_label(ctp_box.get("account_kind") or kind))
         # 券商档案：页面上改的是当前选中的那一份。旧写法不再读写。
         from src.trader.ctp_profile import profile_name_for_kind
@@ -667,6 +674,8 @@ class ConfigCollectMixin:
             item["user_id"] = str(self.ctp_profile_user_var.get() or "").strip()
             item["password_env"] = str(self.ctp_profile_pwd_env_var.get() or "").strip()
             item["auth_code_env"] = str(self.ctp_profile_auth_env_var.get() or "").strip()
+            # 档案里若曾单独写过上限，界面上改的数要真的生效，不能只写公共默认。
+            item["max_order_volume"] = max_order_volume
             profiles[profile_name] = item
             from src.trader.ctp_profile import set_sim_profile_user_id
 

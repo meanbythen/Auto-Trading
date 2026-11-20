@@ -305,6 +305,13 @@ def build_tail_sections(app: AutoTradingApp, scroll: ctk.CTkFrame) -> None:
         hint="平仓后再开新仓也要等够（含手机平仓记进账本）。止损和收盘清仓不耽误",
     )
     app._entry_row(box4, "每日最多下单", app.max_orders_var)
+    app._entry_row(
+        box4,
+        "单笔最大手数",
+        app.ctp_max_volume_var,
+        hint="本机保护上限，不是柜台上限；算仓时直接按它取小，超过不会发单。默认20。保存后运行中立即生效",
+        hint_wrap=260,
+    )
 
     # 下一根开盘 / 镜像闸门 / 滑点、以及策略评估门槛，都只在历史回测页。
     # 点「保存交易配置」仍会把回测页上的这些值写进 config.yaml（config_collect）。

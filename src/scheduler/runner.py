@@ -23,7 +23,7 @@ from src.data import KlineProvider
 from src.data.kline import bars_age_minutes, is_bars_stale
 from src.data.periods import drop_forming_bar, period_label, stale_after_minutes
 from src.login import AppLoginManager
-from src.risk import PositionSizer, RiskGuardian
+from src.risk import PositionSizer, RiskService
 from src.scheduler.flatten_manager import FlattenManagerMixin
 from src.scheduler.login_flow import LoginFlowMixin
 from src.scheduler.order_executor import OrderExecutorMixin
@@ -147,6 +147,8 @@ class TradingBot(
 
     def __init__(self, cfg: dict[str, Any]) -> None:
         self.cfg = cfg
+        root = Path(cfg.get("_project_root", "."))
+        self.root = root
         # 本次运行标识：事件、告警、状态文件都带它，多次运行的数据不会混在一起。
         # 同进程同秒内建两个实例（测试、脚本）也不会撞号，末尾加 4 位随机。
         self.run_id = f"{datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}-{uuid4().hex[:4]}"
@@ -155,7 +157,7 @@ class TradingBot(
 
         set_run_id(self.run_id)
         self.login_mgr = AppLoginManager(cfg)
-        self.risk = RiskGuardian.from_config(cfg)
+        self.risk = RiskService.from_config(cfg, root=root)
         self.sizer = PositionSizer(cfg)
         self.trader = create_trader(cfg)
         self.kline = KlineProvider(cfg)
@@ -241,8 +243,6 @@ class TradingBot(
         # 审计同一时刻只跑一个线程。候选池大、触发密时不让它们叠加。
         self._audit_thread: threading.Thread | None = None
 
-        root = Path(cfg.get("_project_root", "."))
-        self.root = root
         self.event_log = root / "data" / "events.jsonl"
         self.market_health_log = root / "data" / "market_health.jsonl"
         self._order_timeline = OrderTimeline(root)
@@ -660,12 +660,17 @@ class TradingBot(
         st = load_state(self.state_path)
         self.trading_day = str(st.get("trading_day") or futures_trading_day())
         restore_positions(self.strategy, st.get("positions") or {})
-        self.risk.daily_pnl = float(st.get("daily_pnl", 0) or 0)
-        self.risk.orders_today = int(st.get("orders_today", 0) or 0)
-        self.risk.open_orders_today = int(st.get("open_orders_today", self.risk.orders_today) or 0)
-        self.risk.halted = bool(st.get("halted", False))
-        self.risk.halt_reason = str(st.get("halt_reason", "") or "")
-        self.risk.halt_kind = str(st.get("halt_kind", "") or "")
+        restore_risk = getattr(self.risk, "restore", None)
+        if callable(restore_risk):
+            self.trading_day = str(restore_risk(st) or self.trading_day)
+        else:
+            # 兼容旧测试和外部嵌入的轻量风控对象。
+            self.risk.daily_pnl = float(st.get("daily_pnl", 0) or 0)
+            self.risk.orders_today = int(st.get("orders_today", 0) or 0)
+            self.risk.open_orders_today = int(st.get("open_orders_today", self.risk.orders_today) or 0)
+            self.risk.halted = bool(st.get("halted", False))
+            self.risk.halt_reason = str(st.get("halt_reason", "") or "")
+            self.risk.halt_kind = str(st.get("halt_kind", "") or "")
         # 从策略持仓重建风控净仓
         self._rebuild_risk_positions()
         last_bars = st.get("last_entry_bars") or {}
@@ -680,6 +685,13 @@ class TradingBot(
         self._reconcile_broker_at_startup()
         # 恢复出来的隔夜仓也要纳入扫描，否则没人管它的止损和收盘清仓。
         self._refresh_scan_symbols()
+        # 对账可能改了净仓、日亏或熔断，启动收尾再保存一次最终状态。
+        save_risk = getattr(self.risk, "save_state", None)
+        if callable(save_risk):
+            try:
+                save_risk(self.trading_day)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("启动对账后的风控状态保存失败: {}", exc)
         logger.info(
             "状态已加载 | 持仓={} | 当日盈亏={:.2f} | 熔断={}",
             snapshot_positions(self.strategy),
@@ -1215,6 +1227,13 @@ class TradingBot(
 
     def _persist_state(self) -> None:
         """把关键运行态写盘。"""
+        save_risk = getattr(self.risk, "save_state", None)
+        if callable(save_risk):
+            try:
+                save_risk(self.trading_day)
+            except Exception as exc:  # noqa: BLE001
+                # 新状态端口故障时仍保留旧 bot_state，升级/回退都有恢复依据。
+                logger.warning("风控状态保存失败，继续写旧运行状态: {}", exc)
         save_state(
             self.state_path,
             {
@@ -1439,6 +1458,18 @@ class TradingBot(
                 self.cfg.setdefault("risk", {})["contracts"] = contracts
             self._refresh_sessions()
             self.sync_risk_limits(limit)
+            # 单笔最大手数改了要立刻生效；否则要等下次重连才更新。
+            ctp = (cfg.get("trade") or {}).get("ctp") or {}
+            try:
+                max_volume = max(1, int(ctp.get("max_order_volume") or 20))
+            except (TypeError, ValueError):
+                max_volume = 20
+            gateway = getattr(getattr(self, "trader", None), "gateway", None)
+            settings = getattr(gateway, "settings", None) or getattr(
+                getattr(self, "trader", None), "settings", None
+            )
+            if settings is not None and hasattr(settings, "max_order_volume"):
+                settings.max_order_volume = max_volume
 
     def positions_snapshot(self) -> dict[str, dict[str, Any]]:
         """程序账持仓的只读副本，供界面与报告展示；改返回值不影响运行状态。"""

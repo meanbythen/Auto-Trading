@@ -118,6 +118,20 @@ def test_weighted_blocks_open_without_daily_bars() -> None:
     assert "日线" in decision.reason
 
 
+def test_adopted_short_without_stop_does_not_close_on_the_first_bar() -> None:
+    """柜台认领的仓没有止损价时，先按开仓价外放 2×ATR，不能第一根就自触发平仓。"""
+    strategy = MultiFactorStrategy(_cfg("multi_factor"))
+    bars = _frame([100.0] * 79 + [101.0], spread=1.0)
+    strategy.positions["bu"] = PositionState(
+        side="short", volume=2, entry_price=100.0, initial_stop=0.0, trail_stop=0.0
+    )
+
+    decision = strategy.evaluate("bu", bars, now=datetime(2026, 1, 1, 10, 0))
+
+    assert decision.action == StrategyAction.HOLD
+    assert strategy.positions["bu"].trail_stop > 101.0
+
+
 def test_weighted_exits_when_daily_and_score_flip() -> None:
     strategy = MultiFactorStrategy(_cfg("multi_factor"))
     strategy.positions["bu"] = PositionState(

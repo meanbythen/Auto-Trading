@@ -77,6 +77,22 @@ def test_each_product_uses_its_own_margin() -> None:
     assert asphalt.volume == 0
 
 
+def test_per_order_cap_cuts_lots_before_the_broker_rejects() -> None:
+    """资金管理允许更多手，但本机单笔上限只有 1 手时，算仓就直接压到 1 手。"""
+    sized = PositionSizer(_cfg(0)).calc_open("bu2612", 4585, 4575, max_per_order=1)
+    assert sized.intent_lots >= 2
+    assert sized.volume == 1
+    assert "单笔上限1" in sized.reason
+
+
+def test_per_order_cap_does_not_change_lots_below_the_cap() -> None:
+    """上限比算出来的手数大时，手数不受影响。"""
+    free = PositionSizer(_cfg(0)).calc_open("bu2612", 4585, 4575)
+    capped = PositionSizer(_cfg(0)).calc_open("bu2612", 4585, 4575, max_per_order=99)
+    assert capped.volume == free.volume
+    assert "单笔上限99" in capped.reason
+
+
 def test_backtest_margin_box_overrides_product_margin() -> None:
     """回测这一次只认输入框。品种自己的保证金先清掉，填 0 就不再被 7794 卡住。"""
     cfg = _cfg(0)

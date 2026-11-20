@@ -628,7 +628,7 @@ def _prepare_backtest(
             pass
     # 成交近似：下一根开盘、破止损按止损价、按跳滑点。
     fill = FillModel.from_cfg(cfg, symbol)
-    # 涨跌停/流动性：默认关闭，只有配置里打开才拦开仓、顺延平仓。
+    # 涨跌停/部分成交/挂单超时：默认开启，让成交笔数和净盈亏更贴近实盘。
     liquidity = LiquidityModel.from_cfg(cfg)
 
     if bars_signal is None:
@@ -901,9 +901,26 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
     )
     pos = strategy.positions.get(symbol)
     want = "long" if decision.action == StrategyAction.BUY_OPEN else "short"
-    # 涨跌停一字板：这根没有可成交价，开仓和反手都不做。
+    # 涨跌停一字板：成交那根没有价格，开仓和反手都不做。
+    # 下一根开盘成交时，挂单最多等 entry_timeout_bars 根；等到超时就当撤单。
+    exec_idx = _fill_bar_index(ctx) if run.fill.on_next_open else ctx.i
     exec_bar = _execution_bar(run, ctx)
-    if run.liquidity.locked(exec_bar):
+    if run.fill.on_next_open and next_open is not None:
+        wait_idx = run.liquidity.wait_fill_index(run.bars_signal, exec_idx)
+        if wait_idx is None:
+            run.note_reject(
+                "超时撤单",
+                f"挂单等满 {run.liquidity.entry_timeout_bars} 根仍是一字板，开仓撤单",
+                "多" if want == "long" else "空",
+                at=now,
+                price=px,
+                stop=stop_before or decision.stop_price,
+                key="涨跌停超时撤单",
+            )
+            return None
+        exec_idx = wait_idx
+        exec_bar = run.bars_signal.iloc[exec_idx]
+    elif run.liquidity.locked(exec_bar):
         run.note_reject(
             "涨跌停",
             "成交这根没有价格波动，开仓不成交",
@@ -1002,9 +1019,14 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
     # 只有最后一根没有下一根时才按当根收盘成交。
     # 不能再用策略内部价顶替，否则跳空时会报出当天根本没成交过的开仓价。
     if run.fill.on_next_open and next_open is not None:
-        entry_ref = next_open
-        fill_i = _fill_bar_index(ctx)
-        entry_ts = run.bars_signal.index[fill_i if fill_i is not None else ctx.i + 1]
+        # 涨跌停锁住导致挂单顺延到后面几根时，按真正成交那根的开盘价成交。
+        if exec_idx is not None and exec_idx != _fill_bar_index(ctx):
+            entry_ref = float(run.bars_signal["open"].iloc[int(exec_idx)])
+            entry_ts = run.bars_signal.index[int(exec_idx)]
+        else:
+            entry_ref = next_open
+            fill_i = _fill_bar_index(ctx)
+            entry_ts = run.bars_signal.index[fill_i if fill_i is not None else ctx.i + 1]
         # 下一根已经是收盘清仓时点：按开盘成交再按同一根收盘强平，
         # 实盘不会这样下单。换月移仓不算新开仓，照旧放行。
         flatten = getattr(strategy, "is_flatten_time", None)
@@ -1043,7 +1065,7 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
         live_proxy = float(entry_ref or 0)
         if run.fill.on_next_open:
             try:
-                fill_i = _fill_bar_index(ctx)
+                fill_i = exec_idx
                 if fill_i is not None and 0 <= int(fill_i) < len(run.bars_signal):
                     next_close = float(run.bars_signal["close"].iloc[int(fill_i)])
                     if next_close > 0 and live_proxy > 0:
@@ -1127,11 +1149,11 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
             f"换月移仓：止损宽于每笔风险%，仍按{open_vol}手把仓移到新主力"
             + (f"（{allowed_reason}）" if allowed_reason else "")
         )
-    # 流动性：单根新开仓手数不能超过这根成交量的约定比例。
+    # 流动性/部分成交：单根新开仓手数不能超过这根成交量的约定比例，余量当根撤单。
     if open_vol > 0 and run.liquidity.max_volume_pct > 0:
         capped = run.liquidity.cap_open_volume(open_vol, exec_bar)
         if capped <= 0:
-            reason = "这根成交量太小，开仓不成交"
+            reason = "这根成交量太小，开仓部分成交 0 手，余量撤单"
             run.limits.note_skip(reason)
             run.note_reject(
                 "流动性",
@@ -1144,7 +1166,7 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
             )
             return None
         if capped < open_vol:
-            note = f"单根成交量上限{capped}手"
+            note = f"部分成交 {capped}/{open_vol} 手，余量当根撤单"
             size_reason = f"{note}（{size_reason}）" if size_reason else note
             open_vol = capped
     if open_vol <= 0:
@@ -1564,10 +1586,10 @@ def _params_snapshot(setup: _BacktestSetup, run: _BacktestRun) -> dict[str, Any]
         "fill_on_next_open": fill.on_next_open,
         "slippage_ticks": fill.slippage_ticks,
         "price_tick": fill.price_tick,
-        "fill_note": fill.describe(),
+        "fill_note": fill.describe() + "\n" + run.liquidity.describe(),
         "mirror_live_gates": bool(fill.mirror_live_gates),
         "mirror_gate_hits": list(run.gate_hits),
-        # 涨跌停/流动性口径。默认关闭时会原样写明，便于和历史结果对照。
+        # 涨跌停/部分成交/挂单超时口径，原样写进快照，便于和历史结果对照。
         "liquidity": run.liquidity.snapshot(),
         "sizing_mode": str(risk.get("sizing_mode", "risk_pct")),
         "kelly_in_backtest": bool(

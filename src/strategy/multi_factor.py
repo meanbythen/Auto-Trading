@@ -475,8 +475,16 @@ class CtaFactorStrategy(TrendStrategyBase):
         """2 倍 ATR 跟踪止损，只往有利方向收，亏的方向不放宽。"""
         snap: FactorSnapshot = ind["snap"]
         close = float(bar["close"])
-        current = float(pos.trail_stop or pos.initial_stop or close)
         pad = self.atr_stop_mult * float(snap.atr)
+        current = float(pos.trail_stop or pos.initial_stop or 0.0)
+        if current <= 0:
+            # 柜台认领 / 账本重建的仓没有止损价：按开仓价和现价里更差的一侧往外放 2×ATR。
+            # 不能拿现价兜底当止损，否则认领后第一根 K 线就会把仓位平掉。
+            entry = float(pos.entry_price or close)
+            if pos.side == "long":
+                current = min(entry, close) - pad
+            else:
+                current = max(entry, close) + pad
         if pos.side == "long":
             stop = max(current, close - pad)
         else:

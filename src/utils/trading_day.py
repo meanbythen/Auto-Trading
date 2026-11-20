@@ -148,6 +148,24 @@ def futures_trading_day(moment: datetime | date | str | None = None) -> date:
     return _session_day(moment, NIGHT_START)
 
 
+def next_trading_day(
+    moment: datetime | date | str | None = None,
+    *,
+    extra_closed: Iterable[date] | None = None,
+    calendar: HolidayCalendar | None = None,
+) -> date:
+    """
+    moment 所属交易日的下一个交易日，跳过周末和休市日。
+
+    回测结束日只算到当天 20:59，当晚 21:00 的夜盘属于下一交易日。
+    勾「含结束日当晚夜盘」时用它把结束日往后推一格。
+    """
+    day = futures_trading_day(moment) + timedelta(days=1)
+    while not is_trading_day(day, extra_closed=extra_closed, calendar=calendar):
+        day += timedelta(days=1)
+    return day
+
+
 def trading_days_between(
     start: datetime | date | str | None,
     end: datetime | date | str | None,

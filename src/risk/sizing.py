@@ -19,6 +19,10 @@
    - 仓位上限% ≤ 0，或本品种没填比例也没填金额：本层不限制
    - 例：燃油 4000 点、每手 10 吨、比例 23% → 每手 9200 元
 
+3) 单笔上限（柜台渠道）
+   - 由调用方传入当前交易对象的 max_order_volume；回测不传，历史结果不变
+   - 委托超过这个数会在发单前被本机拦住，所以算仓时直接压到上限
+
 开仓前另外还要过（不算进手数，只决定能不能下单）：
    - 日最大亏损熔断（只拦开新仓，不自动平仓）
    - 两笔开仓最小间隔、每天最多开仓次数
@@ -145,6 +149,7 @@ class PositionSizer:
         stop_price: float | None,
         current_abs_position: int = 0,
         positions: dict[str, int] | None = None,
+        max_per_order: int | None = None,
     ) -> SizeResult:
         """
         计算开仓手数。
@@ -155,6 +160,8 @@ class PositionSizer:
             stop_price: 策略止损价（可空；按风险百分比算仓时必须有效，否则拒单）
             current_abs_position: 当前已持手数绝对值（用于已占用保证金）
             positions: 各品种净持仓。用来按各自的保证金扣掉已经占用的钱。
+            max_per_order: 本机单笔上限（交易对象的 max_order_volume）。
+                回测不传；实盘传了就直接压到手数里，避免算完再被柜台前拦下。
         """
         intent, intent_note, risk_cash, risk_per_lot, stop_dist = self._intent_for_symbol(
             symbol, entry_price, stop_price
@@ -166,6 +173,10 @@ class PositionSizer:
         caps = [intent]
         if margin_lots is not None:
             caps.append(margin_lots)
+        order_cap: int | None = None
+        if max_per_order is not None and int(max_per_order) > 0:
+            order_cap = int(max_per_order)
+            caps.append(order_cap)
         vol = min(caps)
 
         if margin_lots is not None and margin_lots <= 0 and intent > 0:
@@ -211,7 +222,11 @@ class PositionSizer:
 
         reason = f"{intent_note} → 取小后 {vol}手（意图{intent}"
         if margin_lots is not None:
-            reason += f" / 仓位上限{margin_lots}；{margin_note}，每手{lot_margin:.0f}元"
+            reason += f" / 仓位上限{margin_lots}"
+        if order_cap is not None:
+            reason += f" / 单笔上限{order_cap}"
+        if margin_lots is not None:
+            reason += f"；{margin_note}，每手{lot_margin:.0f}元"
         reason += "）"
         logger.info(reason)
         return SizeResult(
