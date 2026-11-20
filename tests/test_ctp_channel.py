@@ -1029,6 +1029,32 @@ def test_shfe_contract_is_sent_in_lowercase() -> None:
     assert ctp_exchange_id("c2511") == "DCE"
 
 
+def test_place_order_connects_before_checking_working_orders() -> None:
+    """断线时本地委托表可能是空的：先重连并查回未成交单，再判断有没有挂单。"""
+    from src.trader.ctp_logic import TrackedOrder
+
+    client = FakeClient()
+    gateway = CtpGateway(_settings(), client)
+    trader = CtpTrader({"dry_run": False}, gateway)
+    gateway.session.phase = "disconnected"
+    gateway.session.need_order_check = False
+    calls: list[str] = []
+
+    def fake_connect() -> tuple[bool, str]:
+        calls.append("connect")
+        gateway.session.phase = "ready"
+        gateway.session.need_order_check = False
+        gateway.table.add(TrackedOrder("9", "bu2612", "0", "0", 1, 4500.0, status="submitted"))
+        return True, "已连接"
+
+    trader.connect = fake_connect  # type: ignore[method-assign]
+    result = trader.place_order(OrderRequest("bu2612", "buy_open", 1, 4500))
+
+    assert calls == ["connect"]
+    assert result.ok is False
+    assert "未成交委托" in result.message
+
+
 def test_other_accounts_orders_are_not_our_errors() -> None:
     """本程序没发过的成交和拒单，不记成我们自己的报单。"""
     gateway = CtpGateway(_settings(), FakeClient())

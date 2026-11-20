@@ -10,7 +10,9 @@ CTP 执行通道。
 
 from __future__ import annotations
 
+import threading
 import time
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Any, Callable
 
@@ -52,6 +54,9 @@ class CtpTrader(TraderBase):
         self._books_match = False
         self._last_query = 0.0
         self._last_note = "还没有和柜台对过账"
+        # 交易台和常驻共用这一份通道。查挂单到报单之间只放一笔过去，
+        # 否则两边各自查到「没有挂单」，会对同一根 K 线各报一笔。
+        self._order_gate = threading.Lock()
         self.last_broker_equity: float | None = None
         # 最近一次三方对账的完整结果，给运行台和启动修复用。
         self.last_report: ReconcileReport | None = None
@@ -396,7 +401,13 @@ class CtpTrader(TraderBase):
 
         开仓一笔。平仓在沥青、玉米上按今仓昨仓拆开，可能变成两笔。
         只有柜台确认全部成交才算 filled。点击成功不算成交。
+        同一时间只放一笔单过这道门，交易台和常驻不会各查一次挂单、各报一笔。
         """
+        gate = getattr(self, "_order_gate", None)
+        with (gate if gate is not None else nullcontext()):
+            return self._place_order_locked(req)
+
+    def _place_order_locked(self, req: OrderRequest) -> OrderResult:
         started_at = now_iso()
         if self.cfg.get("dry_run", True):
             return self._reject_order(req, started_at, "dry_run", "模拟开关开着，不会向 CTP 发单")
@@ -419,6 +430,12 @@ class CtpTrader(TraderBase):
             text = "已暂停开新仓，本笔没有发到柜台"
             logger.warning(text)
             return self._reject_order(req, started_at, "paused", text)
+        if not self.gateway.session.ready or self.gateway.session.need_order_check:
+            ok, message = self.connect()
+            if not ok:
+                return self._reject_order(req, started_at, "connection", message)
+        # 连上并查回未完成报单之后再查挂单。断线时本地委托表可能是空的，
+        # 先查会把「柜台其实还挂着单」当成没有，重登后又报一笔。
         if not self.settings.desk_session and self.has_working_order(req.symbol):
             text = (
                 f"{req.symbol} 还有未成交委托占着仓。"
@@ -426,10 +443,6 @@ class CtpTrader(TraderBase):
             )
             logger.warning(text)
             return self._reject_order(req, started_at, "working_order", text)
-        if not self.gateway.session.ready or self.gateway.session.need_order_check:
-            ok, message = self.connect()
-            if not ok:
-                return self._reject_order(req, started_at, "connection", message)
 
         volume = int(req.volume)
         if volume <= 0:
