@@ -503,6 +503,46 @@ def test_config_mapping_save_and_reload_round_trip(real_app) -> None:
     assert "apply_limits" not in loaded["risk"]
 
 
+def test_ctp_max_volume_display_uses_effective_min(real_app) -> None:
+    """公共 3 / 档案 20 时，界面显示实际拦单值 3，而不是档案的 20。"""
+    from src.trader.ctp_profile import selected_profile_name
+
+    ctp = real_app.cfg.setdefault("trade", {}).setdefault("ctp", {})
+    profiles = ctp.setdefault("ctp_profiles", {})
+    name = selected_profile_name(ctp)
+    profiles.setdefault(name, {})["kind"] = ctp.get("account_kind") or "sim"
+    profiles[name]["max_order_volume"] = 20
+    ctp["max_order_volume"] = 3
+
+    real_app.ctp_profile_var.set(name)
+    real_app._fill_ctp_profile_vars()
+    assert real_app.ctp_max_volume_var.get() == "3"
+
+
+def test_ctp_profile_form_survives_first_save(real_app) -> None:
+    """首次保存不能把刚输入的手数与档案字段刷回旧值。"""
+    from src.trader.ctp_profile import selected_profile_name
+
+    ctp = real_app.cfg.setdefault("trade", {}).setdefault("ctp", {})
+    profiles = ctp.setdefault("ctp_profiles", {})
+    name = selected_profile_name(ctp)
+    item = profiles.setdefault(name, {})
+    item["kind"] = ctp.get("account_kind") or "sim"
+    item["max_order_volume"] = 20
+    item["broker_id"] = "8080"
+
+    real_app.ctp_profile_var.set(name)
+    real_app.ctp_max_volume_var.set("3")
+    real_app.ctp_profile_broker_var.set("9999")
+    cfg = real_app._apply_ui_to_cfg()
+
+    saved = cfg["trade"]["ctp"]
+    assert saved["max_order_volume"] == 3
+    assert saved["ctp_profiles"][name]["max_order_volume"] == 3
+    assert saved["ctp_profiles"][name]["broker_id"] == "9999"
+    assert real_app.ctp_max_volume_var.get() == "3"
+
+
 def test_copy_risk_to_backtest_full_does_not_save(real_app) -> None:
     real_app._set_watch_codes(["bu2612"], select="bu2612", save=False)
     real_app.engine_var.set("daily_body")

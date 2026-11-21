@@ -70,6 +70,14 @@ def _flag(value: Any, default: bool = True) -> bool:
     return default
 
 
+def _int_or_zero(value: Any) -> int:
+    """正整数上限；空值或写错的文字按 0（不设限）处理，由调用方决定默认。"""
+    try:
+        return max(0, int(float(str(value))))
+    except (TypeError, ValueError):
+        return 0
+
+
 def probe_front_tcp(td_front: str, timeout_sec: float = 3.0) -> bool | None:
     """
     只测交易前置的 IP 端口能不能连上。
@@ -141,6 +149,18 @@ class CtpSettings:
     # 当前券商档案名与显示名，日志和界面对照用。
     profile: str = ""
     profile_label: str = ""
+    # 注册表物化时带上账号身份。本地柜台只接受内置账号 + 专用前置 + 仿真环境。
+    account_id: str = ""
+
+    @property
+    def is_self_test(self) -> bool:
+        from src.domain import trading_account as ta
+
+        return (
+            self.account_id == ta.SELF_TEST_ACCOUNT_ID
+            and ta.is_self_test_front(self.td_front)
+            and normalize_ctp_kind(self.account_kind) == CTP_KIND_SIM
+        )
 
     @classmethod
     def from_cfg(cls, cfg: dict[str, Any]) -> "CtpSettings":
@@ -159,11 +179,20 @@ class CtpSettings:
             logger.warning("补读 CTP 密钥失败，仍按当前内存配置连接: {}", exc)
         # 公共默认 + 券商档案覆盖；没有档案或档案名写错时连接字段留空，登录会明确报错。
         raw_ctp = trade.get("ctp") or {}
+        configured_max = _int_or_zero(raw_ctp.get("max_order_volume")) if isinstance(raw_ctp, dict) else 0
         ctp = resolve_ctp_profile(
             raw_ctp,
             account=account,
             kind=(raw_ctp.get("account_kind") if isinstance(raw_ctp, dict) else None),
         )
+        # 配置页的「单笔最大手数」是本机硬上限：档案只能再往下压，
+        # 不能让档案默认的 20 把页面上填的 2 盖回去。
+        if configured_max > 0:
+            from src.trader.ctp_limits import effective_max_order_volume
+
+            ctp["max_order_volume"] = effective_max_order_volume(
+                configured_max, ctp.get("max_order_volume")
+            )
         for note in profile_validation_notes(trade.get("ctp") or {}, account=account):
             logger.debug("CTP 档案提示：{}", note)
         root = str(cfg.get("_project_root") or "")
@@ -211,6 +240,7 @@ class CtpSettings:
             ),
             profile=str(ctp.get("profile") or ""),
             profile_label=str(ctp.get("profile_label") or ""),
+            account_id=str(ctp.get("account_id") or "").strip().lower(),
         )
 
     def submit_wait_sec(self) -> float:
@@ -235,7 +265,7 @@ class CtpSettings:
             names.append("BrokerID")
         if not self.user_id:
             names.append("资金账号")
-        if not self.password:
+        if not self.password and not self.is_self_test:
             names.append("交易密码")
         if not self.app_id:
             names.append("AppID")
@@ -303,6 +333,13 @@ class CtpGateway:
 
         已经就绪就直接返回。缺参数或动态库时返回失败原因，不抛给界面。
         """
+        from src.domain import trading_account as ta
+
+        local_front = ta.is_self_test_front(self.settings.td_front)
+        if local_front and not self.settings.is_self_test:
+            text = "本地自测前置只能用于内置程序自测账号，真实及普通账号禁止使用"
+            self.session.last_error = text
+            return False, text
         blocked = test_front_blocks_live_account(
             self.settings.account_kind,
             self.settings.user_id,
@@ -321,9 +358,14 @@ class CtpGateway:
             return True, "交易前置已登录，结算单已确认"
         if self.client is None:
             try:
-                from src.trader.ctp_td import OpenctpClient
+                if self.settings.is_self_test:
+                    from src.trader.sim_counter_client import SimCounterClient
 
-                self.client = OpenctpClient()
+                    self.client = SimCounterClient()
+                else:
+                    from src.trader.ctp_td import OpenctpClient
+
+                    self.client = OpenctpClient()
             except Exception as exc:  # noqa: BLE001
                 text = f"CTP 动态库没有加载成功：{exc}"
                 self.session.last_error = text

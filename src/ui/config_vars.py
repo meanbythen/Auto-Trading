@@ -772,8 +772,17 @@ class ConfigVarsMixin:
         self.ctp_profile_pwd_env_var.set(str(resolved.get("password_env") or "CTP_PASSWORD"))
         self.ctp_profile_auth_env_var.set(str(resolved.get("auth_code_env") or ""))
         self.ctp_profile_note_var.set("；".join(profile_validation_notes(ctp_box, account)))
-        # 档案没写就用公共默认；这里显示的是实际生效值。
-        self.ctp_max_volume_var.set(str(resolved.get("max_order_volume") or 20))
+        # 显示实际生效值：公共上限与档案上限取小，和运行时拦单同一口径。
+        from src.trader.ctp_limits import effective_max_order_volume
+
+        self.ctp_max_volume_var.set(
+            str(
+                effective_max_order_volume(
+                    ctp_box.get("max_order_volume"),
+                    resolved.get("max_order_volume"),
+                )
+            )
+        )
 
     def _on_ctp_kind_changed(self, *_args: object) -> None:
         """配置页切仿真/真实，和交易台一样只换账号和前置。"""

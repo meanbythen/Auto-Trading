@@ -665,6 +665,12 @@ risk:
   max_daily_loss: 5000
   min_order_interval_sec: 60
   max_orders_per_day: 20
+  # 组合风控（跨品种/跨账号敞口）。默认 observe：只记录「本应拦截」，不改变报单。
+  # mode: off 关闭 | observe 只留痕 | enforce 真正拦单。上限为 0 表示该维度不限。
+  portfolio:
+    mode: observe
+    max_symbol_lots: 0
+    max_gross_lots: 0
   # 账户从最高点回撤、或波动突然放大时少开/暂停。日最大亏损仍只看当天。
   # 1 手账户减半仍是 1 手，不会被强平。enabled: false 就不再压这一层。
   dynamic:

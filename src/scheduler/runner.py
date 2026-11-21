@@ -22,6 +22,8 @@ from loguru import logger
 from src.data import KlineProvider
 from src.data.kline import bars_age_minutes, is_bars_stale
 from src.data.periods import drop_forming_bar, period_label, stale_after_minutes
+from src.kernel.commands import Command, CommandBus, FLATTEN, SCAN, STOP
+from src.kernel.events import EventBus, SIGNAL
 from src.kernel.trace import new_trace_id, set_trace_id
 from src.login import AppLoginManager
 from src.ops import journal
@@ -188,6 +190,10 @@ class TradingBot(
         self._running = False  # GUI / 外部可调用 stop() 结束循环
         self._stopped = threading.Event()
         self._stop_requested_at: float | None = None
+        # P2：命令/事件总线。命令由运行页或脚本投递，主循环按 FIFO 处理；
+        # 事件只做旁路通知，账本落库仍在同步链路里完成，顺序不变。
+        self.commands = CommandBus()
+        self.events = EventBus()
         # 暂停报单：扫描还在跑，开平仓、止损、清仓都不发出去。和交易台「暂停报单」同一标志。
         self._orders_paused = False
         # 窗口点击真下单前，必须先把价格改成对手价。没改成就不允许点买卖。
@@ -1702,6 +1708,26 @@ class TradingBot(
             payload={"bar_time": str(bar_time or ""), "price": price},
             root=self.cfg.get("_project_root"),
         )
+        # P2：类型化信号事件。账本/审计已经同步写完，这里只通知旁路订阅者，
+        # 订阅者出问题不能反过来影响交易决定。
+        try:
+            self.events.publish(
+                SIGNAL,
+                {
+                    "trace_id": trace_id,
+                    "account_id": account_id,
+                    "strategy_id": strategy_id,
+                    "symbol": decision.symbol,
+                    "bar_time": str(bar_time or ""),
+                    "action": decision.action.value,
+                    "price": price,
+                    "score": score,
+                    "reason": str(decision.reason or ""),
+                    "stop_price": decision.stop_price,
+                },
+            )
+        except Exception as exc:  # noqa: BLE001 - 旁路订阅失败不能改交易结果
+            logger.warning("SIGNAL 事件订阅者异常，已忽略: {}", exc)
         return trace_id
 
     def scan_symbol(self, symbol: str) -> None:
@@ -2286,6 +2312,25 @@ class TradingBot(
         self._running = False
         logger.info("已请求停止机器人主循环")
 
+    def post_command(self, name: str, **data: Any) -> bool:
+        """界面/脚本下发命令；常驻主循环按 FIFO 处理。返回 False 表示队列已满。"""
+        return self.commands.post(name, data)
+
+    def _handle_command(self, command: Command) -> None:
+        """执行一条命令。命令在调度线程里同步执行，不改变风控与报单顺序。"""
+        if command.name == STOP:
+            self.stop()
+            return
+        if command.name == FLATTEN:
+            self._flatten_pending = True
+            self.flatten_if_due(force=True)
+            return
+        if command.name == SCAN:
+            # 主循环拿到 SCAN 会把下一拍提前到立即执行，这里不重复扫描。
+            logger.info("收到立即扫描命令")
+            return
+        logger.warning("未知命令 {}，已忽略", command.name)
+
     def wait_stopped(self, timeout: float = 15.0) -> bool:
         """等待主循环真正结束并完成落盘。"""
         return self._stopped.wait(timeout)
@@ -2390,29 +2435,37 @@ class TradingBot(
         flatten_at = datetime.now() if in_window else self._next_flatten_at()
 
         try:
+            # P2：第一拍立即扫描；之后由命令队列的超时等待驱动，不再每秒 sleep。
+            next_scan_at = time.monotonic()
             while self._running:
                 try:
                     schedule.run_pending()
-                    self.scan_once()
-                    # 可选：当日最后收盘后预约关机（有夜盘不会在下午就关）
-                    self._maybe_shutdown_after_close()
-                    # 分段 sleep，便于更快响应 stop()
-                    for _ in range(int(max(self.scan_interval, 1))):
-                        if not self._running:
-                            break
-                        if flatten_at is not None and datetime.now() >= flatten_at:
-                            if not self._flatten_pending:
-                                # 刚到清仓钟点：开一轮新的清仓待办（允许重新尝试）。
-                                self._flatten_pending = True
-                                self.flatten_if_due(force=True)
-                            else:
-                                # 上一轮没平掉：继续重试，不受 10 分钟窗口限制。
-                                self.flatten_if_due()
-                            if self._flatten_pending:
-                                flatten_at = datetime.now() + timedelta(seconds=self._flatten_retry_sec)
-                            else:
-                                flatten_at = self._next_flatten_at()
-                        time.sleep(1)
+                    wait = max(0.0, min(1.0, next_scan_at - time.monotonic()))
+                    command = self.commands.get(timeout=wait)
+                    flatten_from_command = False
+                    if command is not None:
+                        self._handle_command(command)
+                        if command.name == SCAN:
+                            next_scan_at = 0.0
+                        elif command.name == FLATTEN:
+                            flatten_from_command = True
+                    if not flatten_from_command and flatten_at is not None and datetime.now() >= flatten_at:
+                        if not self._flatten_pending:
+                            # 刚到清仓钟点：开一轮新的清仓待办（允许重新尝试）。
+                            self._flatten_pending = True
+                            self.flatten_if_due(force=True)
+                        else:
+                            # 上一轮没平掉：继续重试，不受 10 分钟窗口限制。
+                            self.flatten_if_due()
+                        if self._flatten_pending:
+                            flatten_at = datetime.now() + timedelta(seconds=self._flatten_retry_sec)
+                        else:
+                            flatten_at = self._next_flatten_at()
+                    if self._running and time.monotonic() >= next_scan_at:
+                        self.scan_once()
+                        # 可选：当日最后收盘后预约关机（有夜盘不会在下午就关）
+                        self._maybe_shutdown_after_close()
+                        next_scan_at = time.monotonic() + max(self.scan_interval, 1)
                 except Exception as exc:  # noqa: BLE001
                     # 单轮异常不能让常驻线程整体退出（磁盘、登录、日志都可能偶发失败）。
                     self.last_error = str(exc)

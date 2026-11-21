@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import json
 from pathlib import Path
 
 from src.account import registry as reg
@@ -123,7 +124,98 @@ def test_ensure_registry_writes_once_and_reloads(tmp_path: Path) -> None:
     second = reg.ensure_registry(tmp_path, cfg)
     assert second is not None
     assert [item.account_id for item in second.accounts] == [item.account_id for item in first.accounts]
-    assert path.read_text(encoding="utf-8").count("account_id:") == 3
+    assert path.read_text(encoding="utf-8").count("account_id:") == 4
+    assert second.account("acc_program_selftest") is not None
+    assert second.profile("program_selftest") is not None
+
+
+def test_builtin_self_test_account_materializes_without_password(tmp_path: Path) -> None:
+    from src.account.session import set_active_account
+    from src.trader.ctp_gateway import CtpSettings
+
+    cfg = _cfg()
+    registry = reg.ensure_registry(tmp_path, cfg)
+    assert registry is not None
+    account = registry.account("acc_program_selftest")
+    assert account is not None
+    assert account.book_id == "self_test"
+    assert registry.validate() == []
+
+    session = set_active_account(tmp_path, cfg, account.account_id, {})
+    assert session.book_id == "self_test"
+    item = cfg["trade"]["ctp"]["ctp_profiles"]["program_selftest"]
+    assert item["td_front"] == "local://program-selftest"
+    assert item["account_id"] == "acc_program_selftest"
+    settings = CtpSettings.from_cfg(cfg)
+    assert settings.is_self_test
+    assert "交易密码" not in settings.missing()
+
+
+def test_resolve_session_previews_self_test_without_switching_active_account(tmp_path: Path) -> None:
+    from src.account.session import resolve_session, set_active_account
+
+    cfg = _cfg()
+    reg.ensure_registry(tmp_path, cfg)
+    set_active_account(tmp_path, cfg, "acc_huatai_sim_01", {})
+    active_file = tmp_path / "data" / "active_account.json"
+    before = active_file.read_text(encoding="utf-8")
+
+    preview = resolve_session(tmp_path, cfg, {}, account_id="acc_program_selftest")
+
+    assert preview is not None and preview.account_id == "acc_program_selftest"
+    assert cfg["trade"]["ctp"]["account_id"] == "acc_program_selftest"
+    assert cfg["trade"]["ctp"]["ctp_profile"] == "program_selftest"
+    assert active_file.read_text(encoding="utf-8") == before
+
+
+def test_self_test_account_keeps_configured_max_order_volume(tmp_path: Path) -> None:
+    """配置页的「单笔最大手数」不能被自测档案默认的 20 盖回去。"""
+    from src.account.session import resolve_session
+    from src.trader.ctp_gateway import CtpSettings
+    from src.trader.ctp_orders import prepare_self_test_cfg
+
+    cfg = _cfg()
+    reg.ensure_registry(tmp_path, cfg)
+    cfg["trade"]["ctp"]["max_order_volume"] = 2
+
+    session = resolve_session(tmp_path, cfg, {}, account_id="acc_program_selftest")
+    assert session is not None
+    settings = CtpSettings.from_cfg(prepare_self_test_cfg(cfg))
+
+    assert settings.is_self_test
+    assert settings.max_order_volume == 2
+
+
+def test_configured_max_order_volume_only_lowers_profile_default(tmp_path: Path) -> None:
+    """配置页写 30 时也不能抬高档案默认的 20：本机上限只降不升。"""
+    from src.account.session import resolve_session
+    from src.trader.ctp_gateway import CtpSettings
+
+    cfg = _cfg()
+    reg.ensure_registry(tmp_path, cfg)
+    cfg["trade"]["ctp"]["max_order_volume"] = 30
+
+    assert resolve_session(tmp_path, cfg, {}, account_id="acc_huatai_sim_01") is not None
+    assert CtpSettings.from_cfg(cfg).max_order_volume == 20
+
+
+def test_local_self_test_front_rejects_normal_and_live_accounts() -> None:
+    profile = _profile(
+        "program_selftest",
+        "sim",
+        td_fronts=["local://program-selftest"],
+        md_fronts=["local://program-selftest"],
+    )
+    normal = _account("acc_sim_01", profile_id="program_selftest")
+    assert any("只能用于内置" in item for item in validate_registry([normal], [profile]))
+    live = _account(
+        "acc_live_01",
+        environment="live",
+        profile_id="program_selftest",
+        investor_id="20318052",
+    )
+    profile.environment = "live"
+    assert any("只能用于内置" in item for item in validate_registry([live], [profile]))
 
 
 # —— 物化 ——
@@ -500,3 +592,92 @@ def test_validate_requires_investor_for_gui() -> None:
     )
     problems = validate_registry([account], [])
     assert any("GUI 账号必须填资金账号" in item for item in problems)
+
+
+# —— P1：账号账本一对一 ——
+
+
+def test_one_book_per_account_switch_defaults_on() -> None:
+    assert reg.one_book_per_account_enabled({}) is True
+    assert reg.one_book_per_account_enabled({"trade": {"ctp": {}}}) is True
+    assert (
+        reg.one_book_per_account_enabled({"trade": {"ctp": {"one_book_per_account": False}}})
+        is False
+    )
+    assert (
+        reg.one_book_per_account_enabled({"trade": {"ctp": {"one_book_per_account": "off"}}})
+        is False
+    )
+
+
+def test_migrate_legacy_books_copies_and_is_idempotent(tmp_path: Path) -> None:
+    registry = reg.migrate_from_cfg(_cfg())
+    data = tmp_path / "data"
+    data.mkdir(parents=True)
+    (data / "signal_account_ctp_sim.json").write_text('{"trades": []}', encoding="utf-8")
+    (data / "bot_state_ctp_sim.json").write_text('{"positions": {}}', encoding="utf-8")
+    intents = data / "intents" / "ctp_sim"
+    intents.mkdir(parents=True)
+    (intents / "1.json").write_text("{}", encoding="utf-8")
+
+    notes = reg.migrate_legacy_books(tmp_path, registry)
+
+    assert notes
+    sim = registry.account("acc_huatai_sim_01")
+    assert sim is not None and sim.book_id == "acc_huatai_sim_01"
+    assert (data / "signal_account_huatai_sim_01.json").read_text(encoding="utf-8") == '{"trades": []}'
+    assert (data / "bot_state_huatai_sim_01.json").exists()
+    assert (data / "intents" / "acc_huatai_sim_01" / "1.json").exists()
+    # 旧文件不删，随时可以改回去。
+    assert (data / "signal_account_ctp_sim.json").exists()
+    assert "book_migrate" in (data / "accounts_audit.jsonl").read_text(encoding="utf-8")
+    # 再跑一次不重复迁移。
+    assert reg.migrate_legacy_books(tmp_path, registry) == []
+
+
+def test_migrate_legacy_books_repoints_active_account(tmp_path: Path) -> None:
+    registry = reg.migrate_from_cfg(_cfg())
+    data = tmp_path / "data"
+    data.mkdir(parents=True)
+    (data / "active_account.json").write_text('{"id": "ctp_sim"}', encoding="utf-8")
+
+    reg.migrate_legacy_books(tmp_path, registry)
+
+    payload = json.loads((data / "active_account.json").read_text(encoding="utf-8"))
+    assert payload["version"] == 2
+    assert payload["account_id"] == "acc_huatai_sim_01"
+
+
+def test_ensure_registry_runs_one_book_migration(tmp_path: Path) -> None:
+    cfg = _cfg()
+    registry = reg.ensure_registry(tmp_path, cfg)
+
+    assert registry is not None
+    assert {item.book_id for item in registry.accounts if item.account_id != "acc_program_selftest"} == {
+        "acc_huatai_sim_01",
+        "acc_huatai_live_01",
+        "acc_gui_01",
+    }
+
+
+def test_ensure_registry_can_disable_one_book_migration(tmp_path: Path) -> None:
+    cfg = _cfg()
+    cfg["trade"]["ctp"]["one_book_per_account"] = False
+    registry = reg.ensure_registry(tmp_path, cfg)
+
+    assert registry is not None
+    assert registry.account("acc_huatai_sim_01").book_id == "ctp_sim"
+
+
+def test_validate_rejects_shared_derived_book_file() -> None:
+    registry = reg.AccountRegistry(
+        accounts=[
+            _account("acc_a_01", book_id="acc_a_01"),
+            _account("acc_b_01", book_id="a_01"),
+        ],
+        profiles=[_profile("huatai_sim", "sim")],
+    )
+
+    problems = registry.validate()
+
+    assert any("signal_account_a_01.json" in item for item in problems)

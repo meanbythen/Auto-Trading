@@ -192,7 +192,7 @@ class RunTabMixin:
             command=self._on_go_live_done,
         ).pack(side="left", expand=True, fill="x", padx=(4, 0))
 
-        # 试跑一轮 / 点击下单 / 完整自检收进一个入口，避免三个按钮挤在一起。
+        # 试跑一轮 / 点击下单 / 完整自检 / 仿真柜台收进一个入口。
         self.btn_test_tools = ctk.CTkButton(
             left,
             text="测试工具",
@@ -208,7 +208,7 @@ class RunTabMixin:
         self.btn_test_tools.pack(fill="x", padx=8, pady=(0, 4))
         tools_hint = ctk.CTkLabel(
             left,
-            text="日常先「试跑一轮」；要验坐标用「点击下单」；怀疑程序坏了再「完整自检」。",
+            text="日常先「试跑一轮」；验坐标用「点击下单」；程序自检用「完整自检」；随时测 CTP 链路用「仿真柜台」。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=420,
@@ -1065,7 +1065,7 @@ class RunTabMixin:
 
 
     def _on_test_tools(self) -> None:
-        """打开测试工具：试跑一轮 / 点击下单 / 完整自检，三项分选。"""
+        """打开测试工具：试跑一轮 / 点击下单 / 完整自检 / 仿真柜台。"""
         from src.ui.test_tools import open_test_tools
 
         open_test_tools(
@@ -1073,7 +1073,15 @@ class RunTabMixin:
             on_once=self._on_once,
             on_order=self._on_order_simulator,
             on_full=self._on_sim_test,
+            on_counter=self._on_sim_counter,
         )
+
+
+    def _on_sim_counter(self) -> None:
+        """打开独立本机柜台控制面板；关闭面板不会中断交易台自测。"""
+        from src.ui.sim_counter import open_sim_counter
+
+        open_sim_counter(self)
 
 
     def _on_once(self) -> None:
@@ -1528,6 +1536,12 @@ class RunTabMixin:
 
     def _on_close(self) -> None:
         self._closing = True
+        try:
+            from src.ui.sim_counter import shutdown_owned_counter
+
+            shutdown_owned_counter(self)
+        except Exception as exc:  # noqa: BLE001 - 关窗不能因柜台回收失败被拦住
+            logger.debug("关闭运行页时回收自测柜台失败：{}", exc)
         recorder = getattr(self, "_tick_recorder", None)
         if recorder is not None:
             try:
@@ -1586,8 +1600,10 @@ class RunTabMixin:
                         bot.note_force_close()
                     except Exception:  # noqa: BLE001
                         pass
-        self.destroy()
+        from src.ui.sim_counter import shutdown_owned_counter
 
+        shutdown_owned_counter(self)
+        self.destroy()
 
     def _resume_ui_timers(self) -> None:
         """用户取消关闭：恢复刚才为关窗停掉的界面定时器。"""

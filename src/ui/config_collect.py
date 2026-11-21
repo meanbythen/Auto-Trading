@@ -639,17 +639,26 @@ class ConfigCollectMixin:
             ctp_box = {}
             trade["ctp"] = ctp_box
         # 单笔最大手数只在本机拦单，不是柜台上限；夹到 1~1000，非法值退回默认 20。
-        # 先取值再改 ctp_kind：改种类会重灌档案控件，别把刚输入的数冲掉。
         try:
             max_order_volume = max(1, min(1000, int(float(self.ctp_max_volume_var.get()))))
         except (TypeError, ValueError):
             max_order_volume = 20
         ctp_box["max_order_volume"] = max_order_volume
-        self.ctp_kind_var.set(ctp_kind_label(ctp_box.get("account_kind") or kind))
         # 券商档案：页面上改的是当前选中的那一份。旧写法不再读写。
+        # 先把表单值全取出来再动 ctp_kind：改种类会重灌档案控件，别把刚输入的值冲掉。
+        from src.trader.ctp_fronts import dump_front_field, split_fronts
         from src.trader.ctp_profile import profile_name_for_kind
 
         profile_name = str(self.ctp_profile_var.get() or "").strip()
+        form = {
+            "td_front": dump_front_field(split_fronts(self.ctp_profile_td_var.get())),
+            "md_front": dump_front_field(split_fronts(self.ctp_profile_md_var.get())),
+            "broker_id": str(self.ctp_profile_broker_var.get() or "").strip(),
+            "user_id": str(self.ctp_profile_user_var.get() or "").strip(),
+            "password_env": str(self.ctp_profile_pwd_env_var.get() or "").strip(),
+            "auth_code_env": str(self.ctp_profile_auth_env_var.get() or "").strip(),
+            "max_order_volume": max_order_volume,
+        }
         if profile_name:
             profiles = ctp_box.get("ctp_profiles")
             if not isinstance(profiles, dict):
@@ -663,18 +672,9 @@ class ConfigCollectMixin:
                 (current or {}).get("kind") if isinstance(current, dict) else ctp_box["account_kind"],
             )
             item.setdefault("label", profile_name)
-            from src.trader.ctp_fronts import dump_front_field, split_fronts
-
-            item["td_front"] = dump_front_field(split_fronts(self.ctp_profile_td_var.get()))
-            item["md_front"] = dump_front_field(split_fronts(self.ctp_profile_md_var.get()))
+            item.update(form)
             item.pop("td_fronts", None)
             item.pop("md_fronts", None)
-            item["broker_id"] = str(self.ctp_profile_broker_var.get() or "").strip()
-            item["user_id"] = str(self.ctp_profile_user_var.get() or "").strip()
-            item["password_env"] = str(self.ctp_profile_pwd_env_var.get() or "").strip()
-            item["auth_code_env"] = str(self.ctp_profile_auth_env_var.get() or "").strip()
-            # 档案里若曾单独写过上限，界面上改的数要真的生效，不能只写公共默认。
-            item["max_order_volume"] = max_order_volume
             profiles[profile_name] = item
             from src.trader.ctp_profile import set_sim_profile_user_id
 
@@ -684,6 +684,15 @@ class ConfigCollectMixin:
             if sim_name and profile_name == sim_name:
                 item["user_id"] = sim_user
                 self.ctp_profile_user_var.set(sim_user)
+        else:
+            from src.trader.ctp_profile import set_sim_profile_user_id
+
+            set_sim_profile_user_id(ctp_box, str(self.ctp_sim_user_var.get() or "").strip())
+        # 档案字段都写完后再切种类：标签没变就不 set，避免 trace 把刚输入的值刷回旧值。
+        kind_label = ctp_kind_label(ctp_box.get("account_kind") or kind)
+        if self.ctp_kind_var.get() != kind_label:
+            self.ctp_kind_var.set(kind_label)
+        if profile_name:
             matched = profile_name_for_kind(ctp_box, ctp_box.get("account_kind"))
             ctp_box["ctp_profile"] = matched or profile_name
             if matched and matched != profile_name:
@@ -691,10 +700,6 @@ class ConfigCollectMixin:
                 self.ctp_profile_var.set(matched)
                 self._ctp_profile_syncing = False
                 self._fill_ctp_profile_vars()
-        else:
-            from src.trader.ctp_profile import set_sim_profile_user_id
-
-            set_sim_profile_user_id(ctp_box, str(self.ctp_sim_user_var.get() or "").strip())
         try:
             trade["volume"] = int(self.volume_var.get())
         except ValueError:

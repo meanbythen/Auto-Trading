@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import json
+import shutil
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -173,7 +174,23 @@ class AccountRegistry:
         return ta.runtime_profile_key(account, shared=shared)
 
     def validate(self) -> list[str]:
-        return ta.validate_registry(self.accounts, self.profiles)
+        problems = ta.validate_registry(self.accounts, self.profiles)
+        # 光看 book_id 不够：book_a 与 acc_a 会派生同一个账本文件，也必须拦住。
+        from src.domain.accounts import book_layout
+
+        seen: dict[str, tuple[str, str]] = {}
+        for account in self.accounts:
+            if not account.book_id:
+                continue
+            label = account.display_name or account.account_id
+            name = book_layout(account.book_id)["book_name"]
+            previous = seen.get(name)
+            if previous is not None and previous[0] != account.book_id:
+                problems.append(
+                    f"账本文件 {name} 被 {previous[1]} 与 {label} 共用（一个账号一本账）"
+                )
+            seen[name] = (account.book_id, label)
+        return problems
 
     # —— 增删改 ——
 
@@ -268,6 +285,8 @@ class AccountRegistry:
         source = self.account(account_id)
         if source is None:
             raise KeyError(f"账号不存在: {account_id}")
+        if ta.is_self_test_account(source):
+            raise ValueError("内置程序自测账号是只读账号，不能复制")
         env = ta.normalize_environment(environment or source.environment)
         new_investor = str(investor_id or source.investor_id).strip()
         if env == ta.ENV_LIVE and source.environment == ta.ENV_SIM and new_investor == source.investor_id:
@@ -299,6 +318,8 @@ class AccountRegistry:
         account = self.account(account_id)
         if account is None:
             raise KeyError(f"账号不存在: {account_id}")
+        if ta.is_self_test_account(account):
+            raise ValueError("内置程序自测账号是只读账号，不能修改")
         for key in (
             "display_name",
             "investor_id",
@@ -333,6 +354,8 @@ class AccountRegistry:
         account = self.account(account_id)
         if account is None:
             raise KeyError(f"账号不存在: {account_id}")
+        if ta.is_self_test_account(account):
+            raise ValueError("内置程序自测账号是只读账号，不能停用或归档")
         account.status = ta.normalize_status(status)
         account.touch()
         return account
@@ -342,6 +365,8 @@ class AccountRegistry:
         account = self.account(account_id)
         if account is None:
             return False
+        if ta.is_self_test_account(account):
+            raise ValueError("内置程序自测账号是只读账号，不能删除")
         if hard:
             self.accounts = [item for item in self.accounts if item.account_id != account.account_id]
             self.profiles = [item for item in self.profiles if item.profile_id != account.profile_id]
@@ -460,6 +485,8 @@ class AccountRegistry:
         profiles = (ctp.get("ctp_profiles") or {}) if isinstance(ctp, dict) else {}
         notes: list[str] = []
         for account in self.ctp_accounts():
+            if ta.is_self_test_account(account):
+                continue
             profile = self.profile(account.profile_id)
             base_item = profiles.get(account.profile_id)
             runtime_key = self.runtime_profile_key(account.account_id)
@@ -506,6 +533,157 @@ class AccountRegistry:
                     pass
             account.touch()
         return notes
+
+
+def one_book_per_account_enabled(cfg: dict[str, Any]) -> bool:
+    """是否允许把旧四本共用账一次性迁成账号独立账。默认开启。"""
+    trade = cfg.get("trade") or {}
+    ctp = (trade.get("ctp") or {}) if isinstance(trade, dict) else {}
+    value = (ctp or {}).get("one_book_per_account")
+    if value is None:
+        return True
+    return str(value).strip().lower() not in {"false", "off", "0", "no"}
+
+
+def _copy_ledger_path(source: Path, target: Path) -> bool:
+    """源存在且目标不存在时复制（文件或目录）；不复用、不覆盖。"""
+    if not source.exists() or target.exists():
+        return False
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.is_dir():
+        shutil.copytree(source, target)
+    else:
+        shutil.copy2(source, target)
+    return True
+
+
+def _repoint_active_book(
+    root: Path, renamed: dict[str, str], registry: AccountRegistry
+) -> None:
+    """迁移后把 active_account.json 里的旧账本记号换成账号，避免启动仍落在旧文件。"""
+    path = root / "data" / "active_account.json"
+    if not path.exists() or not renamed:
+        return
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return
+    if isinstance(data, dict):
+        if str(data.get("account_id") or "").strip():
+            return
+        legacy = str(data.get("id") or "").strip().lower()
+    else:
+        legacy = str(data or "").strip().lower()
+    target = renamed.get(legacy)
+    if not target:
+        return
+    account = registry.account(target)
+    payload = {
+        "version": 2,
+        "account_id": target,
+        "label": (account.display_name if account is not None else target),
+        "updated_at": _now(),
+    }
+    tmp = path.with_suffix(".json.tmp")
+    try:
+        tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(path)
+    except OSError as exc:
+        logger.warning("更新当前账本指向失败（旧账本文件仍可读）: {}", exc)
+        return
+    _audit(root, "active_book_repoint", old_book=legacy, new_book=target)
+
+
+def migrate_legacy_books(
+    root: str | Path,
+    registry: AccountRegistry,
+    *,
+    enabled: bool = True,
+) -> list[str]:
+    """把共用旧账本一次性迁成账号独立账本。
+
+    只复制、不删除旧文件，因此随时可以改回去；重复执行不会重复复制。
+    返回中文说明列表；空列表表示没有账号需要迁移。
+    """
+    if not enabled:
+        return []
+    from src.domain.accounts import LEGACY_BOOK_IDS, book_layout
+
+    base = Path(root)
+    data_dir = base / "data"
+    layout_of = {}
+    owners: dict[str, list[str]] = {}
+    for account in registry.accounts:
+        if ta.is_self_test_account(account):
+            continue
+        layout = book_layout(account.book_id or account.account_id)
+        layout_of[account.account_id] = layout
+        owners.setdefault(layout["book_name"], []).append(account.account_id)
+
+    def _needs_migration(account: TradingAccount) -> bool:
+        if ta.is_self_test_account(account):
+            return False
+        book = str(account.book_id or "").strip().lower()
+        if not book or book in LEGACY_BOOK_IDS:
+            return True
+        return len(owners.get(layout_of[account.account_id]["book_name"], [])) > 1
+
+    notes: list[str] = []
+    renamed: dict[str, str] = {}
+    for account in registry.accounts:
+        if not _needs_migration(account):
+            continue
+        old_book = str(account.book_id or "").strip().lower()
+        new_book = account.account_id
+        source = layout_of.get(account.account_id) or (
+            book_layout(old_book) if old_book else None
+        )
+        target = book_layout(new_book)
+        copied: list[str] = []
+        skipped: list[str] = []
+        if source is not None:
+            for key in ("book_name", "state_name", "intent_name", "periods_dir"):
+                src = data_dir / source[key]
+                dst = data_dir / target[key]
+                try:
+                    if _copy_ledger_path(src, dst):
+                        copied.append(target[key])
+                    elif src.exists():
+                        skipped.append(target[key])
+                except OSError as exc:
+                    logger.warning("迁移账本 {} → {} 失败: {}", src, dst, exc)
+                    skipped.append(target[key])
+            old_intents = data_dir / "intents" / old_book
+            new_intents = data_dir / "intents" / new_book
+            try:
+                if _copy_ledger_path(old_intents, new_intents):
+                    copied.append(f"intents/{new_book}")
+                elif old_intents.exists():
+                    skipped.append(f"intents/{new_book}")
+            except OSError as exc:
+                logger.warning("迁移委托意图 {} → {} 失败: {}", old_intents, new_intents, exc)
+                skipped.append(f"intents/{new_book}")
+        account.book_id = new_book
+        account.touch()
+        if old_book:
+            renamed[old_book] = new_book
+        _audit(
+            base,
+            "book_migrate",
+            account_id=account.account_id,
+            old_book=old_book,
+            new_book=new_book,
+            copied=copied,
+            skipped=skipped,
+        )
+        notes.append(
+            f"{account.account_id}: 账本 {old_book or '空'}→{new_book}，复制 {len(copied)} 项"
+            + (f"，已存在跳过 {len(skipped)} 项" if skipped else "")
+        )
+    if notes:
+        _repoint_active_book(base, renamed, registry)
+        logger.info("账号账本一对一迁移: {}", "；".join(notes))
+    return notes
 
 
 def migrate_from_cfg(cfg: dict[str, Any]) -> AccountRegistry:
@@ -624,6 +802,45 @@ def _backfill_gui_settings(path: Path, registry: AccountRegistry, cfg: dict[str,
     return changed
 
 
+def _ensure_self_test_account(registry: AccountRegistry) -> bool:
+    """幂等补齐内置自测账号；不改已有账号，也不改变当前账号选择。"""
+    changed = False
+    if registry.profile(ta.SELF_TEST_CONNECTION_ID) is None:
+        registry.profiles.append(
+            BrokerProfileTemplate(
+                profile_id=ta.SELF_TEST_CONNECTION_ID,
+                label=ta.SELF_TEST_LABEL,
+                broker="本机仿真柜台",
+                environment=ta.ENV_SIM,
+                broker_id="9999",
+                td_fronts=[ta.SELF_TEST_FRONT],
+                md_fronts=[ta.SELF_TEST_FRONT],
+                app_id="client_AutoTrading_SelfTest",
+                flow_dir="data/ctp_flow_self_test",
+                password_env="",
+                auth_code_env="",
+            )
+        )
+        changed = True
+    if registry.account(ta.SELF_TEST_ACCOUNT_ID) is None:
+        account = TradingAccount(
+            account_id=ta.SELF_TEST_ACCOUNT_ID,
+            display_name=ta.SELF_TEST_LABEL,
+            broker="本机仿真柜台",
+            channel=ta.CHANNEL_CTP,
+            environment=ta.ENV_SIM,
+            status=ta.STATUS_ENABLED,
+            profile_id=ta.SELF_TEST_CONNECTION_ID,
+            investor_id=ta.SELF_TEST_INVESTOR_ID,
+            book_id=ta.SELF_TEST_BOOK_ID,
+            notes="内置只读账号；先在运行页测试工具启动仿真柜台，无需真实密码",
+        )
+        account.touch()
+        registry.accounts.append(account)
+        changed = True
+    return changed
+
+
 def ensure_registry(
     root: str | Path,
     cfg: dict[str, Any],
@@ -639,15 +856,21 @@ def ensure_registry(
         registry = AccountRegistry.load(root)
         if registry is None:
             return None
-        if _backfill_gui_settings(path, registry, cfg):
+        changed = _backfill_gui_settings(path, registry, cfg)
+        changed = _ensure_self_test_account(registry) or changed
+        if migrate_legacy_books(root, registry, enabled=one_book_per_account_enabled(cfg)):
+            changed = True
+        if changed:
             try:
                 registry.save(root)
             except OSError as exc:
-                logger.warning("GUI 登录参数回填失败，继续用文件里的值: {}", exc)
+                logger.warning("账号注册表自动补齐失败，继续用文件里的值: {}", exc)
         return registry
     registry = migrate_from_cfg(cfg)
     if not registry.accounts and not registry.profiles:
         return None
+    _ensure_self_test_account(registry)
+    migrate_legacy_books(root, registry, enabled=one_book_per_account_enabled(cfg))
     try:
         registry.save(root)
     except OSError as exc:

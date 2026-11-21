@@ -13,6 +13,7 @@ from loguru import logger
 from src.domain.accounts import load_active_id
 from src.kernel.trace import get_trace_id
 from src.risk.guardian import RiskGuardian
+from src.risk.portfolio import PortfolioRisk
 from src.risk.state_store import DualRiskStateStore, RiskStateStore
 from src.utils.trading_day import futures_trading_day
 
@@ -48,10 +49,12 @@ class RiskService:
         account_id: str,
         trading_day: str = "",
         decision_store: DualRiskStateStore | None = None,
+        portfolio: PortfolioRisk | None = None,
     ) -> None:
         object.__setattr__(self, "guardian", guardian)
         object.__setattr__(self, "store", store)
         object.__setattr__(self, "decision_store", decision_store)
+        object.__setattr__(self, "portfolio", portfolio)
         object.__setattr__(self, "account_id", str(account_id))
         object.__setattr__(self, "trading_day", str(trading_day or futures_trading_day()))
 
@@ -69,6 +72,7 @@ class RiskService:
             store,
             account_id=str(account_id or load_active_id(root)),
             decision_store=store,
+            portfolio=PortfolioRisk.from_config(cfg, root=root),
         )
 
     def __getattr__(self, name: str) -> Any:
@@ -139,6 +143,39 @@ class RiskService:
             force=bool(getattr(intent, "force", False)),
             now=now,
         )
+
+    def evaluate_portfolio(self, intent: Any) -> tuple[bool, str, str]:
+        """组合闸门：observe 只留痕，enforce 才拦截。读取失败不改变交易结果。"""
+        if self.portfolio is None:
+            return True, "", ""
+        try:
+            decision = self.portfolio.check(
+                symbol=str(intent.symbol or ""),
+                side=str(intent.side or ""),
+                volume=int(intent.volume or 0),
+            )
+        except Exception as exc:  # noqa: BLE001 - 组合检查是旁路，不能反过来拦单
+            logger.warning("组合风控检查失败，已放行: {}", exc)
+            return True, "", ""
+        # 只在规则命中时留痕：未超限不写决策，避免每笔单都多一条 pass 记录。
+        if not decision.blocked:
+            return True, decision.code, decision.reason
+        blocked = decision.enforced
+        self.record_decision(
+            "portfolio",
+            intent,
+            {
+                "ok": not blocked,
+                "code": decision.code,
+                "reason": decision.reason,
+                "symbol_net": decision.symbol_net,
+                "gross": decision.gross,
+                "snapshot": decision.digest,
+            },
+        )
+        if blocked:
+            return False, decision.code, decision.reason
+        return True, decision.code, decision.reason
 
     def allow(
         self,

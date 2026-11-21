@@ -254,6 +254,23 @@ def _render_account_detail(app: AutoTradingApp) -> None:
         text_color=T.TEXT_DIM,
     ).pack(anchor="w", padx=8, pady=(0, 6))
 
+    from src.domain import trading_account as ta
+
+    if ta.is_self_test_account(account):
+        ctk.CTkLabel(
+            holder,
+            text=f"专用前置 {ta.SELF_TEST_FRONT}\n独立账本 {ta.SELF_TEST_BOOK_ID} · 无需真实密码",
+            font=T.FONT_BODY,
+            text_color=T.TEXT,
+            justify="left",
+        ).pack(anchor="w", padx=8, pady=12)
+        _note(
+            holder,
+            "这是程序内置的只读自测账号，不能改名、改绑、停用或归档。"
+            "请先在运行页测试工具中启动“仿真柜台”，再设为当前账号并打开交易台。",
+        )
+        return
+
     app._entry_row(holder, "显示名", app.account_name_var, width=200)
     app._entry_row(holder, "资金账号", app.account_investor_var, width=200)
     if is_gui:
@@ -469,6 +486,11 @@ def _show_problems(app: AutoTradingApp, problems: list[str]) -> None:
 
 def _save_account_fields(app: AutoTradingApp) -> None:
     registry, account = _selected_account(app)
+    if account is not None:
+        from src.domain import trading_account as ta
+
+        if ta.is_self_test_account(account):
+            return
     if registry is None or account is None:
         messagebox.showwarning("还没有账号", "请先在配置页保存一次配置，生成账号注册表。", parent=app)
         return
@@ -611,6 +633,10 @@ def _toggle_account_status(app: AutoTradingApp) -> None:
     registry, account = _selected_account(app)
     if registry is None or account is None:
         return
+    from src.domain import trading_account as ta
+
+    if ta.is_self_test_account(account):
+        return
     new_status = "disabled" if account.status == "enabled" else "enabled"
     old_status = account.status
     account.status = new_status
@@ -626,6 +652,10 @@ def _toggle_account_status(app: AutoTradingApp) -> None:
 def _delete_account(app: AutoTradingApp) -> None:
     registry, account = _selected_account(app)
     if registry is None or account is None:
+        return
+    from src.domain import trading_account as ta
+
+    if ta.is_self_test_account(account):
         return
     if not messagebox.askyesno(
         "删除账号",

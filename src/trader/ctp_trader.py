@@ -395,19 +395,20 @@ class CtpTrader(TraderBase):
             },
         )
 
-    def place_order(self, req: OrderRequest) -> OrderResult:
+    def place_order(self, req: OrderRequest, *, max_volume: int | None = None) -> OrderResult:
         """
         提交报单。交易台按钮和常驻策略的唯一发单入口。
 
         开仓一笔。平仓在沥青、玉米上按今仓昨仓拆开，可能变成两笔。
         只有柜台确认全部成交才算 filled。点击成功不算成交。
         同一时间只放一笔单过这道门，交易台和常驻不会各查一次挂单、各报一笔。
+        max_volume 只允许往下压，不能抬高登录时的本机上限。
         """
         gate = getattr(self, "_order_gate", None)
         with (gate if gate is not None else nullcontext()):
-            return self._place_order_locked(req)
+            return self._place_order_locked(req, max_volume=max_volume)
 
-    def _place_order_locked(self, req: OrderRequest) -> OrderResult:
+    def _place_order_locked(self, req: OrderRequest, *, max_volume: int | None = None) -> OrderResult:
         started_at = now_iso()
         if self.cfg.get("dry_run", True):
             return self._reject_order(req, started_at, "dry_run", "模拟开关开着，不会向 CTP 发单")
@@ -416,12 +417,16 @@ class CtpTrader(TraderBase):
             return self._reject_order(req, started_at, "config", "CTP 还缺：" + "、".join(missing))
         if req.price is None or float(req.price) <= 0:
             return self._reject_order(req, started_at, "price", "CTP 限价单需要价格")
+        limit = self.settings.max_order_volume
+        if max_volume is not None and int(max_volume) > 0:
+            current = int(max_volume)
+            limit = min(limit, current) if limit > 0 else current
         blocked = check_order_instruction(
             req.symbol,
             float(req.price),
             int(req.volume),
             price_tick=self.settings.price_tick,
-            max_volume=self.settings.max_order_volume,
+            max_volume=limit,
         )
         if blocked:
             logger.error(blocked)

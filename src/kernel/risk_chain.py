@@ -155,6 +155,17 @@ def _guardian(intent: TradeIntent, risk: Any) -> GateResult | None:
     return None
 
 
+def _portfolio(intent: TradeIntent, risk: Any) -> GateResult | None:
+    # 组合闸门排在单账号闸门之后：先看本账号，再看跨品种/跨账号敞口。
+    check = getattr(risk, "evaluate_portfolio", None)
+    if not callable(check):
+        return None
+    ok, code, reason = check(intent)
+    if not ok:
+        return GateResult(False, str(code or "portfolio_block"), str(reason or "组合敞口超限"))
+    return None
+
+
 # 发单前两段：先拦暂停/记账/重复信号，执行器可能还要先平反向仓，再拦手数和柜台。
 # 顺序必须和常驻原来的判断一致，不能对调。
 EARLY_RULES: tuple[Callable[[TradeIntent, Any], GateResult | None], ...] = (
@@ -169,6 +180,7 @@ SEND_RULES: tuple[Callable[[TradeIntent, Any], GateResult | None], ...] = (
     _working,
     _books,
     _guardian,
+    _portfolio,
 )
 
 
@@ -200,7 +212,7 @@ def run_early_gates(intent: TradeIntent, risk: Any) -> GateResult:
 
 
 def run_send_gates(intent: TradeIntent, risk: Any) -> GateResult:
-    """手数、上线阶段、未完成委托、持仓对账、日亏损与频率。通过后才允许真正发单。"""
+    """手数、上线阶段、未完成委托、持仓对账、日亏损与频率、组合敞口。通过后才允许真正发单。"""
     result = _run(intent, risk, SEND_RULES)
     _audit(risk, "send", intent, result)
     return result

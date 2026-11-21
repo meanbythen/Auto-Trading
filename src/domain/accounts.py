@@ -26,6 +26,8 @@ CTP_SIM = "ctp_sim"
 # CTP 真实资金：账号就是配置页「资金账号」（GUI 登录那一号）。
 CTP_LIVE = "ctp_live"
 ORDER = (LIVE, PAPER, CTP_SIM, CTP_LIVE)
+# 旧四本账的记号：升级前所有账号共用这几本。P1 迁移后新账号只用 account_id。
+LEGACY_BOOK_IDS = frozenset(ORDER)
 
 # 界面下拉框上的名字，和文件内部记号分开，方便以后改字不改文件。
 PROFILES: dict[str, dict[str, str]] = {
@@ -205,6 +207,42 @@ def _derived_profile(book_id: str, meta: dict[str, str]) -> dict[str, str]:
         "funding": "ctp" if is_ctp else "manual",
         **({"ctp_kind": meta.get("environment") or "sim"} if is_ctp else {}),
     }
+
+
+def book_layout(book_id: str, meta: dict[str, str] | None = None) -> dict[str, str]:
+    """账本记号 → 账本/账期/状态/意图四类文件名。
+
+    旧四本账走固定表；账号账本按 book_id 派生。迁移和冲突校验共用这一份规则。
+    """
+    key = str(book_id or "").strip().lower()
+    if key in PROFILES:
+        return dict(PROFILES[key])
+    return _derived_profile(key or "account", dict(meta or {}))
+
+
+def book_choices(root: str | Path | None = None) -> list[tuple[str, str]]:
+    """账本下拉选项：[(account_id, 标签), ...]。
+
+    有注册表时只列账号（含停用/归档，便于查历史账）；没有注册表时回退旧四本账。
+    标签重复的账号追加 account_id，保证界面选项能唯一解析回账号。
+    """
+    base = Path(root) if root is not None else _default_root()
+    meta = _registry_book_meta(base)
+    if not meta:
+        return [(key, PROFILES[key]["label"]) for key in ORDER]
+    rows: list[tuple[str, str]] = []
+    for book_id, item in meta.items():
+        account_id = str(item.get("account_id") or book_id).strip().lower()
+        name = item.get("display_name") or account_id
+        env = "真实" if item.get("environment") == "live" else "仿真"
+        rows.append((account_id, f"{name} · {env}"))
+    seen: dict[str, int] = {}
+    for _, label in rows:
+        seen[label] = seen.get(label, 0) + 1
+    return [
+        (account_id, label if seen[label] == 1 else f"{label}（{account_id}）")
+        for account_id, label in rows
+    ]
 
 
 def profile_of(account_id: Any = None, *, root: str | Path | None = None) -> dict[str, str]:

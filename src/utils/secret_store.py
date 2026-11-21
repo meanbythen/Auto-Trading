@@ -175,8 +175,11 @@ class DpapiCipher:
         if self._ctypes is not None:
             return self._ctypes.unprotect(raw).decode("utf-8")
         assert self._crypt is not None
-        data, _desc = self._crypt.CryptUnprotectData(raw, None, None, None, 0)
-        return bytes(data).decode("utf-8")
+        result = self._crypt.CryptUnprotectData(raw, None, None, None, 0)
+        first, second = result if isinstance(result, tuple) else (result, b"")
+        # pywin32 各版本返回顺序不同：新版是 (说明, 数据)，旧版是 (数据, 说明)。
+        data = second if isinstance(first, str) and not isinstance(second, str) else first
+        return data if isinstance(data, str) else bytes(data).decode("utf-8")
 
 
 def normalize_ref(ref: Any) -> str:

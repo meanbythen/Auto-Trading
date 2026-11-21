@@ -20,6 +20,10 @@ def normalize_front(value: Any) -> str:
     text = str(value or "").strip()
     if not text:
         return ""
+    from src.domain import trading_account as ta
+
+    if ta.is_self_test_front(text):
+        return ta.SELF_TEST_FRONT
     parsed = urlparse(text if "://" in text else f"tcp://{text}")
     host = parsed.hostname
     port = parsed.port

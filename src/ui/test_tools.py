@@ -1,6 +1,6 @@
 """
 运行页「测试工具」入口
-功能：把试跑一轮、点击下单、完整自检收进一个窗口，三项分选，逻辑仍走原来的三个函数。
+功能：把试跑一轮、点击下单、完整自检、仿真柜台收进一个窗口，逻辑仍走各自入口。
 原理：主界面只留一个按钮，避免三个入口挤在一起；默认选「试跑一轮」，符合日常用法。
 """
 
@@ -16,11 +16,13 @@ from src.ui import theme as T
 OPTION_ONCE = "once"
 OPTION_ORDER = "order"
 OPTION_FULL = "full"
+OPTION_COUNTER = "counter"
 
 _LABELS = {
     OPTION_ONCE: "试跑一轮信号",
     OPTION_ORDER: "点击下单自检",
     OPTION_FULL: "完整自检",
+    OPTION_COUNTER: "仿真柜台",
 }
 
 _DETAILS = {
@@ -36,6 +38,10 @@ _DETAILS = {
         "跑程序自检脚本：强制模拟通道，用假K线测开平仓、止损、清仓、风控。"
         "不会点真实登录。怀疑程序坏了再用；日常看盘不必点。"
     ),
+    OPTION_COUNTER: (
+        "启动独立本机仿真柜台，随时验证交易台现有按钮经过生产 CTP 链路的开平撤、查询和异步回报。"
+        "支持挂单、部分成交、拒单、无回报和断线场景；不会连接真实或外部仿真柜台。"
+    ),
 }
 
 
@@ -45,6 +51,7 @@ def open_test_tools(
     on_once: Callable[[], None],
     on_order: Callable[[], None],
     on_full: Callable[[], None],
+    on_counter: Callable[[], None],
 ) -> None:
     """打开测试工具。已经开着就提到前面。"""
     existing = getattr(master, "_test_tools_window", None)
@@ -56,12 +63,18 @@ def open_test_tools(
         except Exception:  # noqa: BLE001
             pass
         return
-    window = _TestToolsWindow(master, on_once=on_once, on_order=on_order, on_full=on_full)
+    window = _TestToolsWindow(
+        master,
+        on_once=on_once,
+        on_order=on_order,
+        on_full=on_full,
+        on_counter=on_counter,
+    )
     master._test_tools_window = window  # type: ignore[attr-defined]
 
 
 class _TestToolsWindow(ctk.CTkToplevel):
-    """三项分选 + 默认提示。点「开始」才执行对应逻辑。"""
+    """四项分选 + 默认提示。点「开始」才执行对应逻辑。"""
 
     def __init__(
         self,
@@ -70,14 +83,16 @@ class _TestToolsWindow(ctk.CTkToplevel):
         on_once: Callable[[], None],
         on_order: Callable[[], None],
         on_full: Callable[[], None],
+        on_counter: Callable[[], None],
     ) -> None:
         super().__init__(master)
         self.title("测试工具")
-        self.geometry("460x420")
+        self.geometry("500x500")
         self._actions = {
             OPTION_ONCE: on_once,
             OPTION_ORDER: on_order,
             OPTION_FULL: on_full,
+            OPTION_COUNTER: on_counter,
         }
         self.choice = ctk.StringVar(value=OPTION_ONCE)
         self._build()
@@ -101,7 +116,7 @@ class _TestToolsWindow(ctk.CTkToplevel):
         ).pack(anchor="w", padx=16, pady=(16, 4))
         ctk.CTkLabel(
             self,
-            text="日常先「试跑一轮」；要验坐标用「点击下单」；怀疑程序坏了再「完整自检」。",
+            text="日常先试跑；CTP 链路随时可测用「仿真柜台」，不需要外部仿真账号或日盘时段。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,
             wraplength=420,
@@ -110,7 +125,7 @@ class _TestToolsWindow(ctk.CTkToplevel):
 
         box = ctk.CTkFrame(self, fg_color=T.BG_ELEVATED, corner_radius=10)
         box.pack(fill="x", padx=16, pady=(0, 8))
-        for key in (OPTION_ONCE, OPTION_ORDER, OPTION_FULL):
+        for key in (OPTION_ONCE, OPTION_ORDER, OPTION_FULL, OPTION_COUNTER):
             ctk.CTkRadioButton(
                 box,
                 text=_LABELS[key],

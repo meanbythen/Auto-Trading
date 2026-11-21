@@ -29,6 +29,7 @@ from src.domain.accounts import (
     PAPER,
     PROFILES,
     active_file,
+    book_choices,
     book_file,
     book_id_for_ctp_kind,
     id_from_label,
@@ -50,6 +51,7 @@ __all__ = [
     "PAPER",
     "PROFILES",
     "active_file",
+    "book_choices",
     "book_file",
     "book_id_for_ctp_kind",
     "ctp_kind_of_book",
@@ -64,6 +66,7 @@ __all__ = [
     "normalize_id",
     "periods_folder",
     "profile_of",
+    "resolve_choice",
     "resolve_ctp_book",
     "set_active_id",
     "state_file",
@@ -186,14 +189,38 @@ def _registry_account_label(account_id: str, root: str | Path | None = None) -> 
         if account is None:
             return ""
         env = "仿真" if account.environment == "sim" else "真实"
-        return f"{account.display_name} · {env}"
+        label = f"{account.display_name} · {env}"
+        # 与 book_choices 保持一致：重名账号追加 account_id，当前值才能落在下拉选项里。
+        same = [
+            item
+            for item in registry.accounts
+            if (item.display_name or item.account_id)
+            == (account.display_name or account.account_id)
+            and ("仿真" if item.environment == "sim" else "真实") == env
+        ]
+        if len(same) > 1:
+            label = f"{label}（{account.account_id}）"
+        return label
     except Exception:  # noqa: BLE001 - 只是显示名，不能影响记账
         return ""
 
 
 def labels(root: str | Path | None = None) -> list[str]:
-    """下拉框从左到右：同花顺实盘、同花顺模拟、华泰仿真、华泰真实。"""
-    return [display_label(key, root) for key in ORDER]
+    """账本下拉：有注册表就只列账号，没有注册表才回退旧四本账。"""
+    return [label for _account_id, label in book_choices(root)]
+
+
+def resolve_choice(choice: Any, root: str | Path | None = None) -> str:
+    """把下拉框文字解析回账号/账本记号。
+
+    先按当前选项精确匹配（账号显示名），匹配不到再走旧的 normalize_id，
+    保证旧标签、直接传 account_id 或 legacy 记号都还能用。
+    """
+    text = str(choice or "").strip()
+    for account_id, label in book_choices(root):
+        if text == label:
+            return account_id
+    return normalize_id(text)
 
 
 def set_active_id(root: str | Path, account_id: Any) -> str:

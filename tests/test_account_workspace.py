@@ -1,5 +1,7 @@
 """两本账互不覆盖：实盘文件还在，模拟账另写一份。"""
 
+import yaml
+
 from src.account.signal_book import book_path, load_book, new_book, periods_dir, record_program_trade, save_book
 from src.account.workspace import (
     CTP_LIVE,
@@ -9,13 +11,16 @@ from src.account.workspace import (
     book_file,
     book_id_for_ctp_kind,
     is_ctp_book,
+    labels,
     normalize_id,
     intent_file,
     load_active_id,
     periods_folder,
+    resolve_choice,
     set_active_id,
     state_file,
 )
+from src.domain.accounts import ORDER, PROFILES
 from src.utils.state_store import default_state_path
 
 
@@ -474,3 +479,74 @@ def test_repair_ctp_daily_from_history_recovers_wiped_zero() -> None:
     report = analyze_book(book, start=date(2026, 11, 19), end=date(2026, 11, 19))
     assert abs(report.daily_pnl[date(2026, 11, 19)] - 395.53) < 0.02
     assert abs(report.account.net_pnl - 395.53) < 0.02
+
+
+# —— P1：账本下拉只认账号 ——
+
+
+def _write_accounts(root, rows) -> None:
+    path = root / "config" / "accounts.yaml"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        yaml.safe_dump(
+            {"version": 2, "connections": [], "accounts": rows},
+            allow_unicode=True,
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+
+def test_labels_fallback_without_registry(tmp_path) -> None:
+    assert labels(tmp_path) == [PROFILES[key]["label"] for key in ORDER]
+
+
+def test_labels_and_resolve_choice_use_accounts(tmp_path) -> None:
+    _write_accounts(
+        tmp_path,
+        [
+            {
+                "account_id": "acc_sim_01",
+                "display_name": "仿真一",
+                "channel": "ctp",
+                "environment": "sim",
+                "book_id": "acc_sim_01",
+            },
+            {
+                "account_id": "acc_live_01",
+                "display_name": "真实一",
+                "channel": "ctp",
+                "environment": "live",
+                "book_id": "acc_live_01",
+            },
+        ],
+    )
+
+    assert labels(tmp_path) == ["仿真一 · 仿真", "真实一 · 真实"]
+    assert resolve_choice("仿真一 · 仿真", tmp_path) == "acc_sim_01"
+    assert resolve_choice("acc_live_01", tmp_path) == "acc_live_01"
+
+
+def test_duplicate_display_name_gets_account_suffix(tmp_path) -> None:
+    _write_accounts(
+        tmp_path,
+        [
+            {
+                "account_id": "acc_a_01",
+                "display_name": "同名",
+                "channel": "ctp",
+                "environment": "sim",
+                "book_id": "acc_a_01",
+            },
+            {
+                "account_id": "acc_b_01",
+                "display_name": "同名",
+                "channel": "ctp",
+                "environment": "sim",
+                "book_id": "acc_b_01",
+            },
+        ],
+    )
+
+    assert labels(tmp_path) == ["同名 · 仿真（acc_a_01）", "同名 · 仿真（acc_b_01）"]
+    assert resolve_choice("同名 · 仿真（acc_b_01）", tmp_path) == "acc_b_01"

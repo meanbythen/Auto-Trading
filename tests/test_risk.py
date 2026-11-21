@@ -315,3 +315,79 @@ def test_risk_sqlite_disabled_keeps_json_authoritative(tmp_path) -> None:
     assert restored.last_order_ts == 100
     assert len(restored.decisions(trading_day="2026-11-20")) == 1
     assert not (tmp_path / "data" / "trading.db").exists()
+
+
+def test_portfolio_limits_default_to_observe() -> None:
+    from src.risk.portfolio import PortfolioLimits
+
+    assert PortfolioLimits.from_config({}).mode == "observe"
+    assert PortfolioLimits.from_config({"risk": {"portfolio": {"mode": "enforce"}}}).mode == "enforce"
+    assert PortfolioLimits.from_config({"risk": {"portfolio": {"mode": "bogus"}}}).mode == "observe"
+
+
+def test_portfolio_snapshot_nets_across_accounts() -> None:
+    from src.risk.portfolio import PortfolioSnapshot
+
+    snapshot = PortfolioSnapshot.from_rows(
+        [
+            {"book_id": "acc_a", "symbol": "fu2701", "side": "long", "volume": 2},
+            {"book_id": "acc_b", "symbol": "fu2701", "side": "short", "volume": 1},
+            {"book_id": "acc_b", "symbol": "bu2612", "side": "long", "volume": 3},
+        ]
+    )
+    assert snapshot.net_lots("fu2701") == 1
+    assert snapshot.gross_lots() == 6
+    assert snapshot.digest() == snapshot.digest()
+
+
+def test_portfolio_observe_records_but_does_not_block(tmp_path) -> None:
+    from src.kernel.risk_chain import TradeIntent, run_send_gates
+    from src.risk.portfolio import PortfolioLimits, PortfolioRisk, PortfolioSnapshot
+    from src.risk.service import RiskService
+
+    cfg = {
+        "risk": {
+            "min_order_interval_sec": 0,
+            "portfolio": {"mode": "observe", "max_symbol_lots": 1},
+        }
+    }
+    service = RiskService.from_config(cfg, root=tmp_path, account_id="acc_a")
+    service.write_alerts = False
+    service.portfolio = PortfolioRisk(
+        PortfolioLimits.from_config(cfg),
+        snapshot=PortfolioSnapshot.from_rows(
+            [{"book_id": "acc_b", "symbol": "fu2701", "side": "long", "volume": 2}]
+        ),
+    )
+    intent = TradeIntent(symbol="fu2701", side="buy_open", volume=1)
+
+    assert run_send_gates(intent, service).ok is True
+    gates = [row["gate"] for row in service.decisions()]
+    assert "portfolio" in gates
+    portfolio_rows = [row for row in service.decisions() if row["gate"] == "portfolio"]
+    assert "超过上限" in portfolio_rows[-1]["reason"]
+
+
+def test_portfolio_enforce_blocks_over_limit(tmp_path) -> None:
+    from src.kernel.risk_chain import TradeIntent, run_send_gates
+    from src.risk.portfolio import PortfolioLimits, PortfolioRisk, PortfolioSnapshot
+    from src.risk.service import RiskService
+
+    cfg = {
+        "risk": {
+            "min_order_interval_sec": 0,
+            "portfolio": {"mode": "enforce", "max_symbol_lots": 2},
+        }
+    }
+    service = RiskService.from_config(cfg, root=tmp_path, account_id="acc_a")
+    service.write_alerts = False
+    service.portfolio = PortfolioRisk(
+        PortfolioLimits.from_config(cfg),
+        snapshot=PortfolioSnapshot.from_rows(
+            [{"book_id": "acc_b", "symbol": "fu2701", "side": "long", "volume": 2}]
+        ),
+    )
+    result = run_send_gates(TradeIntent(symbol="fu2701", side="buy_open", volume=1), service)
+
+    assert result.ok is False
+    assert result.code == "portfolio_symbol_limit"

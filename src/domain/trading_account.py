@@ -30,6 +30,14 @@ STATUSES = (STATUS_ENABLED, STATUS_DISABLED, STATUS_ARCHIVED)
 # 只属于仿真柜台的地址标记。真实账号误填这些前置时直接拦住，避免把真单发到仿真环境。
 SIM_ONLY_MARKERS = ("simnow", "180.168.146.187", "59.36.3.115")
 
+# 内置程序自测账号。local:// 前置不会交给真实 CTP SDK，只路由到本机独立仿真柜台。
+SELF_TEST_ACCOUNT_ID = "acc_program_selftest"
+SELF_TEST_CONNECTION_ID = "program_selftest"
+SELF_TEST_FRONT = "local://program-selftest"
+SELF_TEST_BOOK_ID = "self_test"
+SELF_TEST_INVESTOR_ID = "SELFTEST"
+SELF_TEST_LABEL = "程序自测仿真柜台"
+
 _ACCOUNT_ID_RE = re.compile(r"^acc_[a-z0-9_]{2,64}$")
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9_]{2,64}$")
 
@@ -76,6 +84,15 @@ def _split_fronts(value: Any) -> list[str]:
     for sep in (";", "\n", "；"):
         text = text.replace(sep, ",")
     return [item.strip() for item in text.split(",") if item.strip()]
+
+
+def is_self_test_front(value: Any) -> bool:
+    """是否为本程序自测专用前置；只认完整标记，避免普通地址被误路由。"""
+    return str(value or "").strip().lower() == SELF_TEST_FRONT
+
+
+def is_self_test_account(account: Any) -> bool:
+    return str(getattr(account, "account_id", "") or "").strip().lower() == SELF_TEST_ACCOUNT_ID
 
 
 def _float(value: Any, default: float) -> float:
@@ -372,6 +389,25 @@ def validate_registry(
         if account.channel != CHANNEL_CTP:
             continue
         profile = profile_map.get(account.profile_id)
+        self_test = is_self_test_account(account)
+        local_front = profile is not None and any(
+            is_self_test_front(front) for front in (*profile.td_fronts, *profile.md_fronts)
+        )
+        if self_test:
+            expected = (
+                account.channel == CHANNEL_CTP
+                and account.environment == ENV_SIM
+                and account.profile_id == SELF_TEST_CONNECTION_ID
+                and account.investor_id == SELF_TEST_INVESTOR_ID
+                and account.book_id == SELF_TEST_BOOK_ID
+                and account.status == STATUS_ENABLED
+            )
+            if not expected:
+                problems.append(f"{label}：内置程序自测账号的身份、环境、连接和账本不可修改")
+            if profile is None or profile.td_fronts != [SELF_TEST_FRONT] or profile.md_fronts != [SELF_TEST_FRONT]:
+                problems.append(f"{label}：必须使用专用本地前置 {SELF_TEST_FRONT}")
+        elif local_front:
+            problems.append(f"{label}：本地自测前置只能用于内置程序自测账号，真实及普通账号禁止使用")
         if profile is None:
             problems.append(f"{label}：找不到连接 {account.profile_id or '（空）'}")
         else:
@@ -391,7 +427,7 @@ def validate_registry(
                 problems.append(f"{label}：启用中的 CTP 账号必须绑定连接")
             if not account.investor_id:
                 problems.append(f"{label}：启用中的 CTP 账号必须填资金账号")
-            if not (
+            if not self_test and not (
                 account.password_ref
                 or (profile is not None and (profile.password_ref or profile.password_env))
             ):

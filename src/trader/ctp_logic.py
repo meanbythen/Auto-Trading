@@ -17,6 +17,8 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
+from src.trader.ctp_symbols import ctp_exchange_id, product_code, symbol_key
+
 
 # 柜台开平标志。和上期技术 CTP 的 CombOffsetFlag 一致。
 OFFSET_OPEN = "0"
@@ -42,49 +44,6 @@ def offset_cn(code: str) -> str:
 # 需要单独报平今、平昨的品种。配置里可再追加；上期所、能源中心、大商所即使没写也会拆。
 # 用完整字母前缀比较，避免把沪铜 cu 当成玉米 c。
 DEFAULT_CLOSE_SPLIT_PRODUCTS = ("bu", "c")
-
-
-def product_code(symbol: str) -> str:
-    """bu2612 -> bu，c2511 -> c，cu2601 -> cu。"""
-    text = str(symbol or "").strip().lower()
-    end = 0
-    while end < len(text) and text[end].isalpha():
-        end += 1
-    return text[:end]
-
-
-def symbol_key(symbol: str) -> str:
-    """柜台返回 BU2612，程序里记 bu2612。比对前都收成小写。"""
-    return str(symbol or "").strip().lower()
-
-
-# 郑商所、中金所的合约代码必须大写。上期所、能源中心、大商所、广期所必须小写。
-# 把沥青写成 BU2612 时，柜台会直接回「找不到合约」。
-_CTP_EXCHANGE_BY_PRODUCT: dict[str, str] = {
-    "AP": "CZCE", "CF": "CZCE", "CJ": "CZCE", "CY": "CZCE", "FG": "CZCE",
-    "JR": "CZCE", "LR": "CZCE", "MA": "CZCE", "OI": "CZCE", "PF": "CZCE",
-    "PK": "CZCE", "PL": "CZCE", "PM": "CZCE", "PR": "CZCE", "PX": "CZCE",
-    "RI": "CZCE", "RM": "CZCE", "RS": "CZCE", "SA": "CZCE", "SF": "CZCE",
-    "SH": "CZCE", "SM": "CZCE", "SR": "CZCE", "TA": "CZCE", "UR": "CZCE",
-    "WH": "CZCE", "ZC": "CZCE",
-    "IF": "CFFEX", "IH": "CFFEX", "IC": "CFFEX", "IM": "CFFEX",
-    "T": "CFFEX", "TF": "CFFEX", "TS": "CFFEX", "TL": "CFFEX",
-    "CU": "SHFE", "AL": "SHFE", "ZN": "SHFE", "PB": "SHFE", "NI": "SHFE",
-    "SN": "SHFE", "AU": "SHFE", "AG": "SHFE", "RB": "SHFE", "HC": "SHFE",
-    "SS": "SHFE", "BU": "SHFE", "RU": "SHFE", "SP": "SHFE", "FU": "SHFE",
-    "WR": "SHFE", "AO": "SHFE", "BR": "SHFE", "AD": "SHFE",
-    "SC": "INE", "NR": "INE", "LU": "INE", "BC": "INE", "EC": "INE",
-    "A": "DCE", "B": "DCE", "C": "DCE", "CS": "DCE", "EB": "DCE", "EG": "DCE",
-    "I": "DCE", "J": "DCE", "JM": "DCE", "L": "DCE", "M": "DCE", "P": "DCE",
-    "PG": "DCE", "PP": "DCE", "V": "DCE", "Y": "DCE", "LH": "DCE", "JD": "DCE",
-    "FB": "DCE", "BB": "DCE", "RR": "DCE", "LG": "DCE",
-    "SI": "GFEX", "LC": "GFEX", "PS": "GFEX",
-}
-
-
-def ctp_exchange_id(symbol: str) -> str:
-    """bu2612 -> SHFE，SA2701 -> CZCE。不认识的品种留空，让柜台按合约自己判断。"""
-    return _CTP_EXCHANGE_BY_PRODUCT.get(product_code(symbol).upper(), "")
 
 
 def needs_close_split(symbol: str) -> bool:
@@ -191,20 +150,6 @@ def ctp_depth_row(data: Any) -> dict[str, Any] | None:
         "lower": _num("LowerLimitPrice"),
         "time": ctp_quote_clock(data),
     }
-
-
-def ctp_instrument_id(symbol: str) -> str:
-    """
-    发给柜台的合约代码。
-
-    上期所沥青必须是 bu2612。写成 BU2612，柜台回报就是「找不到合约」。
-    郑商所、中金所相反，要大写，例如 SA2701、IF2612。
-    """
-    text = str(symbol or "").strip()
-    exchange = ctp_exchange_id(text)
-    if exchange in {"CZCE", "CFFEX"}:
-        return text.upper()
-    return text.lower()
 
 
 # 合约写成字母加数字，例如 bu2612。写错就在本机拦住，不发给柜台。

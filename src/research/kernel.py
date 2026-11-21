@@ -3,6 +3,7 @@
 
 功能：生成可回溯的 run manifest，并从回测结果统一取净盈亏、交易笔数等指标。
 原理：清单只组装、不写库；需要落库时转给 src.ops.journal，研究模块不依赖调度或界面。
+注意：本模块统一的是运行清单与结果口径，不是字面上的 BacktestKernel，各页编排仍各自保留。
 """
 
 from __future__ import annotations

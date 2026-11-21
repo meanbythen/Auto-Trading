@@ -100,3 +100,18 @@ def prepare_live_ctp_cfg(cfg: dict[str, Any], kind: str) -> dict[str, Any]:
     # 挂单留给人撤，方便华泰测手撤、批量撤、重复报单；常驻仍一次只挂一笔并超时撤。
     ctp["desk_session"] = True
     return cfg
+
+
+def prepare_self_test_cfg(cfg: dict[str, Any]) -> dict[str, Any]:
+    """
+    交易台连本机程序自测柜台。
+
+    账号、前置和账本已由 resolve_session 按内置自测账号写进 cfg；这里只关掉模拟、
+    标记交易台会话。不再按种类挑档案，避免挑到别的仿真账号。
+    """
+    trade = cfg.setdefault("trade", {})
+    ctp = trade.setdefault("ctp", {})
+    cfg["dry_run"] = False
+    ctp["account_kind"] = "sim"
+    ctp["desk_session"] = True
+    return cfg

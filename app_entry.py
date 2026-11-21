@@ -20,6 +20,7 @@ def _want_gui(argv: list[str]) -> bool:
     cli_flags = (
         "--once",
         "--sim-test",
+        "--sim-counter",
         "-h",
         "--help",
         "--tick-record",
@@ -38,6 +39,13 @@ def main() -> int:
 
     ensure_runtime_layout()
     argv = sys.argv[1:]
+
+    if "--sim-counter" in argv:
+        # 程序自测柜台由交易台在独立进程里启动；不能走单实例拦截，否则会被主界面挡住。
+        from src.trader.sim_counter import main as counter_main
+
+        counter_main([arg for arg in argv if arg != "--sim-counter"])
+        return 0
 
     if "--pick-coords" in argv:
         # 主界面点「标定下单坐标」时会再开一个自己。这里只弹标定窗口，不再打开主界面。

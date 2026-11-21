@@ -16,6 +16,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
+from src.trader.ctp_limits import effective_max_order_volume as effective_max_order_volume
+
 CTP_KIND_SIM = "sim"
 CTP_KIND_LIVE = "live"
 

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 
 from src.trader.base import DEFAULT_CAPABILITIES, OrderRequest
 from src.trader.ctp_gateway import CtpGateway, CtpSettings
@@ -1442,7 +1443,7 @@ def test_runner_rolls_over_daytime_counters_when_date_changes(tmp_path) -> None:
     assert bot._rollover_trading_day() is False
 
 
-def test_strategy_volume_cannot_exceed_risk_sized_lots() -> None:
+def test_strategy_volume_cannot_exceed_risk_sized_lots(tmp_path: Path) -> None:
     """策略写 meta.volume 时只能往下压，不能超过资金管理算出的手数。"""
     from types import SimpleNamespace
 
@@ -1461,7 +1462,7 @@ def test_strategy_volume_cannot_exceed_risk_sized_lots() -> None:
         def total_abs_position() -> int:
             return 0
 
-    stub = SimpleNamespace(sizer=FakeSizer(), risk=FakeRisk())
+    stub = SimpleNamespace(sizer=FakeSizer(), risk=FakeRisk(), root=tmp_path)
     decision = StrategyDecision(
         StrategyAction.BUY_OPEN,
         "jm2701",
@@ -2031,3 +2032,39 @@ def test_config_loader_reads_password_env_per_profile(tmp_path, monkeypatch) -> 
     assert profiles["huatai_sim"]["resolved_auth_code"] == "huatai-auth"
     assert profiles["simnow"]["resolved_password"] == "simnow-secret"
     assert profiles["simnow"]["resolved_auth_code"] == ""
+
+def test_effective_max_order_volume_takes_the_smaller_cap() -> None:
+    """本机上限的实际生效值：公共值与档案值都有效时取小。"""
+    from src.trader.ctp_profile import effective_max_order_volume
+
+    assert effective_max_order_volume(3, 20) == 3
+    assert effective_max_order_volume(20, 5) == 5
+    assert effective_max_order_volume(20, 0) == 20
+    assert effective_max_order_volume(0, 5) == 5
+    assert effective_max_order_volume(0, 0) == 20
+    assert effective_max_order_volume(None, "") == 20
+
+
+def test_runtime_limits_use_public_cap_not_profile_default() -> None:
+    """公共 3 / 档案 20 时，交易对象拿到的实际上限必须是 3。"""
+    settings = CtpSettings.from_cfg(
+        {
+            "trade": {
+                "ctp": {
+                    "max_order_volume": 3,
+                    "ctp_profile": "program_selftest",
+                    "ctp_profiles": {
+                        "program_selftest": {
+                            "kind": "sim",
+                            "td_front": "local://program-selftest",
+                            "md_front": "local://program-selftest",
+                            "broker_id": "9999",
+                            "user_id": "selftest",
+                            "max_order_volume": 20,
+                        }
+                    },
+                }
+            }
+        }
+    )
+    assert settings.max_order_volume == 3

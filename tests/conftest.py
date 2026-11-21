@@ -7,6 +7,35 @@ import tkinter as tk
 import pytest
 
 
+class _MemoryCipher:
+    """测试用：不碰真实 DPAPI，密文就是带前缀的明文。"""
+
+    def protect(self, text: str) -> str:
+        return "mem:" + text
+
+    def unprotect(self, token: str) -> str:
+        from src.utils.secret_store import SecretStoreUnavailable
+
+        if not token.startswith("mem:"):
+            raise SecretStoreUnavailable("测试密钥库解不开这条密文")
+        return token[4:]
+
+
+@pytest.fixture(autouse=True)
+def _isolated_secret_store(tmp_path, monkeypatch):
+    """每个用例用自己的空密钥库，别把开发机上的真实密码读进断言。"""
+    from src.account import registry as registry_module
+    from src.account import session as session_module
+    from src.utils import secret_store as ss
+
+    store = ss.SecretStore(tmp_path / "secrets.dpapi.json", cipher=_MemoryCipher())
+    monkeypatch.setattr(ss, "_DEFAULT", store)
+    monkeypatch.setattr(ss, "default_store", lambda: store)
+    monkeypatch.setattr(session_module, "default_store", lambda: store)
+    monkeypatch.setattr(registry_module, "default_store", lambda: store)
+    yield store
+
+
 @pytest.fixture(scope="module")
 def _real_app_module(tmp_path_factory):
     """整套 UI 用例共享窗口，避免 CustomTkinter 反复分配 Windows 菜单。"""

@@ -367,16 +367,16 @@ class AccountTabMixin:
         from src.account.signal_book import load_book, multiplier_map, shown_equity
         from src.account.workspace import (
             display_label,
-            id_from_label,
             is_ctp_book,
             load_active_id,
             profile_of,
+            resolve_choice,
             set_active_id,
         )
 
         if self._account_switch_busy:
             return
-        wanted = id_from_label(choice)
+        wanted = resolve_choice(choice, self.root_dir)
         current = load_active_id(self.root_dir)
         if wanted == current:
             self._paint_account_hint()

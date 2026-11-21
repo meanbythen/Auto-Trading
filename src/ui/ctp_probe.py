@@ -17,7 +17,13 @@ from tkinter import ttk
 from loguru import logger
 
 from src.trader.base import capabilities_for
-from src.trader.ctp_orders import ctp_order, flatten_order_steps, prepare_live_ctp_cfg, reverse_order_steps
+from src.trader.ctp_orders import (
+    ctp_order,
+    flatten_order_steps,
+    prepare_live_ctp_cfg,
+    prepare_self_test_cfg,
+    reverse_order_steps,
+)
 from src.trader.ctp_display import (
     account_headline,
     account_pairs,
@@ -33,10 +39,9 @@ from src.trader.ctp_display import (
     split_position_rows,
     trade_footer,
 )
-from src.trader.ctp_gateway import STATUS_TEXT
+from src.trader.ctp_gateway import STATUS_TEXT, CtpSettings
 from src.risk.sizing import PositionSizer
 from src.trader.ctp_logic import (
-    CTP_KIND_LABELS,
     ctp_kind_label,
     direction_cn,
     normalize_ctp_kind,
@@ -45,6 +50,7 @@ from src.trader.ctp_logic import (
     symbol_key,
 )
 from src.trader.ctp_trader import CtpTrader
+from src.domain import trading_account as ta
 from src.trader.go_live import (
     HUATAI_REQUIRED,
     account_kind_for_stage,
@@ -191,7 +197,10 @@ class CtpProbeWindow(tk.Toplevel):
         self._root = str(cfg.get("_project_root") or ".")
         self._stage = current_stage_from_cfg(cfg)
         kind = account_kind_for_stage(self._stage)
-        self.kind = tk.StringVar(value=ctp_kind_label(kind))
+        active = str(((cfg.get("trade") or {}).get("ctp") or {}).get("account_id") or "").strip().lower()
+        self.kind = tk.StringVar(
+            value=ta.SELF_TEST_LABEL if active == ta.SELF_TEST_ACCOUNT_ID else ctp_kind_label(kind)
+        )
         self._go_live = load_state(self._root)
         self._huatai_vars: dict[str, tk.BooleanVar] = {}
         self._shown_quote: tuple[str, ...] | None = None
@@ -222,16 +231,17 @@ class CtpProbeWindow(tk.Toplevel):
         kind_box = ttk.Combobox(
             top,
             textvariable=self.kind,
-            values=list(CTP_KIND_LABELS.values()),
+            values=[ctp_kind_label("sim"), ctp_kind_label("live"), ta.SELF_TEST_LABEL],
             state="readonly",
-            width=12,
+            width=18,
         )
         kind_box.grid(row=0, column=1, sticky="w", padx=(4, 12))
         kind_box.bind("<<ComboboxSelected>>", lambda _e: self._on_kind_change())
         self._kind_box = kind_box
-        ttk.Label(top, text="仿真和真实走同一套下单，只换账号和前置。换账后请再点连接登录。").grid(
-            row=0, column=2, sticky="w"
-        )
+        ttk.Label(
+            top,
+            text="程序自测只在本机柜台成交；仿真/真实走同一套下单。换账后请再点连接登录。",
+        ).grid(row=0, column=2, sticky="w")
 
         form = ttk.Frame(self)
         form.pack(fill="x", **pad)
@@ -564,13 +574,16 @@ class CtpProbeWindow(tk.Toplevel):
         self._ui_queue.put(task)
 
     def _log_tag(self) -> str:
-        """运行日志前缀。实盘写真实账号，仿真写仿真账号，不再一律叫仿真测试。"""
+        """运行日志前缀。程序自测、仿真和真实账号明确区分。"""
         from src.trader.ctp_logic import ctp_kind_label
-        from src.trader.ctp_md import quote_channel_word
 
         trader = self.trader
         if trader is None:
             return "交易台"
+        if trader.settings.is_self_test:
+            return "交易台（程序自测/本机仿真柜台）"
+        from src.trader.ctp_md import quote_channel_word
+
         kind = ctp_kind_label(trader.settings.account_kind)
         channel = quote_channel_word(trader.settings)
         return f"交易台（{kind}/{channel}）"
@@ -620,6 +633,25 @@ class CtpProbeWindow(tk.Toplevel):
     def _selected_kind(self) -> str:
         return normalize_ctp_kind(self.kind.get())
 
+    def _selected_self_test(self) -> bool:
+        return str(self.kind.get()).strip() == ta.SELF_TEST_LABEL
+
+    def _selected_mode(self) -> str:
+        return "self_test" if self._selected_self_test() else self._selected_kind()
+
+    @staticmethod
+    def _settings_mode(trader: CtpTrader) -> str:
+        if trader.settings.is_self_test:
+            return "self_test"
+        return normalize_ctp_kind(trader.settings.account_kind)
+
+    @staticmethod
+    def _mode_label(mode: str) -> str:
+        return ta.SELF_TEST_LABEL if mode == "self_test" else ctp_kind_label(mode)
+
+    def _trader_label(self, trader: CtpTrader) -> str:
+        return self._mode_label(self._settings_mode(trader))
+
     def _drop_session(self) -> None:
         """换账号时先关掉旧连接，避免两本账混在一个流文件里。"""
         if self.md is not None:
@@ -636,33 +668,44 @@ class CtpProbeWindow(tk.Toplevel):
 
     def _on_kind_change(self) -> None:
         if self._attached_resident:
-            self._say("正在看常驻柜台，不能在这里换操作账。要换仿真/真实请先停止常驻。")
+            self._say("正在看常驻柜台，不能在这里换操作账。要换请先停止常驻。")
             if self.trader is not None:
-                self.kind.set(ctp_kind_label(self.trader.settings.account_kind))
+                self.kind.set(self._trader_label(self.trader))
             return
-        kind = self._selected_kind()
-        if self.trader is not None and self.trader.settings.account_kind != kind:
+        mode = self._selected_mode()
+        if self.trader is not None and self._settings_mode(self.trader) != mode:
             self._drop_session()
             self.account_line.set("已换操作账，请重新点「连接登录」")
-            self._say(f"已改成{ctp_kind_label(kind)}。换账后必须重新登录。")
+            self._say(f"已改成{self._mode_label(mode)}。换账后必须重新登录。")
 
     def _ensure(self) -> CtpTrader | None:
         if self._attached_resident and self.trader is not None:
             return self.trader
-        kind = self._selected_kind()
+        mode = self._selected_mode()
         if self.trader is not None:
-            if self.trader.settings.account_kind == kind:
+            if self._settings_mode(self.trader) == mode:
                 return self.trader
             self._drop_session()
-        cfg = prepare_live_ctp_cfg(load_config(), kind)
-        ctp = (cfg.get("trade") or {}).get("ctp") or {}
-        preview = overlay_ctp_profile(ctp, kind, account=cfg.get("account"))
-        if kind == "live" and not str(preview.get("td_front") or "").strip():
-            self._say("真实账号还缺交易前置。请到配置页在「档案交易前置」里填实盘地址。")
-            return None
-        if kind == "live" and not str(preview.get("user_id") or "").strip():
-            self._say("真实账号还缺资金账号。请到「账号」页填「资金账号」。")
-            return None
+        cfg = load_config()
+        if mode == "self_test":
+            from src.account.session import resolve_session
+
+            session = resolve_session(self._root, cfg, account_id=ta.SELF_TEST_ACCOUNT_ID)
+            if session is None or session.account_id != ta.SELF_TEST_ACCOUNT_ID:
+                self._say("账号页里没有内置的「程序自测仿真柜台」。请重启程序让账号注册表自检补齐。")
+                return None
+            cfg = prepare_self_test_cfg(cfg)
+        else:
+            kind = mode
+            cfg = prepare_live_ctp_cfg(cfg, kind)
+            ctp = (cfg.get("trade") or {}).get("ctp") or {}
+            preview = overlay_ctp_profile(ctp, kind, account=cfg.get("account"))
+            if kind == "live" and not str(preview.get("td_front") or "").strip():
+                self._say("真实账号还缺交易前置。请到配置页在「档案交易前置」里填实盘地址。")
+                return None
+            if kind == "live" and not str(preview.get("user_id") or "").strip():
+                self._say("真实账号还缺资金账号。请到「账号」页填「资金账号」。")
+                return None
         self.trader = CtpTrader(cfg)
         return self.trader
 
@@ -682,7 +725,7 @@ class CtpProbeWindow(tk.Toplevel):
             return
         self._attached_resident = True
         self.trader = trader
-        self.kind.set(ctp_kind_label(trader.settings.account_kind))
+        self.kind.set(self._trader_label(trader))
         if self._kind_box is not None:
             self._kind_box.configure(state="disabled")
         bot = getattr(getattr(self.master, "worker", None), "bot", None)
@@ -694,7 +737,10 @@ class CtpProbeWindow(tk.Toplevel):
                 watch = str(symbols[0]).strip() if symbols else ""
         if watch:
             self.symbol.set(watch)
-        self.title("CTP 交易台（正在看常驻柜台；关掉窗口不断线）")
+        if trader.settings.is_self_test:
+            self.title("程序自测交易台（正在看常驻本机柜台；关掉窗口不断线）")
+        else:
+            self.title("CTP 交易台（正在看常驻柜台；关掉窗口不断线）")
         self._say(
             "已接到常驻正在用的柜台，不再重新登录。"
             "资金、持仓、委托、成交跟这一条连接。"
@@ -729,8 +775,12 @@ class CtpProbeWindow(tk.Toplevel):
         prefix = "正在看常驻 · " if attached else ""
         warn = trader.settings.order_count_warn
         lots = trader.settings.max_order_volume
+        self_test = trader.settings.is_self_test
+        if self_test:
+            self.title("程序自测交易台（独立本机仿真柜台；与生产报单链路一致）")
+        mode = "程序自测仿真柜台" if self_test else ctp_kind_label(trader.settings.account_kind)
         self.account_line.set(
-            f"{prefix}已登录{ctp_kind_label(trader.settings.account_kind)}"
+            f"{prefix}已登录{mode}"
             f" {trader.settings.user_id}  AppID {trader.settings.app_id}"
             f"  前置 {trader.settings.td_front}"
         )
@@ -762,6 +812,14 @@ class CtpProbeWindow(tk.Toplevel):
 
         self._run_in_background("正在同步常驻柜台的资金、持仓和委托。", work)
 
+    def _ensure_counter(self) -> None:
+        """自测登录前确认柜台在跑；没有就启动独立进程。"""
+        from src.ui.sim_counter import counter_for
+
+        app = getattr(self.master, "master", None)
+        owner = app if app is not None and hasattr(app, "_on_close") else self.master
+        counter_for(owner).start()
+
     def _connect(self) -> None:
         if self._attached_resident and self.trader is not None:
             if self.trader.gateway.session.ready:
@@ -782,9 +840,15 @@ class CtpProbeWindow(tk.Toplevel):
                     "会直接看到常驻的持仓，不要再单独登录。"
                 )
                 return
-        self._say(f"准备用{ctp_kind_label(trader.settings.account_kind)}登录 {trader.settings.user_id}")
+        self._say(f"准备用{self._mode_label(self._settings_mode(trader))}登录 {trader.settings.user_id}")
 
         def work() -> None:
+            if trader.settings.is_self_test:
+                try:
+                    self._ensure_counter()
+                except Exception as exc:  # noqa: BLE001 - 柜台起不来要显示真实原因
+                    self._say(f"本机仿真柜台没起来：{exc}")
+                    return
             ok, message = trader.connect()
             self._say(("连接成功：" if ok else "连接失败：") + message)
             if not ok:
@@ -850,6 +914,12 @@ class CtpProbeWindow(tk.Toplevel):
         self.after(2500, self._keep_quotes)
 
     def _open_market(self, trader: CtpTrader) -> None:
+        if trader.settings.is_self_test:
+            # 自测只替换最底层柜台通信；盘口也来自该进程，绝不加载真实 CTP 行情客户端。
+            self.md = None
+            self._say("程序自测盘口来自本机仿真柜台，不连接 CTP 行情前置。")
+            self._load_price_band(trader)
+            return
         from src.trader.ctp_md import CtpMdClient
 
         if self.md is None:
@@ -1572,6 +1642,29 @@ class CtpProbeWindow(tk.Toplevel):
     def _send(self, side: str, position_side: str | None = None) -> None:
         self._place_chain([{"side": side, "position_side": position_side}])
 
+    def _current_order_limit(self, trader: CtpTrader) -> int:
+        """配置页可能在登录后改过；按当前配置再压一次，避免继续用旧上限。"""
+        try:
+            # 只读账号和柜台字段；不重复打开品种 Excel。
+            cfg = load_config(apply_universe=False)
+            if trader.settings.is_self_test:
+                # 自测账的账号不在配置页里，必须按内置账号重新物化一次，
+                # 否则读到的只是配置页上的原始上限，和登录时用的账对不上。
+                from src.account.session import resolve_session
+
+                resolve_session(self._root, cfg, account_id=ta.SELF_TEST_ACCOUNT_ID)
+                cfg = prepare_self_test_cfg(cfg)
+            else:
+                cfg = prepare_live_ctp_cfg(
+                    cfg, normalize_ctp_kind(trader.settings.account_kind)
+                )
+            fresh = CtpSettings.from_cfg(cfg)
+        except Exception:  # noqa: BLE001 - 读不到配置就沿用登录时的上限
+            return int(trader.settings.max_order_volume)
+        if fresh.account_id != trader.settings.account_id:
+            return int(trader.settings.max_order_volume)
+        return int(fresh.max_order_volume)
+
     def _place_chain(self, steps: list[dict]) -> None:
         """
         按顺序发几笔限价单。反手是两笔：先平、再开。
@@ -1604,7 +1697,10 @@ class CtpProbeWindow(tk.Toplevel):
                     position_side=position_side,
                     remark="交易台手工",
                 )
-                result = trader.place_order(request)
+                result = trader.place_order(
+                    request,
+                    max_volume=self._current_order_limit(trader),
+                )
                 label = labels.get(side, side)
                 self._say(f"{label}：{result.message}")
                 note = trader.gateway.activity.describe()
