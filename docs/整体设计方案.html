@@ -6,10 +6,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Auto-Trading 项目审阅与整体设计方案</title>
 <style>
-@font-face { font-family: "Instrument Sans"; src: url("./_shared/fonts/InstrumentSans-Regular.ttf") format("truetype"); font-weight: 400; font-style: normal; }
-@font-face { font-family: "Instrument Sans"; src: url("./_shared/fonts/InstrumentSans-Bold.ttf") format("truetype"); font-weight: 700; font-style: normal; }
-@font-face { font-family: "JetBrains Mono"; src: url("./_shared/fonts/JetBrainsMono-Regular.ttf") format("truetype"); font-weight: 400; font-style: normal; }
-@font-face { font-family: "JetBrains Mono"; src: url("./_shared/fonts/JetBrainsMono-Bold.ttf") format("truetype"); font-weight: 700; font-style: normal; }
+@font-face { font-family: "Instrument Sans"; src: url("./project-review-2026/_shared/fonts/InstrumentSans-Regular.ttf") format("truetype"); font-weight: 400; font-style: normal; }
+@font-face { font-family: "Instrument Sans"; src: url("./project-review-2026/_shared/fonts/InstrumentSans-Bold.ttf") format("truetype"); font-weight: 700; font-style: normal; }
+@font-face { font-family: "JetBrains Mono"; src: url("./project-review-2026/_shared/fonts/JetBrainsMono-Regular.ttf") format("truetype"); font-weight: 400; font-style: normal; }
+@font-face { font-family: "JetBrains Mono"; src: url("./project-review-2026/_shared/fonts/JetBrainsMono-Bold.ttf") format("truetype"); font-weight: 700; font-style: normal; }
 
 :root {
   --bg: #f6f4ef;
@@ -538,7 +538,7 @@ stateDiagram-v2
 
 <h3>P0 · 严重（实盘资金安全，建议立即处理）</h3>
 
-<p>2026-11-15：4 项 P0 已按 <a href="p0-fix/spec.md">修复规格</a> 与 <a href="p0-fix/tasks.md">任务清单</a> 全部实现；<code>ruff check src tests</code> 全绿，<code>pytest tests/ -q</code> 1200+ 项全部通过。四次提交：P0-1 <code>0ee2d75</code>、P0-2 <code>481b613</code>、P0-3 <code>5e8db07</code>、P0-4 <code>21b4ba1</code>，随 44.11.0 发布。下表以「已修复（44.11.0）」标注。剩余两项需仿真/实盘账号的人工演练（T5.3、T5.4）列在 <a href="../TODO.md">TODO.md</a> 第一节。</p>
+<p>2026-11-15：4 项 P0 已按 <a href="project-review-2026/p0-fix/spec.md">修复规格</a> 与 <a href="project-review-2026/p0-fix/tasks.md">任务清单</a> 全部实现；<code>ruff check src tests</code> 全绿，<code>pytest tests/ -q</code> 1200+ 项全部通过。四次提交：P0-1 <code>0ee2d75</code>、P0-2 <code>481b613</code>、P0-3 <code>5e8db07</code>、P0-4 <code>21b4ba1</code>，随 44.11.0 发布。下表以「已修复（44.11.0）」标注。剩余两项需仿真/实盘账号的人工演练（T5.3、T5.4）列在 <a href="TODO.md">TODO.md</a> 第一节。</p>
 
 <div class="table-wrap">
 <table>
@@ -789,20 +789,20 @@ flowchart LR
 <h2 id="docs"><span class="num">10</span>文档体系与后续待办</h2>
 
 <p>44.11.0 把散落的阶段性文档重新分层：介绍与日志进 README / CHANGELOG，操作细节进说明书，设计规划留在本页，<strong>没做完的事只保留一份清单</strong>。已完成的阶段文档移到 <code>docs/archive/</code>，与现行功能冲突的策略目录已删除。</p>
-<p>44.12.0 补齐批次 A 的四项硬门槛：节假日日历外置（<code>config/holidays.yaml</code>，实盘缺年份只禁开仓）、飞书告警外发（<code>runtime.alerts</code>，默认关）、<code>run_id</code> 贯穿事件/告警/状态、冷备守护（<code>tools/guardian.py</code>，默认关）。完整设计与验收标准见 <a href="batch-a/spec.md">batch-a/spec.md</a>；A1 两项人工演练与华泰条件单确认仍待执行。</p>
+<p>44.12.0 补齐批次 A 的四项硬门槛：节假日日历外置（<code>config/holidays.yaml</code>，实盘缺年份只禁开仓）、飞书告警外发（<code>runtime.alerts</code>，默认关）、<code>run_id</code> 贯穿事件/告警/状态、冷备守护（<code>tools/guardian.py</code>，默认关）。完整设计与验收标准见 <a href="project-review-2026/batch-a/spec.md">batch-a/spec.md</a>；A1 两项人工演练与华泰条件单确认仍待执行。</p>
 
 <div class="table-wrap">
 <table>
 <thead><tr><th style="width:26%">文档</th><th style="width:18%">定位</th><th>内容</th><th style="width:14%">状态</th></tr></thead>
 <tbody>
-<tr><td><a href="../../README.md">README.md</a></td><td>项目介绍</td><td>能做什么、怎么装、路线选择、配置、FAQ、文档索引</td><td><span class="badge b-ok">现行</span></td></tr>
-<tr><td><a href="../../CHANGELOG.md">CHANGELOG.md</a></td><td>版本日志</td><td>逐版本记录功能、修复与行为变化，最新 44.12.0</td><td><span class="badge b-ok">现行</span></td></tr>
-<tr><td><a href="../实盘交易简易说明书.md">实盘交易简易说明书.md</a></td><td>操作手册</td><td>盘前到收盘五步、CTP 四步上线、对账处理、止损边界、排错</td><td><span class="badge b-ok">现行</span></td></tr>
-<tr><td><a href="../配置说明书.md">配置说明书.md</a></td><td>控件字典</td><td>十个页签逐项编号说明；44.12.0 新增日历、告警外发、冷备守护配置（HD-14～HD-23）</td><td><span class="badge b-ok">现行</span></td></tr>
-<tr><td><a href="../策略编辑器使用说明.md">策略编辑器使用说明.md</a></td><td>DSL 手册</td><td>YAML 语法、指标库、五个内置模板、与 vnpy 原版对照</td><td><span class="badge b-ok">现行</span></td></tr>
-<tr><td><a href="../扩展能力规划.md">扩展能力规划.md</a></td><td>未来设计</td><td>重构方案第六条五项能力的详细设计，尚未实施</td><td><span class="badge b-ok">现行</span></td></tr>
-<tr><td><a href="../TODO.md">TODO.md</a></td><td>唯一待办</td><td>人工验收、CTP 上线、策略增强、评估缺口、运维与文档补齐</td><td><span class="badge b-ok">现行</span></td></tr>
-<tr><td><a href="../archive/">archive/</a></td><td>存档</td><td>系统蓝图、代码重构方案、策略基础逻辑、CTP 上线流程、旧操作说明书、specs 等</td><td><span class="badge">归档</span></td></tr>
+<tr><td><a href="../README.md">README.md</a></td><td>项目介绍</td><td>能做什么、怎么装、路线选择、配置、FAQ、文档索引</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../CHANGELOG.md">CHANGELOG.md</a></td><td>版本日志</td><td>逐版本记录功能、修复与行为变化，最新 44.12.0</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="实盘交易简易说明书.md">实盘交易简易说明书.md</a></td><td>操作手册</td><td>盘前到收盘五步、CTP 四步上线、对账处理、止损边界、排错</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="配置说明书.md">配置说明书.md</a></td><td>控件字典</td><td>十个页签逐项编号说明；44.12.0 新增日历、告警外发、冷备守护配置（HD-14～HD-23）</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="策略编辑器使用说明.md">策略编辑器使用说明.md</a></td><td>DSL 手册</td><td>YAML 语法、指标库、五个内置模板、与 vnpy 原版对照</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="扩展能力规划.md">扩展能力规划.md</a></td><td>未来设计</td><td>重构方案第六条五项能力的详细设计，尚未实施</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="TODO.md">TODO.md</a></td><td>唯一待办</td><td>人工验收、CTP 上线、策略增强、评估缺口、运维与文档补齐</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="archive/">archive/</a></td><td>存档</td><td>系统蓝图、代码重构方案、策略基础逻辑、CTP 上线流程、旧操作说明书、specs 等</td><td><span class="badge">归档</span></td></tr>
 <tr><td>已删除</td><td>过时</td><td>4 套日内策略、多因子复合 CTA、凯利突破、以损定开、长线箱体突破等策略说明（有效内容已并入编辑器手册与 TODO）</td><td><span class="badge">删除</span></td></tr>
 </tbody>
 </table>
@@ -821,9 +821,9 @@ flowchart LR
 <table>
 <thead><tr><th style="width:14%">优先级</th><th>事项</th><th style="width:20%">详见</th></tr></thead>
 <tbody>
-<tr><td>P0 收尾</td><td>T5.3 / T5.4 人工演练；华泰条件单能力确认；冷备守护演练；CTP 主通道自动降级</td><td><a href="../TODO.md">TODO 第一、二节</a></td></tr>
-<tr><td>P1</td><td>订单时间线、成交质量回流、连续偏离禁开总闸；策略增强（多因子相关性、凯利滚动胜率、箱体加仓/移仓、VPVR）</td><td><a href="../TODO.md">TODO 第一、三节</a></td></tr>
-<tr><td>P2</td><td>评估体系补齐（组合相关性/保证金/蒙特卡洛）、多账户 A/B、告警通道扩展（微信/钉钉/邮件）、故障恢复手册</td><td><a href="../TODO.md">TODO 第四、五节</a></td></tr>
+<tr><td>P0 收尾</td><td>T5.3 / T5.4 人工演练；华泰条件单能力确认；冷备守护演练；CTP 主通道自动降级</td><td><a href="TODO.md">TODO 第一、二节</a></td></tr>
+<tr><td>P1</td><td>订单时间线、成交质量回流、连续偏离禁开总闸；策略增强（多因子相关性、凯利滚动胜率、箱体加仓/移仓、VPVR）</td><td><a href="TODO.md">TODO 第一、三节</a></td></tr>
+<tr><td>P2</td><td>评估体系补齐（组合相关性/保证金/蒙特卡洛）、多账户 A/B、告警通道扩展（微信/钉钉/邮件）、故障恢复手册</td><td><a href="TODO.md">TODO 第四、五节</a></td></tr>
 </tbody>
 </table>
 
@@ -849,7 +849,7 @@ flowchart LR
 
 </div>
 
-<script src="./_shared/js/mermaid.min.js"></script>
-<script src="assets/report.js"></script>
+<script src="./project-review-2026/_shared/js/mermaid.min.js"></script>
+<script src="project-review-2026/assets/report.js"></script>
 </body>
 </html>
