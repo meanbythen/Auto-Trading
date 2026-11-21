@@ -12,6 +12,7 @@ import queue
 import threading
 import time
 import tkinter as tk
+from dataclasses import dataclass
 from tkinter import ttk
 
 from loguru import logger
@@ -155,27 +156,37 @@ def open_ctp_probe(master: tk.Misc) -> None:
     master._ctp_probe = window  # type: ignore[attr-defined]
 
 
+@dataclass
+class _QuoteRow:
+    """盘口一行。单合约就是只看第一行，多合约时每行各自保存。"""
+
+    symbol: tk.StringVar
+    last: tk.StringVar
+    bid: tk.StringVar
+    bid_vol: tk.StringVar
+    ask: tk.StringVar
+    ask_vol: tk.StringVar
+    upper: tk.StringVar
+    lower: tk.StringVar
+    quote_time: tk.StringVar
+    signature: tuple[str, ...] | None = None
+
+
 class CtpProbeWindow(tk.Toplevel):
     """CTP 交易窗口。仿真测试和以后实盘柜台用同一套按钮和表格。"""
+
+    QUOTE_ROWS = 5
 
     def __init__(self, master: tk.Misc) -> None:
         super().__init__(master)
         self.title("CTP 交易台（手工测开平撤；挂机请用启动常驻）")
-        self.geometry("1280x840")
+        self.geometry("1280x900")
         self.trader: CtpTrader | None = None
         self.md = None
         self.symbol = tk.StringVar(value="fu2701")
         self.price = tk.StringVar(value="")
         self.volume = tk.StringVar(value="1")
-        self.last = tk.StringVar(value="—")
-        self.bid = tk.StringVar(value="—")
-        self.ask = tk.StringVar(value="—")
-        self.upper = tk.StringVar(value="—")
-        self.lower = tk.StringVar(value="—")
-        self.quote_time = tk.StringVar(value="—")
-        self.local_time = tk.StringVar(value="—")
-        self.bid_vol = tk.StringVar(value="0")
-        self.ask_vol = tk.StringVar(value="0")
+        self._quote_rows: list[_QuoteRow] = []
         self.quote_hint = tk.StringVar(value="")
         self.account_line = tk.StringVar(value="还没登录")
         self.limit_line = tk.StringVar(value="")
@@ -187,7 +198,7 @@ class CtpProbeWindow(tk.Toplevel):
         self.contract_detail = tk.StringVar(value="登录后输入代码或前缀，点查询。再点一行，会填进上方合约框并查出保证金、手续费。")
         self._fund_values: dict[str, tk.StringVar] = {}
         self._filling_tree = False
-        self._followed_symbol = ""
+        self._followed_symbols: tuple[str, ...] = ()
         self._picked_order_ref = ""
         self._cost_loaded: set[str] = set()
         self._last_pick = ""
@@ -203,7 +214,6 @@ class CtpProbeWindow(tk.Toplevel):
         )
         self._go_live = load_state(self._root)
         self._huatai_vars: dict[str, tk.BooleanVar] = {}
-        self._shown_quote: tuple[str, ...] | None = None
         self._last_said = ""
         self._buttons: list[ttk.Button] = []
         self._busy = False
@@ -263,18 +273,49 @@ class CtpProbeWindow(tk.Toplevel):
 
         quotes = ttk.Frame(self)
         quotes.pack(fill="x", **pad)
-        for col, title, var, fill in (
-            (0, "最新", self.last, "last"),
-            (1, "买一", self.bid, "bid"),
-            (2, "买一量", self.bid_vol, None),
-            (3, "卖一", self.ask, "ask"),
-            (4, "卖一量", self.ask_vol, None),
-            (5, "涨停", self.upper, "upper"),
-            (6, "跌停", self.lower, "lower"),
-            (7, "行情时间", self.quote_time, None),
-            (8, "本机时间", self.local_time, None),
-        ):
-            self._quote_cell(quotes, col, title, var, fill)
+        titles = ("合约", "最新", "买一", "买一量", "卖一", "卖一量", "涨停", "跌停", "行情时间")
+        for col, title in enumerate(titles):
+            ttk.Label(quotes, text=title).grid(row=0, column=col, sticky="w", padx=6)
+        for index in range(self.QUOTE_ROWS):
+            row = _QuoteRow(
+                symbol=tk.StringVar(value="fu2701" if index == 0 else ""),
+                last=tk.StringVar(value="—"),
+                bid=tk.StringVar(value="—"),
+                bid_vol=tk.StringVar(value="0"),
+                ask=tk.StringVar(value="—"),
+                ask_vol=tk.StringVar(value="0"),
+                upper=tk.StringVar(value="—"),
+                lower=tk.StringVar(value="—"),
+                quote_time=tk.StringVar(value="—"),
+            )
+            self._quote_rows.append(row)
+            row.symbol.trace_add("write", lambda *_args, item=row: self._watch_symbol_edit(item))
+            ttk.Entry(quotes, textvariable=row.symbol, width=12).grid(
+                row=index + 1, column=0, sticky="w", padx=6, pady=2
+            )
+            for col, (var, fill) in enumerate(
+                (
+                    (row.last, "last"),
+                    (row.bid, "bid"),
+                    (row.bid_vol, None),
+                    (row.ask, "ask"),
+                    (row.ask_vol, None),
+                    (row.upper, "upper"),
+                    (row.lower, "lower"),
+                    (row.quote_time, None),
+                ),
+                start=1,
+            ):
+                self._quote_cell(quotes, index + 1, col, var, fill, index)
+        self.local_time = tk.StringVar(value="—")
+        ttk.Label(quotes, textvariable=self.local_time).grid(
+            row=self.QUOTE_ROWS + 1, column=8, sticky="w", padx=6
+        )
+        ttk.Label(
+            self,
+            text="点盘口数字会把这一行的合约和价格填进上方；只订阅填了代码的行。",
+            foreground="#666",
+        ).pack(anchor="w", padx=8)
         ttk.Label(self, textvariable=self.quote_hint, foreground="#666").pack(anchor="w", padx=8)
 
         buttons = ttk.Frame(self)
@@ -871,8 +912,8 @@ class CtpProbeWindow(tk.Toplevel):
 
         self._run_in_background("正在连接柜台，请稍等。窗口不会卡住。", work)
 
-    def _load_price_band(self, trader: CtpTrader) -> None:
-        symbol = self.symbol.get().strip() or "fu2701"
+    def _load_price_band(self, trader: CtpTrader, symbol: str = "") -> None:
+        symbol = (symbol or self.symbol.get().strip() or "fu2701").strip()
         ok, text = trader.gateway.query_price_band(symbol)
         if not ok:
             self._say(text)
@@ -884,8 +925,10 @@ class CtpProbeWindow(tk.Toplevel):
         if md is not None:
             # 柜台快照用来补涨跌停；缺卖一时不要把实时盘口擦掉。
             md.apply_tick(band, replace_empty=False)
-            if md.latest:
-                self._show_quote_soon(md.latest)
+            latest_for = getattr(md, "latest_for", None)
+            snapshot = latest_for(symbol) if callable(latest_for) else md.latest
+            if snapshot:
+                self._show_quote_soon(snapshot)
                 return
         self._show_quote_soon(band)
 
@@ -906,7 +949,7 @@ class CtpProbeWindow(tk.Toplevel):
 
             def work() -> None:
                 try:
-                    self._load_price_band(trader)
+                    self._load_price_band(trader, self.symbol.get())
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("补刷盘口失败: {}", exc)
 
@@ -918,6 +961,7 @@ class CtpProbeWindow(tk.Toplevel):
             # 自测只替换最底层柜台通信；盘口也来自该进程，绝不加载真实 CTP 行情客户端。
             self.md = None
             self._say("程序自测盘口来自本机仿真柜台，不连接 CTP 行情前置。")
+            self._ensure_top_row()
             self._load_price_band(trader)
             return
         from src.trader.ctp_md import CtpMdClient
@@ -928,25 +972,66 @@ class CtpProbeWindow(tk.Toplevel):
         self._say(message)
         if not ok:
             return
-        self._follow_symbol(trader)
+        self._follow_symbols(trader)
 
     def _resub(self) -> None:
         trader = self._need_login()
         if trader is None:
             return
-        self._follow_symbol(trader)
+        self._ensure_top_row()
+        self._follow_symbols(trader)
         self._load_price_band(trader)
 
-    def _follow_symbol(self, trader: CtpTrader) -> None:
-        symbol = self.symbol.get().strip() or "fu2701"
-        if self.md is None:
+    def _watch_symbols(self) -> list[str]:
+        """盘口里填了代码的行 + 上方当前下单合约。单合约只有一行。"""
+        symbols: list[str] = []
+        seen: set[str] = set()
+        for row in self._quote_rows:
+            text = row.symbol.get().strip()
+            key = symbol_key(text)
+            if text and key and key not in seen:
+                seen.add(key)
+                symbols.append(text)
+        top = self.symbol.get().strip()
+        if top and symbol_key(top) not in seen:
+            symbols.append(top)
+        return symbols
+
+    def _ensure_top_row(self) -> bool:
+        """当前下单合约不在盘口里时，放进第一个空行，保证看得到报价。"""
+        symbol_var = getattr(self, "symbol", None)
+        rows = getattr(self, "_quote_rows", [])
+        if symbol_var is None or not rows:
+            return False
+        top = symbol_var.get().strip()
+        if not top:
+            return False
+        key = symbol_key(top)
+        for row in rows:
+            if key and symbol_key(row.symbol.get()) == key:
+                return True
+        for row in rows:
+            if not row.symbol.get().strip():
+                row.symbol.set(top)
+                return True
+        self._say(f"5 行盘口都填了合约，{top} 仍会订阅，但没有单独一行；先清空一行再加。")
+        return False
+
+    def _follow_symbols(self, trader: CtpTrader) -> None:
+        """按盘口清单一次订阅。单合约就是清单里只有一个。"""
+        self._ensure_top_row()
+        self._follow_symbols_list(trader, self._watch_symbols())
+
+    def _follow_symbols_list(self, trader: CtpTrader, symbols: list[str]) -> None:
+        """订阅已经取好的合约清单，可在后台线程调用，不碰 Tk 变量。"""
+        if self.md is None or not symbols:
             return
-        key = symbol_key(symbol)
-        if key and key == self._followed_symbol:
+        key = tuple(symbol_key(symbol) for symbol in symbols)
+        if key == self._followed_symbols:
             return
-        ok, message = self.md.subscribe(symbol)
+        ok, message = self.md.subscribe_many(symbols)
         if ok:
-            self._followed_symbol = key
+            self._followed_symbols = key
         self._say(message if ok else ("订阅失败：" + message))
 
     def _note_pick(self, signature: str) -> bool:
@@ -967,51 +1052,66 @@ class CtpProbeWindow(tk.Toplevel):
             self.volume.set(str(int(lots)))
         trader = self.trader
         if trader is not None and trader.gateway.session.ready:
-            self._follow_symbol(trader)
+            self._follow_symbols(trader)
 
-    def _quote_cell(self, parent: ttk.Frame, col: int, title: str, var: tk.StringVar, fill: str | None) -> None:
+    def _quote_cell(
+        self,
+        parent: ttk.Frame,
+        row: int,
+        col: int,
+        var: tk.StringVar,
+        fill: str | None,
+        index: int,
+    ) -> None:
         """
-        盘口一格。买一、卖一、最新整块都能点，把价格填进上面的价格框。
+        盘口一格。买一、卖一、最新整块都能点，把这一行的合约和价格填进上面。
         原理：ttk 标签可点面积太小，这里用普通标签加大热区，手形光标表示能点。
         """
         box = tk.Frame(parent, cursor="hand2" if fill else "")
-        box.grid(row=0, column=col, padx=8, pady=2)
-        head = title + "（点填价）" if fill else title
-        items = [
-            tk.Label(box, text=head, fg="#555" if fill else None),
-            tk.Label(box, textvariable=var, font=("Segoe UI", 11, "bold"), fg="#0b57d0" if fill else None),
-        ]
-        for item in items:
-            item.pack()
-            if fill:
-                item.configure(cursor="hand2")
-                item.bind("<Button-1>", lambda _e, kind=fill: self._use_quote(kind))
+        box.grid(row=row, column=col, padx=8, pady=2)
+        item = tk.Label(
+            box,
+            textvariable=var,
+            font=("Segoe UI", 10, "bold"),
+            fg="#0b57d0" if fill else None,
+            width=8,
+            anchor="e",
+        )
+        item.pack()
         if fill:
-            box.bind("<Button-1>", lambda _e, kind=fill: self._use_quote(kind))
+            item.configure(cursor="hand2")
+            item.bind("<Button-1>", lambda _e, kind=fill, idx=index: self._use_quote(kind, idx))
+            box.bind("<Button-1>", lambda _e, kind=fill, idx=index: self._use_quote(kind, idx))
 
-    def _use_quote(self, which: str) -> None:
+    def _use_quote(self, which: str, index: int) -> None:
+        if not 0 <= index < len(self._quote_rows):
+            return
+        row = self._quote_rows[index]
+        symbol = row.symbol.get().strip()
         mapping = {
-            "bid": self.bid,
-            "ask": self.ask,
-            "last": self.last,
-            "upper": self.upper,
-            "lower": self.lower,
+            "bid": row.bid,
+            "ask": row.ask,
+            "last": row.last,
+            "upper": row.upper,
+            "lower": row.lower,
         }
         names = {"bid": "买一", "ask": "卖一", "last": "最新", "upper": "涨停", "lower": "跌停"}
         var = mapping.get(which)
         text = var.get() if var is not None else ""
         if text and text != "—":
+            if symbol:
+                self.symbol.set(symbol)
             self.price.set(text)
             self.price_mode.set("手动")
-            self._say(f"已把{names.get(which, which)} {text} 填进价格框。")
+            self._say(f"已切到 {symbol or '当前合约'}，并把{names.get(which, which)} {text} 填进价格框。")
             return
         missing = {
-            "ask": "现在没有卖一。盘口没人挂卖单。卖开请点买一；买开才用卖一。",
-            "bid": "现在没有买一。盘口没人挂买单。买开请点卖一。",
-            "upper": "现在没有涨停价。请先订阅行情。",
-            "lower": "现在没有跌停价。请先订阅行情。",
+            "ask": "这一行现在没有卖一。盘口没人挂卖单。卖开请点买一；买开才用卖一。",
+            "bid": "这一行现在没有买一。盘口没人挂买单。买开请点卖一。",
+            "upper": "这一行现在没有涨停价。请先订阅行情。",
+            "lower": "这一行现在没有跌停价。请先订阅行情。",
         }
-        self._say(missing.get(which, "现在没有最新价。请先订阅行情。"))
+        self._say(missing.get(which, "这一行现在没有最新价。请先订阅行情。"))
 
     def _show_quote_soon(self, row: dict) -> None:
         copied = dict(row)
@@ -1019,9 +1119,41 @@ class CtpProbeWindow(tk.Toplevel):
 
     def _refresh_quote(self) -> None:
         md = self.md
-        if md is None or md.latest is None:
+        if md is None:
             return
-        self._show_quote(md.latest)
+        latest_for = getattr(md, "latest_for", None)
+        for row in self._quote_rows:
+            symbol = row.symbol.get().strip()
+            if not symbol:
+                continue
+            quote = latest_for(symbol) if callable(latest_for) else getattr(md, "latest", None)
+            if quote:
+                self._show_quote(quote)
+
+    def _quote_row(self, symbol: str) -> _QuoteRow | None:
+        key = symbol_key(symbol)
+        if not key:
+            return None
+        for row in self._quote_rows:
+            if symbol_key(row.symbol.get()) == key:
+                return row
+        return None
+
+    def _clear_quote_row(self, row: _QuoteRow) -> None:
+        row.signature = None
+        row.last.set("—")
+        row.bid.set("—")
+        row.bid_vol.set("0")
+        row.ask.set("—")
+        row.ask_vol.set("0")
+        row.upper.set("—")
+        row.lower.set("—")
+        row.quote_time.set("—")
+
+    def _watch_symbol_edit(self, row: _QuoteRow) -> None:
+        """改了合约代码就清掉旧报价，避免把上一个合约的价格填进下单框。"""
+        if row.signature and symbol_key(row.signature[0]) != symbol_key(row.symbol.get()):
+            self._clear_quote_row(row)
 
     def _show_quote(self, row: dict) -> None:
         if not self.winfo_exists():
@@ -1029,6 +1161,9 @@ class CtpProbeWindow(tk.Toplevel):
         from src.trader.ctp_md import describe_quote
 
         view = describe_quote(row)
+        target = self._quote_row(str(view.get("symbol") or ""))
+        if target is None:
+            return
         signature = (
             str(view.get("symbol") or ""),
             str(view.get("last_text") or "—"),
@@ -1040,21 +1175,22 @@ class CtpProbeWindow(tk.Toplevel):
             str(view.get("bid_vol_text") or "0"),
             str(view.get("ask_vol_text") or "0"),
         )
-        if signature == self._shown_quote:
+        if signature == target.signature:
             return
-        self._shown_quote = signature
-        self.last.set(signature[1])
-        self.bid.set(signature[2])
-        self.ask.set(signature[3])
-        self.upper.set(signature[4])
-        self.lower.set(signature[5])
-        self.quote_time.set(signature[6])
-        self.bid_vol.set(signature[7])
-        self.ask_vol.set(signature[8])
+        target.signature = signature
+        target.last.set(signature[1])
+        target.bid.set(signature[2])
+        target.ask.set(signature[3])
+        target.upper.set(signature[4])
+        target.lower.set(signature[5])
+        target.quote_time.set(signature[6])
+        target.bid_vol.set(signature[7])
+        target.ask_vol.set(signature[8])
+        self.local_time.set(time.strftime("%H:%M:%S"))
         if signature[3] == "—":
-            self.quote_hint.set("卖一是横线=盘口暂时没人挂卖。卖开请点买一填价（对手价），不要等卖一。")
+            self.quote_hint.set("卖一是横线=这一行盘口暂时没人挂卖。卖开请点买一填价（对手价），不要等卖一。")
         else:
-            self.quote_hint.set("点蓝色的最新/买一/卖一/涨停/跌停，价格会填进上面的框。")
+            self.quote_hint.set("点蓝色的最新/买一/卖一/涨停/跌停，会把这一行的合约和价格填进上面的框。")
         # 盘口只画在交易台数字上。买一卖一每跳一次都写日志，运行窗口会被刷满。
 
     def _paint_blotter(self) -> None:
@@ -1164,30 +1300,32 @@ class CtpProbeWindow(tk.Toplevel):
             return ""
         return str(values[index] or "")
 
+    def _active_quote_row(self) -> _QuoteRow | None:
+        """只认当前下单合约所在的行。行里没有就不自动填价，避免拿错合约。"""
+        return self._quote_row(self.symbol.get())
+
     def _pos_rows(self, gateway) -> list[tuple[str, ...]]:
         rows: list[tuple[str, ...]] = []
-        last = None
-        upper = None
-        lower = None
-        try:
-            last = float(self.last.get())
-        except ValueError:
-            last = None
-        try:
-            upper = float(self.upper.get())
-        except ValueError:
-            upper = None
-        try:
-            lower = float(self.lower.get())
-        except ValueError:
-            lower = None
-        watched = symbol_key(self.symbol.get())
         items: list[dict[str, str]] = []
         for name in sorted(gateway.positions):
             view = gateway.positions[name]
-            quote_last = last if watched == name else None
-            quote_upper = upper if watched == name else None
-            quote_lower = lower if watched == name else None
+            quote_row = self._quote_row(name)
+            quote_last = None
+            quote_upper = None
+            quote_lower = None
+            if quote_row is not None:
+                try:
+                    quote_last = float(quote_row.last.get())
+                except ValueError:
+                    quote_last = None
+                try:
+                    quote_upper = float(quote_row.upper.get())
+                except ValueError:
+                    quote_upper = None
+                try:
+                    quote_lower = float(quote_row.lower.get())
+                except ValueError:
+                    quote_lower = None
             for item in split_position_rows(
                 name,
                 view,
@@ -1432,12 +1570,16 @@ class CtpProbeWindow(tk.Toplevel):
         mode = self.price_mode.get()
         if mode == "手动":
             return True
+        row = self._active_quote_row()
+        if row is None:
+            self._say("还没有盘口行，请先订阅行情。")
+            return False
         if mode == "最新价":
-            text = self.last.get()
+            text = row.last.get()
         elif side == "buy_open" or (side == "close" and position_side == "short"):
-            text = self.ask.get()
+            text = row.ask.get()
         else:
-            text = self.bid.get()
+            text = row.bid.get()
         if not text or text == "—":
             self._say("还没有报价，请先订阅行情，或改回手动填价格。")
             return False
@@ -1496,7 +1638,8 @@ class CtpProbeWindow(tk.Toplevel):
         return None
 
     def _quote_last_price(self) -> float:
-        text = str(self.last.get() or "").strip()
+        row = self._active_quote_row()
+        text = str(row.last.get() or "").strip() if row is not None else ""
         if not text or text == "—":
             return 0.0
         try:
@@ -1674,9 +1817,11 @@ class CtpProbeWindow(tk.Toplevel):
         trader = self._ensure()
         if trader is None:
             return
+        self._ensure_top_row()
+        followed = self._watch_symbols()
 
         def work() -> None:
-            self._follow_symbol(trader)
+            self._follow_symbols_list(trader, followed)
             labels = {"buy_open": "买开", "sell_open": "卖开", "close": "平仓"}
             for index, step in enumerate(steps):
                 side = str(step.get("side") or "")
