@@ -50,6 +50,7 @@ from src.trader.ctp_logic import (
     overlay_ctp_profile,
     symbol_key,
 )
+from src.trader.ctp_symbols import ctp_instrument_id
 from src.trader.ctp_trader import CtpTrader
 from src.domain import trading_account as ta
 from src.trader.go_live import (
@@ -277,7 +278,12 @@ class CtpProbeWindow(tk.Toplevel):
         form.pack(fill="x", **pad)
         ttk.Label(form, text="合约").grid(row=0, column=0, sticky="w")
         ttk.Entry(form, textvariable=self.symbol, width=12).grid(row=0, column=1, sticky="w")
-        ttk.Button(form, text="订阅行情", command=self._resub).grid(row=0, column=2, padx=4)
+        sub_buttons = ttk.Frame(form)
+        sub_buttons.grid(row=0, column=2, padx=4)
+        ttk.Button(sub_buttons, text="订阅行情", command=self._resub).pack(side="left")
+        ttk.Button(sub_buttons, text="订阅诊断", command=self._sub_diagnose).pack(
+            side="left", padx=(4, 0)
+        )
         ttk.Label(form, text="价格").grid(row=0, column=3, sticky="w")
         ttk.Entry(form, textvariable=self.price, width=10).grid(row=0, column=4, sticky="w")
         ttk.Label(form, text="手数").grid(row=0, column=5, sticky="w")
@@ -1012,6 +1018,32 @@ class CtpProbeWindow(tk.Toplevel):
         self._ensure_top_row()
         self._follow_symbols(trader)
         self._load_price_band(trader)
+
+    def _sub_diagnose(self) -> None:
+        """逐合约报柜台应答：有没有被接受、多久没来行情。验收配额和权限用。"""
+        if self.md is None:
+            self._say("还没有行情连接。请先连接登录，再点订阅行情。")
+            return
+        symbols = self._watch_symbols()
+        if not symbols:
+            self._say("盘口和上方合约都是空的，没有可诊断的订阅。")
+            return
+        status = dict(getattr(self.md, "sub_status", {}) or {})
+        lines = [f"订阅诊断（{len(symbols)} 个合约）："]
+        for symbol in symbols:
+            code = ctp_instrument_id(symbol)
+            state = status.get(code.upper())
+            if state is None:
+                lines.append(f"{code}：柜台还没回应")
+                continue
+            ok, message = state
+            if not ok:
+                lines.append(f"{code}：被拒绝，{message or '柜台没有说明原因'}")
+                continue
+            stale = float(self.md.stale_seconds_for(symbol))
+            age = "还没收到行情" if stale >= 9999 else f"{stale:.0f} 秒前有行情"
+            lines.append(f"{code}：已接受，{age}")
+        self._say("\n".join(lines))
 
     def _watch_symbols(self) -> list[str]:
         """盘口里填了代码的行 + 上方当前下单合约。单合约只有一行。"""

@@ -25,6 +25,34 @@ def test_desk_watchlist_current_symbol_first() -> None:
     assert watch_seed({"trade": {}, "strategy": {"symbols": []}}) == ["fu2701"]
 
 
+def test_sub_diagnose_reports_counter_reply_per_symbol() -> None:
+    """订阅诊断要逐合约报：被拒原因、多久没来行情。"""
+    window = object.__new__(CtpProbeWindow)
+    window._quote_rows = [
+        SimpleNamespace(symbol=SimpleNamespace(get=lambda code=code: code))
+        for code in ("fu2701", "LH2701", "jd2612")
+    ]
+    window.symbol = SimpleNamespace(get=lambda: "fu2701")
+    window.md = SimpleNamespace(
+        sub_status={
+            "FU2701": (True, ""),
+            "LH2701": (False, "CTP:没有报备行情权限"),
+            "JD2612": (True, ""),
+        },
+        stale_seconds_for=lambda symbol: 3.0 if symbol == "fu2701" else 9999.0,
+    )
+    said: list[str] = []
+    window._say = said.append
+
+    window._sub_diagnose()
+
+    text = said[0]
+    assert "订阅诊断（3 个合约）" in text
+    assert "fu2701：已接受，3 秒前有行情" in text
+    assert "lh2701：被拒绝，CTP:没有报备行情权限" in text
+    assert "jd2612：已接受，还没收到行情" in text
+
+
 def test_desk_keeps_resident_wait_and_auto_cancel() -> None:
     """交易台只换操作账、关掉模拟，不得改短等待或关掉超时撤单。"""
     cfg = prepare_live_ctp_cfg(
