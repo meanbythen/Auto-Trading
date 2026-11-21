@@ -71,6 +71,31 @@ def test_apply_runtime_config_updates_max_order_volume() -> None:
     assert bot.trader.settings.max_order_volume == 5
 
 
+def test_apply_runtime_config_keeps_broker_profile_volume_cap() -> None:
+    """公共上限 20、当前档案上限 5 时，热更新不能把运行上限放大到 20。"""
+    bot = _bot()
+    bot._refresh_sessions = lambda: None  # type: ignore[method-assign]
+    bot.sync_risk_limits = lambda value: None  # type: ignore[method-assign]
+    bot.trader = SimpleNamespace(settings=SimpleNamespace(max_order_volume=2))  # type: ignore[attr-defined]
+
+    bot.apply_runtime_config(
+        {
+            "trade": {
+                "ctp": {
+                    "max_order_volume": 20,
+                    "ctp_profile": "huatai_sim",
+                    "account_kind": "sim",
+                    "ctp_profiles": {
+                        "huatai_sim": {"kind": "sim", "max_order_volume": 5},
+                    },
+                }
+            }
+        }
+    )
+
+    assert bot.trader.settings.max_order_volume == 5
+
+
 def test_positions_snapshot_is_a_copy() -> None:
     bot = _bot()
     position = SimpleNamespace(side="long", volume=2, entry_price=3000.0, opened_at="2026-11-20T09:00")

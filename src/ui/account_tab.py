@@ -504,11 +504,10 @@ class AccountTabMixin:
         return amount
 
 
-    def _commit_signal_book(self, book, note: str) -> None:
-        """保存账本，并把新余额写进配置和正在跑的程序。"""
-        from src.account.signal_book import save_manual, write_capital_to_config
+    def _after_signal_book_save(self, balance: float, note: str) -> None:
+        """账本保存并释放锁后，再写配置、同步运行状态并刷新界面。"""
+        from src.account.signal_book import write_capital_to_config
 
-        balance = save_manual(self.root_dir, book)
         write_capital_to_config(balance)
         self._apply_book_balance(balance)
         self._refresh_signal_view()
@@ -551,7 +550,7 @@ class AccountTabMixin:
         """
         from tkinter import messagebox
 
-        from src.account.signal_book import load_book, start_new_period
+        from src.account.signal_book import balance_of, load_book, start_new_period
         from src.version import read_version
 
         try:
@@ -579,7 +578,8 @@ class AccountTabMixin:
         note = f"已开始新账期，初始资金 {amount:g} 元。新存档 data/signal_periods/{book.get('period_file')}"
         if archived is not None:
             note += f"。上一账期已存档 {archived.name}"
-        self._commit_signal_book(book, note)
+        # start_new_period 已在账本锁内存档并保存，不能重复写回而覆盖随后追加的成交。
+        self._after_signal_book_save(balance_of(book), note)
 
 
     def _on_signal_deposit(self) -> None:
@@ -596,7 +596,7 @@ class AccountTabMixin:
         """入金和出金共用。账本还没有就先用当前初始资金建一本。"""
         from tkinter import messagebox
 
-        from src.account.signal_book import add_cash, balance_of
+        from src.account.signal_book import add_cash, balance_of, book_lock, save_manual
         from src.account.workspace import is_ctp_book, load_active_id
 
         if is_ctp_book(load_active_id(self.root_dir)):
@@ -609,19 +609,23 @@ class AccountTabMixin:
             if kind == "withdraw" and amount > balance_of(book) + 0.001:
                 if not messagebox.askyesno("出金", "这笔出金比当前余额还大，余额会变成负数。仍要记吗？"):
                     return
-            add_cash(book, kind, amount)
         except ValueError:
             messagebox.showerror("还不能记", f"{label}请填一个大于 0 的数。")
             return
+        # 确认框不持锁；确认后重新读最新账本，读改写与成交记账共用一把锁。
+        with book_lock():
+            book = self._signal_book_or_new()
+            add_cash(book, kind, amount)
+            balance = save_manual(self.root_dir, book)
         self.ac_cash_var.set("")
-        self._commit_signal_book(book, f"信号账户已记{label} {amount:g} 元")
+        self._after_signal_book_save(balance, f"信号账户已记{label} {amount:g} 元")
 
 
     def _on_signal_settle(self) -> None:
         """每日结算：差额单独记一笔，开平仓价格不动。"""
         from tkinter import messagebox
 
-        from src.account.signal_book import settle_to
+        from src.account.signal_book import book_lock, save_manual, settle_to
         from src.account.workspace import is_ctp_book, load_active_id
 
         if is_ctp_book(load_active_id(self.root_dir)):
@@ -633,14 +637,18 @@ class AccountTabMixin:
         except ValueError:
             messagebox.showerror("还不能结算", "实际余额请填一个数。")
             return
-        book = self._signal_book_or_new()
-        delta = settle_to(book, target)
-        if abs(delta) < 0.005:
+        balance = None
+        with book_lock():
+            book = self._signal_book_or_new()
+            delta = settle_to(book, target)
+            if abs(delta) >= 0.005:
+                balance = save_manual(self.root_dir, book)
+        if balance is None:
             messagebox.showinfo("不用调整", "当前余额已经和你填的数一样。")
             self._refresh_signal_view()
             return
         self.ac_settle_var.set("")
-        self._commit_signal_book(book, f"每日结算已把余额调到 {target:g} 元，差额 {delta:g} 元")
+        self._after_signal_book_save(balance, f"每日结算已把余额调到 {target:g} 元，差额 {delta:g} 元")
 
 
     def _account_action_row(self, parent, label: str, var, buttons: list[tuple[str, Any, bool]]) -> None:
@@ -1000,6 +1008,19 @@ class AccountTabMixin:
                 )
             self._set_result_text(self.ac_result_box, empty)
             return
+        if str(book.get("funding") or "") == "ctp":
+            from src.account.signal_book import book_lock, repair_ctp_daily, save_book
+
+            # 结算后空壳快照会把日历盖成 0；锁内重读最新账本，再按历史纠正并写回。
+            with book_lock():
+                latest = load_book(self.root_dir)
+                if latest is not None:
+                    book = latest
+                    if repair_ctp_daily(book):
+                        try:
+                            save_book(self.root_dir, book)
+                        except Exception:  # noqa: BLE001
+                            pass
         path = book_path(self.root_dir)
         try:
             self._signal_book_mtime = path.stat().st_mtime
@@ -1013,14 +1034,8 @@ class AccountTabMixin:
             initial = float(book.get("initial_capital") or 0)
             self.ac_capital_var.set(str(int(initial)) if initial == int(initial) else f"{initial:.2f}")
         if str(book.get("funding") or "") == "ctp":
-            from src.account.signal_book import describe_ctp_funds, repair_ctp_daily, save_book
+            from src.account.signal_book import describe_ctp_funds
 
-            # 结算后空壳快照会把日历盖成 0；打开本页时按历史纠正并写回。
-            if repair_ctp_daily(book):
-                try:
-                    save_book(self.root_dir, book)
-                except Exception:  # noqa: BLE001
-                    pass
             if hasattr(self, "ac_ledger_title"):
                 self.ac_ledger_title.configure(text="柜台资金与程序成交")
             self._set_result_text(self.ac_result_box, describe_ctp_funds(book))

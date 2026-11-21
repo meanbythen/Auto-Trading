@@ -550,3 +550,87 @@ def test_duplicate_display_name_gets_account_suffix(tmp_path) -> None:
 
     assert labels(tmp_path) == ["同名 · 仿真（acc_a_01）", "同名 · 仿真（acc_b_01）"]
     assert resolve_choice("同名 · 仿真（acc_b_01）", tmp_path) == "acc_b_01"
+
+
+def test_account_cash_save_does_not_overwrite_concurrent_trade(tmp_path, monkeypatch) -> None:
+    """界面保存出入金时到达的成交，必须和这笔资金变动一起留在账本里。"""
+    import threading
+
+    import src.account.signal_book as signal_book
+    from src.account.signal_book import balance_of
+    from src.ui.account_tab import AccountTabMixin
+
+    record_program_trade(
+        tmp_path,
+        initial_capital=10000,
+        symbol="bu2612",
+        offset="开仓",
+        direction="多",
+        price=3500,
+        volume=1,
+        multiplier=10,
+        fill_key="open-before-cash",
+    )
+
+    class _Var:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def get(self) -> str:
+            return self.value
+
+        def set(self, value: str) -> None:
+            self.value = value
+
+    tab = AccountTabMixin.__new__(AccountTabMixin)
+    tab.root_dir = tmp_path
+    tab.ac_cash_var = _Var("500")
+    saved_balances: list[float] = []
+    tab._after_signal_book_save = lambda balance, _note: saved_balances.append(balance)  # type: ignore[method-assign]
+
+    original_add_cash = signal_book.add_cash
+    threads: list[threading.Thread] = []
+    errors: list[Exception] = []
+
+    def record_close() -> None:
+        try:
+            record_program_trade(
+                tmp_path,
+                initial_capital=10000,
+                symbol="bu2612",
+                offset="平仓",
+                direction="多",
+                price=3510,
+                volume=1,
+                multiplier=10,
+                fill_key="close-during-cash-save",
+            )
+        except Exception as exc:  # noqa: BLE001 - 把线程异常带回主测试线程
+            errors.append(exc)
+
+    def add_cash_with_concurrent_trade(book, kind, amount, **kwargs):
+        thread = threading.Thread(target=record_close)
+        threads.append(thread)
+        thread.start()
+        # 修复后成交线程在这里等账本锁；旧实现会先写完成交，再被旧快照覆盖。
+        thread.join(timeout=0.2)
+        return original_add_cash(book, kind, amount, **kwargs)
+
+    monkeypatch.setattr(signal_book, "add_cash", add_cash_with_concurrent_trade)
+    tab._on_signal_cash("deposit", "入金")
+    for thread in threads:
+        thread.join(timeout=5)
+        assert not thread.is_alive()
+
+    assert errors == []
+    assert saved_balances == [10500]
+    assert tab.ac_cash_var.get() == ""
+    saved = load_book(tmp_path)
+    assert saved is not None
+    assert [row["fill_key"] for row in saved["trades"]] == [
+        "open-before-cash",
+        "close-during-cash-save",
+    ]
+    assert [row["kind"] for row in saved["cashflows"]] == ["deposit"]
+    assert saved["cashflows"][0]["amount"] == 500
+    assert balance_of(saved) == 10600

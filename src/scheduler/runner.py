@@ -1466,12 +1466,19 @@ class TradingBot(
                 self.cfg.setdefault("risk", {})["contracts"] = contracts
             self._refresh_sessions()
             self.sync_risk_limits(limit)
-            # 单笔最大手数改了要立刻生效；否则要等下次重连才更新。
+            # 单笔最大手数改了要立刻生效；公共配置与当前券商档案取小，和启动时一致。
             ctp = (cfg.get("trade") or {}).get("ctp") or {}
-            try:
-                max_volume = max(1, int(ctp.get("max_order_volume") or 20))
-            except (TypeError, ValueError):
-                max_volume = 20
+            from src.trader.ctp_limits import effective_max_order_volume
+            from src.trader.ctp_profile import resolve_ctp_profile
+
+            resolved = resolve_ctp_profile(
+                ctp,
+                account=cfg.get("account") or {},
+                kind=ctp.get("account_kind"),
+            )
+            max_volume = effective_max_order_volume(
+                ctp.get("max_order_volume"), resolved.get("max_order_volume")
+            )
             gateway = getattr(getattr(self, "trader", None), "gateway", None)
             settings = getattr(gateway, "settings", None) or getattr(
                 getattr(self, "trader", None), "settings", None
