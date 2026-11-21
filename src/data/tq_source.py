@@ -405,6 +405,173 @@ def _wait_update(client: Any, deadline: float) -> None:
         client.wait_update()
 
 
+def _client_serials(client: Any) -> dict[tuple[str, int], tuple[int, Any]]:
+    """每个天勤连接自己的 K 线序列缓存。重连换了对象，旧序列自然丢掉。"""
+    try:
+        cache = getattr(client, "_at_kline_serials", None)
+        if cache is None:
+            cache = {}
+            setattr(client, "_at_kline_serials", cache)
+        return cache
+    except Exception:  # noqa: BLE001
+        # 极少数封装不允许挂属性，退化成每次都新建，不影响结果。
+        return {}
+
+
+def _fill_history(
+    client: Any,
+    codes: dict[str, str],
+    serials: dict[str, Any],
+    seconds: int,
+    size: int,
+) -> None:
+    """等这些序列的历史填满。多个合约共用同一次 wait_update。"""
+    filled: dict[str, int] = {}
+    unknown = False
+    for symbol in codes:
+        count = _filled_close_count(serials[symbol])
+        if count is None:
+            unknown = True
+            filled[symbol] = 0
+        else:
+            filled[symbol] = int(count)
+    if unknown:
+        _wait_update(client, time.time() + 3)
+        for symbol in codes:
+            count = _filled_close_count(serials[symbol])
+            if count is not None:
+                filled[symbol] = int(count)
+    skip: set[str] = set()
+    for symbol, code in codes.items():
+        known_short = _HISTORY_SHORT.get((code, seconds))
+        if known_short is not None and filled[symbol] >= known_short and filled[symbol] < size:
+            skip.add(symbol)
+    stalled = {symbol: 0 for symbol in codes}
+    deadline = time.time() + 15
+    while time.time() < deadline:
+        active = [symbol for symbol in codes if symbol not in skip and filled[symbol] < size]
+        if not active:
+            break
+        previous = {symbol: filled[symbol] for symbol in active}
+        _wait_update(client, min(time.time() + 1, deadline))
+        for symbol in active:
+            count = _filled_close_count(serials[symbol])
+            if count is None:
+                count = previous[symbol]
+            if int(count) <= previous[symbol]:
+                stalled[symbol] += 1
+                filled[symbol] = int(count)
+                if stalled[symbol] >= _HISTORY_STALL_WAITS:
+                    skip.add(symbol)
+            else:
+                stalled[symbol] = 0
+                filled[symbol] = int(count)
+    for symbol, code in codes.items():
+        hist_key = (code, seconds)
+        count = filled[symbol]
+        if count < size:
+            _HISTORY_SHORT[hist_key] = count
+            warn_key = (code, seconds, count, size)
+            if warn_key not in _HISTORY_SHORT_WARNED:
+                _HISTORY_SHORT_WARNED.add(warn_key)
+                logger.warning(
+                    "天勤K线 {} 只填满 {}/{} 根，按现有数据继续（更早的历史可能没有了）",
+                    code,
+                    count,
+                    size,
+                )
+        else:
+            _HISTORY_SHORT.pop(hist_key, None)
+
+
+def fetch_frames(
+    symbols: Any,
+    period: str,
+    *,
+    limit: int = 200,
+    user: str = "",
+    password: str = "",
+    api: Any | None = None,
+) -> dict[str, pd.DataFrame]:
+    """向天勤要多个合约同一周期的 K 线，单合约就是列表里只有一个元素。
+
+    多个合约共用一次 wait_update；序列按 (天勤代码, 周期) 复用，
+    不在每一轮重新创建，避免扫描多品种时序列数量不断累积。
+    """
+    wanted: list[str] = []
+    for item in symbols:
+        text = str(item or "").strip()
+        if text and text not in wanted:
+            wanted.append(text)
+    if not wanted:
+        return {}
+    code_period = canonical_period(period)
+    if code_period == "W":
+        # 免费接口不能直接要一周秒数。先拿日线，再收到周五，和新浪周线同一套收法。
+        daily = fetch_frames(
+            wanted,
+            "D",
+            limit=max(int(limit), 80),
+            user=user,
+            password=password,
+            api=api,
+        )
+        from src.data.periods import resample_ohlc
+
+        weeks: dict[str, pd.DataFrame] = {}
+        for symbol in wanted:
+            frame = daily.get(symbol)
+            if frame is None:
+                continue
+            week = resample_ohlc(frame, "W")
+            if week is None or len(week) == 0:
+                if len(wanted) == 1:
+                    raise RuntimeError("天勤日线合成周线后没有K线")
+                logger.warning("天勤周线合成失败，跳过 {}", symbol)
+                continue
+            logger.info("天勤周线 {} 由日线合成 {} 根（日线 {} 根）", symbol, len(week), len(frame))
+            weeks[symbol] = week
+        return weeks
+    seconds = period_seconds(period)
+    # 天勤服务端自己有上限（免费账号实测约 10000 根），超过会被静默截断；
+    # 夹取到上限，否则 while filled < size 会恒成立、等满 15 秒超时。
+    size = max(10, min(int(limit), _TQ_MAX_SIZE))
+    codes = {symbol: tq_symbol(symbol) for symbol in wanted}
+    # 登录不持 _LOCK：_get_api 要联网握手，回测首次登录时不能把实盘扫描挡在锁外。
+    client = api if api is not None else _get_api(user, password)
+    with _LOCK:
+        try:
+            cache = _client_serials(client)
+            serials: dict[str, Any] = {}
+            for symbol, code in codes.items():
+                key = (code, seconds)
+                cached = cache.get(key)
+                if cached is None or cached[0] < size:
+                    klines = client.get_kline_serial(code, seconds, data_length=size)
+                    cache[key] = (size, klines)
+                else:
+                    klines = cached[1]
+                serials[symbol] = klines
+            # 等服务端把历史填满再转换：服务端分批下发，只等一次可能拿到半截数据。
+            _fill_history(client, codes, serials, seconds, size)
+        except Exception:
+            # 连接断了就丢掉，下一轮重新登录，不要拿着死连接一直重试。
+            if api is None:
+                reset_api()
+            raise
+        frames: dict[str, pd.DataFrame] = {}
+        for symbol in wanted:
+            try:
+                frames[symbol] = frame_from_klines(serials[symbol], seconds)
+            except Exception:
+                if len(wanted) == 1:
+                    raise
+                logger.warning("天勤K线 {} 没有可用数据，跳过", codes[symbol])
+        for symbol, frame in frames.items():
+            logger.info("天勤K线 {} {} {} 根", codes[symbol], period, len(frame))
+        return frames
+
+
 def fetch_frame(
     symbol: str,
     period: str,
@@ -414,72 +581,18 @@ def fetch_frame(
     password: str = "",
     api: Any | None = None,
 ) -> pd.DataFrame:
-    """向天勤要这一段 K 线。测试可以传入假的 api，不必真的登录。"""
-    code_period = canonical_period(period)
-    if code_period == "W":
-        # 免费接口不能直接要一周秒数。先拿日线，再收到周五，和新浪周线同一套收法。
-        daily = fetch_frame(symbol, "D", limit=max(int(limit), 80), user=user, password=password, api=api)
-        from src.data.periods import resample_ohlc
-
-        week = resample_ohlc(daily, "W")
-        if week is None or len(week) == 0:
-            raise RuntimeError("天勤日线合成周线后没有K线")
-        logger.info("天勤周线由日线合成 {} 根（日线 {} 根）", len(week), len(daily))
-        return week
-    seconds = period_seconds(period)
-    code = tq_symbol(symbol)
-    # 天勤服务端自己有上限（免费账号实测约 10000 根），超过会被静默截断；
-    # 夹取到上限，否则 while filled < size 会恒成立、等满 15 秒超时。
-    size = max(10, min(int(limit), _TQ_MAX_SIZE))
-    # 登录不持 _LOCK：_get_api 要联网握手，回测首次登录时不能把实盘扫描挡在锁外。
-    client = api if api is not None else _get_api(user, password)
-    with _LOCK:
-        try:
-            klines = client.get_kline_serial(code, seconds, data_length=size)
-            # 等服务端把历史填满再转换：服务端分批下发，只等一次可能拿到半截数据。
-            # 填满到请求根数就提前走；close 连续几次不增加，当作更早没有了，不必空等 15 秒。
-            filled = _filled_close_count(klines)
-            hist_key = (code, seconds)
-            if filled is None:
-                _wait_update(client, time.time() + 3)
-            else:
-                known_short = _HISTORY_SHORT.get(hist_key)
-                already_at_ceiling = (
-                    known_short is not None and filled >= known_short and filled < size
-                )
-                if not already_at_ceiling:
-                    deadline = time.time() + 15
-                    stalled = 0
-                    while filled < size and time.time() < deadline:
-                        prev = filled
-                        _wait_update(client, min(time.time() + 1, deadline))
-                        filled = _filled_close_count(klines) or filled
-                        if filled <= prev:
-                            stalled += 1
-                            if stalled >= _HISTORY_STALL_WAITS:
-                                break
-                        else:
-                            stalled = 0
-                if filled < size:
-                    _HISTORY_SHORT[hist_key] = filled
-                    warn_key = (code, seconds, filled, size)
-                    if warn_key not in _HISTORY_SHORT_WARNED:
-                        _HISTORY_SHORT_WARNED.add(warn_key)
-                        logger.warning(
-                            "天勤K线只填满 {}/{} 根，按现有数据继续（更早的历史可能没有了）",
-                            filled,
-                            size,
-                        )
-                else:
-                    _HISTORY_SHORT.pop(hist_key, None)
-        except Exception:
-            # 连接断了就丢掉，下一轮重新登录，不要拿着死连接一直重试。
-            if api is None:
-                reset_api()
-            raise
-        frame = frame_from_klines(klines, seconds)
-    logger.info("天勤K线 {} {} {} 根", code, period, len(frame))
-    return frame
+    """向天勤要这一段 K 线。单合约走 fetch_frames，只是列表里只有一个。"""
+    frames = fetch_frames(
+        [symbol],
+        period,
+        limit=limit,
+        user=user,
+        password=password,
+        api=api,
+    )
+    if symbol in frames:
+        return frames[symbol]
+    raise RuntimeError(f"天勤没有返回 {symbol} 的K线")
 
 
 # 进程退出时主动关闭天勤连接，消除退出时一片 "Event loop is closed" 的 asyncio 噪音。

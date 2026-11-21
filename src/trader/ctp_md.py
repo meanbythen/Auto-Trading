@@ -13,7 +13,7 @@ import os
 import threading
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from loguru import logger
 
@@ -133,7 +133,11 @@ def quote_line(row: dict[str, Any], *, channel: str = "") -> str:
 
 
 class CtpMdClient:
-    """连行情前置，只订阅当前要看的那一个合约。仿真、真实同一套。"""
+    """连行情前置，订阅一个或多个合约。仿真、真实同一套。
+
+    单合约就是列表里只有一个元素；多合约用 subscribe_many()。
+    两种走同一条订阅与分发路径，不再维护两套逻辑。
+    """
 
     def _md_name(self) -> str:
         """给窗口和日志用的名称：真实行情 / 仿真行情。"""
@@ -149,8 +153,12 @@ class CtpMdClient:
         )
         self.front = self.fronts[0] if self.fronts else market_front(getattr(settings, "md_front", ""))
         self.wanted = ""
+        self.wanted_symbols: set[str] = set()
         self.latest: dict[str, Any] | None = None
+        self.latest_by_symbol: dict[str, dict[str, Any]] = {}
+        self.sub_status: dict[str, tuple[bool, str]] = {}
         self.last_tick_at = 0.0
+        self.last_tick_at_by_symbol: dict[str, float] = {}
         self.ready = False
         self._api: Any = None
         self._spi: Any = None
@@ -200,47 +208,112 @@ class CtpMdClient:
         return True, f"{self._md_name()}已登录 {self.front}"
 
     def subscribe(self, symbol: str) -> tuple[bool, str]:
-        """只订阅这一个合约。期权代码不会拿来覆盖它。"""
-        code = ctp_instrument_id(symbol)
-        if not code:
+        """订阅单个合约。等价于 subscribe_many([symbol])，保持原有调用不变。"""
+        return self.subscribe_many([symbol])
+
+    def subscribe_many(
+        self, symbols: Iterable[str], *, replace: bool = True
+    ) -> tuple[bool, str]:
+        """订阅多个合约。单合约就是列表里只有一个元素。
+
+        replace=True 时替换当前订阅集合；replace=False 时在原有基础上追加。
+        一次调用把整个列表交给柜台，避免单合约与多合约两套代码。
+        """
+        codes: list[str] = []
+        seen: set[str] = set()
+        for symbol in symbols:
+            code = ctp_instrument_id(symbol)
+            key = code.upper()
+            if code and key not in seen:
+                seen.add(key)
+                codes.append(code)
+        if not codes:
             return False, "请先填写合约"
         if not self.ready or self._api is None:
             return False, f"{self._md_name()}还没登录"
-        self.wanted = code
+        if replace:
+            self.wanted_symbols = set()
+            self.sub_status.clear()
+        self.wanted_symbols.update(codes)
+        if replace:
+            self.wanted = codes[0]
+        elif not self.wanted:
+            self.wanted = codes[0]
         try:
-            result = self._subscribe(code)
+            result = self._subscribe(codes)
         except Exception as exc:  # noqa: BLE001
             text = f"订阅{self._md_name()}失败：{exc}"
             logger.warning(text)
             return False, text
         if int(result or 0) != 0:
-            return False, f"订阅 {code} 没有成功，返回码 {result}"
-        logger.info("已订阅{} {}。报价看交易台数字，不再写入运行日志。", self._md_name(), code)
-        return True, f"已订阅{self._md_name()} {code}。报价看交易台上面的数字，不再写入运行日志。"
+            return False, f"订阅 {', '.join(codes)} 没有成功，返回码 {result}"
+        if len(codes) == 1:
+            logger.info("已订阅{} {}。报价看交易台数字，不再写入运行日志。", self._md_name(), codes[0])
+            return True, f"已订阅{self._md_name()} {codes[0]}。报价看交易台上面的数字，不再写入运行日志。"
+        logger.info("已订阅{} {} 个合约：{}", self._md_name(), len(codes), ", ".join(codes))
+        return True, f"已订阅{self._md_name()} {len(codes)} 个合约：{', '.join(codes)}"
 
-    def _subscribe(self, code: str) -> int:
-        """6.7 封装要合约列表和个数。先按字节再按字符串试一次。"""
+    def _subscribe(self, codes: str | Iterable[str]) -> int:
+        """6.7 封装要合约列表和个数。单合约也走这里，只是列表长度为 1。"""
+        items = [codes] if isinstance(codes, str) else list(codes)
+        if not items:
+            return 0
         try:
-            return int(self._api.SubscribeMarketData([code.encode("utf-8")], 1) or 0)
+            payload = [code.encode("utf-8") for code in items]
+            return int(self._api.SubscribeMarketData(payload, len(payload)) or 0)
         except TypeError:
-            return int(self._api.SubscribeMarketData([code], 1) or 0)
+            return int(self._api.SubscribeMarketData(items, len(items)) or 0)
 
     def apply_tick(self, row: dict[str, Any], replace_empty: bool = True) -> bool:
-        """收下和当前合约完全相同的一条。别的合约丢掉。"""
+        """收下已订阅合约的一条行情，按合约分别保存。
+
+        没有 wanted_symbols 时保持旧行为：只认 wanted 那一个。
+        """
         got = str(row.get("symbol") or "").strip()
         if not got:
             return False
-        if self.wanted and got.lower() != self.wanted.lower():
+        key = got.upper()
+        if self.wanted_symbols:
+            if key not in {item.upper() for item in self.wanted_symbols}:
+                return False
+        elif self.wanted and got.lower() != self.wanted.lower():
             return False
-        self.latest = merge_quote(self.latest, row, replace_empty=replace_empty)
-        self.last_tick_at = time.time()
+        merged = merge_quote(self.latest_by_symbol.get(key), row, replace_empty=replace_empty)
+        self.latest_by_symbol[key] = merged
+        self.latest = merged
+        now = time.time()
+        self.last_tick_at = now
+        self.last_tick_at_by_symbol[key] = now
         return True
+
+    def latest_for(self, symbol: str) -> dict[str, Any] | None:
+        """按合约取最近一条行情。非订阅合约返回 None，不拿别的合约顶替。"""
+        code = ctp_instrument_id(symbol)
+        if not code:
+            return None
+        return self.latest_by_symbol.get(code.upper())
+
+    def stale_seconds_for(self, symbol: str) -> float:
+        """某个合约距离上一笔行情过了几秒。"""
+        code = ctp_instrument_id(symbol)
+        if not code:
+            return 9999.0
+        at = self.last_tick_at_by_symbol.get(code.upper(), 0.0)
+        if at <= 0:
+            return 9999.0
+        return time.time() - at
 
     def stale_seconds(self) -> float:
         """距离上一笔行情过了几秒。还没收到过就很大。"""
         if self.last_tick_at <= 0:
             return 9999.0
         return time.time() - self.last_tick_at
+
+    def on_sub_result(self, symbol: str, ok: bool, message: str = "") -> None:
+        """记录柜台对每个合约的订阅应答，供诊断工具判断配额与权限。"""
+        code = ctp_instrument_id(symbol)
+        if code:
+            self.sub_status[code.upper()] = (bool(ok), str(message or ""))
 
     def on_connected(self) -> None:
         """行情前置连上之后登录。行情登录不需要交易那一步的认证码。"""
@@ -326,10 +399,17 @@ def _build_md_spi(mdapi: Any, client: CtpMdClient) -> Any:
 
         def OnRspSubMarketData(self, data: Any, info: Any, _req: int, _last: bool) -> None:
             ok, message = _md_ok(info)
-            if not ok:
-                logger.warning("订阅{}被拒绝: {}", client._md_name(), message or "柜台没有说明原因")
-                return
             symbol = ctp_field_symbol(data)
+            if symbol:
+                client.on_sub_result(symbol, ok, message)
+            if not ok:
+                logger.warning(
+                    "订阅{} {} 被拒绝: {}",
+                    client._md_name(),
+                    symbol or "某个合约",
+                    message or "柜台没有说明原因",
+                )
+                return
             if symbol:
                 logger.info("{}订阅已确认 {}", client._md_name(), symbol)
 

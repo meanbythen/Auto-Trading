@@ -110,6 +110,47 @@ def test_only_the_watched_contract_updates_the_quote() -> None:
     assert "涨停 4097" in quote_line(describe_quote(client.latest))
 
 
+class _MdApi:
+    """只记订阅请求，不连柜台。"""
+
+    def __init__(self) -> None:
+        self.calls: list[tuple[list[str], int]] = []
+
+    def SubscribeMarketData(self, codes, count):  # noqa: N802
+        self.calls.append(([str(code) for code in codes], int(count)))
+        return 0
+
+
+def test_multi_subscribe_keeps_each_contract_quote() -> None:
+    """一次订阅多个合约，各自保存行情，互不覆盖。"""
+    client = CtpMdClient(_settings())
+    client.ready = True
+    api = _MdApi()
+    client._api = api
+    ok, message = client.subscribe_many(["fu2701", "bu2612"])
+    assert ok, message
+    assert api.calls == [(["b'fu2701'", "b'bu2612'"], 2)]
+    assert client.wanted_symbols == {"fu2701", "bu2612"}
+    assert client.apply_tick({"symbol": "fu2701", "last": 4035, "bid": 4034, "ask": 4036})
+    assert client.apply_tick({"symbol": "bu2612", "last": 4090, "bid": 4089, "ask": 4091})
+    assert client.latest_for("fu2701")["last"] == 4035
+    assert client.latest_for("bu2612")["last"] == 4090
+    assert client.apply_tick({"symbol": "rb2705", "last": 3000}) is False
+
+
+def test_single_subscribe_still_replaces_the_set() -> None:
+    """原来的单合约订阅语义不变：再订阅一个，就只认这一个。"""
+    client = CtpMdClient(_settings())
+    client.ready = True
+    client._api = _MdApi()
+    assert client.subscribe_many(["fu2701", "bu2612"])[0]
+    assert client.subscribe("fu2701")[0]
+    assert client.wanted_symbols == {"fu2701"}
+    assert client.apply_tick({"symbol": "bu2612", "last": 4090}) is False
+    assert client.apply_tick({"symbol": "fu2701", "last": 4035})
+    assert client.latest_for("bu2612") is None
+
+
 class _settings:
     td_front = "tcp://59.36.3.115:27226"
     md_front = ""

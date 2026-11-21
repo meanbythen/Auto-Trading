@@ -13,6 +13,7 @@ from src.data.tq_source import (
     _filled_close_count,
     config_symbol_from_tq,
     fetch_frame,
+    fetch_frames,
     frame_from_klines,
     main_contract,
     period_seconds,
@@ -160,6 +161,42 @@ def test_fetch_frame_uses_the_fake_client() -> None:
     frame = fetch_frame("fu2701", "5", limit=10, api=fake)
     assert fake.calls == [("SHFE.fu2701", 300, 10)]
     assert len(frame) == 10
+
+
+def test_fetch_frames_pulls_each_contract_and_reuses_serial() -> None:
+    """多合约一次拉取：各自一根序列，共用等待；第二轮不再新建序列。"""
+    starts = [f"2026-10-30 01:{m:02d}" for m in range(10)]
+
+    class _MultiApi:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, int, int]] = []
+            self.waits = 0
+            self.raw = {}
+            for code in ("SHFE.fu2701", "DCE.c2701"):
+                frame = _raw(*starts)
+                frame["close"] = float("nan")
+                self.raw[code] = frame
+
+        def get_kline_serial(self, code: str, seconds: int, data_length: int = 200) -> pd.DataFrame:
+            self.calls.append((code, seconds, data_length))
+            return self.raw[code]
+
+        def wait_update(self, deadline: float | None = None) -> None:
+            self.waits += 1
+            for frame in self.raw.values():
+                frame.loc[frame.index[:10], "close"] = 4700.0
+
+    _clear_history_short()
+    fake = _MultiApi()
+    frames = fetch_frames(["fu2701", "c2701"], "5", limit=10, api=fake)
+    assert sorted(frames) == ["c2701", "fu2701"]
+    assert all(len(frame) == 10 for frame in frames.values())
+    assert fake.calls == [("SHFE.fu2701", 300, 10), ("DCE.c2701", 300, 10)]
+    assert fake.waits == 1
+
+    again = fetch_frames(["fu2701", "c2701"], "5", limit=10, api=fake)
+    assert len(again) == 2
+    assert len(fake.calls) == 2  # 序列复用，没有重复创建
 
 
 def test_fetch_frame_needs_account() -> None:

@@ -105,8 +105,8 @@
     <h1>自动交易系统完整架构<br>与三条数据流</h1>
     <p class="sub">单进程、多线程的期货自动交易系统。界面下发命令，调度线程串行完成扫描、风控、报单与记账；行情与交易数据分库存储，账号与账本以文件为权威、SQLite 为可重建投影。本文给出分层架构、功能块职责，以及实盘、回测、模拟三条链路的数据流向与调用关系。</p>
     <div class="meta">
-      <span class="chip">版本 <b>49.23.2</b></span>
-      <span class="chip">规模 <b>255 个 Python 文件 · 101,972 行</b></span>
+      <span class="chip">版本 <b>49.24.0</b></span>
+      <span class="chip">规模 <b>255 个 Python 文件 · 102,173 行</b></span>
       <span class="chip">测试 <b>160 个测试文件</b></span>
       <span class="chip">基线日期 <b>2026-11-21</b></span>
       <span class="chip">运行形态 <b>单进程多线程</b></span>
@@ -252,7 +252,7 @@ flowchart TB
         <div class="card">
           <span class="tag">DATA</span>
           <h4>行情与数据目录</h4>
-          <p>K 线落 <code>market.sqlite</code>（清洗后）与 <code>raw.sqlite</code>（原始）；tick 走 vnpy 表结构；<code>catalog.py</code> 维护合约、K 线、tick 目录快照，启动时 <code>refresh_all()</code> 对齐。</p>
+          <p>K 线落 <code>market.sqlite</code>（清洗后）与 <code>raw.sqlite</code>（原始）；tick 走 vnpy 表结构；<code>catalog.py</code> 维护合约、K 线、tick 目录快照，启动时 <code>refresh_all()</code> 对齐。CTP 行情支持多合约订阅与按合约取价，天勤 K 线支持批量拉取与序列复用；单合约只是列表长度为 1。</p>
           <p><strong>不负责：</strong>策略信号、交易决策。</p>
         </div>
         <div class="card">

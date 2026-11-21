@@ -133,7 +133,15 @@ class OrderPricingMixin:
         last = bid = ask = upper = lower = 0.0
         gateway = getattr(getattr(self, "trader", None), "gateway", None)
         md = getattr(gateway, "md", None) or getattr(getattr(self, "trader", None), "md", None)
-        row = getattr(md, "latest", None) if md is not None else None
+        row = None
+        if md is not None:
+            latest_for = getattr(md, "latest_for", None)
+            if callable(latest_for):
+                row = latest_for(symbol)
+            # 没有按合约取价的旧行情对象，才退回单一 latest；
+            # 多合约订阅后不能拿别的合约的报价来顶替。
+            if row is None and not getattr(md, "wanted_symbols", None):
+                row = getattr(md, "latest", None)
         if isinstance(row, dict):
             last = float(row.get("last") or 0)
             bid = float(row.get("bid") or 0)
