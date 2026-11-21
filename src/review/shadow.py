@@ -15,6 +15,7 @@ from typing import Any
 
 from src.account.signal_book import load_named_book, matched_closes, open_position_rows
 from src.account.workspace import CTP_LIVE, CTP_SIM, display_label
+from src.domain.accounts import ctp_book_ids
 from src.domain.pnl_stats import summarize_pnl
 
 
@@ -92,8 +93,10 @@ def _avg_entry(rows: list[dict[str, Any]]) -> float:
 def shadow_report(root: Path | str, *, symbol: str = "") -> ShadowReport:
     """读两本 CTP 账，返回并排汇总。文件不存在时两边都是 0，不编造。"""
     base = Path(root)
-    sim = _side(base, CTP_SIM, symbol=symbol)
-    live = _side(base, CTP_LIVE, symbol=symbol)
+    # 注册表存在时按账号账本比对；没有时回退旧四本账。
+    ids = ctp_book_ids(base)
+    sim = _side(base, ids.get("sim") or CTP_SIM, symbol=symbol)
+    live = _side(base, ids.get("live") or CTP_LIVE, symbol=symbol)
     sim_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     live_groups: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for row in sim.rows:

@@ -29,6 +29,11 @@ from src.utils.secret_store import default_store, ref_for_env
 
 REGISTRY_REL = Path("config") / "accounts.yaml"
 AUDIT_REL = Path("data") / "accounts_audit.jsonl"
+# 审计文件只保留一代：超过这个大小先改名为 .1 再继续写。
+AUDIT_MAX_BYTES = 5 * 1024 * 1024
+# 迁移后内容完全相同的旧账本移到这里，宁可多留一份也不删除。
+LEGACY_ARCHIVE_REL = Path("data") / "archive" / "legacy_books"
+_ARCHIVE_KEYS = ("book_name", "state_name", "intent_name")
 # v2：连接与账号分离。连接不含资金号和密码，一条连接可被多个账号引用。
 REGISTRY_VERSION = 2
 
@@ -41,12 +46,28 @@ def _now() -> str:
     return datetime.now().isoformat(timespec="seconds")
 
 
+def _rotate_if_needed(path: Path, max_bytes: int) -> None:
+    """超过上限就把当前文件改名为 .1（覆盖旧 .1），保持只留一代。"""
+    try:
+        if not path.exists() or path.stat().st_size < max_bytes:
+            return
+    except OSError:
+        return
+    backup = path.with_name(path.name + ".1")
+    try:
+        backup.unlink(missing_ok=True)
+        path.replace(backup)
+    except OSError as exc:
+        logger.warning("轮转日志 {} 失败，继续追加: {}", path, exc)
+
+
 def _audit(root: str | Path, action: str, **fields: Any) -> None:
     """账号相关操作留痕。只记引用和字段名，不记密钥值。"""
     row = {"ts": _now(), "action": action, **fields}
     path = Path(root) / AUDIT_REL
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_if_needed(path, AUDIT_MAX_BYTES)
         with path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
     except OSError as exc:  # 审计失败不能拦住账号保存
@@ -594,6 +615,72 @@ def _repoint_active_book(
     _audit(root, "active_book_repoint", old_book=legacy, new_book=target)
 
 
+def archive_duplicate_legacy_books(
+    root: str | Path,
+    registry: AccountRegistry,
+) -> list[str]:
+    """把与新账号账本内容完全一致的旧账本移入归档目录，不删除。
+
+    只处理还在使用旧账本 id（ctp_sim / ctp_live / live / paper）的条目；
+    内容有任何差异就保留原位，避免误伤仍在使用的历史账。
+    """
+    from src.domain.accounts import LEGACY_BOOK_IDS, book_layout
+
+    base = Path(root)
+    data_dir = base / "data"
+    archive_dir = base / LEGACY_ARCHIVE_REL
+    used = {str(item.book_id or "").strip().lower() for item in registry.accounts}
+    targets: list[tuple[str, dict[str, str]]] = []
+    for account in registry.accounts:
+        book = str(account.book_id or "").strip().lower()
+        if not book or book in LEGACY_BOOK_IDS or ta.is_self_test_account(account):
+            continue
+        targets.append((account.account_id, book_layout(book)))
+    archived: list[str] = []
+    for legacy in sorted(LEGACY_BOOK_IDS):
+        if legacy in used:
+            continue
+        source_layout = book_layout(legacy)
+        for key in _ARCHIVE_KEYS:
+            src = data_dir / source_layout[key]
+            if not src.exists():
+                continue
+            owner = ""
+            for account_id, layout in targets:
+                dst = data_dir / layout[key]
+                if not dst.exists():
+                    continue
+                try:
+                    if src.read_bytes() == dst.read_bytes():
+                        owner = account_id
+                        break
+                except OSError:
+                    continue
+            if not owner:
+                continue
+            dest = archive_dir / src.name
+            try:
+                archive_dir.mkdir(parents=True, exist_ok=True)
+                if dest.exists():
+                    dest = archive_dir / f"{src.stem}.{datetime.now():%Y%m%d%H%M%S}{src.suffix}"
+                shutil.move(str(src), str(dest))
+            except OSError as exc:
+                logger.warning("归档旧账本 {} 失败: {}", src, exc)
+                continue
+            _audit(
+                base,
+                "legacy_book_archive",
+                account_id=owner,
+                legacy_book=legacy,
+                file=src.name,
+                archive=dest.relative_to(base).as_posix(),
+            )
+            archived.append(f"{src.name}→{dest.name}")
+    if archived:
+        logger.info("旧账本归档（内容与账号账本一致）: {}", "；".join(archived))
+    return archived
+
+
 def migrate_legacy_books(
     root: str | Path,
     registry: AccountRegistry,
@@ -683,6 +770,8 @@ def migrate_legacy_books(
     if notes:
         _repoint_active_book(base, renamed, registry)
         logger.info("账号账本一对一迁移: {}", "；".join(notes))
+    # 迁移后旧文件若与新账本内容完全相同，移入归档目录；不同则保留，随时可回退。
+    archive_duplicate_legacy_books(base, registry)
     return notes
 
 

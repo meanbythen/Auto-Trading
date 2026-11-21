@@ -4,6 +4,34 @@
 
 规则写在 README 的「版本」一节。已经写在这里的旧版本不再改写，新的改动加在最上面。
 
+## 49.23.0 — 2026-11-21
+
+第五批（P3/P4 收尾）。把“结果口径、数据留痕、可观测接口、启动目录、参数校验”五处未完成项补齐；不改开仓、止损、清仓规则。**不涉及数据迁移。**
+
+- 结果口径统一：`result_summary()` 现在同时接受回测结果对象、Performance 对象和 performance 字典，固定返回成交、净盈亏、胜率、盈利因子、最大回撤等字段；历史回测结果页与交易台推送的摘要改用同一份口径，不再各读各的 performance。复盘仍按点数统计（不含手续费滑点），属已标注的独立口径。
+- 研究运行补 K 线内容哈希：研究清单新增 `data_sha256`，主回测用 `fingerprint_bars()` 对本次实际 K 线取 SHA-256，并写入 `research_runs.data_sha256`；旧库首次写入会自动补列，不需要手工迁移。
+- 可观测接口接通：启动时汇总当天报单、成交、拒单和平均耗时并记一条日志；新增 `python tools/ops_report.py`，可按日期看指标或按 `trace_id` 打印“信号 → 风控 → 审计”时间线。
+- 启动刷新数据目录：启动阶段由“只刷合约快照”改为同时刷新合约、K 线目录和 tick 目录，日志分别输出条数；SQLite 关闭或行情库不存在时保持静默，不建库。
+- 策略参数校验前移：新增 `validate_strategy_params()`，配置页保存时按插件参数 schema 统一检查类型，发现不一致只记告警、不阻断保存；内置策略、自定义规则和未知引擎不误报。
+- 新增 `tools/ops_report.py`；新增 `tests/test_review_7_5_consistency.py` 11 项回归。
+- 验证：完整 `pytest -q` 退出码 0，`lint-imports` 3/3 KEPT，`ruff check src tests` 与 `mypy src` 通过，`import src.ui.app` 正常。
+
+## 49.22.0 — 2026-11-21
+
+第四批（规范与文档）。修掉几个“显示/命名/交易日”小问题和日志无界增长；不改开仓、止损、清仓规则。**不涉及数据迁移。**
+
+- 自测账 `self_test` 不再被当成 GUI 实盘：账本名不符合 `acc_`/`book_` 前缀，之前 `normalize_id("self_test")` 会回落到 `live`，现在显式保留。
+- 交易台“仅禁开新仓”不再显示成“已熔断”：`status_snapshot()` 补上 `halt_kind`，界面按真实熔断原因展示。
+- 复盘交易日认节假日：`previous_trading_day()` 改用内置交易日表，国庆等长假后不会把休市日算进复盘窗口。
+- 旧四本账只归档不删除：迁移后旧 JSON 与新账号账本**内容完全一致**时才移入 `data/archive/legacy_books/`，内容不同或仍被账号引用就原样保留；目录不搬。影子盘改为按注册表解析 CTP 仿真/真实账本，没有注册表时才回退旧 id。
+- 审计与告警不再无限增长：`accounts_audit.jsonl`、`alerts.jsonl` 超过 5MB 自动轮转为 `.1`（只留一代）；`market_health.jsonl` 原有 20MB 轮转不变。
+- 新增 `python tools/rebuild_experiment_index.py`：扫描 `data/experiments/*/manifest.json` 重建 `index.json`，只写索引，不搬动、不删除历史实验。已为现有 99 个实验重建。
+- 组合风控两个上限都为 0 时，启动会提示“等同于不拦截”，避免以为开了组合风控；拦截语义不变。
+- 回测口径差异补充说明：`strategy.catch_up_on_start` 只在实盘启动时补单，回测从区间起点连续运行，没有离线缺口。
+- 文档定案：账号以 `config/accounts.yaml` + JSON 账本/风控状态为权威，`data/trading.db` 的 `accounts` 等表为可删除重建的投影；同步修正事件总线、`result_summary` 的过期表述。
+- 新增 `tests/test_review_7_4_regression.py` 10 项回归；完整 `pytest -q` 退出码 0，`lint-imports` 3/3 KEPT，`ruff check src tests` 与 `mypy src` 通过。
+- 建议关掉程序再打开，让轮转与启动归档生效。
+
 ## 49.21.0 — 2026-11-21
 
 第三批（一致性：回测与实盘）。把能对齐的口径改到同一套，不能完全对齐的在回测结果页和复盘里写清楚。**回测净盈亏、成交笔数可能和旧版不同。**

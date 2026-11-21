@@ -45,6 +45,7 @@ def build_run_manifest(
     data_catalog: dict[str, Any] | None = None,
     metrics: dict[str, Any] | None = None,
     extra: dict[str, Any] | None = None,
+    data_sha256: str = "",
 ) -> dict[str, Any]:
     """组装一份运行清单；任何辅助信息取不到时降级为空，不阻断研究。"""
     from src.kernel.trace import ensure_trace_id
@@ -91,6 +92,7 @@ def build_run_manifest(
         "duration_ms": round(float(duration_ms or 0.0), 3),
         "strategy": strategy_info,
         "params_sha256": params_sha256,
+        "data_sha256": str(data_sha256 or ""),
         "data_catalog": catalog,
         "symbols": [str(item) for item in (symbols or [])],
         "period": str(period or ""),
@@ -102,23 +104,42 @@ def build_run_manifest(
     return dict(_json_safe(manifest))
 
 
-def result_summary(result: Any) -> dict[str, float | int]:
-    """所有研究页共用的结果取值，避免各页各算一套口径。"""
+def _perf_source(result: Any) -> Any:
+    """从结果对象/Performance/字典里取出绩效来源；取不到返回 None。"""
+    if result is None or isinstance(result, dict):
+        return result
     perf = getattr(result, "performance", None)
-    if perf is None:
-        return {
-            "trades": 0,
-            "net_pnl": 0.0,
-            "win_rate": 0.0,
-            "profit_factor": 0.0,
-            "max_drawdown": 0.0,
-        }
+    return perf if perf is not None else result
+
+
+def _perf_value(source: Any, key: str, default: Any) -> Any:
+    if source is None:
+        return default
+    if isinstance(source, dict):
+        return source.get(key, default)
+    return getattr(source, key, default)
+
+
+def result_summary(result: Any) -> dict[str, float | int | None]:
+    """所有研究页共用的结果取值，避免各页各算一套口径。
+
+    接受三种输入：带 performance 的结果对象、Performance 对象本身、performance 字典。
+    expectancy 可能是 None（样本不足算不出），原样保留，不强行转 0。
+    """
+    source = _perf_source(result)
     return {
-        "trades": int(getattr(perf, "trades", 0) or 0),
-        "net_pnl": float(getattr(perf, "net_pnl", 0.0) or 0.0),
-        "win_rate": float(getattr(perf, "win_rate", 0.0) or 0.0),
-        "profit_factor": float(getattr(perf, "profit_factor", 0.0) or 0.0),
-        "max_drawdown": float(getattr(perf, "max_drawdown", 0.0) or 0.0),
+        "trades": int(_perf_value(source, "trades", 0) or 0),
+        "net_pnl": float(_perf_value(source, "net_pnl", 0.0) or 0.0),
+        "win_rate": float(_perf_value(source, "win_rate", 0.0) or 0.0),
+        "profit_factor": float(_perf_value(source, "profit_factor", 0.0) or 0.0),
+        "max_drawdown": float(_perf_value(source, "max_drawdown", 0.0) or 0.0),
+        "wins": int(_perf_value(source, "wins", 0) or 0),
+        "losses": int(_perf_value(source, "losses", 0) or 0),
+        "avg_win": float(_perf_value(source, "avg_win", 0.0) or 0.0),
+        "avg_loss": float(_perf_value(source, "avg_loss", 0.0) or 0.0),
+        "payoff": float(_perf_value(source, "payoff", 0.0) or 0.0),
+        "expectancy": _perf_value(source, "expectancy", None),
+        "max_drawdown_pct": float(_perf_value(source, "max_drawdown_pct", 0.0) or 0.0),
     }
 
 

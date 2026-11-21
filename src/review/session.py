@@ -13,6 +13,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta
 
+from src.utils.trading_day import is_trading_day
+
 
 # 界面上三个选项，必须和这里的字完全一致
 SCOPE_DAY = "日盘"
@@ -40,9 +42,9 @@ class SessionWindow:
 
 
 def previous_trading_day(day: date) -> date:
-    """前一个交易日。周六、周日没有交易，向前落到周五。"""
+    """前一个交易日。跳过周末，也跳过内置节假日表里的休市日。"""
     prev = day - timedelta(days=1)
-    while prev.weekday() >= 5:
+    while not is_trading_day(prev):
         prev -= timedelta(days=1)
     return prev
 

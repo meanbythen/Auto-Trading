@@ -81,9 +81,11 @@ class BacktestActionsMixin:
         from src.backtest.rollover import format_rollover_lines
         from src.backtest.slippage import build_ladder, ladder_lines
         from src.screen.picker import format_cover_lines
+        from src.research.kernel import result_summary
         from src.strategy.profile import header_line
 
         p = result.performance
+        summary = result_summary(result)
         snap = result.params_snapshot or {}
         profile_note = header_line(
             str(snap.get("engine", engine_fallback)),
@@ -98,9 +100,9 @@ class BacktestActionsMixin:
             baseline=used_slip,
         )
         note = ""
-        if p.trades < 3:
+        if summary["trades"] < 3:
             note = (
-                f"\n注意：K线 {result.bars} 根、成交仅 {p.trades} 笔，"
+                f"\n注意：K线 {result.bars} 根、成交仅 {summary['trades']} 笔，"
                 "胜率参考价值低（可改成「全部可用」再试）。"
             )
         lines = [
@@ -134,20 +136,20 @@ class BacktestActionsMixin:
                 enabled=bool(snap.get("mirror_live_gates")),
             ),
             f"K线根数   {result.bars}",
-            f"成交      {p.trades} 笔（赢{p.wins} / 亏{p.losses}）",
+            f"成交      {summary['trades']} 笔（赢{p.wins} / 亏{p.losses}）",
             f"没开成    {len(result.rejected)} 条开仓信号（被策略过滤或风控挡住，明细在下面）"
             if result.rejected
             else "没开成    无（每个开仓信号都成交了）",
-            f"胜率      {p.win_rate:.0%}",
+            f"胜率      {summary['win_rate']:.0%}",
             *format_payoff_lines(p.avg_win, p.avg_loss, p.payoff),
-            format_expectancy_line(p.win_rate, p.avg_win, p.avg_loss, p.expectancy),
-            f"净盈亏    {p.net_pnl:.0f} 元",
-            f"盈利因子  {p.profit_factor:.2f}",
-            f"最大回撤  {p.max_drawdown:.0f} 元（{p.max_drawdown_pct:.2%}）",
+            format_expectancy_line(summary["win_rate"], p.avg_win, p.avg_loss, p.expectancy),
+            f"净盈亏    {summary['net_pnl']:.0f} 元",
+            f"盈利因子  {summary['profit_factor']:.2f}",
+            f"最大回撤  {summary['max_drawdown']:.0f} 元（{p.max_drawdown_pct:.2%}）",
             *format_cover_lines(
-                p.net_pnl,
-                p.max_drawdown,
-                p.trades,
+                summary["net_pnl"],
+                summary["max_drawdown"],
+                summary["trades"],
                 str(snap.get("data_from") or ""),
                 str(snap.get("data_to") or ""),
             ),
@@ -258,7 +260,9 @@ class BacktestActionsMixin:
                 from src.research.kernel import record_run
 
                 record_run(result.run, root=cfg.get("_project_root"))
-                p = result.performance
+                from src.research.kernel import result_summary
+
+                summary = result_summary(result)
                 th = EvaluationThresholds.from_cfg(cfg)
 
                 def _runner(local_cfg, **kwargs):
@@ -297,11 +301,11 @@ class BacktestActionsMixin:
                         "header": header,
                         "symbol": result.symbol,
                         "bars": result.bars,
-                        "trades": p.trades,
-                        "win_rate": p.win_rate,
-                        "payoff": p.payoff,
-                        "expectancy": p.expectancy,
-                        "net_pnl": p.net_pnl,
+                        "trades": summary["trades"],
+                        "win_rate": summary["win_rate"],
+                        "payoff": summary["payoff"],
+                        "expectancy": summary["expectancy"],
+                        "net_pnl": summary["net_pnl"],
                     },
                 )
                 if box is not None:

@@ -1668,6 +1668,7 @@ class TradingBot(
             "daily_pnl": self.risk.daily_pnl,
             "halted": self.risk.halted,
             "halt_reason": self.risk.halt_reason,
+            "halt_kind": str(getattr(self.risk, "halt_kind", "") or ""),
             "positions": snapshot_positions(self.strategy),
             "symbols": self.symbols,
             "last_alert": _safe_last_alert(self.risk.max_daily_loss),

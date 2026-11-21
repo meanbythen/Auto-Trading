@@ -156,6 +156,17 @@ class PortfolioRisk:
         self.limits = limits
         self.root = Path(root) if root is not None else None
         self._fixed = snapshot
+        if (
+            limits.mode != "off"
+            and limits.max_symbol_lots <= 0
+            and limits.max_gross_lots <= 0
+        ):
+            # 0 表示该维度不限。两个维度都没配时，开着的组合风控实际不拦任何单，留一条启动提示。
+            logger.warning(
+                "组合风控已开启（{}）但未配置任何上限，等同于不拦截；"
+                "请设置 risk.portfolio.max_symbol_lots 或 max_gross_lots",
+                limits.mode,
+            )
 
     @classmethod
     def from_config(

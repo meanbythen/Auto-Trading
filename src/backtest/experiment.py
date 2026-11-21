@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
+from loguru import logger
 
 from src.utils.paths import project_root
 from src.version import read_version
@@ -248,6 +249,23 @@ def _write_bars(path: Path, frame: pd.DataFrame) -> None:
             frame.to_csv(zipped, index_label="datetime", encoding="utf-8")
 
 
+def _index_row(manifest: dict[str, Any]) -> dict[str, Any]:
+    """一条实验索引。归档和重建索引共用同一份字段。"""
+    details = manifest.get("details") or {}
+    return {
+        "experiment_id": manifest["experiment_id"],
+        "kind": manifest.get("kind", ""),
+        "created_at": manifest.get("created_at", ""),
+        "symbol": details.get("symbol", ""),
+        "code_version": (manifest.get("code") or {}).get("version", ""),
+        "git_commit": (manifest.get("code") or {}).get("git_commit", ""),
+        "config_sha256": (manifest.get("config") or {}).get("sha256", ""),
+        "data_sha256": [item.get("sha256", "") for item in (manifest.get("data") or {}).get("files", [])],
+        "snapshot_complete": (manifest.get("review_gate") or {}).get("snapshot_complete", False),
+        "report": f"{manifest['experiment_id']}/report.json",
+    }
+
+
 def _update_index(root: Path, manifest: dict[str, Any]) -> None:
     index_path = root / "index.json"
     if index_path.exists():
@@ -255,24 +273,41 @@ def _update_index(root: Path, manifest: dict[str, Any]) -> None:
     else:
         index = {"schema_version": SCHEMA_VERSION, "experiments": []}
     rows = [row for row in index.get("experiments", []) if row.get("experiment_id") != manifest["experiment_id"]]
-    details = manifest.get("details") or {}
-    rows.append(
-        {
-            "experiment_id": manifest["experiment_id"],
-            "kind": manifest.get("kind", ""),
-            "created_at": manifest.get("created_at", ""),
-            "symbol": details.get("symbol", ""),
-            "code_version": (manifest.get("code") or {}).get("version", ""),
-            "git_commit": (manifest.get("code") or {}).get("git_commit", ""),
-            "config_sha256": (manifest.get("config") or {}).get("sha256", ""),
-            "data_sha256": [item.get("sha256", "") for item in (manifest.get("data") or {}).get("files", [])],
-            "snapshot_complete": (manifest.get("review_gate") or {}).get("snapshot_complete", False),
-            "report": f"{manifest['experiment_id']}/report.json",
-        }
-    )
+    rows.append(_index_row(manifest))
     rows.sort(key=lambda row: str(row.get("created_at") or ""))
     index["experiments"] = rows
     _atomic_json(index_path, index)
+
+
+def rebuild_index(root: Path | str) -> int:
+    """扫描 experiments/*/manifest.json 重建 index.json，返回条目数。
+
+    只读历史实验、只写索引文件；不搬动、不删除任何实验目录。
+    """
+    base = Path(root)
+    exp_dir = base / "experiments"
+    if not exp_dir.is_dir():
+        return 0
+    rows: list[dict[str, Any]] = []
+    skipped = 0
+    for manifest_path in sorted(exp_dir.glob("*/manifest.json")):
+        try:
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            skipped += 1
+            continue
+        if not isinstance(manifest, dict) or not manifest.get("experiment_id"):
+            skipped += 1
+            continue
+        rows.append(_index_row(manifest))
+    if not rows:
+        return 0
+    rows.sort(key=lambda row: str(row.get("created_at") or ""))
+    _atomic_json(exp_dir / "index.json", {"schema_version": SCHEMA_VERSION, "experiments": rows})
+    if skipped:
+        # 损坏的 manifest 不阻塞重建，但要在日志里留个数字方便排查。
+        logger.warning("实验索引重建跳过 {} 个无法解析的 manifest.json", skipped)
+    return len(rows)
 
 
 def archive_report(

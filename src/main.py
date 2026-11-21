@@ -94,15 +94,35 @@ def main() -> None:
     logger.info("项目目录: {}", root)
     logger.info("当前为【{}】模式", "模拟 dry_run" if cfg.get("dry_run") else "实盘相关")
 
-    # P3 数据目录：总表内容变了才生成新快照，失败不影响交易。
+    # P3 数据目录：合约快照按内容变化刷新，K 线/tick 库存每次启动对齐；失败不影响交易。
     try:
-        from src.data.catalog import refresh_instruments
+        from src.data.catalog import refresh_all
 
-        snapshot = refresh_instruments(root, cfg)
-        if snapshot:
-            logger.info("合约快照已就绪: {}", snapshot)
+        catalog = refresh_all(root, cfg)
+        logger.info(
+            "数据目录已刷新：合约快照={} K线={} tick={}",
+            catalog.get("instruments") or "无变化",
+            catalog.get("klines", 0),
+            catalog.get("ticks", 0),
+        )
     except Exception as exc:  # noqa: BLE001
-        logger.warning("合约快照导入失败（不影响交易）: {}", exc)
+        logger.warning("数据目录刷新失败（不影响交易）: {}", exc)
+
+    # P4 可观测：启动时汇总当天订单/成交/拒单与延迟，便于对照昨日留痕。
+    try:
+        from src.ops.journal import metrics_snapshot
+
+        snapshot = metrics_snapshot()
+        logger.info(
+            "今日运行指标：报单 {} 成交 {} 拒单 {} 平均报单耗时 {}ms 平均成交耗时 {}ms",
+            snapshot.get("orders_sent", 0),
+            snapshot.get("fills", 0),
+            snapshot.get("rejected", 0),
+            snapshot.get("avg_send_ms", 0.0),
+            snapshot.get("avg_fill_ms", 0.0),
+        )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("运行指标汇总跳过: {}", exc)
 
     if args.tick_status:
         _print_tick_status(cfg)

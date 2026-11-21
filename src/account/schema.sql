@@ -260,6 +260,7 @@ CREATE TABLE IF NOT EXISTS research_runs (
     strategy_id      TEXT NOT NULL DEFAULT '',
     strategy_version TEXT NOT NULL DEFAULT '',
     params_sha256    TEXT NOT NULL DEFAULT '',
+    data_sha256      TEXT NOT NULL DEFAULT '',
     period           TEXT NOT NULL DEFAULT '',
     symbols_json     TEXT NOT NULL DEFAULT '[]',
     commit_hash      TEXT NOT NULL DEFAULT '',

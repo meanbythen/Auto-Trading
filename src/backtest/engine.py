@@ -1674,7 +1674,8 @@ def _params_snapshot(setup: _BacktestSetup, run: _BacktestRun) -> dict[str, Any]
             f"手数口径 {'随剩余权益' if limits.chain_capital else '固定起始资金'}；"
             f"K线长度 实盘扫描默认 {int((cfg.get('data') or {}).get('live_max_bars', 200))} 根、"
             f"回测默认 {int(setup.max_bars)} 根；"
-            "清仓时点 5分钟周期与实盘 14:55/22:55 一致，15分钟以上按该根收盘（如 15:00）成交。"
+            "清仓时点 5分钟周期与实盘 14:55/22:55 一致，15分钟以上按该根收盘（如 15:00）成交；"
+            "启动回溯补开仓（strategy.catch_up_on_start）只在实盘启动时补单，回测从区间起点连续运行、没有离线缺口，故不模拟。"
         ),
         "mirror_live_gates": bool(fill.mirror_live_gates),
         "mirror_gate_hits": list(run.gate_hits),
@@ -1902,6 +1903,14 @@ def run_backtest(
         },
     }
     ran_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    # P4 留痕：记录本次实际使用 K 线的内容哈希，便于判断两次研究是否同一份数据。
+    data_sha256 = ""
+    try:
+        from src.backtest.experiment import fingerprint_bars
+
+        data_sha256 = str(fingerprint_bars(bars_signal).get("sha256") or "")
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("K 线内容哈希计算失败（不影响回测）: {}", exc)
     manifest = build_run_manifest(
         source,
         cfg,
@@ -1912,6 +1921,7 @@ def run_backtest(
         run_id=run_id,
         strategy=strategy_info,
         data_catalog=data_catalog,
+        data_sha256=data_sha256,
         metrics={
             "bars": max(0, n - int(trade_from)),
             "trades": int(perf.trades),

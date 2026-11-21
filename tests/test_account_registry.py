@@ -628,9 +628,16 @@ def test_migrate_legacy_books_copies_and_is_idempotent(tmp_path: Path) -> None:
     assert (data / "signal_account_huatai_sim_01.json").read_text(encoding="utf-8") == '{"trades": []}'
     assert (data / "bot_state_huatai_sim_01.json").exists()
     assert (data / "intents" / "acc_huatai_sim_01" / "1.json").exists()
-    # 旧文件不删，随时可以改回去。
-    assert (data / "signal_account_ctp_sim.json").exists()
-    assert "book_migrate" in (data / "accounts_audit.jsonl").read_text(encoding="utf-8")
+    # 旧 JSON 与新账本内容完全一致时移入归档目录，不删除，随时可以改回去。
+    archive = data / "archive" / "legacy_books"
+    assert (archive / "signal_account_ctp_sim.json").read_text(encoding="utf-8") == '{"trades": []}'
+    assert (archive / "bot_state_ctp_sim.json").exists()
+    assert not (data / "signal_account_ctp_sim.json").exists()
+    # 目录不参与归档。
+    assert (data / "intents" / "ctp_sim" / "1.json").exists()
+    audit = (data / "accounts_audit.jsonl").read_text(encoding="utf-8")
+    assert "book_migrate" in audit
+    assert "legacy_book_archive" in audit
     # 再跑一次不重复迁移。
     assert reg.migrate_legacy_books(tmp_path, registry) == []
 

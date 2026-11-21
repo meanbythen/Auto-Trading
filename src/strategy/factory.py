@@ -504,6 +504,28 @@ def param_section(name: Any) -> str:
     return _ENGINE_ALIASES.get(key, key)
 
 
+def validate_strategy_params(cfg: dict[str, Any]) -> list[str]:
+    """按当前 strategy.engine 的插件参数 schema 校验配置；只返回消息，不抛异常。
+
+    内置策略、rule_dsl 和未知引擎没有插件 schema，直接返回空列表，避免误报。
+    """
+    strategy = cfg.get("strategy") or {}
+    raw = str(strategy.get("engine", DEFAULT_ENGINE)).lower().strip() or DEFAULT_ENGINE
+    name = _ENGINE_ALIASES.get(raw, raw)
+    if name in _REMOVED_ENGINES or rule_engine_stem(name):
+        return []
+    if not _plugin_registered(name):
+        return []
+    params = strategy.get(param_section(name))
+    if not isinstance(params, dict):
+        return []
+    try:
+        return list(_plugins().validate_params(name, params))
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("策略参数校验失败，已跳过: {}", exc)
+        return []
+
+
 def engine_label(name: Any, *, short: bool = False) -> str:
     """引擎中文名。short=True 用交叉测试短名。认不出时原样返回，方便界面显示非法配置。"""
     table = ENGINE_SHORT_LABELS if short else ENGINE_LABELS

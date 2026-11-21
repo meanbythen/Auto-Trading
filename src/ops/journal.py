@@ -131,18 +131,36 @@ def record_audit(
     )
 
 
+def _ensure_research_runs_column(root: str | Path | None) -> None:
+    """旧库补 data_sha256 列；库不存在或表缺失时交给正式写入去建表。"""
+    path = db_path_for(root)
+    if not Path(path).exists():
+        return
+    try:
+        with DB_LOCK, closing(connect(path)) as conn:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(research_runs)")}
+            if cols and "data_sha256" not in cols:
+                with conn:
+                    conn.execute(
+                        "ALTER TABLE research_runs ADD COLUMN data_sha256 TEXT NOT NULL DEFAULT ''"
+                    )
+    except Exception as exc:  # noqa: BLE001
+        logger.debug("research_runs 补列跳过: {}", exc)
+
+
 def record_research_run(manifest: dict[str, Any], *, root: str | Path | None = None) -> bool:
     """把研究运行清单落库；同一 run_id 重跑时覆盖。"""
     if not manifest:
         return False
+    _ensure_research_runs_column(root)
     strategy = manifest.get("strategy") or {}
     commit = manifest.get("commit") or {}
     sql = """
         INSERT OR REPLACE INTO research_runs (
             run_id, trace_id, source, status, started_at, finished_at, duration_ms,
-            strategy_id, strategy_version, params_sha256, period, symbols_json,
+            strategy_id, strategy_version, params_sha256, data_sha256, period, symbols_json,
             commit_hash, message, payload_json
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """
     return _write(
         root,
@@ -158,6 +176,7 @@ def record_research_run(manifest: dict[str, Any], *, root: str | Path | None = N
             str(strategy.get("id") or strategy.get("engine") or ""),
             str(strategy.get("version") or ""),
             str(manifest.get("params_sha256") or ""),
+            str(manifest.get("data_sha256") or ""),
             str(manifest.get("period") or ""),
             json_text(manifest.get("symbols") or []),
             str(commit.get("git_commit") or ""),

@@ -17,6 +17,8 @@ from typing import Any
 import yaml
 from loguru import logger
 
+from src.domain.trading_account import SELF_TEST_BOOK_ID
+
 # 实盘账：原来那一套文件，GUI 点真实资金时用这一本。
 LIVE = "live"
 # 模拟账：交易软件里打开「模拟交易」时用这一本，不改实盘文件。
@@ -106,6 +108,9 @@ def normalize_id(raw: Any) -> str:
     """把界面文字收成内部记号。认不出来就当 GUI 实盘，避免误进模拟账。"""
     text = str(raw or "").strip().lower()
     shown = str(raw or "")
+    # 自测账是内置账号，账本名 self_test 不符合 acc_/book_ 前缀，单独豁免。
+    if text == SELF_TEST_BOOK_ID:
+        return SELF_TEST_BOOK_ID
     if text in {CTP_SIM, "huatai_sim"} or "华泰仿真" in shown or "ctp仿真" in text:
         return CTP_SIM
     if text in {CTP_LIVE, "huatai_live"} or "华泰真实" in shown or "ctp真实" in text:
@@ -177,6 +182,19 @@ def _registry_book_meta(root: str | Path) -> dict[str, dict[str, str]]:
         }
     _REGISTRY_CACHE[str(path)] = (stamp, result)
     return result
+
+
+def ctp_book_ids(root: str | Path | None = None) -> dict[str, str]:
+    """注册表里 CTP 渠道的 sim/live 账本 id；没有注册表时返回空。"""
+    base = Path(root) if root is not None else _default_root()
+    out: dict[str, str] = {}
+    for book_id, item in _registry_book_meta(base).items():
+        if item.get("channel") != "ctp":
+            continue
+        env = str(item.get("environment") or "").strip().lower()
+        if env in ("sim", "live"):
+            out.setdefault(env, book_id)
+    return out
 
 
 def invalidate_registry_cache(root: str | Path) -> None:

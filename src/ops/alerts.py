@@ -17,6 +17,8 @@ from typing import Any
 from loguru import logger
 
 FILE_NAME = "alerts.jsonl"
+# 告警文件只保留一代：超过这个大小先改名为 .1 再继续写。
+ALERTS_MAX_BYTES = 5 * 1024 * 1024
 _COOLDOWN_SEC = 600.0
 _last_emit: dict[str, float] = {}
 # 当前这次运行的标识，由 TradingBot 启动时设置；没设置时写空串。
@@ -27,6 +29,21 @@ _HALT_LIMIT_RE = re.compile(r"已超过限额\s*([0-9]+(?:\.[0-9]+)?)")
 
 def alerts_path(root: Path | str) -> Path:
     return Path(root) / "data" / FILE_NAME
+
+
+def _rotate_if_needed(path: Path) -> None:
+    """超过上限就把当前告警文件改名为 .1（覆盖旧 .1），保持只留一代。"""
+    try:
+        if not path.exists() or path.stat().st_size < ALERTS_MAX_BYTES:
+            return
+    except OSError:
+        return
+    backup = path.with_name(path.name + ".1")
+    try:
+        backup.unlink(missing_ok=True)
+        path.replace(backup)
+    except OSError as exc:
+        logger.warning("轮转告警文件 {} 失败，继续追加: {}", path, exc)
 
 
 def set_run_id(run_id: str | None) -> None:
@@ -63,6 +80,7 @@ def emit_alert(
     base = Path(root) if root else project_root()
     path = alerts_path(base)
     path.parent.mkdir(parents=True, exist_ok=True)
+    _rotate_if_needed(path)
     row = {
         "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "level": str(level or "warning"),

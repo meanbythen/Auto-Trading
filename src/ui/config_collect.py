@@ -544,6 +544,13 @@ class ConfigCollectMixin:
         from src.strategy.factory import sanitize_strategy_config
 
         sanitize_strategy_config(self.cfg)
+        # 插件策略参数类型统一按 schema 校验一次；只提示，不阻断保存。
+        from src.strategy.factory import validate_strategy_params
+
+        warnings = validate_strategy_params(self.cfg)
+        self._strategy_param_warnings = warnings
+        for message in warnings:
+            logger.warning("策略参数与 schema 不一致: {}", message)
 
         # 收盘后关机
         rt = self.cfg.setdefault("runtime", {})
