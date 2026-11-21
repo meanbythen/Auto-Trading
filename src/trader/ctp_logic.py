@@ -17,7 +17,12 @@ from dataclasses import dataclass, field
 from decimal import Decimal
 from typing import Any
 
-from src.trader.ctp_symbols import ctp_exchange_id, product_code, symbol_key
+from src.trader.ctp_symbols import (
+    ctp_exchange_id,
+    ctp_instrument_id as ctp_instrument_id,
+    product_code,
+    symbol_key,
+)
 
 
 # 柜台开平标志。和上期技术 CTP 的 CombOffsetFlag 一致。

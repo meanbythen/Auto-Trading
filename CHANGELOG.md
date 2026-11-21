@@ -4,6 +4,13 @@
 
 规则写在 README 的「版本」一节。已经写在这里的旧版本不再改写，新的改动加在最上面。
 
+## 49.20.1 — 2026-11-21
+
+修启动报错 `ImportError: cannot import name 'ctp_instrument_id' from 'src.trader.ctp_logic'`。
+
+- 49.20.0 把合约代码与交易所映射抽到 `src/trader/ctp_symbols.py` 时，`ctp_logic` 只转导出了 `ctp_exchange_id`、`product_code`、`symbol_key`，漏了 `ctp_instrument_id`；网关、行情和交易前置仍从 `ctp_logic` 导入它，导致程序在启动导入阶段直接退出。现已补上转导出。
+- 配置与交易行为不变。`src.ui.app` 与 CTP 各模块导入通过，95 项 CTP 测试通过。
+
 ## 49.20.0 — 2026-11-21
 
 功能更新。这一版把「程序自测」做成不依赖真柜台的闭环，补上组合风控与一账号一本账，并修掉单笔最大手数保存、重启回 20 的问题（本版替换此前未发布的 49.19.1 草稿）。
