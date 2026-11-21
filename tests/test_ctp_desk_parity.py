@@ -3,7 +3,7 @@
 from types import SimpleNamespace
 
 from src.trader.ctp_gateway import CtpSettings
-from src.ui.ctp_probe import CtpProbeWindow
+from src.ui.ctp_probe import CtpProbeWindow, watch_seed
 from src.trader.ctp_logic import PositionView
 from src.trader.ctp_orders import (
     ctp_order,
@@ -13,6 +13,16 @@ from src.trader.ctp_orders import (
     reverse_order_steps,
 )
 from src.trader.ctp_trader import CtpTrader
+
+
+def test_desk_watchlist_current_symbol_first() -> None:
+    """第一行是当前交易合约，后面按关注列表顺序，重复项只留一次。"""
+    cfg = {
+        "trade": {"symbol": "lh2701"},
+        "strategy": {"symbols": ["fu2701", "LH2701", "jd2612"]},
+    }
+    assert watch_seed(cfg) == ["lh2701", "fu2701", "jd2612"]
+    assert watch_seed({"trade": {}, "strategy": {"symbols": []}}) == ["fu2701"]
 
 
 def test_desk_keeps_resident_wait_and_auto_cancel() -> None:

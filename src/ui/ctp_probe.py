@@ -156,6 +156,23 @@ def open_ctp_probe(master: tk.Misc) -> None:
     master._ctp_probe = window  # type: ignore[attr-defined]
 
 
+def watch_seed(cfg: dict) -> list[str]:
+    """盘口初始清单：当前交易合约排第一，后面跟配置关注品种，去重保序。"""
+    trade = cfg.get("trade") or {}
+    strategy = cfg.get("strategy") or {}
+    first = str(trade.get("symbol") or "").strip()
+    items = [first] if first else []
+    items.extend(str(item).strip() for item in (strategy.get("symbols") or []) if str(item).strip())
+    result: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        key = symbol_key(item)
+        if key and key not in seen:
+            seen.add(key)
+            result.append(item)
+    return result or ["fu2701"]
+
+
 @dataclass
 class _QuoteRow:
     """盘口一行。单合约就是只看第一行，多合约时每行各自保存。"""
@@ -183,11 +200,15 @@ class CtpProbeWindow(tk.Toplevel):
         self.geometry("1280x900")
         self.trader: CtpTrader | None = None
         self.md = None
-        self.symbol = tk.StringVar(value="fu2701")
+        cfg = load_config()
+        self._watch = watch_seed(cfg)
+        watch = self._watch
+        self.symbol = tk.StringVar(value=watch[0])
         self.price = tk.StringVar(value="")
         self.volume = tk.StringVar(value="1")
         self._quote_rows: list[_QuoteRow] = []
         self.quote_hint = tk.StringVar(value="")
+        self.watch_line = tk.StringVar(value="")
         self.account_line = tk.StringVar(value="还没登录")
         self.limit_line = tk.StringVar(value="")
         self.count_line = tk.StringVar(value="今日报单 0 笔，撤单 0 笔")
@@ -203,7 +224,6 @@ class CtpProbeWindow(tk.Toplevel):
         self._cost_loaded: set[str] = set()
         self._last_pick = ""
         self._last_pick_at = 0.0
-        cfg = load_config()
         self._sizer = PositionSizer(cfg)
         self._root = str(cfg.get("_project_root") or ".")
         self._stage = current_stage_from_cfg(cfg)
@@ -278,7 +298,9 @@ class CtpProbeWindow(tk.Toplevel):
             ttk.Label(quotes, text=title).grid(row=0, column=col, sticky="w", padx=6)
         for index in range(self.QUOTE_ROWS):
             row = _QuoteRow(
-                symbol=tk.StringVar(value="fu2701" if index == 0 else ""),
+                symbol=tk.StringVar(
+                    value=self._watch[index] if index < len(self._watch) else ""
+                ),
                 last=tk.StringVar(value="—"),
                 bid=tk.StringVar(value="—"),
                 bid_vol=tk.StringVar(value="0"),
@@ -316,6 +338,15 @@ class CtpProbeWindow(tk.Toplevel):
             text="点盘口数字会把这一行的合约和价格填进上方；只订阅填了代码的行。",
             foreground="#666",
         ).pack(anchor="w", padx=8)
+        ttk.Label(self, textvariable=self.watch_line, foreground="#666").pack(anchor="w", padx=8)
+        shown = min(len(self._watch), self.QUOTE_ROWS)
+        line = f"盘口 {shown} 行来自配置关注品种（当前交易合约排第一）。"
+        if len(self._watch) > self.QUOTE_ROWS:
+            line += (
+                f"配置关注共 {len(self._watch)} 个，其余 {len(self._watch) - self.QUOTE_ROWS} 个未订阅；"
+                "需要看时先清空一行，再在上方切换；当前合约仍会订阅，但不会多占一行。"
+            )
+        self.watch_line.set(line)
         ttk.Label(self, textvariable=self.quote_hint, foreground="#666").pack(anchor="w", padx=8)
 
         buttons = ttk.Frame(self)

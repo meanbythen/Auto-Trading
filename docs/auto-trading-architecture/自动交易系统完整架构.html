@@ -105,8 +105,8 @@
     <h1>自动交易系统完整架构<br>与三条数据流</h1>
     <p class="sub">单进程、多线程的期货自动交易系统。界面下发命令，调度线程串行完成扫描、风控、报单与记账；行情与交易数据分库存储，账号与账本以文件为权威、SQLite 为可重建投影。本文给出分层架构、功能块职责，以及实盘、回测、模拟三条链路的数据流向与调用关系。</p>
     <div class="meta">
-      <span class="chip">版本 <b>49.25.0</b></span>
-      <span class="chip">规模 <b>255 个 Python 文件 · 102,318 行</b></span>
+      <span class="chip">版本 <b>49.26.0</b></span>
+      <span class="chip">规模 <b>255 个 Python 文件 · 102,349 行</b></span>
       <span class="chip">测试 <b>160 个测试文件</b></span>
       <span class="chip">基线日期 <b>2026-11-21</b></span>
       <span class="chip">运行形态 <b>单进程多线程</b></span>
@@ -378,7 +378,7 @@ sequenceDiagram
       </div>
 
       <div class="callout warn">
-        <b>边界说明：</b>CTP 交易台与仿真柜台窗口的“手工单”属于人工测试入口，直接调用柜台适配器，不经过 <code>run_early_gates / run_send_gates</code>，但仍受单笔上限、<code>dry_run</code>、拆分平仓等网关约束。交易台盘口为 5 行，每行一个合约，只订阅填了代码的行；单合约就是只用第一行。
+        <b>边界说明：</b>CTP 交易台与仿真柜台窗口的“手工单”属于人工测试入口，直接调用柜台适配器，不经过 <code>run_early_gates / run_send_gates</code>，但仍受单笔上限、<code>dry_run</code>、拆分平仓等网关约束。交易台盘口为 5 行，第一行是当前交易合约，其余按配置关注品种预填；只订阅填了代码的行，单合约就是只用第一行。
       </div>
     </section>
 
