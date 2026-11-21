@@ -83,6 +83,7 @@ class FillModel:
         else:
             parts.append("未加滑点")
         parts.append("破止损按止损价成交，跳空按开盘价")
+        parts.append("实盘按对手价/盘口成交并受单笔上限约束；回测按上述参考价加减固定跳数")
         if self.mirror_live_gates:
             parts.append("已套实盘过期K和追价闸（放弃的根不会成交）")
         return "成交近似  " + "；".join(parts)

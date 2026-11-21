@@ -309,17 +309,37 @@ class OrderIntentMixin:
             return dict(intent)
         return None
 
+    # 人工在持仓核对页确认后可解除的熔断种类：遗留委托、发单结果未知、风控同步失败。
+    _MANUAL_RECOVER_HALT_KINDS = frozenset(
+        {"pending_intent", "order_dispatch_unknown", "risk_sync_failed", "risk_state_migration_conflict"}
+    )
+
     def confirm_positions_reviewed(self) -> tuple[bool, str]:
         """人工核对交易软件持仓后，清掉遗留委托意图并解除对应熔断。"""
         if self._pending_intent is None:
+            # 没有遗留点击委托，但可能是发单异常/风控同步失败触发的熔断，也从这里人工解除。
+            if self.risk.halted and self.risk.halt_kind in self._MANUAL_RECOVER_HALT_KINDS:
+                kind = str(self.risk.halt_kind)
+                self.risk.clear_halt()
+                try:
+                    self.set_orders_paused(False)
+                except Exception:  # noqa: BLE001
+                    pass
+                self._persist_state()
+                self._record_event("position_review_confirmed", halt_kind=kind)
+                return True, "已解除熔断，可以继续扫描。"
             return False, "没有待核对的委托记录。"
         intent = dict(self._pending_intent)
         self._clear_order_intent()
         if self.risk.halted and (
-            self.risk.halt_kind == "pending_intent"
+            self.risk.halt_kind in self._MANUAL_RECOVER_HALT_KINDS
             or str(self.risk.halt_reason).startswith(self._INTENT_HALT_PREFIX)
         ):
             self.risk.clear_halt()
+            try:
+                self.set_orders_paused(False)
+            except Exception:  # noqa: BLE001
+                pass
         self._persist_state()
         self._record_event("position_review_confirmed", **intent)
         return True, "已解除熔断，可以继续扫描。"

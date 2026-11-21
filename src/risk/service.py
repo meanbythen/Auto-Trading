@@ -14,7 +14,7 @@ from src.domain.accounts import load_active_id
 from src.kernel.trace import get_trace_id
 from src.risk.guardian import RiskGuardian
 from src.risk.portfolio import PortfolioRisk
-from src.risk.state_store import DualRiskStateStore, RiskStateStore
+from src.risk.state_store import DualRiskStateStore, RiskStateStore, migrate_legacy_keys
 from src.utils.trading_day import futures_trading_day
 
 _DELEGATED_FIELDS = {
@@ -66,6 +66,10 @@ class RiskService:
         root: str | Path,
         account_id: str | None = None,
     ) -> "RiskService":
+        try:
+            migrate_legacy_keys(root, cfg)
+        except Exception as exc:  # noqa: BLE001 - 迁移失败不能拦住启动
+            logger.warning("风控状态旧键迁移失败（不阻断启动）: {}", exc)
         store = DualRiskStateStore(root, cfg)
         return cls(
             RiskGuardian.from_config(cfg),

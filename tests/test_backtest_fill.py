@@ -733,3 +733,31 @@ def test_partial_close_keeps_volume_fee_allocation_and_actual_exit_time(monkeypa
     assert result.ambiguities == []
 
 
+def test_fifteen_minute_flatten_fills_at_bar_close(monkeypatch) -> None:
+    """15 分钟周期没有 14:55 那根：清仓落在 15:00 收盘，锁定已知的 5 分钟差。"""
+    rows = [("2026-10-16 09:00", 100, 101, 99, 100)]
+    rows += [
+        (f"2026-10-16 {hour:02d}:{minute:02d}", 100, 101, 99, 100)
+        for hour, minute in (
+            (9, 15), (9, 30), (9, 45),
+            (10, 0), (10, 15), (10, 30), (10, 45),
+            (11, 0), (11, 15), (11, 30),
+            (13, 30), (13, 45),
+            (14, 0), (14, 15), (14, 30), (14, 45),
+        )
+    ]
+    rows.append(("2026-10-16 15:00", 100, 101, 99, 102))
+    bars = _ohlc_frame(rows)
+    cfg = _cfg(slippage_ticks=0)
+    cfg["strategy"]["timeframe"] = "15"
+    cfg["strategy"]["flatten_at_close"] = True
+    cfg["strategy"]["flatten_times"] = ["14:55"]
+    result = _run_scripted(monkeypatch, bars, None, cfg)
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit_time == "2026-10-16T15:00:00"
+    assert trade.exit_price == 102.0
+    assert "收盘清仓" in trade.reason_exit
+
+

@@ -182,6 +182,7 @@ def build_quality_report(trades: list[SignalTrade]) -> QualityReport:
             "若 MAE 经常接近止损距离，说明止损偏紧或进场位置差。"
         )
 
+    report.lines.append("质量指标按点数统计，不含手续费、滑点；与回测/实盘金额口径不可直接比较。")
     report.lines.append("分笔明细：")
     for i, t in enumerate(trades, 1):
         report.lines.append(f"  · {_trade_line(i, t)}")

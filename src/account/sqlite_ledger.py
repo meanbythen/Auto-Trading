@@ -14,7 +14,14 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from src.account.trading_db import DB_LOCK, connect, json_text, resolve_db_path, storage_settings
+from src.account.trading_db import (
+    DB_LOCK,
+    connect,
+    connect_readonly,
+    json_text,
+    resolve_db_path,
+    storage_settings,
+)
 from src.domain.accounts import load_active_id
 from src.domain.ledger import ctp_history_equity, ensure_changes, equity_points
 
@@ -27,7 +34,17 @@ def _now() -> str:
 
 
 def _book_id(root: str | Path, book: dict[str, Any]) -> str:
-    return str(book.get("account_id") or load_active_id(root))
+    """解析账本的真实 book_id（账本名），不能直接拿 account_id 当 book_id。
+
+    自测账 account_id=acc_program_selftest，但 book_id=self_test；若直接存 account_id，
+    组合风控按 SELF_TEST_BOOK_ID 过滤就会漏掉自测成交。统一走注册表 profile_of 解析。
+    """
+    from src.domain.accounts import profile_of
+
+    explicit = str(book.get("book_id") or "").strip()
+    if explicit:
+        return explicit
+    return profile_of(book.get("account_id"), root=root)["id"]
 
 
 def _fill_id(book: dict[str, Any], row: dict[str, Any], index: int) -> str:
@@ -213,7 +230,10 @@ class SQLiteLedgerStore:
 
     def load_book(self, book_id: str) -> dict[str, Any] | None:
         """读 SQLite 中的无损快照，后续仍调用原 signal_book/signal_stats 统计。"""
-        with closing(connect(self.db_path)) as conn:
+        conn = connect_readonly(self.db_path)
+        if conn is None:
+            return None
+        with closing(conn):
             row = conn.execute("SELECT payload_json FROM books WHERE book_id = ?", (str(book_id),)).fetchone()
         if row is None:
             return None
@@ -239,8 +259,12 @@ class SQLiteLedgerStore:
         book_id = _book_id(self.root, book)
         stored = self.load_book(book_id)
         target = str(day)[:10]
-        with closing(connect(self.db_path)) as conn:
-            rows = conn.execute("SELECT time FROM fills WHERE book_id = ?", (book_id,)).fetchall()
+        conn = connect_readonly(self.db_path)
+        if conn is None:
+            rows: list[Any] = []
+        else:
+            with closing(conn):
+                rows = conn.execute("SELECT time FROM fills WHERE book_id = ?", (book_id,)).fetchall()
         json_fills = sum(
             1 for row in book.get("trades") or [] if str(row.get("time") or "")[:10] == target
         )

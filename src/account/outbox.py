@@ -22,7 +22,7 @@ from typing import Any
 
 from loguru import logger
 
-from src.account.trading_db import DB_LOCK, connect, json_text, storage_settings
+from src.account.trading_db import DB_LOCK, connect, connect_readonly, json_text, storage_settings
 
 ORDER_SUBMITTED = "OrderSubmitted"
 ORDER_FILLED = "OrderFilled"
@@ -127,8 +127,11 @@ def _rows(root: str | Path, status: str, limit: int) -> list[dict[str, Any]]:
     if not _enabled(root):
         return []
     settings = storage_settings(root)
+    conn = connect_readonly(settings.db_path)
+    if conn is None:
+        return []
     try:
-        with closing(connect(settings.db_path)) as conn:
+        with closing(conn):
             rows = conn.execute(
                 """
                 SELECT * FROM event_outbox
@@ -184,6 +187,36 @@ def _fail(root: str | Path, event: dict[str, Any], exc: Exception, *, keep: str)
         event.get("event_id"),
         exc,
     )
+    if status == "failed":
+        book = str(event.get("book_id") or event.get("account_id") or "")
+        msg = (
+            f"发件箱事件失败（已达最大重试 {MAX_ATTEMPTS} 次）："
+            f"{event.get('type')} {event.get('event_id')} 账本 {book}：{str(exc)[:200]}"
+        )
+        logger.error(msg)
+        try:
+            from src.ops.alerts import emit_alert
+
+            emit_alert("outbox_failed", msg, level="error")
+        except Exception:  # noqa: BLE001 - 告警失败不影响事件流转
+            pass
+
+
+def report_failed(root: str | Path, limit: int = 200) -> int:
+    """启动时汇总存量 failed 事件并告警，避免静默堆积。返回 failed 数量。"""
+    failed = _rows(root, "failed", limit)
+    if not failed:
+        return 0
+    preview = ", ".join(str(e["event_id"]) for e in failed[:5])
+    msg = f"发件箱存在 {len(failed)} 条 failed 事件未处理，请人工核对后重投（首批：{preview}）"
+    logger.error(msg)
+    try:
+        from src.ops.alerts import emit_alert
+
+        emit_alert("outbox_failed_backlog", msg, level="error")
+    except Exception:  # noqa: BLE001
+        pass
+    return len(failed)
 
 
 def _active_book(root: str | Path) -> str:
@@ -348,6 +381,7 @@ def start_dispatcher(
             existing.wake()
             return existing
         dispatcher = OutboxDispatcher(root, handler)
+        report_failed(root)
         dispatcher.start()
         _DISPATCHERS[key] = dispatcher
         return dispatcher

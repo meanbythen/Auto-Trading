@@ -26,6 +26,10 @@ from src.domain.trading_account import BrokerProfileTemplate, TradingAccount
 SCHEMA_PATH = Path(__file__).with_name("schema.sql")
 DEFAULT_DB_REL = Path("data") / "trading.db"
 
+# SQLite 投影的 schema 版本。每次 connect 只在 user_version 低于此值时跑迁移，
+# 避免每连接重复 DDL / 拿写锁。
+SCHEMA_VERSION = 1
+
 PROFILE_COLUMNS = (
     "profile_id",
     "label",
@@ -217,6 +221,39 @@ def _ensure_columns(
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
 
 
+def init_schema(conn: sqlite3.Connection) -> None:
+    """按 PRAGMA user_version 幂等初始化 schema。版本已达标时什么都不做。
+
+    写连接在事务外调用；迁移本身用单独事务提交。只读连接不调用此函数。
+    """
+    row = conn.execute("PRAGMA user_version").fetchone()
+    version = int(row[0] if row and row[0] is not None else 0)
+    if version >= SCHEMA_VERSION:
+        return
+    with conn:
+        if version < 1:
+            # v0→v1：旧的 ux_accounts_profile 唯一索引与「一条连接多账号」冲突，
+            # 只在首次迁移时删一次；之后 schema.sql 不再包含该 DROP。
+            conn.execute("DROP INDEX IF EXISTS ux_accounts_profile")
+            conn.executescript(load_schema())
+            _ensure_columns(
+                conn,
+                "accounts",
+                {
+                    "password_ref": "TEXT NOT NULL DEFAULT ''",
+                    "auth_code_ref": "TEXT NOT NULL DEFAULT ''",
+                    "captcha_mode": "TEXT NOT NULL DEFAULT 'pause'",
+                    "skip_auto_login": "INTEGER NOT NULL DEFAULT 1",
+                },
+            )
+            _ensure_columns(
+                conn,
+                "risk_decisions",
+                {"trace_id": "TEXT NOT NULL DEFAULT ''"},
+            )
+        conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+
+
 def migrate(
     root: str | Path,
     db_path: str | Path | None = None,
@@ -247,22 +284,7 @@ def migrate(
 
     conn_path = ":memory:" if dry_run else str(target)
     with closing(_connect(conn_path)) as conn:
-        conn.executescript(load_schema())
-        _ensure_columns(
-            conn,
-            "accounts",
-            {
-                "password_ref": "TEXT NOT NULL DEFAULT ''",
-                "auth_code_ref": "TEXT NOT NULL DEFAULT ''",
-                "captcha_mode": "TEXT NOT NULL DEFAULT 'pause'",
-                "skip_auto_login": "INTEGER NOT NULL DEFAULT 1",
-            },
-        )
-        _ensure_columns(
-            conn,
-            "risk_decisions",
-            {"trace_id": "TEXT NOT NULL DEFAULT ''"},
-        )
+        init_schema(conn)
         with conn:
             written = _upsert(
                 conn,

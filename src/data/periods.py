@@ -773,6 +773,7 @@ def drop_forming_bar(
     bars: pd.DataFrame | None,
     *,
     now: datetime | None = None,
+    period: str | None = None,
 ) -> pd.DataFrame | None:
     """
     去掉还没收盘的最后一根，留下已经走完的 K 线。
@@ -783,9 +784,21 @@ def drop_forming_bar(
 
     否则午休后、夜盘开盘后，第一根已收盘 K 线会单独挂在末尾，
     被误删后程序会一直以为最新已收盘还是上午最后一根，止损会晚好几分钟。
+
+    日线不能只看墙上时钟：天勤日线标签是交易日 00:00，当天盘中墙钟早就过了
+    00:00，那根其实还在走。传了 period="D" 就按期货交易日截断，只留已完成日线，
+    和回测看到的大周期序列保持一致。周线维持原有右标签口径。
     """
     if bars is None or len(bars) == 0:
         return bars
+    if period is not None and canonical_period(period) == "D":
+        from src.utils.trading_day import futures_trading_day
+
+        wall = now or datetime.now()
+        if getattr(wall, "tzinfo", None) is not None:
+            wall = wall.replace(tzinfo=None)
+        cutoff = pd.Timestamp(futures_trading_day(wall))
+        return bars[bars.index < cutoff]
     if len(bars) == 1:
         # 只有一根时：还没收盘就先空着；已经收盘就留下。
         last = pd.Timestamp(bars.index[-1]).to_pydatetime()

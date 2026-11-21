@@ -59,7 +59,8 @@ CREATE TABLE IF NOT EXISTS accounts (
 );
 
 -- 一条连接可被多个账号引用（资金号只存在账号上），旧的唯一约束不再使用。
-DROP INDEX IF EXISTS ux_accounts_profile;
+-- 旧索引 ux_accounts_profile 的删除改由 init_schema() 的 v0→v1 迁移一次性完成，
+-- 避免每次连接都执行 DDL / 拿写锁。
 
 -- 一个账号一本账。
 CREATE UNIQUE INDEX IF NOT EXISTS ux_accounts_book

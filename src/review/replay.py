@@ -34,6 +34,12 @@ from src.strategy.engine_labels import (
 from src.strategy.types import PositionState
 
 
+REPLAY_COST_NOTE = (
+    "复盘口径：按价格点数估算开平仓，不含手续费、滑点与合约乘数；"
+    "净盈亏与回测/实盘金额口径不可直接相加。"
+)
+
+
 @dataclass
 class ReplayEvent:
     """一次开仓或平仓。"""
@@ -193,6 +199,7 @@ def replay_strategy(
         "是信号演示，不是实际执行价。"
     )
     result.lines.append(f"窗口内一共看了 {covered} 根已收盘K线。")
+    result.lines.append(REPLAY_COST_NOTE)
 
     if opens:
         result.opened = True

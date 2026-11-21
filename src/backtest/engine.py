@@ -97,13 +97,64 @@ def _net_pnl_after_fees(
     价差盈亏扣掉本笔分摊的开仓费 + 平仓费。
 
     返回 (净盈亏, 本笔手续费合计)。部分平仓时按手数分摊开仓费。
+    平仓费按每笔开仓（lot）分别判断平今/平昨：加仓不更新最早 entry_time 时，
+    跨日加仓的部分不会整笔被误当成平昨。消耗顺序为最新 lot 优先（平今优先，费用更保守）。
     """
     open_fee_left = float(open_meta.get("open_fee") or 0)
     held_lots = max(1, int(held or volume or 1))
     cut = max(0, min(int(volume or 0), held_lots))
     open_share = round(open_fee_left * cut / held_lots, 2) if open_fee_left else 0.0
-    today = is_close_today(str(open_meta.get("entry_time") or ""), exit_time)
-    close_fee = fee_close(contracts, symbol, cut, close_today=today)
+
+    # 老结果或手工构造的 open_meta 没有 lots：按单一开仓时间回退，行为与旧版一致。
+    raw_lots = open_meta.get("lots")
+    lots: list[dict[str, Any]] = []
+    if isinstance(raw_lots, list):
+        for item in raw_lots:
+            if not isinstance(item, dict):
+                continue
+            try:
+                lot_volume = int(item.get("volume") or 0)
+            except (TypeError, ValueError):
+                lot_volume = 0
+            if lot_volume > 0:
+                lots.append({"time": str(item.get("time") or ""), "volume": lot_volume})
+    if not lots:
+        lots = [
+            {
+                "time": str(open_meta.get("entry_time") or ""),
+                "volume": max(0, int(open_meta.get("open_volume") or held_lots)),
+            }
+        ]
+
+    left = cut
+    close_fee = 0.0
+    for lot in reversed(lots):
+        if left <= 0:
+            break
+        take = min(left, int(lot["volume"]))
+        if take <= 0:
+            continue
+        close_fee += fee_close(
+            contracts,
+            symbol,
+            take,
+            close_today=is_close_today(lot["time"], exit_time),
+        )
+        lot["volume"] = int(lot["volume"]) - take
+        left -= take
+    if left > 0:
+        # lots 合计少于持仓（理论上不该发生）：剩余部分按最早开仓时间兜底，不静默免掉手续费。
+        close_fee += fee_close(
+            contracts,
+            symbol,
+            left,
+            close_today=is_close_today(str(open_meta.get("entry_time") or ""), exit_time),
+        )
+
+    remaining = [lot for lot in lots if int(lot["volume"]) > 0]
+    open_meta["lots"] = remaining
+    if remaining:
+        open_meta["entry_time"] = str(remaining[0].get("time") or open_meta.get("entry_time") or "")
     total_fee = round(open_share + close_fee, 2)
     open_meta["open_fee"] = round(max(0.0, open_fee_left - open_share), 2)
     if "open_volume" in open_meta:
@@ -473,6 +524,7 @@ class _BacktestSetup:
     trade_from: int
     loop_start: int
     carry: dict[str, Any] | None
+    margin_rate: float = MARGIN_RATE
     calendar: Any = None
 
 
@@ -618,6 +670,14 @@ def _prepare_backtest(
     # 回测需要足够长的历史；旧逻辑只留约100根 → 经常只有1笔成交、胜率失真
     bt_cfg = cfg.get("backtest") or {}
     max_bars = int(bt_cfg.get("max_bars", 1200))
+    # 收益率分母的保证金比例。默认仍 10%；配置非法时回退默认，避免把收益率算成天文数字。
+    raw_margin = bt_cfg.get("margin_rate", MARGIN_RATE)
+    try:
+        margin_rate = float(raw_margin)
+    except (TypeError, ValueError):
+        margin_rate = MARGIN_RATE
+    if not (0 < margin_rate <= 1):
+        margin_rate = MARGIN_RATE
     warmup = int(bt_cfg.get("warmup", warmup))
     # 策略自带的最少 K 线（含行情过滤回看窗口）比默认预热更长时，把前面那些根直接跳过，
     # 不参加回测循环。不这么做也能跑，只是会重复回放一堆「K线不足」的空决策。
@@ -655,10 +715,10 @@ def _prepare_backtest(
             bars_trend = None
     # 最后一根可能还没走完（行情源会给正在走的那根）。回测只用收盘价，先去掉；
     # 各行情源口径统一，不用每家自己删一次。
-    bars_signal = unique_ohlc_columns(drop_forming_bar(bars_signal))
-    bars_trail = unique_ohlc_columns(drop_forming_bar(bars_trail))
+    bars_signal = unique_ohlc_columns(drop_forming_bar(bars_signal, period=tf))
+    bars_trail = unique_ohlc_columns(drop_forming_bar(bars_trail, period=trail_tf))
     if bars_trend is not None:
-        bars_trend = unique_ohlc_columns(drop_forming_bar(bars_trend))
+        bars_trend = unique_ohlc_columns(drop_forming_bar(bars_trend, period=trend_tf))
     # 先记下行情实际能给的头尾，再按用户日期截。截完后的区间可能比填写的短。
     available_from = str(bars_signal.index[0]) if bars_signal is not None and len(bars_signal) else ""
     available_to = str(bars_signal.index[-1]) if bars_signal is not None and len(bars_signal) else ""
@@ -730,6 +790,7 @@ def _prepare_backtest(
         trade_from=trade_from,
         loop_start=loop_start,
         carry=carry,
+        margin_rate=margin_rate,
         calendar=calendar,
     )
 
@@ -1222,6 +1283,18 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
         run.open_meta["reason"] = decision.reason
         run.open_meta["open_fee"] = float(run.open_meta.get("open_fee") or 0) + open_fee
         run.open_meta["open_volume"] = total_vol
+        entry_text = entry_time.isoformat(timespec="seconds")
+        lots = run.open_meta.get("lots")
+        if not isinstance(lots, list):
+            lots = [
+                {
+                    "time": str(run.open_meta.get("entry_time") or entry_text),
+                    "volume": prev_vol,
+                }
+            ]
+        # entry_time 保持最早一笔，供成交明细展示；平今/平昨按各 lot 自己的时间判断。
+        lots.append({"time": entry_text, "volume": open_vol})
+        run.open_meta["lots"] = lots
     else:
         run.open_meta = {
             "side": "long" if decision.action == StrategyAction.BUY_OPEN else "short",
@@ -1230,6 +1303,12 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
             "reason": decision.reason,
             "open_fee": open_fee,
             "open_volume": open_vol,
+            "lots": [
+                {
+                    "time": _ts_to_dt(entry_ts).isoformat(timespec="seconds"),
+                    "volume": open_vol,
+                }
+            ],
             "score": meta.get("score"),
             "score_ma": meta.get("score_ma"),
             "score_turtle": meta.get("score_turtle"),
@@ -1588,6 +1667,15 @@ def _params_snapshot(setup: _BacktestSetup, run: _BacktestRun) -> dict[str, Any]
         "slippage_ticks": fill.slippage_ticks,
         "price_tick": fill.price_tick,
         "fill_note": fill.describe() + "\n" + run.liquidity.describe(),
+        # 回测没有模拟的实盘环节，集中写清楚，避免拿回测净盈亏直接对上实盘。
+        "live_gap_note": (
+            "未模拟：组合敞口限额、行情健康/过期拒单、信号去重、账本/发单暂停、排队拒单、网络延迟、部分成交分布；"
+            f"保证金按 {float(setup.margin_rate):.0%} 估算；"
+            f"手数口径 {'随剩余权益' if limits.chain_capital else '固定起始资金'}；"
+            f"K线长度 实盘扫描默认 {int((cfg.get('data') or {}).get('live_max_bars', 200))} 根、"
+            f"回测默认 {int(setup.max_bars)} 根；"
+            "清仓时点 5分钟周期与实盘 14:55/22:55 一致，15分钟以上按该根收盘（如 15:00）成交。"
+        ),
         "mirror_live_gates": bool(fill.mirror_live_gates),
         "mirror_gate_hits": list(run.gate_hits),
         # 涨跌停/部分成交/挂单超时口径，原样写进快照，便于和历史结果对照。
@@ -1607,8 +1695,8 @@ def _params_snapshot(setup: _BacktestSetup, run: _BacktestRun) -> dict[str, Any]
         "max_orders_per_day": int(risk.get("max_orders_per_day", 20)),
         "margin_per_lot": float(risk.get("margin_per_lot", 0) or 0),
         # 这一笔仓最多要交多少保证金。收益率用它做分母，不拿来改手数。
-        "margin_used": peak_margin(run.trades, run.mult, MARGIN_RATE),
-        "margin_rate": MARGIN_RATE,
+        "margin_used": peak_margin(run.trades, run.mult, setup.margin_rate),
+        "margin_rate": setup.margin_rate,
         "skipped_opens": dict(limits.skipped),
         "ambiguity_count": len(run.ambiguities),
         "ambiguity_pnl_impact": round(

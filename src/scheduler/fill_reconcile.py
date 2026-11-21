@@ -257,6 +257,29 @@ class FillReconcileMixin:
             self.risk.on_order_filled(decision.action.value, vol, symbol=symbol)
         except Exception as exc:  # noqa: BLE001
             logger.exception("风控净仓同步失败: {}", exc)
+            # 净仓同步失败后持仓视图不可信：停开新仓 + 告警，等人工核对。
+            # 不阻断后续成交记账与 POSITION_CHANGED 入队（事实仍需落库）。
+            message = f"风控净仓同步失败，已停止开新仓，请人工核对：{exc}"
+            try:
+                self.risk.set_halt("risk_sync_failed", message)
+                save = getattr(self.risk, "save_state", None)
+                if callable(save):
+                    save()
+            except Exception:  # noqa: BLE001
+                pass
+            trader = getattr(self, "trader", None)
+            mark = getattr(trader, "mark_reconcile_unknown", None)
+            if callable(mark):
+                try:
+                    mark(f"risk sync failed: {exc}")
+                except Exception:  # noqa: BLE001
+                    pass
+            try:
+                from src.ops.alerts import emit_alert
+
+                emit_alert("risk_sync_failed", message, level="error")
+            except Exception:  # noqa: BLE001
+                pass
 
         if fill_event_id and direction:
             from src.account.outbox import POSITION_CHANGED, enqueue

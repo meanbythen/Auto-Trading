@@ -455,6 +455,10 @@ def load_config(
         from src.account.session import apply_active_session
 
         apply_active_session(root, cfg, secrets)
+        # 比对 SQLite 账号投影与 YAML 注册表：漂移只告警，不阻断启动。
+        from src.account.trading_db import check_account_projection
+
+        check_account_projection(root, cfg)
     except Exception as exc:  # noqa: BLE001 - 注册表不能拦住启动
         logger.warning("账号注册表接入失败，继续用旧 ctp_profiles: {}", exc)
     pwd_env = cfg.get("account", {}).get("password_env", "FUTURES_PASSWORD")

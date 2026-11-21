@@ -766,7 +766,11 @@ class TradingBot(
                     used_bar[str(sym)] = str(bar_id)
 
     def _session_key_from_timestamp(self, raw: str) -> str:
-        """从开仓时间或 K 线时间推日盘/夜盘名额键，格式与日内实体一致。"""
+        """从开仓时间或 K 线时间推日盘/夜盘名额键，格式与日内实体一致。
+
+        名额键的日期用期货交易日 futures_trading_day：21:00 之后归入下一交易日，
+        这样 21:00 与次日 00:30 的夜盘共用同一个键，重启后名额保持。
+        """
         text = str(raw or "").strip()
         if not text:
             return ""
@@ -778,16 +782,17 @@ class TradingBot(
             return ""
         if stamp.tzinfo is not None:
             stamp = stamp.tz_localize(None)
-        clock = stamp.to_pydatetime().time()
+        dt = stamp.to_pydatetime()
+        clock = dt.time()
         day_open = dtime(9, 0)
         night_open = dtime(21, 0)
         if day_open <= clock < night_open:
             anchor = day_open
-        elif clock >= night_open:
-            anchor = night_open
         else:
-            return ""
-        return f"{stamp.date().isoformat()} {anchor.strftime('%H:%M')}"
+            # 包含 >=21:00 和 <09:00（跨零点的夜盘），都算夜盘。
+            anchor = night_open
+        fday = futures_trading_day(dt)
+        return f"{fday.isoformat()} {anchor.strftime('%H:%M')}"
 
     def _reconcile_books(self) -> None:
         """
@@ -1766,7 +1771,7 @@ class TradingBot(
         health = self._capture_market_health(symbol, str(signal_tf), bars)
         # 只去掉「墙上时钟还没到结束时刻」的最后一根。
         # 午休后第一根已收盘若被盲删，会一直以为最新还是上午那根，止损会晚好几分钟。
-        closed = drop_forming_bar(bars)
+        closed = drop_forming_bar(bars, period=str(signal_tf))
         if closed is None or len(closed) == 0:
             closed = bars
         forming = None
@@ -1774,16 +1779,9 @@ class TradingBot(
             forming = bars.iloc[len(closed) :]
 
         trail_closed = None
-        trail_forming = None
         if str(trail_tf) != str(signal_tf):
             trail_bars = self.kline.fetch(symbol, period=str(trail_tf))
-            trail_closed = drop_forming_bar(trail_bars)
-            if (
-                trail_bars is not None
-                and trail_closed is not None
-                and len(trail_bars) > len(trail_closed)
-            ):
-                trail_forming = trail_bars.iloc[len(trail_closed) :]
+            trail_closed = drop_forming_bar(trail_bars, period=str(trail_tf))
 
         # 有的策略会另外要日线。拉不到就不开新仓，不用分钟线自己拼日线，也不改用别的策略。
         trend_closed = None
@@ -1792,7 +1790,7 @@ class TradingBot(
             try:
                 trend_bars = self.kline.fetch(symbol, period=str(trend_tf))
                 # 最后一根日线可能还在走，先拿掉。策略还会再核对一次是不是已经走完。
-                trend_closed = drop_forming_bar(trend_bars)
+                trend_closed = drop_forming_bar(trend_bars, period=str(trend_tf))
             except Exception as e:  # noqa: BLE001
                 logger.warning("{} 的日线没拿到，这一轮看不清方向，不开新仓: {}", symbol, e)
 
@@ -1827,25 +1825,9 @@ class TradingBot(
         eval_trail = trail_closed
         eval_trend = trend_closed
         catch_up_used = False
-        # 空仓/持仓时是否把还在走的那根也拼进去：
-        #   - 止损用「触及即止损」（stop_on_touch=True）时，持仓拼未收线那根，让箱沿止损能看到当前影线。
-        #   - 开仓用「触发即开仓」（entry_mode=trigger）时，空仓也拼未收线那根，让开仓能看到当前影线。
-        # 否则只用已收盘 K 线，避免影线假突破。
-        from src.strategy.types import ENTRY_MODE_TRIGGER
-
-        touch_stop = bool(getattr(self.strategy, "stop_on_touch", True))
-        entry_trigger = (
-            str(getattr(self.strategy, "entry_mode", None) or "").strip().lower()
-            == ENTRY_MODE_TRIGGER
-        )
-        flat = self._symbol_is_flat(symbol)
-        use_forming_for_entry = entry_trigger and flat
-        use_forming_for_stop = touch_stop and not flat
-        if (use_forming_for_entry or use_forming_for_stop) and closed is not None and forming is not None and len(forming) > 0:
-            try:
-                eval_bars = pd.concat([closed, forming])
-            except Exception:  # noqa: BLE001
-                eval_bars = closed
+        # 策略评估和通用止损都只看已收线 K 线：未收线的盘中影线不触发
+        # trigger/touch，和回测「只用已收盘 K 线、下一根成交」保持同一口径。
+        # forming 仍保留给健康状态和启动回溯判断，不参与本轮决策。
         if try_catch_up:
             hit = find_catch_up_open(
                 cfg=self.cfg,
@@ -1919,9 +1901,6 @@ class TradingBot(
         # 策略要反手/开仓时不抢，它本身也会先平掉旧仓；谁先触发都算平仓。
         if decision.action == StrategyAction.HOLD and not self._symbol_is_flat(symbol):
             gs_bars = trail_closed if trail_closed is not None else closed
-            gs_forming = (
-                trail_forming if str(trail_tf) != str(signal_tf) else forming
-            )
             decision, gs_hit = apply_generic_stop(
                 self.generic_stop,
                 symbol,
@@ -1929,7 +1908,7 @@ class TradingBot(
                 self._position_for(symbol),
                 gs_bars,
                 flat=False,
-                forming=gs_forming,
+                forming=None,
                 mode=getattr(self.strategy, "stop_mode", "touch"),
                 # 平仓未成交时别每轮都重复发单，和策略自身止损的等待口径一致。
                 cooldown_sec=120.0,
@@ -2154,15 +2133,20 @@ class TradingBot(
         sent = False
         try:
             sent = bool(self._execute(decision))
-        except Exception:
+        except Exception as exc:
+            dispatch_started = bool(getattr(self, "_order_dispatch_started", False))
             # 还没进到点单就出异常（比如下单前拼参数写错），把信号标记放开，下一轮还能重试；
             # 已经点出去了就不放开，避免重复下单。
             if (
                 decision.action in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN)
-                and not getattr(self, "_order_dispatch_started", False)
+                and not dispatch_started
             ):
                 self._release_signal_mark(decision)
             self._dyn_cut_pending = ""
+            # 发单阶段异常且可能已报单：委托结果未知，停开新仓 + 告警，等人工确认。
+            # 保护性平仓（close）不受影响，沿用现有 set_orders_paused / set_halt 语义。
+            if dispatch_started:
+                self._halt_on_unknown_dispatch(exc)
             raise
         pending_cut = str(getattr(self, "_dyn_cut_pending", "") or "")
         if pending_cut:
@@ -2208,6 +2192,30 @@ class TradingBot(
             kwargs["now"] = now
         return self.strategy.evaluate(symbol, bars, **kwargs)
 
+    def _halt_on_unknown_dispatch(self, exc: Exception) -> None:
+        """发单阶段异常且委托结果未知：停开新仓 + 持久化 + 告警，等人工确认。
+
+        只停新开仓，保护性平仓继续；人工在持仓核对页确认后由 confirm_positions_reviewed 解除。
+        """
+        message = f"发单阶段异常，委托结果未知，已停止开新仓，请人工核对：{exc}"
+        try:
+            self.set_orders_paused(True)
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            self.risk.set_halt("order_dispatch_unknown", message)
+            save = getattr(self.risk, "save_state", None)
+            if callable(save):
+                save()
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            from src.ops.alerts import emit_alert
+
+            emit_alert("order_dispatch_unknown", message, level="error")
+        except Exception:  # noqa: BLE001
+            pass
+        logger.error(message)
 
     def scan_once(self, force: bool = False) -> None:
         """

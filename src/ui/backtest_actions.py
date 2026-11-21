@@ -120,6 +120,11 @@ class BacktestActionsMixin:
             str(snap.get("coverage_note") or "").strip(),
             *([rollover_text] if rollover_text else []),
             str(snap.get("fill_note") or "").strip(),
+            *(
+                [f"口径差异  {snap['live_gap_note']}"]
+                if snap.get("live_gap_note")
+                else []
+            ),
             *ladder_lines(
                 ladder,
                 used=float(used_slip) if isinstance(used_slip, (int, float)) else None,

@@ -23,7 +23,7 @@ from typing import Any
 
 from loguru import logger
 
-from src.account.trading_db import DB_LOCK, connect, json_text, storage_settings
+from src.account.trading_db import DB_LOCK, connect, connect_readonly, json_text, storage_settings
 
 KLINE_MARKET = Path("data") / "klines" / "market.sqlite"
 KLINE_RAW = Path("data") / "klines" / "raw.sqlite"
@@ -77,10 +77,7 @@ def _read_conn(
     root: str | Path, cfg: dict[str, Any] | None = None
 ) -> sqlite3.Connection | None:
     """只读不建库：库文件不在就返回 None，避免回测凭空生成 trading.db。"""
-    path = _db_path(root, cfg)
-    if not path.exists():
-        return None
-    return connect(path)
+    return connect_readonly(_db_path(root, cfg))
 
 
 def latest_instrument_snapshot(

@@ -17,7 +17,7 @@ from typing import Any
 
 from loguru import logger
 
-from src.account.trading_db import DB_LOCK, connect, json_text, storage_settings
+from src.account.trading_db import DB_LOCK, connect, connect_readonly, json_text, storage_settings
 
 
 def db_path_for(root: str | Path | None = None) -> Path:
@@ -173,8 +173,10 @@ def trace_events(trace_id: str, *, root: str | Path | None = None) -> list[dict[
         return []
     rows: list[dict[str, Any]] = []
     try:
-        path = db_path_for(root)
-        with closing(connect(path)) as conn:
+        conn = connect_readonly(db_path_for(root))
+        if conn is None:
+            return []
+        with closing(conn):
             for row in conn.execute(
                 "SELECT * FROM signals WHERE trace_id = ?", (str(trace_id),)
             ):

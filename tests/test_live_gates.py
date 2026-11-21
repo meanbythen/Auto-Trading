@@ -88,7 +88,9 @@ def test_gate_off_never_blocks() -> None:
 def test_fill_model_default_does_not_mirror() -> None:
     fill = FillModel.from_cfg({"backtest": {}, "trade": {}})
     assert fill.mirror_live_gates is False
-    assert "实盘" not in fill.describe()
+    text = fill.describe()
+    assert "追价闸" not in text
+    assert "已套实盘" not in text
 
 
 def test_fill_model_reads_mirror_flag() -> None:

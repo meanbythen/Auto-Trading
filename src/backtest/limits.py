@@ -50,6 +50,18 @@ class BacktestLimits:
         from src.strategy.types import config_flag
 
         self.apply = config_flag((cfg.get("risk") or {}).get("apply_limits", True), default=True)
+        # 和实盘同一个单笔上限：trade.ctp.max_order_volume。只往下压手数，不放大。
+        # 回测没有登录账号，不读取券商档案里的更小上限。
+        ctp = (cfg.get("trade") or {}).get("ctp") or {}
+        raw_cap = ctp.get("max_order_volume")
+        self.max_per_order: int | None = None
+        if raw_cap not in (None, ""):
+            try:
+                cap = int(raw_cap)
+            except (TypeError, ValueError):
+                cap = 0
+            if cap > 0:
+                self.max_per_order = cap
         # 和回测页「真实账户口径」是同一个开关：开=手数跟着剩余权益走；关=一直按这一段的起始资金。
         self.chain_capital = config_flag(
             (cfg.get("backtest") or {}).get("chain_capital"), default=False
@@ -105,6 +117,7 @@ class BacktestLimits:
             stop,
             current_abs_position=self.guard.total_abs_position(),
             positions=self.guard.positions,
+            max_per_order=self.max_per_order,
         )
         return int(sized.volume), sized.reason
 

@@ -9,14 +9,14 @@
 from __future__ import annotations
 
 import hashlib
-import sqlite3
+from contextlib import closing
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping
 
 from loguru import logger
 
-from src.account.trading_db import storage_settings
+from src.account.trading_db import connect_readonly, storage_settings
 from src.domain.trading_account import SELF_TEST_BOOK_ID
 
 _OPEN_SIDES = {"buy_open", "sell_open"}
@@ -187,20 +187,15 @@ class PortfolioRisk:
     @staticmethod
     def _read(root: Path) -> PortfolioSnapshot:
         path = storage_settings(root).db_path
-        if not path.exists():
+        conn = connect_readonly(path)
+        if conn is None:
             return PortfolioSnapshot(books={})
         try:
-            conn = sqlite3.connect(str(path), timeout=2.0)
-        except sqlite3.Error as exc:
+            with closing(conn):
+                rows = conn.execute("SELECT book_id, symbol, side, volume FROM positions").fetchall()
+        except Exception as exc:  # noqa: BLE001
             logger.warning("组合风控读取持仓失败，按空快照处理: {}", exc)
             return PortfolioSnapshot(books={})
-        try:
-            rows = conn.execute("SELECT book_id, symbol, side, volume FROM positions").fetchall()
-        except sqlite3.Error as exc:
-            logger.warning("组合风控读取持仓失败，按空快照处理: {}", exc)
-            return PortfolioSnapshot(books={})
-        finally:
-            conn.close()
         return PortfolioSnapshot.from_rows(
             {"book_id": row[0], "symbol": row[1], "side": row[2], "volume": row[3]}
             for row in rows
