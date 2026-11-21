@@ -105,7 +105,9 @@
     <h1>自动交易系统完整架构<br>与三条数据流</h1>
     <p class="sub">单进程、多线程的期货自动交易系统。界面下发命令，调度线程串行完成扫描、风控、报单与记账；行情与交易数据分库存储，账号与账本以文件为权威、SQLite 为可重建投影。本文给出分层架构、功能块职责，以及实盘、回测、模拟三条链路的数据流向与调用关系。</p>
     <div class="meta">
-      <span class="chip">版本 <b>49.23.1</b></span>
+      <span class="chip">版本 <b>49.23.2</b></span>
+      <span class="chip">规模 <b>255 个 Python 文件 · 101,972 行</b></span>
+      <span class="chip">测试 <b>160 个测试文件</b></span>
       <span class="chip">基线日期 <b>2026-11-21</b></span>
       <span class="chip">运行形态 <b>单进程多线程</b></span>
       <span class="chip">权威来源 <b>YAML / JSON</b></span>
@@ -123,6 +125,7 @@
     <a href="#calls">6 功能调用关系</a>
     <a href="#data">7 数据资产与权威</a>
     <a href="#contracts">8 架构契约</a>
+    <a href="#maintenance">9 文档维护约定</a>
   </nav>
 
   <main>
@@ -279,7 +282,7 @@ flowchart TB
         <div class="card">
           <span class="tag">OPS</span>
           <h4>审计、告警与日志</h4>
-          <p><code>accounts_audit.jsonl</code>、<code>alerts.jsonl</code> 按 5MB 轮转；<code>research_runs</code>、<code>trace_events</code>、<code>metrics_snapshot</code> 落 <code>trading.db</code>；日志带 <code>trace_id</code>。</p>
+          <p><code>accounts_audit.jsonl</code>、<code>alerts.jsonl</code> 按 5MB 轮转；<code>research_runs</code>、<code>trace_events</code>、<code>metrics_snapshot</code> 落 <code>trading.db</code>；日志带 <code>trace_id</code>。<code>tools/ops_report.py</code> 可按日期汇总指标、按 <code>trace_id</code> 打印事件时间线；<code>tools/rebuild_experiment_index.py</code> 可只重建实验索引。</p>
           <p><strong>不负责：</strong>改变交易结果。</p>
         </div>
       </div>
@@ -568,10 +571,33 @@ flowchart TB
       </div>
     </section>
 
+    <!-- ================= 9 ================= -->
+    <section id="maintenance">
+      <h2><span class="no">09</span>文档维护约定</h2>
+      <p class="lead">本页是系统全貌的唯一维护入口。<a href="../project-review-2026/整体设计方案.html">整体设计方案</a> 已冻结为 44.11.0 历史审查与演进决策记录（只保留复核结论），不再逐版更新；未完成事项只维护 <a href="../TODO.md">TODO.md</a>。</p>
+
+      <div class="table-wrap">
+        <table>
+          <thead><tr><th style="width:22%">每次版本更新</th><th>要改什么</th></tr></thead>
+          <tbody>
+            <tr><td>版本与日志</td><td><code>VERSION</code>、<code>CHANGELOG.md</code> 顶部、<code>README.md</code> 里三处版本号</td></tr>
+            <tr><td>本页</td><td>封面版本号与规模数字（文件数、行数、测试文件数）；链路、模块、数据资产有变化时，同步更新对应图与表</td></tr>
+            <tr><td>TODO</td><td>删掉已完成项，补新事项，更新顶部「对应版本」</td></tr>
+            <tr><td>整体设计方案</td><td>冻结，不随版本更新；只有新的审查结论才补一段复核说明</td></tr>
+            <tr><td>自动检查</td><td>发版前运行 <code>python tools/check_doc_versions.py</code>，版本号或统计数字不一致会非零退出</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div class="callout">
+        <b>只回答问题、不改程序时不升版本</b>，以上文档也不用动。
+      </div>
+    </section>
+
   </main>
 
   <footer class="foot">
-    依据代码与文档：<code>docs/系统架构与演进方案.md</code>、<code>docs/项目全面审查报告-2026-11-21.md</code>、<code>src/</code> 当前实现（版本 49.23.1）。图中模块名与文件路径均可在仓库中检索。
+    依据代码与文档：<code>docs/系统架构与演进方案.md</code>、<code>docs/项目全面审查报告-2026-11-21.md</code>、<code>src/</code> 当前实现（版本 49.23.2）。本页是系统全貌的唯一维护入口；图中模块名与文件路径均可在仓库中检索。
   </footer>
 
 </div>

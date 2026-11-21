@@ -75,7 +75,7 @@ P0 修完之后，程序在「进程正常活着」这一前提下已经能兜�
 
 - 优先使用华泰仿真账号（`trade.ctp.account_kind=sim`），不足时用 `executor=sim` 做前半段、CTP 仿真做后半段。
 - 合约用流动性好的主力（如 `bu2612`），手数 1 手。
-- 全程录屏或截图，证据存 `docs/project-review-2026/batch-a/drill/`。
+- 全程录屏或截图，证据存 `docs/archive/project-review-2026/batch-a/drill/`。
 
 ### 5.3 演练步骤 T5.3
 
@@ -350,7 +350,7 @@ runtime:
 - `tools/guardian.py`
 - `config/holidays.yaml`
 - `tests/test_holidays.py`、`tests/test_notify.py`、`tests/test_run_events.py`、`tests/test_guardian.py`
-- `docs/project-review-2026/batch-a/drill/`（A1 证据）
+- `docs/archive/project-review-2026/batch-a/drill/`（A1 证据）
 
 修改：
 

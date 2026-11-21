@@ -6,10 +6,10 @@
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Auto-Trading 项目审阅与整体设计方案</title>
 <style>
-@font-face { font-family: "Instrument Sans"; src: url("./project-review-2026/_shared/fonts/InstrumentSans-Regular.ttf") format("truetype"); font-weight: 400; font-style: normal; }
-@font-face { font-family: "Instrument Sans"; src: url("./project-review-2026/_shared/fonts/InstrumentSans-Bold.ttf") format("truetype"); font-weight: 700; font-style: normal; }
-@font-face { font-family: "JetBrains Mono"; src: url("./project-review-2026/_shared/fonts/JetBrainsMono-Regular.ttf") format("truetype"); font-weight: 400; font-style: normal; }
-@font-face { font-family: "JetBrains Mono"; src: url("./project-review-2026/_shared/fonts/JetBrainsMono-Bold.ttf") format("truetype"); font-weight: 700; font-style: normal; }
+@font-face { font-family: "Instrument Sans"; src: url("./_shared/fonts/InstrumentSans-Regular.ttf") format("truetype"); font-weight: 400; font-style: normal; }
+@font-face { font-family: "Instrument Sans"; src: url("./_shared/fonts/InstrumentSans-Bold.ttf") format("truetype"); font-weight: 700; font-style: normal; }
+@font-face { font-family: "JetBrains Mono"; src: url("./_shared/fonts/JetBrainsMono-Regular.ttf") format("truetype"); font-weight: 400; font-style: normal; }
+@font-face { font-family: "JetBrains Mono"; src: url("./_shared/fonts/JetBrainsMono-Bold.ttf") format("truetype"); font-weight: 700; font-style: normal; }
 
 :root {
   --bg: #f6f4ef;
@@ -141,11 +141,16 @@ footer .sources .src-url { display: block; margin-top: .15rem; font-size: .82rem
   <h1>Auto-Trading<br>项目审阅与整体设计方案</h1>
   <p class="lede">对一套面向国内期货的程序化交易桌面系统做全量审查：架构分层、交易链路、回测口径、数据管道、UI 线程与异常处理，并给出覆盖现有全部功能的蓝图与分阶段优化路线。</p>
   <div class="meta-row">
-    <span class="chip">198 个 Python 文件</span>
-    <span class="chip">75,891 行</span>
-    <span class="chip">10 个功能页签</span>
-    <span class="chip">100 个测试文件</span>
-    <span class="chip">只读审查 · 未改动业务代码</span>
+    <span class="chip">复核基线 49.23.1</span>
+    <span class="chip">255 个 Python 文件</span>
+    <span class="chip">101,972 行</span>
+    <span class="chip">7 个主页签 + 研究子页</span>
+    <span class="chip">160 个测试文件</span>
+    <span class="chip">复核日期 2026-11-21</span>
+  </div>
+
+  <div class="callout">
+    <p><strong>文档定位：</strong>本页冻结为 44.11.0 审查与演进决策记录，只保留复核结论，不再逐版更新。<strong>系统现状、模块职责与数据流以 <a href="../auto-trading-architecture/自动交易系统完整架构.html">auto-trading-architecture</a> 为准</strong>；未完成事项以 <a href="../TODO.md">TODO.md</a> 为准。</p>
   </div>
 </header>
 
@@ -166,28 +171,32 @@ footer .sources .src-url { display: block; margin-top: .15rem; font-size: .82rem
 <h2 id="summary"><span class="num">01</span>摘要与结论</h2>
 
 <div class="stats">
-  <div class="stat"><div class="v">10</div><div class="l">功能页签：运行 / 配置 / 策略编辑器 / 回测 / 数据 / 交叉测试 / 优化 / 复盘 / 账户 / 规律候选</div></div>
+  <div class="stat"><div class="v">7</div><div class="l">主页签：运行 / 交易账号 / 交易配置 / 策略编辑器 / 策略研究 / 数据管理 / 账户分析</div></div>
   <div class="stat"><div class="v">38</div><div class="l">策略 DSL 支持的指标种类，含日内锚定与多周期过滤</div></div>
-  <div class="stat"><div class="v">27</div><div class="l">本次审查确认的问题：严重 4 · 重要 16 · 一般 7</div></div>
-  <div class="stat"><div class="v">5</div><div class="l">交易链路断点：部分成交、重启对账、柜台保护、实盘移仓、并发记账</div></div>
+  <div class="stat"><div class="v">27</div><div class="l">44.11.0 基线审查问题：严重 4 · 重要 16 · 一般 7</div></div>
+  <div class="stat"><div class="v">0</div><div class="l">未修 P0：Q1、Q2 已于 49.20.3 修复，其余 P1/P2 见复核说明</div></div>
+</div>
+
+<div class="callout">
+  <p><strong>2026-11-21 复核（49.23.1）：</strong>本页正文保留 44.11.0 的审查现场，结论已按后续版本更新。4 项 P0 于 44.11.0 修复；Q1（热更新绕过档案取小）、Q2（界面改账本覆盖并发成交）于 49.20.3 修复；§7.2 账本/投影/一致性于 49.20.4 完成；§7.3 回测与实盘一致性于 49.21.0 修正或标注；§7.4 规范与文档于 49.22.0 完成；§7.5 的 `result_summary`、K 线内容哈希、`trace_events`/`metrics_snapshot`、启动目录刷新、参数 schema 校验于 49.23.0 完成。当前全量 `pytest`、`lint-imports`、`ruff`、`mypy` 均通过。详细问题清单与验收记录见 <a href="../项目全面审查报告-2026-11-21.md">项目全面审查报告</a>。</p>
 </div>
 
 <div class="score">
-  <div class="grade">B</div>
-  <div class="txt">工程完成度高、可维护性中上；<strong>实盘上线前必须先处理 4 个 P0</strong>。研究/回测/策略编辑能力已相当完整，短板集中在「资金安全边界」与「数据/统计口径」。</div>
+  <div class="grade">A-</div>
+  <div class="txt">工程完成度高、可维护性中上；<strong>资金安全 P0 已全部修复，账本/投影、回测一致性与规范文档已收口</strong>。研究/回测/策略编辑能力完整，剩余工作集中在人工演练、实盘上线与若干增强项（见 TODO）。</div>
 </div>
 
 <h3>五条核心结论</h3>
 <ol>
   <li><mark class="key">架构分层是健康的</mark>：<code>ui → scheduler/backtest/strategy → data/risk/trader → domain/kernel/utils</code>，非 UI 模块不反向依赖 UI；风控已抽成责任链，领域对象独立，具备继续演进的基础。</li>
-  <li><mark class="key">交易链「能跑通」，但边界情况不闭环</mark>：正常行情下信号→风控→下单→回报→记账→对账完整；断线、部分成交、重启、换月四类场景存在缺口。</li>
-  <li><mark class="key">最大的实盘风险是并发与「本地唯一事实源」</mark>：CTP 回调线程直接回写策略仓位/账本，且启动对账以本地账本为准，可能产生「柜台有仓、程序无仓」。</li>
+  <li><mark class="key">交易链「能跑通」，边界情况已收口</mark>：正常行情下信号→风控→下单→回报→记账→对账完整；断线、部分成交、重启、换月四类场景的缺口已在 44.11.0～49.20.4 逐项修复（未知发单熔断、发件箱按事件账本补记、风控同步失败停开仓等）。</li>
+  <li><mark class="key">并发与「本地唯一事实源」曾是最大实盘风险</mark>：CTP 回调直接回写仓位/账本、启动对账以本地账本为准，可能产生「柜台有仓、程序无仓」。现已在 44.11.0 加锁去重、49.20.3 账本锁边界、49.20.4 三方对账与投影治理中收口。</li>
   <li><mark class="key">研究结论的严谨性有两处硬伤</mark>：walk-forward 汇总把训练期当作样本外；年化收益用自然日却按 252 交易日折算，系统性低估约 31%。</li>
   <li><mark class="key">性能瓶颈在数据管道而非策略计算</mark>：抓取被一把全局锁串行化，且每轮全量读取 1 分钟库再重采样，随历史线性变慢。</li>
 </ol>
 
 <div class="callout">
-  <p><strong>建议的决策顺序</strong>：先做 Sprint 0「止血」（P0 + 统计口径 + 末根假成交），再补委托生命周期与柜台保护，最后才做架构重构。不要先拆文件、先上事件总线——那会放大当前风险。</p>
+  <p><strong>建议的决策顺序</strong>：先做 Sprint 0「止血」（P0 + 统计口径 + 末根假成交），再补委托生命周期与柜台保护，最后才做架构重构。<strong>截至 49.23.1，Sprint 0 与后续四批修复均已完成</strong>，剩余事项转入 <a href="../TODO.md">TODO</a>。</p>
 </div>
 
 <!-- ============================================================ -->
@@ -378,7 +387,7 @@ flowchart TB
 <!-- ============================================================ -->
 <h2 id="chain"><span class="num">04</span>交易链路与断点</h2>
 
-<p>交易链的正常路径如下。图中用 <strong>A–E</strong> 标出本次审查确认的断点，后文「审查发现」逐条对应。</p>
+<p>交易链的正常路径如下。图中 <strong>A–E</strong> 为 44.11.0 审查确认的断点；这些断点已在 44.11.0～49.20.4 修复或明确标注，保留图示用于说明链路位置与当时的风险。</p>
 
 <figure class="diagram">
 <pre class="mermaid">
@@ -534,11 +543,11 @@ stateDiagram-v2
 <!-- ============================================================ -->
 <h2 id="findings"><span class="num">06</span>审查发现</h2>
 
-<p>共 <strong>27</strong> 项：严重 4、重要 16、一般 7。每条给出结论、证据位置与建议修法；「证据」中的行号对应审查时的工作区版本。</p>
+<p>共 <strong>27</strong> 项：严重 4、重要 16、一般 7。每条给出结论、证据位置与建议修法；「证据」中的行号对应 44.11.0 审查时的工作区版本。<strong>下表是历史基线</strong>：4 项 P0 标「已修复（44.11.0）」；账本/投影、回测一致性、规范文档与 P3/P4 收尾已在 49.20.4～49.23.0 完成，最新状态见 <a href="../项目全面审查报告-2026-11-21.md">项目全面审查报告</a> 的 §0.2～§0.5。</p>
 
 <h3>P0 · 严重（实盘资金安全，建议立即处理）</h3>
 
-<p>2026-11-15：4 项 P0 已按 <a href="project-review-2026/p0-fix/spec.md">修复规格</a> 与 <a href="project-review-2026/p0-fix/tasks.md">任务清单</a> 全部实现；<code>ruff check src tests</code> 全绿，<code>pytest tests/ -q</code> 1200+ 项全部通过。四次提交：P0-1 <code>0ee2d75</code>、P0-2 <code>481b613</code>、P0-3 <code>5e8db07</code>、P0-4 <code>21b4ba1</code>，随 44.11.0 发布。下表以「已修复（44.11.0）」标注。剩余两项需仿真/实盘账号的人工演练（T5.3、T5.4）列在 <a href="TODO.md">TODO.md</a> 第一节。</p>
+<p>2026-11-15：4 项 P0 已按 <a href="../archive/project-review-2026/p0-fix/spec.md">修复规格</a> 与 <a href="../archive/project-review-2026/p0-fix/tasks.md">任务清单</a> 全部实现；<code>ruff check src tests</code> 全绿，<code>pytest tests/ -q</code> 1200+ 项全部通过。四次提交：P0-1 <code>0ee2d75</code>、P0-2 <code>481b613</code>、P0-3 <code>5e8db07</code>、P0-4 <code>21b4ba1</code>，随 44.11.0 发布。下表以「已修复（44.11.0）」标注。剩余两项需仿真/实盘账号的人工演练（T5.3、T5.4）列在 <a href="../TODO.md">TODO.md</a> 第一节。</p>
 
 <div class="table-wrap">
 <table>
@@ -789,41 +798,43 @@ flowchart LR
 <h2 id="docs"><span class="num">10</span>文档体系与后续待办</h2>
 
 <p>44.11.0 把散落的阶段性文档重新分层：介绍与日志进 README / CHANGELOG，操作细节进说明书，设计规划留在本页，<strong>没做完的事只保留一份清单</strong>。已完成的阶段文档移到 <code>docs/archive/</code>，与现行功能冲突的策略目录已删除。</p>
-<p>44.12.0 补齐批次 A 的四项硬门槛：节假日日历外置（<code>config/holidays.yaml</code>，实盘缺年份只禁开仓）、飞书告警外发（<code>runtime.alerts</code>，默认关）、<code>run_id</code> 贯穿事件/告警/状态、冷备守护（<code>tools/guardian.py</code>，默认关）。完整设计与验收标准见 <a href="project-review-2026/batch-a/spec.md">batch-a/spec.md</a>；A1 两项人工演练与华泰条件单确认仍待执行。</p>
+<p>44.12.0 补齐批次 A 的四项硬门槛：节假日日历外置（<code>config/holidays.yaml</code>，实盘缺年份只禁开仓）、飞书告警外发（<code>runtime.alerts</code>，默认关）、<code>run_id</code> 贯穿事件/告警/状态、冷备守护（<code>tools/guardian.py</code>，默认关）。完整设计与验收标准见 <a href="../archive/project-review-2026/batch-a/spec.md">batch-a/spec.md</a>；A1 两项人工演练与华泰条件单确认仍待执行。</p>
+<p>49.20.3～49.23.1 按 2026-11-21 审查报告分批收口：49.20.3 修 Q1/Q2 两个 P0；49.20.4 完成账本/投影/一致性（§7.2）；49.21.0 修正或标注回测与实盘差异（§7.3）；49.22.0 统一规范与文档（§7.4）；49.23.0 完成 P3/P4 收尾（§7.5：统一 <code>result_summary</code>、研究运行补 K 线内容哈希、接通 <code>trace_events</code>/<code>metrics_snapshot</code>、启动刷新 K 线/tick 目录、保存前按 schema 校验参数）；49.23.1 精简数据管理与运行页说明文本。各批规格见 <code>docs/archive/project-review-2026/</code> 下的 <code>p0-fix</code>、<code>batch-a</code>、<code>batch-7.3</code>～<code>batch-7.5</code>。</p>
 
 <div class="table-wrap">
 <table>
 <thead><tr><th style="width:26%">文档</th><th style="width:18%">定位</th><th>内容</th><th style="width:14%">状态</th></tr></thead>
 <tbody>
-<tr><td><a href="../README.md">README.md</a></td><td>项目介绍</td><td>能做什么、怎么装、路线选择、配置、FAQ、文档索引</td><td><span class="badge b-ok">现行</span></td></tr>
-<tr><td><a href="../CHANGELOG.md">CHANGELOG.md</a></td><td>版本日志</td><td>逐版本记录功能、修复与行为变化，最新 44.12.0</td><td><span class="badge b-ok">现行</span></td></tr>
-<tr><td><a href="实盘交易简易说明书.md">实盘交易简易说明书.md</a></td><td>操作手册</td><td>盘前到收盘五步、CTP 四步上线、对账处理、止损边界、排错</td><td><span class="badge b-ok">现行</span></td></tr>
-<tr><td><a href="配置说明书.md">配置说明书.md</a></td><td>控件字典</td><td>十个页签逐项编号说明；44.12.0 新增日历、告警外发、冷备守护配置（HD-14～HD-23）</td><td><span class="badge b-ok">现行</span></td></tr>
-<tr><td><a href="策略编辑器使用说明.md">策略编辑器使用说明.md</a></td><td>DSL 手册</td><td>YAML 语法、指标库、五个内置模板、与 vnpy 原版对照</td><td><span class="badge b-ok">现行</span></td></tr>
-<tr><td><a href="扩展能力规划.md">扩展能力规划.md</a></td><td>未来设计</td><td>重构方案第六条五项能力的详细设计，尚未实施</td><td><span class="badge b-ok">现行</span></td></tr>
-<tr><td><a href="TODO.md">TODO.md</a></td><td>唯一待办</td><td>人工验收、CTP 上线、策略增强、评估缺口、运维与文档补齐</td><td><span class="badge b-ok">现行</span></td></tr>
-<tr><td><a href="archive/">archive/</a></td><td>存档</td><td>系统蓝图、代码重构方案、策略基础逻辑、CTP 上线流程、旧操作说明书、specs 等</td><td><span class="badge">归档</span></td></tr>
+<tr><td><a href="../../README.md">README.md</a></td><td>项目介绍</td><td>能做什么、怎么装、路线选择、配置、FAQ、文档索引</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../../CHANGELOG.md">CHANGELOG.md</a></td><td>版本日志</td><td>逐版本记录功能、修复与行为变化，最新 49.23.1</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../实盘交易简易说明书.md">实盘交易简易说明书.md</a></td><td>操作手册</td><td>盘前到收盘五步、CTP 四步上线、对账处理、止损边界、排错</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../配置说明书.md">配置说明书.md</a></td><td>控件字典</td><td>七个主页签逐项编号说明；44.12.0 新增日历、告警外发、冷备守护配置（HD-14～HD-23）</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../策略编辑器使用说明.md">策略编辑器使用说明.md</a></td><td>DSL 手册</td><td>YAML 语法、指标库、五个内置模板、与 vnpy 原版对照</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../扩展能力规划.md">扩展能力规划.md</a></td><td>未来设计</td><td>重构方案第六条五项能力的详细设计，尚未实施</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../项目全面审查报告-2026-11-21.md">项目全面审查报告-2026-11-21.md</a></td><td>最新审查</td><td>49.20.1 基线；交易链路、回测一致性、账本投影、架构落地核对，§0.2～§0.5 为四批修复复核</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../auto-trading-architecture/自动交易系统完整架构.html">auto-trading-architecture</a></td><td>架构图</td><td>五层架构、功能块职责、实盘/回测/模拟三条数据流与调用关系（49.23.1）</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../TODO.md">TODO.md</a></td><td>唯一待办</td><td>人工验收、CTP 上线、策略增强、评估缺口、运维与文档补齐（对应 49.23.1）</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../archive/">archive/</a></td><td>存档</td><td>系统蓝图、代码重构方案、策略基础逻辑、CTP 上线流程、旧操作说明书、specs 等</td><td><span class="badge">归档</span></td></tr>
 <tr><td>已删除</td><td>过时</td><td>4 套日内策略、多因子复合 CTA、凯利突破、以损定开、长线箱体突破等策略说明（有效内容已并入编辑器手册与 TODO）</td><td><span class="badge">删除</span></td></tr>
 </tbody>
 </table>
 </div>
 
-<h3>10.1 P0 修复后的状态</h3>
+<h3>10.1 修复后的状态（截至 49.23.1）</h3>
 <ul>
-  <li><strong>已完成</strong>：P0-1 成交回报加锁去重、P0-2 关窗等待后台线程、P0-3 三方对账与未认领仓、P0-4 看门狗与退出保护。均有单测，全量 pytest 与 ruff 通过。</li>
-  <li><strong>待人工验收</strong>：T5.3 带仓关窗 → 重启 → 核对持仓/账本/告警；T5.4 仿真账号制造 phantom，确认补记只发生一次。需仿真或实盘账号。</li>
-  <li><strong>批次 A（44.12.0）已完成</strong>：A2 节假日日历外置与缺年份阻断、A3 飞书告警外发、A4 <code>run_id</code> 贯穿、A5.3 冷备守护（默认关）。</li>
-  <li><strong>批次 A 仍待</strong>：A1 两项人工演练；A5.1 向华泰确认条件单/预埋单接口；A5.5 守护的仿真演练。</li>
-  <li><strong>仍是缺口</strong>：标准 CTP 无原生止损单，整机断电/断网期间仍无柜台保护；缺故障注入测试；缺故障恢复手册与状态机图。</li>
+  <li><strong>已完成</strong>：P0-1～P0-4（44.11.0）、Q1/Q2（49.20.3）、§7.2 账本/投影/一致性（49.20.4）、§7.3 回测与实盘一致性（49.21.0）、§7.4 规范与文档（49.22.0）、§7.5 P3/P4 收尾（49.23.0）。</li>
+  <li><strong>验证</strong>：全量 <code>pytest</code>、<code>lint-imports</code> 3/3、<code>ruff check src tests</code>、<code>mypy src</code> 均通过；7.3/7.4/7.5 三批新增回归共 35 项。</li>
+  <li><strong>待人工验收</strong>：T5.3 带仓关窗重启核对、T5.4 phantom 补记、冷备守护真实账号演练、华泰条件单确认、CTP 四步上线。</li>
+  <li><strong>已知边界</strong>：标准 CTP 无原生止损单，整机断电/断网期间仍无柜台保护；回测与实盘在成交撮合、风控闸门、保证金与清仓时点上存在差异，已在结果页标注，不能视为完全等价。</li>
 </ul>
 
 <h3>10.2 后续优先级</h3>
 <table>
 <thead><tr><th style="width:14%">优先级</th><th>事项</th><th style="width:20%">详见</th></tr></thead>
 <tbody>
-<tr><td>P0 收尾</td><td>T5.3 / T5.4 人工演练；华泰条件单能力确认；冷备守护演练；CTP 主通道自动降级</td><td><a href="TODO.md">TODO 第一、二节</a></td></tr>
-<tr><td>P1</td><td>订单时间线、成交质量回流、连续偏离禁开总闸；策略增强（多因子相关性、凯利滚动胜率、箱体加仓/移仓、VPVR）</td><td><a href="TODO.md">TODO 第一、三节</a></td></tr>
-<tr><td>P2</td><td>评估体系补齐（组合相关性/保证金/蒙特卡洛）、多账户 A/B、告警通道扩展（微信/钉钉/邮件）、故障恢复手册</td><td><a href="TODO.md">TODO 第四、五节</a></td></tr>
+<tr><td>P0 收尾</td><td>T5.3 / T5.4 人工演练；华泰条件单能力确认；冷备守护演练；CTP 主通道自动降级</td><td><a href="../TODO.md">TODO 第一、二节</a></td></tr>
+<tr><td>P1</td><td>成交质量回流、连续偏离禁开总闸；策略增强（多因子相关性、凯利滚动胜率、箱体加仓/移仓、VPVR）</td><td><a href="../TODO.md">TODO 第一、三节</a></td></tr>
+<tr><td>P2</td><td>评估体系补齐（组合相关性/保证金/蒙特卡洛）、多账户 A/B、告警通道扩展（微信/钉钉/邮件）、故障恢复手册</td><td><a href="../TODO.md">TODO 第四、五节</a></td></tr>
 </tbody>
 </table>
 
@@ -849,7 +860,7 @@ flowchart LR
 
 </div>
 
-<script src="./project-review-2026/_shared/js/mermaid.min.js"></script>
-<script src="project-review-2026/assets/report.js"></script>
+<script src="./_shared/js/mermaid.min.js"></script>
+<script src="assets/report.js"></script>
 </body>
 </html>
