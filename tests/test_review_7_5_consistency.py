@@ -73,6 +73,14 @@ def test_result_summary_none_is_zeroed_and_complete() -> None:
         "payoff",
         "expectancy",
         "max_drawdown_pct",
+        # 批次1可信度底座新增风险指标。
+        "sharpe",
+        "sortino",
+        "sharpe_annualized",
+        "ulcer",
+        "exposure",
+        "turnover",
+        "cost_ratio",
     }
     assert set(summary) == expected
     assert summary["trades"] == 0

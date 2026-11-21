@@ -40,6 +40,18 @@ account:
   skip_auto_login: true
   force_relogin: false
 
+# 多品种实盘（方案见 docs/多品种实盘方案与实施规划.md）
+# enabled 只在仿真/自测账户生效；真实账户还要 allow_live: true，且通过方案门 3/4。
+# 白名单里的空仓品种也会进扫描；GUI 通道打开也会被忽略。
+live:
+  multi_symbol:
+    enabled: false
+    symbols:
+    - fu2701
+    - lh2701
+    scan_interval_sec: 15
+    allow_live: false
+
 schedule:
   login_times:
     - "08:50"
@@ -75,6 +87,17 @@ strategy:
   # 关注列表。第一项是当前合约，例如 bu2612。界面上选中的会排到第一项，启动时只盯第一项
   symbols:
     - "bu2612"
+  # 策略腿：每条腿可以各用不同策略和周期，实盘和交叉测试页的组合回测都按这里跑。
+  # 可在交易配置页「多品种策略腿」里编辑，也可直接手工改本段。
+  # 不写或留空时，按关注品种各生成一条腿，共用上面的 engine / timeframe。
+  # 同一合约只能出现一次：持仓是每合约一个方向净仓，同品种多腿会互相覆盖止损。
+  legs: []
+  # - symbol: "lh2701"
+  #   engine: multi_factor
+  #   timeframe: "15"
+  # - symbol: "fu2701"
+  #   engine: ema_swing
+  #   timeframe: "30"
   # 交叉测试要跑的策略。不写就用程序里的每一套。正在用的策略仍是上面的 engine。
   cross_engines:
     - daily_body
@@ -481,6 +504,13 @@ backtest:
   # 成交近似：信号下一根开盘价成交；滑点按买卖方向各让几跳。
   fill_on_next_open: true
   slippage_ticks: 1.0
+  # 品种级滑点（跳）：键可写合约（fu2701）、品种代码（fu）或小写；
+  # 命中的品种用它，没写的退回上面的 slippage_ticks（默认不配，历史成绩不变）。
+  # slippage_by_symbol:
+  #   fu: 1
+  #   lh: 2
+  # 组合回测共享资金账判断「滑点余量」用的允许滑点，默认 2 跳；只影响同日抢资金的排序。
+  # allowed_slip_ticks: 2
   # 打开后回测开仓再套挂机的过期K和追价上限。默认关，不改原来的回测成绩。
   mirror_live_gates: false
   # 涨跌停/部分成交/挂单超时（默认开启，会改变回测成绩；要复现旧成绩就改成 false/0）：
@@ -629,8 +659,7 @@ trade:
     confirm_times: 0
     # true=点击后立刻改内部持仓（挂机方便，但点击≠成交）；false=只记发单不改仓（更安全）
     assume_fill: true
-    # GUI 默认禁止多品种；标定了 symbol_input 且确需多品种时才开
-    allow_multi_symbol: false
+    # GUI 通道只交易「当前选中」这一个品种；关注列表可以留多个，不会因此拒绝启动
     # symbol_input: [1200, 380]  # 可选：品种输入框坐标
     # confirm_btn: [900, 600]   # 可选：弹窗「确定」按钮坐标
     # 启动常驻后，程序会把这个价格框设成「对手价」，之后下单只改手数、不改价格。

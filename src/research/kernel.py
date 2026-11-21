@@ -140,6 +140,14 @@ def result_summary(result: Any) -> dict[str, float | int | None]:
         "payoff": float(_perf_value(source, "payoff", 0.0) or 0.0),
         "expectancy": _perf_value(source, "expectancy", None),
         "max_drawdown_pct": float(_perf_value(source, "max_drawdown_pct", 0.0) or 0.0),
+        # 批次1可信度底座新增：每笔盈亏口径的风险指标。旧实验缺键时回退 0/False。
+        "sharpe": float(_perf_value(source, "sharpe", 0.0) or 0.0),
+        "sortino": float(_perf_value(source, "sortino", 0.0) or 0.0),
+        "sharpe_annualized": bool(_perf_value(source, "sharpe_annualized", False)),
+        "ulcer": float(_perf_value(source, "ulcer", 0.0) or 0.0),
+        "exposure": float(_perf_value(source, "exposure", 0.0) or 0.0),
+        "turnover": float(_perf_value(source, "turnover", 0.0) or 0.0),
+        "cost_ratio": float(_perf_value(source, "cost_ratio", 0.0) or 0.0),
     }
 
 

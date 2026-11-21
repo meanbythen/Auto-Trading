@@ -7,6 +7,7 @@
      买入（开多/平空）= (成交价 − 理论价) / 每跳；卖出（开空/平多）= (理论价 − 成交价) / 每跳。
      理论价：开仓=信号给的入场价（信号K线收盘价）；止损平仓=止损价；其他平仓没有理论价，留空。
      GUI 假定成交的滑点恒为 0，只留记录；真实滑点要看 CTP 成交回报。
+     build_slippage_calibration：把实盘建议滑点与回测假设滑点对齐，产出带 diff/样本数/生效日期/calibrated 的结构化校准记录，只供展示与引用，不改写配置或下单。
 """
 
 from __future__ import annotations
@@ -16,11 +17,14 @@ import json
 import math
 import os
 import statistics
+from bisect import bisect_right
+from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 FILE_NAME = "slippage_log.csv"
+CALIBRATION_FILE = "slippage_calibration.json"
 
 _FIELDS = [
     "ts",
@@ -236,8 +240,8 @@ def _is_real(row: dict[str, Any]) -> bool:
     return str(row.get("dry_run") or "1") == "0" and str(row.get("executor") or "") == "ctp"
 
 
-def _group_stats(rows: list[dict[str, Any]], key_of) -> list[dict[str, Any]]:
-    """按某个维度分组，优先真实成交；样本 < 3 的不进结论。"""
+def _group_stats(rows: list[dict[str, Any]], key_of, *, min_n: int = 3) -> list[dict[str, Any]]:
+    """按某个维度分组，优先真实成交；样本不足 min_n 的不进结论。"""
     groups: dict[str, list[dict[str, Any]]] = {}
     for row in rows:
         value = _slip_value(row)
@@ -252,7 +256,7 @@ def _group_stats(rows: list[dict[str, Any]], key_of) -> list[dict[str, Any]]:
         real = [row for row in items if _is_real(row)]
         used = real or items
         values = [value for row in used if (value := _slip_value(row)) is not None]
-        if len(values) < 3:
+        if len(values) < max(1, int(min_n)):
             continue
         n, _mean, median, p70 = _stat_line(values)
         out.append(
@@ -311,6 +315,19 @@ def _session_from_table(cfg: dict[str, Any], stamp: str, symbol: str) -> str:
     return "其他"
 
 
+def _session_from_hour(stamp: str) -> str:
+    """没有合约时段表时，按成交钟点粗分日盘、夜盘和其他。"""
+    try:
+        hour = int(stamp[11:13])
+    except (TypeError, ValueError):
+        return ""
+    if 9 <= hour < 15:
+        return "日盘"
+    if hour >= 21 or hour < 3:
+        return "夜盘"
+    return "其他"
+
+
 def summarize_by_session(
     root: Path | str,
     cfg: dict[str, Any] | None = None,
@@ -328,17 +345,132 @@ def summarize_by_session(
             label = _session_from_table(cfg, stamp, str(row.get("symbol") or ""))
             if label:
                 return label
-        try:
-            hour = int(stamp[11:13])
-        except (TypeError, ValueError):
-            return ""
-        if 9 <= hour < 15:
-            return "日盘"
-        if hour >= 21 or hour < 3:
-            return "夜盘"
-        return "其他"
+        return _session_from_hour(stamp) if stamp else ""
 
     return _group_stats(load_rows(root), key_of)
+
+
+def _naive_iso_datetime(value: Any) -> datetime | None:
+    try:
+        when = datetime.fromisoformat(str(value or "").replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is not None:
+        when = when.astimezone().replace(tzinfo=None)
+    return when
+
+
+def _load_market_bars(
+    root: Path | str,
+    cfg: dict[str, Any] | None,
+    symbol: str,
+) -> Any | None:
+    """只读本地清洗 K 线；优先配置的数据源，兼容未带来源后缀的旧库存。"""
+    path = Path(root) / "data" / "klines" / "market.sqlite"
+    if not path.exists():
+        return None
+    from src.data.bar_store import BarStore
+    from src.data.periods import canonical_period
+    from src.data.quote_check import storage_symbol
+
+    data_cfg = (cfg or {}).get("data") or {}
+    strategy_cfg = (cfg or {}).get("strategy") or {}
+    source = data_cfg.get("source")
+    period = canonical_period(str(strategy_cfg.get("timeframe") or "15"))
+    store = BarStore(path)
+    for stored in dict.fromkeys((storage_symbol(symbol, source), symbol)):
+        bars = store.load(stored, period)
+        if bars is not None and len(bars):
+            return bars
+    return None
+
+
+def summarize_by_market_state(
+    root: Path | str,
+    cfg: dict[str, Any] | None = None,
+    *,
+    min_n: int = 3,
+) -> list[dict[str, Any]]:
+    """
+    按「趋势/震荡 + 高波动/低波动」组合标签统计成交滑点。
+
+    ADX 达到配置的 adx_trend 为趋势，否则为震荡；ATR 历史分位 >= 0.5 为高波动。
+    K 线只读 data/klines/market.sqlite，周期取 strategy.timeframe（默认 15 分钟），
+    按 symbol 缓存。K 线是右标签，成交取当时已收盘的最后一根，并逐根复用
+    evaluate_market_state；无法定位、K 线不足或样本不足 min_n 的桶不进结论。
+    """
+    rows = load_rows(root)
+    if not rows:
+        return []
+    try:
+        from src.strategy.market_state import MarketFilterParams, evaluate_market_state
+
+        # 这里只描述市场，不受策略过滤开关影响。
+        params = replace(MarketFilterParams.from_cfg(cfg), enabled=True)
+    except Exception:  # noqa: BLE001 - 缺少行情依赖时，成交质量其它部分仍应可读
+        return []
+
+    bars_cache: dict[str, Any | None] = {}
+    times_cache: dict[str, list[datetime]] = {}
+    state_cache: dict[tuple[str, int], str] = {}
+
+    def label_for(symbol: str, stamp: str) -> str:
+        when = _naive_iso_datetime(stamp)
+        if when is None or not symbol:
+            return ""
+        if symbol not in bars_cache:
+            try:
+                bars = _load_market_bars(root, cfg, symbol)
+                if bars is None or not len(bars) or not {"high", "low", "close"} <= set(bars.columns):
+                    bars = None
+                    times: list[datetime] = []
+                else:
+                    bars = bars.sort_index()
+                    converted = [_naive_iso_datetime(value) for value in bars.index]
+                    if any(value is None for value in converted):
+                        bars = None
+                        times = []
+                    else:
+                        times = [value for value in converted if value is not None]
+            except Exception:  # noqa: BLE001 - 单个品种无行情不阻断其它品种
+                bars = None
+                times = []
+            bars_cache[symbol] = bars
+            times_cache[symbol] = times
+        bars = bars_cache[symbol]
+        if bars is None:
+            return ""
+        position = bisect_right(times_cache[symbol], when) - 1
+        if position < 0:
+            return ""
+        cache_key = (symbol, position)
+        if cache_key in state_cache:
+            return state_cache[cache_key]
+
+        label = ""
+        window = bars.iloc[: position + 1]
+        if len(window) >= params.adx_period + 5:
+            try:
+                state = evaluate_market_state(window, params)
+                adx = float(state.adx)
+                atr_rank = float(state.atr_rank)
+                if math.isfinite(adx) and math.isfinite(atr_rank):
+                    trend = "趋势" if adx >= params.adx_trend else "震荡"
+                    volatility = "高波动" if atr_rank >= 0.5 else "低波动"
+                    label = f"{trend}/{volatility}"
+            except Exception:  # noqa: BLE001 - 异常行情只跳过这一桶
+                pass
+        state_cache[cache_key] = label
+        return label
+
+    tagged: list[dict[str, Any]] = []
+    for row in rows:
+        if _slip_value(row) is None:
+            continue
+        label = label_for(str(row.get("symbol") or ""), str(row.get("ts") or ""))
+        if label:
+            tagged.append({**row, "_market_state": label})
+    return _group_stats(tagged, lambda row: row["_market_state"], min_n=min_n)
 
 
 # 复盘里算「拒单 / 被拦」的事件。只统计没发出去或柜台退回的，不把正常撤单算进来。
@@ -360,7 +492,13 @@ def reject_summary(root: Path | str, *, days: int = 30) -> dict[str, Any]:
     数据来自 data/events.jsonl；没有文件时返回空统计，调用方要如实说「没有记录」。
     """
     path = Path(root) / "data" / "events.jsonl"
-    out: dict[str, Any] = {"total": 0, "by_symbol": [], "by_reason": []}
+    by_session = {"日盘": 0, "夜盘": 0, "其他": 0}
+    out: dict[str, Any] = {
+        "total": 0,
+        "by_symbol": [],
+        "by_reason": [],
+        "by_session": [{"key": key, "n": 0} for key in by_session],
+    }
     if not path.exists():
         return out
     cutoff = datetime.now().timestamp() - max(1, int(days)) * 86400
@@ -383,6 +521,8 @@ def reject_summary(root: Path | str, *, days: int = 30) -> dict[str, Any]:
         symbol = product_of(str(item.get("symbol") or "")) or "—"
         by_symbol[symbol] = by_symbol.get(symbol, 0) + 1
         by_reason[label] = by_reason.get(label, 0) + 1
+        session = _session_from_hour(str(item.get("ts") or "")) or "其他"
+        by_session[session] += 1
         out["total"] += 1
     out["by_symbol"] = sorted(
         ({"key": key, "n": n} for key, n in by_symbol.items()),
@@ -392,6 +532,7 @@ def reject_summary(root: Path | str, *, days: int = 30) -> dict[str, Any]:
         ({"key": key, "n": n} for key, n in by_reason.items()),
         key=lambda item: (-item["n"], item["key"]),
     )
+    out["by_session"] = [{"key": key, "n": n} for key, n in by_session.items()]
     return out
 
 
@@ -406,7 +547,7 @@ def _event_ts(value: Any) -> float | None:
 
 
 def quality_text(root: Path | str, cfg: dict[str, Any] | None = None) -> str:
-    """复盘尾部「成交质量」：方向、时段、拒单三块。样本不足时直说。"""
+    """复盘尾部「成交质量」：方向、时段、市场状态、拒单。样本不足时直说。"""
     lines = ["—— 成交质量（滑点与拒单） ——"]
     side = summarize_by_side(root)
     if side:
@@ -424,14 +565,24 @@ def quality_text(root: Path | str, cfg: dict[str, Any] | None = None) -> str:
     else:
         lines.append("按时段：真实样本不足 3 笔，先不改夜盘参数。")
 
+    market = summarize_by_market_state(root, cfg)
+    if market:
+        lines.append("按市场状态：" + "；".join(
+            f"{item['key']} {item['n']}笔 → 建议 {item['suggested']:g} 跳" for item in market
+        ))
+    else:
+        lines.append("按市场状态：市场状态样本不足或缺少行情，先不下结论。")
+
     rejects = reject_summary(root)
     if not rejects["total"]:
         lines.append("拒单：近 30 天没有记录（或还没点过「启动常驻」）。")
     else:
         reasons = "、".join(f"{item['key']} {item['n']} 次" for item in rejects["by_reason"])
         symbols = "、".join(f"{item['key']} {item['n']} 次" for item in rejects["by_symbol"][:5])
+        sessions = "、".join(f"{item['key']} {item['n']} 次" for item in rejects["by_session"])
         lines.append(f"拒单：近 30 天 {rejects['total']} 次（{reasons}）")
         lines.append(f"  分品种  {symbols}")
+        lines.append(f"  分时段  {sessions}")
     return "\n".join(lines)
 
 
@@ -515,3 +666,185 @@ def summarize_text(root: Path | str) -> str:
                 f"{item['suggested']:g} 跳{suffix}"
             )
     return "\n".join(lines)
+
+
+def build_slippage_calibration(
+    root: Path | str,
+    *,
+    cfg: dict[str, Any] | None = None,
+    backtest_assumed: float | None = None,
+    account: str | None = "live",
+) -> dict[str, Any]:
+    """
+    生成滑点校准记录：实盘建议滑点 vs 回测假设滑点的差异，带样本数与生效日期。
+
+    只产出结构化记录，供复盘/评审/回测引用；不会自动改写配置或下单行为。
+    - 实盘值取自 summarize(root, account=account)（median/p70/suggested/n/real_rows/used_real）。
+      account 默认 "live"，只统计真实实盘成交，避免仿真(sim)混入导致校准失真；显式传 None 才统计全部账户。
+    - backtest_assumed 缺省时从 cfg["backtest"]["slippage_ticks"] 读；仍读不到记 0.0 并在 reason 注明。
+    - diff = live_suggested - backtest_assumed，正数=实盘比回测假设更不利。
+    - calibrated=True 仅当有 CTP 真实成交且样本 n>=3；否则 False，reason 写明原因。
+    任何异常都兜底返回 0.0/0/""/False，不抛异常。
+    """
+    reasons: list[str] = []
+    try:
+        info = summarize(root, account=account)
+    except Exception:  # noqa: BLE001 - 校准记录只读展示，失败也要返回兜底结构
+        info = {}
+    median = float(info.get("median") or 0.0)
+    p70 = float(info.get("p70") or 0.0)
+    suggested = float(info.get("suggested") or 0.0)
+    n = int(info.get("n") or 0)
+    real_rows = int(info.get("real_rows") or 0)
+    used_real = bool(info.get("used_real"))
+    rows = int(info.get("rows") or 0)
+
+    assumed = backtest_assumed
+    if assumed is None:
+        try:
+            assumed = (cfg or {}).get("backtest", {}).get("slippage_ticks")
+        except Exception:  # noqa: BLE001
+            assumed = None
+    if assumed is None or assumed == "":
+        assumed_val = 0.0
+        reasons.append("未提供回测假设滑点")
+    else:
+        try:
+            assumed_val = float(assumed)
+        except (TypeError, ValueError):
+            assumed_val = 0.0
+            reasons.append("回测假设滑点无效")
+
+    diff = suggested - assumed_val
+
+    calibrated = used_real and n >= 3
+    if not rows:
+        reasons.append("无成交滑点记录")
+    elif not used_real:
+        reasons.append("无 CTP 真实成交，仅有 GUI 假定成交")
+    elif n < 3:
+        reasons.append("真实成交样本不足 3 笔")
+    else:
+        reasons.append("已基于真实成交样本校准")
+
+    return {
+        "live_median": median,
+        "live_p70": p70,
+        "live_suggested": suggested,
+        "backtest_assumed": assumed_val,
+        "diff": diff,
+        "sample_n": n,
+        "real_rows": real_rows,
+        "used_real": used_real,
+        "effective_date": datetime.now().strftime("%Y-%m-%d"),
+        "calibrated": calibrated,
+        "reason": "；".join(reasons),
+    }
+
+
+def save_slippage_calibration(
+    root: Path | str,
+    *,
+    cfg: dict[str, Any] | None = None,
+    backtest_assumed: float | None = None,
+    account: str | None = "live",
+) -> dict[str, Any]:
+    """生成并保存校准记录到 data/slippage_calibration.json，返回写入的内容。默认只统计 live 实盘。"""
+    record = build_slippage_calibration(
+        root,
+        cfg=cfg,
+        backtest_assumed=backtest_assumed,
+        account=account,
+    )
+    record["generated_at"] = datetime.now().isoformat(timespec="seconds")
+    path = Path(root) / "data" / CALIBRATION_FILE
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(record, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    return record
+
+
+def load_slippage_calibration(root: Path | str) -> dict[str, Any]:
+    """读取校准记录；文件不存在、不是 JSON 对象或解析失败时返回空 dict。"""
+    path = Path(root) / "data" / CALIBRATION_FILE
+    try:
+        record = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    return record if isinstance(record, dict) else {}
+
+
+def resolve_backtest_slippage(
+    root: Path | str,
+    cfg: dict[str, Any] | None = None,
+    *,
+    use_calibration: bool | None = None,
+) -> dict[str, Any]:
+    """决定回测滑点；只有开关开启且已有达标校准记录时才采用实盘建议值。"""
+    assumed = 1.0
+    backtest: dict[str, Any] = {}
+    try:
+        raw_backtest = (cfg or {}).get("backtest") or {}
+        if isinstance(raw_backtest, dict):
+            backtest = raw_backtest
+        raw_assumed = backtest.get("slippage_ticks")
+        if raw_assumed not in (None, ""):
+            candidate = float(raw_assumed)
+            if math.isfinite(candidate):
+                assumed = candidate
+    except Exception:  # noqa: BLE001 - 配置无效时使用统一默认值
+        assumed = 1.0
+
+    fallback: dict[str, Any] = {
+        "value": assumed,
+        "source": "配置默认",
+        "calibrated": False,
+        "reason": "",
+        "diff": 0.0,
+        "effective_date": "",
+        "sample_n": 0,
+        "live_suggested": 0.0,
+        "backtest_assumed": assumed,
+    }
+    result = dict(fallback)
+    try:
+        from src.strategy.types import config_flag
+
+        if use_calibration is None:
+            enabled = config_flag(backtest.get("use_slippage_calibration"), False)
+        else:
+            enabled = config_flag(use_calibration, False)
+        record = load_slippage_calibration(root)
+        if record:
+            live_suggested = float(record.get("live_suggested") or 0.0)
+            if not math.isfinite(live_suggested):
+                live_suggested = 0.0
+            result.update(
+                {
+                    "diff": live_suggested - assumed,
+                    "effective_date": str(record.get("effective_date") or ""),
+                    "sample_n": int(record.get("sample_n") or 0),
+                    "live_suggested": live_suggested,
+                }
+            )
+
+        if not enabled:
+            result["reason"] = "校准开关未开启，使用配置默认"
+        elif not record:
+            result["reason"] = "无校准记录，使用配置默认"
+        elif not record.get("calibrated"):
+            detail = str(record.get("reason") or "").strip()
+            suffix = f"；{detail}" if detail else ""
+            result["reason"] = f"校准记录未达标（calibrated=False{suffix}），使用配置默认"
+        else:
+            result.update(
+                {
+                    "value": result["live_suggested"],
+                    "source": "实盘校准",
+                    "calibrated": True,
+                    "reason": str(record.get("reason") or "已使用实盘校准"),
+                }
+            )
+    except Exception:  # noqa: BLE001 - 回测滑点解析不允许因校准文件异常中断
+        result = dict(fallback)
+        result["reason"] = "校准读取或解析失败，使用配置默认"
+    return result

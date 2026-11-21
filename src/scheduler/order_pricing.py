@@ -244,9 +244,10 @@ class OrderPricingMixin:
             limit_points = 0.0
         atr = 0.0
         try:
-            bars = self.kline.fetch(decision.symbol, period=str(self.strategy.timeframe))
-            if bars is not None and len(bars) > 0 and hasattr(self.strategy, "_atr"):
-                got = self.strategy._atr(bars)
+            leg = self._strategy_for(decision.symbol)
+            bars = self.kline.fetch(decision.symbol, period=str(leg.timeframe))
+            if bars is not None and len(bars) > 0 and hasattr(leg, "_atr"):
+                got = leg._atr(bars)
                 atr = float(got or 0)
         except Exception:  # noqa: BLE001
             atr = 0.0

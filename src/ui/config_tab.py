@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 import customtkinter as ctk
 
 from src.ui.config_tab_sections import build_entry_stop_sections
+from src.ui.config_tab_sections import build_multi_symbol_section
 from src.ui.config_tab_sections import build_tail_sections
 from src.ui.config_tab_strategy import build_strategy_section
 
@@ -28,5 +29,6 @@ def build_config_tab(
     scroll.pack(fill="both", expand=True, padx=8, pady=8)
 
     build_strategy_section(app, scroll, engine_choices)
+    build_multi_symbol_section(app, scroll, engine_choices)
     build_entry_stop_sections(app, scroll)
     build_tail_sections(app, scroll)

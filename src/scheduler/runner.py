@@ -173,10 +173,40 @@ class TradingBot(
         self.default_symbol = str(trade.get("symbol", "bu2505"))
         self.volume = int(trade.get("volume", 1))  # 固定手数模式 / 缺止损价时的后备
         self.symbols = list(self.strategy.symbols)
+        # 多品种实盘开关：默认关。GUI 通道只开当前选中品种，开了也强制忽略。
+        self._multi_cfg = self._read_multi_cfg()
+        enabled = bool(self._multi_cfg.get("enabled", False))
+        if enabled and self.trader_capabilities.window_driven:
+            logger.warning("GUI 通道不支持多品种开仓，live.multi_symbol.enabled 已忽略")
+            enabled = False
+        if enabled and self._is_live_account() and not bool(self._multi_cfg.get("allow_live", False)):
+            # 方案门 3/4：真实账户必须单独放行；仿真阶段先跑通再谈实盘。
+            logger.warning(
+                "真实账户未放行多品种（live.multi_symbol.allow_live=false），已按单品种运行"
+            )
+            enabled = False
+        self._multi_enabled = enabled
+        self._multi_symbols = [
+            str(item).strip()
+            for item in (self._multi_cfg.get("symbols") or [])
+            if str(item).strip()
+        ]
+        if self._multi_enabled:
+            self._validate_multi_symbol_config()
+            from src.strategy.leg_router import create_leg_router
+
+            self.strategy = create_leg_router(cfg, self.strategy)
         # 常驻只扫「当前选中」这一个品种：其余关注品种保留在 self.symbols 里，
-        # 只给交叉测试等需要多品种的功能用。
+        # 只给交叉测试等需要多品种的功能用。多品种开关打开时，白名单内的空仓品种也扫。
         self.scan_symbols = self._pick_scan_symbols()
         self.scan_interval = int(cfg.get("schedule", {}).get("scan_interval_sec", 30))
+        if self._multi_enabled:
+            # 两个品种串行拉K线、等回报，5 秒一轮扫不完；按决策 D3 抬到 15 秒。
+            multi_interval = int(self._multi_cfg.get("scan_interval_sec", 0) or 0)
+            if multi_interval > 0:
+                self.scan_interval = max(self.scan_interval, multi_interval)
+        self._symbol_sessions: dict[str, list[list[str]]] = {}
+        self._symbol_flatten_times: dict[str, list[str]] = {}
         from src.utils.session_clock import sessions_for_symbol
 
         # 交易时段跟当前盯的合约走（品种表优先；白银黄金默认收到 02:30）。
@@ -598,7 +628,7 @@ class TradingBot(
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
 
     def _refresh_sessions(self) -> None:
-        """每轮按当前合约读品种表里的时段和清仓时刻。"""
+        """每轮按当前扫描清单读各品种的时段和清仓时刻。"""
         from src.utils.session_clock import (
             flatten_times_for_symbol,
             format_session_text,
@@ -606,9 +636,18 @@ class TradingBot(
             sessions_for_symbol,
         )
 
-        symbol = (self.scan_symbols[0] if self.scan_symbols else "") or self.default_symbol
-        self.sessions = sessions_for_symbol(self.cfg, symbol)
-        flats = flatten_times_for_symbol(self.cfg, symbol)
+        symbols = list(getattr(self, "scan_symbols", None) or []) or [self.default_symbol]
+        symbol_sessions: dict[str, list[list[str]]] = {}
+        symbol_flats: dict[str, list[str]] = {}
+        for name in symbols:
+            symbol_sessions[name] = sessions_for_symbol(self.cfg, name)
+            symbol_flats[name] = flatten_times_for_symbol(self.cfg, name)
+        self._symbol_sessions = symbol_sessions
+        self._symbol_flatten_times = symbol_flats
+
+        symbol = self._primary_symbol() or (symbols[0] if symbols else "")
+        self.sessions = symbol_sessions.get(symbol) or sessions_for_symbol(self.cfg, symbol)
+        flats = symbol_flats.get(symbol) or flatten_times_for_symbol(self.cfg, symbol)
         if hasattr(self.strategy, "entry_sessions"):
             self.strategy.entry_sessions = [
                 (parse_hhmm(a), parse_hhmm(b)) for a, b in self.sessions
@@ -617,29 +656,183 @@ class TradingBot(
             self.strategy.flatten_times = [parse_hhmm(x) for x in flats]
         if hasattr(self.strategy, "bind_symbol_sessions"):
             self.strategy.bind_symbol_sessions(symbol)
-        key = f"{symbol}|{self.sessions}|{flats}"
+        key = "|".join(
+            f"{name}:{symbol_sessions.get(name)}:{symbol_flats.get(name)}" for name in symbols
+        )
         if key != self._live_session_key:
-            logger.info(
-                "{} 交易时段 {} ，清仓 {}",
-                symbol,
-                format_session_text(self.sessions) or "未写",
-                ",".join(flats) or "未写",
-            )
+            if self._multi_symbol_enabled():
+                for name in symbols:
+                    logger.info(
+                        "{} 交易时段 {} ，清仓 {}",
+                        name,
+                        format_session_text(symbol_sessions.get(name)) or "未写",
+                        ",".join(symbol_flats.get(name) or []) or "未写",
+                    )
+            else:
+                logger.info(
+                    "{} 交易时段 {} ，清仓 {}",
+                    symbol,
+                    format_session_text(self.sessions) or "未写",
+                    ",".join(flats) or "未写",
+                )
             self._live_session_key = key
+
+    def _symbol_sessions_for(self, symbol: str) -> list[list[str]]:
+        """某个品种自己的交易时段。多品种关闭或没缓存时按品种表重算。"""
+        if self._multi_symbol_enabled():
+            cached = getattr(self, "_symbol_sessions", None) or {}
+            if symbol in cached:
+                return cached[symbol]
+            from src.utils.session_clock import sessions_for_symbol
+
+            return sessions_for_symbol(self.cfg, symbol)
+        return list(getattr(self, "sessions", None) or [])
+
+    def _symbol_flatten_clocks(self, symbol: str) -> list[str]:
+        """某个品种自己的清仓钟点。"""
+        if self._multi_symbol_enabled():
+            cached = getattr(self, "_symbol_flatten_times", None) or {}
+            if symbol in cached:
+                return list(cached[symbol])
+        from src.utils.session_clock import flatten_times_for_symbol
+
+        return list(flatten_times_for_symbol(self.cfg, symbol))
+
+    def _symbol_flatten_due(self, symbol: str, now: datetime | None = None) -> bool:
+        """这个品种现在是不是到自己的收盘清仓钟点了。"""
+        from src.utils.session_clock import flatten_times_for_symbol, in_flatten_window
+
+        if not bool(getattr(self.strategy, "flatten_at_close", False)):
+            return False
+        clocks = self._symbol_flatten_clocks(symbol)
+        if not clocks:
+            clocks = list(flatten_times_for_symbol(self.cfg, symbol))
+        # 夜日连续策略只在日盘收盘清仓；这里跟 daily_body.is_flatten_time 保持同一口径。
+        linked = getattr(self.strategy, "_linked", None)
+        if callable(linked) and linked():
+            from src.utils.session_clock import SCOPE_NIGHT, session_kind
+
+            clocks = [clock for clock in clocks if session_kind(clock) != SCOPE_NIGHT]
+        return in_flatten_window(clocks, now or datetime.now())
+
+    def _any_flatten_due(self, now: datetime | None = None) -> bool:
+        """任一扫描品种到清仓钟点就算。多品种关闭时仍问策略自己。"""
+        if self._multi_symbol_enabled():
+            symbols = list(getattr(self, "scan_symbols", None) or [])
+            return any(self._symbol_flatten_due(name, now) for name in symbols)
+        try:
+            return bool(self.strategy.is_flatten_time(now))
+        except TypeError:
+            return bool(self.strategy.is_flatten_time())
+
+    def _any_symbol_in_session(self, symbols: list[str], now: datetime | None = None) -> bool:
+        """这些品种里是否至少有一个在自己的交易时段内。"""
+        for name in symbols:
+            sessions = self._symbol_sessions_for(name)
+            if not sessions or in_trading_session(sessions, now):
+                return True
+        return False
+
+    def _scan_session_active(self, now: datetime | None = None) -> bool:
+        """本轮扫描是否还有意义：多品种看各自时段，单品种保持原口径。"""
+        if self._multi_symbol_enabled():
+            names = list(getattr(self, "scan_symbols", None) or [])
+            return self._any_symbol_in_session(names, now) or self._any_flatten_due(now)
+        sessions = getattr(self, "sessions", None)
+        if not sessions:
+            return True
+        if in_trading_session(sessions, now):
+            return True
+        try:
+            return bool(self.strategy.is_flatten_time(now))
+        except TypeError:
+            return bool(self.strategy.is_flatten_time())
+
+    def _read_multi_cfg(self) -> dict[str, Any]:
+        """读 live.multi_symbol。没写或写错都当成关闭，不影响单品种老行为。"""
+        live = self.cfg.get("live") if isinstance(self.cfg, dict) else None
+        box = (live or {}).get("multi_symbol") if isinstance(live, dict) else None
+        return box if isinstance(box, dict) else {}
+
+    def _multi_symbol_enabled(self) -> bool:
+        """多品种开仓开关。用 __new__ 建的轻量测试对象没这个属性时按关闭处理。"""
+        return bool(getattr(self, "_multi_enabled", False))
+
+    def _is_live_account(self) -> bool:
+        """当前执行通道是不是真实账户。仿真/自测都返回 False。"""
+        trade = self.cfg.get("trade") if isinstance(self.cfg, dict) else None
+        ctp = (trade or {}).get("ctp") if isinstance(trade, dict) else None
+        box = ctp if isinstance(ctp, dict) else {}
+        return str(box.get("account_kind") or "").strip().lower() == "live"
+
+    def _validate_multi_symbol_config(self) -> None:
+        """多品种启动前体检：白名单不能为空，同一合约不能配两条腿。"""
+        if not self._multi_symbols:
+            logger.warning("live.multi_symbol 没有配置品种白名单，按关注列表全部品种扫描")
+        strategy_box = self.cfg.get("strategy") if isinstance(self.cfg, dict) else None
+        legs = (strategy_box or {}).get("legs") if isinstance(strategy_box, dict) else None
+        seen: set[str] = set()
+        duplicated: set[str] = set()
+        for item in legs or []:
+            if not isinstance(item, dict):
+                continue
+            name = str(item.get("symbol") or "").strip().lower()
+            if not name:
+                continue
+            if name in seen:
+                duplicated.add(name)
+            seen.add(name)
+        if duplicated:
+            raise ValueError(
+                "strategy.legs 同一合约只能有一条腿，重复："
+                + "、".join(sorted(duplicated))
+            )
+
+    def _primary_symbol(self) -> str:
+        """当前选中品种：界面/配置指定的那个；找不到就用关注列表第一个。"""
+        symbols = list(getattr(self, "symbols", None) or [])
+        if not symbols:
+            return str(getattr(self, "default_symbol", "") or "")
+        wanted = str(getattr(self, "default_symbol", "") or "").strip().lower()
+        return next((name for name in symbols if name.lower() == wanted), symbols[0])
 
     def _pick_scan_symbols(self) -> list[str]:
         """
-        常驻扫描清单：当前选中品种 + 程序账上所有非空持仓。
+        常驻扫描清单。
 
+        单品种（默认）：当前选中品种 + 程序账上所有非空持仓。
+        多品种开关打开：白名单内的空仓品种也扫，选中品种仍排第一。
         只扫当前品种会让「已移出关注列表的旧仓」裸奔，没人止损/收盘清仓。
-        当前品种放首位，交易时段仍以它的 K 线为准。
         """
         out: list[str] = []
-        if self.symbols:
-            wanted = str(self.default_symbol or "").strip().lower()
+        symbols = list(getattr(self, "symbols", None) or [])
+        if self._multi_symbol_enabled() and symbols:
+            known = {name.lower(): name for name in symbols}
+            primary = self._primary_symbol()
+            if primary:
+                out.append(known.get(primary.lower(), primary))
+            wanted = list(getattr(self, "_multi_symbols", None) or symbols)
+            warned = getattr(self, "_multi_warned", None)
+            if warned is None:
+                warned = set()
+                self._multi_warned = warned
+            for item in wanted:
+                symbol = known.get(str(item).strip().lower())
+                if symbol is None:
+                    key = str(item).strip().lower()
+                    if key and key not in warned:
+                        warned.add(key)
+                        logger.warning(
+                            "live.multi_symbol 里的 {} 不在 strategy.symbols，已跳过", item
+                        )
+                    continue
+                if symbol.lower() not in {name.lower() for name in out}:
+                    out.append(symbol)
+        elif symbols:
+            wanted_name = str(self.default_symbol or "").strip().lower()
             current = next(
-                (symbol for symbol in self.symbols if symbol.lower() == wanted),
-                self.symbols[0],
+                (symbol for symbol in symbols if symbol.lower() == wanted_name),
+                symbols[0],
             )
             out.append(current)
         seen = {symbol.lower() for symbol in out}
@@ -1743,7 +1936,7 @@ class TradingBot(
             logger.warning("SIGNAL 事件订阅者异常，已忽略: {}", exc)
         return trace_id
 
-    def scan_symbol(self, symbol: str) -> None:
+    def scan_symbol(self, symbol: str, force: bool = False) -> None:
         """对单个品种：拉信号周期 + 止损周期K线 → 策略评估 → 执行。"""
         key = symbol.strip().lower()
         if key in getattr(self, "_frozen_symbols", set()):
@@ -1753,12 +1946,28 @@ class TradingBot(
                 self._record_event("symbol_frozen", symbol=symbol)
             return
 
+        # 多品种：每个品种按自己的时段跑。燃油有夜盘、生猪没有，不能拿选中品种的时段套。
+        if (
+            not force
+            and self._multi_symbol_enabled()
+            and symbol.strip().lower() != self._primary_symbol().strip().lower()
+            and not in_trading_session(self._symbol_sessions_for(symbol))
+            and not self._symbol_flatten_due(symbol)
+        ):
+            self._record_event_throttled(
+                "multi_symbol_outside_session",
+                f"multi_symbol_outside_session|{key}",
+                symbol=symbol,
+            )
+            return
+
         scan_started = time.perf_counter()
         previous_scan = getattr(self, "_market_scan_at", {}).get(key)
         scan_gap_sec = None if previous_scan is None else scan_started - previous_scan
         self._market_scan_at[key] = scan_started
-        signal_tf = getattr(self.strategy, "timeframe", "15")
-        trail_tf = getattr(self.strategy, "trail_timeframe", signal_tf)
+        leg = self._strategy_for(symbol)
+        signal_tf = getattr(leg, "timeframe", "15")
+        trail_tf = getattr(leg, "trail_timeframe", signal_tf)
 
         try:
             bars = self.kline.fetch(symbol, period=str(signal_tf))
@@ -1786,8 +1995,8 @@ class TradingBot(
 
         # 有的策略会另外要日线。拉不到就不开新仓，不用分钟线自己拼日线，也不改用别的策略。
         trend_closed = None
-        trend_tf = getattr(self.strategy, "trend_timeframe", None)
-        if getattr(self.strategy, "uses_trend_bars", False) and trend_tf and str(trend_tf) != str(signal_tf):
+        trend_tf = getattr(leg, "trend_timeframe", None)
+        if getattr(leg, "uses_trend_bars", False) and trend_tf and str(trend_tf) != str(signal_tf):
             try:
                 trend_bars = self.kline.fetch(symbol, period=str(trend_tf))
                 # 最后一根日线可能还在走，先拿掉。策略还会再核对一次是不是已经走完。
@@ -1838,6 +2047,7 @@ class TradingBot(
                 trend_closed=trend_closed,
                 forming=forming,
                 settings=catch_cfg,
+                strategy_cfg=self._strategy_cfg_for(symbol),
             )
             if hit is not None:
                 eval_bars = hit.prefix
@@ -1910,7 +2120,7 @@ class TradingBot(
                 gs_bars,
                 flat=False,
                 forming=None,
-                mode=getattr(self.strategy, "stop_mode", "touch"),
+                mode=getattr(leg, "stop_mode", "touch"),
                 # 平仓未成交时别每轮都重复发单，和策略自身止损的等待口径一致。
                 cooldown_sec=120.0,
             )
@@ -1945,7 +2155,7 @@ class TradingBot(
                 symbol,
                 closed,
                 decision,
-                self.strategy,
+                leg,
                 signal_tf=str(signal_tf),
             )
         except Exception as e:  # noqa: BLE001
@@ -2097,7 +2307,7 @@ class TradingBot(
                 "latest_price_at": now_iso(),
                 "latest_price_source": latest_price_source if live_price > 0 else "unavailable",
             }
-            atr = _latest_atr(closed, self.strategy)
+            atr = _latest_atr(closed, leg)
             limit_atr = float((self.cfg.get("trade") or {}).get("max_entry_slip_atr", 0.5) or 0)
             limit_points = float((self.cfg.get("trade") or {}).get("max_entry_slip_points", 0) or 0)
             blocked, chase, limit = entry_slip_blocked(
@@ -2155,24 +2365,38 @@ class TradingBot(
                 self._dyn_cut_key = pending_cut
             self._dyn_cut_pending = ""
 
-    def _evaluate_accepts(self, name: str) -> bool:
+    def _strategy_for(self, symbol: str) -> Any:
+        """这个品种该用哪条策略腿。单策略时就是原来的全局策略。"""
+        picker = getattr(self.strategy, "strategy_for", None)
+        if callable(picker):
+            return picker(symbol)
+        return self.strategy
+
+    def _strategy_cfg_for(self, symbol: str) -> dict[str, Any] | None:
+        """这个品种的腿配置；没有腿路由时返回 None，回溯仍用全局配置。"""
+        getter = getattr(self.strategy, "cfg_for", None)
+        return getter(symbol) if callable(getter) else None
+
+    def _evaluate_accepts(self, name: str, strategy: Any = None) -> bool:
         """策略的 evaluate 是否真的接受这个关键字参数。
 
         以前用 `except TypeError: pass` 回调一次，会把策略内部的 TypeError
         （真正的 bug）也吞掉，还会让同一根K线被评估两次。这里只看签名。
         """
-        cached = getattr(self, f"_evaluate_accepts_{name}", None)
+        target = strategy or self.strategy
+        cache_key = f"_evaluate_accepts_{id(target)}_{name}"
+        cached = getattr(self, cache_key, None)
         if cached is None:
             import inspect
 
             try:
-                params: Any = inspect.signature(self.strategy.evaluate).parameters
+                params: Any = inspect.signature(target.evaluate).parameters
             except (TypeError, ValueError):
                 params = {}
             cached = name in params or any(
                 param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()
             )
-            setattr(self, f"_evaluate_accepts_{name}", cached)
+            setattr(self, cache_key, cached)
         return bool(cached)
 
     def _evaluate_symbol(
@@ -2185,13 +2409,14 @@ class TradingBot(
         now: datetime | None = None,
     ) -> StrategyDecision:
         """调用正式策略。回溯时可能带上信号时刻；策略不支持就不传。"""
-        uses_trend = bool(getattr(self.strategy, "uses_trend_bars", False))
+        target = self._strategy_for(symbol)
+        uses_trend = bool(getattr(target, "uses_trend_bars", False))
         kwargs: dict[str, Any] = {"trail_bars": trail_bars}
         if uses_trend:
             kwargs["trend_bars"] = trend_bars
-        if now is not None and self._evaluate_accepts("now"):
+        if now is not None and self._evaluate_accepts("now", target):
             kwargs["now"] = now
-        return self.strategy.evaluate(symbol, bars, **kwargs)
+        return target.evaluate(symbol, bars, **kwargs)
 
     def _halt_on_unknown_dispatch(self, exc: Exception) -> None:
         """发单阶段异常且委托结果未知：停开新仓 + 持久化 + 告警，等人工确认。
@@ -2232,21 +2457,22 @@ class TradingBot(
         # 盘前定时审计：每轮扫描开头检查一次，落在 08:55 / 13:25 / 20:25 前后 3 分钟内且距上次
         # 触发已超过 1 小时就跑一次，避免同一时段重复跑。
         self._maybe_run_session_audit()
-        if (
-            not force
-            and self.sessions
-            and not in_trading_session(self.sessions)
-            and not self.strategy.is_flatten_time()
-        ):
+        if not force and not self._scan_session_active():
             now = datetime.now()
             last = self._session_skip_log_at
             if last is None or (now - last).total_seconds() >= 60:
-                night = next((row for row in self.sessions if str(row[0]).startswith("21")), None)
-                night_txt = f"{night[0]}～{night[1]}" if night else "未写夜盘"
-                logger.info(
-                    "现在不在交易时段，本轮不拉K线、不扫描（夜盘按 {}）",
-                    night_txt,
-                )
+                if self._multi_symbol_enabled():
+                    logger.info(
+                        "扫描清单 {} 都不在各自交易时段，本轮不拉K线、不扫描",
+                        ",".join(self.scan_symbols),
+                    )
+                else:
+                    night = next((row for row in self.sessions if str(row[0]).startswith("21")), None)
+                    night_txt = f"{night[0]}～{night[1]}" if night else "未写夜盘"
+                    logger.info(
+                        "现在不在交易时段，本轮不拉K线、不扫描（夜盘按 {}）",
+                        night_txt,
+                    )
                 self._session_skip_log_at = now
             return
 
@@ -2274,7 +2500,7 @@ class TradingBot(
         self._reconcile_ctp()
         for symbol in self.scan_symbols:
             try:
-                self.scan_symbol(symbol)
+                self.scan_symbol(symbol, force=force)
             except RuntimeError as exc:
                 # 行情没拿到时只写一句原因。整段英文报错会占满运行日志，看起来像程序崩了。
                 self.last_error = str(exc)
@@ -2359,13 +2585,8 @@ class TradingBot(
     def run_forever(self) -> None:
         """阻塞运行：定时登录 + 周期扫描。Ctrl+C 或 stop() 退出。"""
         caps = self.trader_capabilities
-        # GUI 多品种硬拦：没有自动切合约时挂机过于危险。只检查常驻实际扫描的品种。
-        allow_multi = bool((self.cfg.get("trade") or {}).get("gui", {}).get("allow_multi_symbol", False))
-        if caps.window_driven and len(self.scan_symbols) > 1 and not allow_multi:
-            raise RuntimeError(
-                f"GUI 模式禁止多品种同时挂机：当前 {self.scan_symbols}。"
-                "请在配置里只留一个合约，或标定 symbol_input 并设 trade.gui.allow_multi_symbol=true。"
-            )
+        # GUI 通道只交易「当前选中」这一个品种，关注列表留多少都不影响启动。
+        # 扫描清单可能多于 1 个（选中品种 + 已有持仓），那是为了给旧仓止损/清仓，不参与开仓。
 
         # 告警外发（默认关）。配置写错只降级成本地告警，不影响扫描。
         from src.ops.notify import configure as configure_notify
@@ -2445,7 +2666,7 @@ class TradingBot(
         # 清仓改成定时触发：先算好下一次钟点，平时每秒只比一次时间，不重复跑策略。
         # 启动时已经在清仓窗口里，就把定时器设成现在，先平一次再说。
         try:
-            in_window = bool(self.strategy.is_flatten_time())
+            in_window = self._any_flatten_due()
         except Exception:  # noqa: BLE001
             in_window = False
         flatten_at = datetime.now() if in_window else self._next_flatten_at()
@@ -2550,8 +2771,22 @@ class TradingBot(
                 flat_s.append(x.strftime("%H:%M"))
             else:
                 flat_s.append(str(x))
+        sessions_for_check = getattr(self, "sessions", None)
+        if self._multi_symbol_enabled():
+            # 多品种关机要等最后一个品种收盘：清仓钟点取并集，时段也取并集。
+            flat_s = []
+            seen_flat: set[str] = set()
+            merged: list[list[str]] = []
+            for name in self.scan_symbols:
+                for text in self._symbol_flatten_clocks(name):
+                    key = str(text)[:5]
+                    if key and key not in seen_flat:
+                        seen_flat.add(key)
+                        flat_s.append(key)
+                merged.extend(self._symbol_sessions_for(name) or [])
+            sessions_for_check = merged
         ok, why = ready_for_shutdown(
-            sessions=self.sessions,
+            sessions=sessions_for_check,
             flatten_times=flat_s or list((self.cfg.get("strategy") or {}).get("flatten_times") or []),
             grace_minutes=int(rt.get("shutdown_grace_minutes", 5)),
             has_position=self._has_any_position(),

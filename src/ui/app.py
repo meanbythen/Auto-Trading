@@ -67,6 +67,7 @@ from src.ui.config_support import ConfigSupportMixin
 from src.ui.config_vars import ConfigVarsMixin
 from src.ui.dashboard import DashboardMixin
 from src.ui.data_tab import DataTabMixin
+from src.ui.governance_tab import GovernanceTabMixin
 from src.ui.optimize_tab import OptimizeTabMixin
 from src.ui.picker_tab import PickerTabMixin
 from src.ui.research_hub import ResearchHubMixin
@@ -100,6 +101,7 @@ class AutoTradingApp(
     RunTabMixin,
     BacktestTabMixin,
     DataTabMixin,
+    GovernanceTabMixin,
     ResearchTabMixin,
     ReviewTabMixin,
     AccountTabMixin,

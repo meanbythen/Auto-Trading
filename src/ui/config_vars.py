@@ -101,6 +101,18 @@ class ConfigVarsMixin:
             value=self._watch_symbols[0] if self._watch_symbols else "（还没有）"
         )
         self.watch_add_var = ctk.StringVar(value="")
+        # 多品种实盘与策略腿。界面只改这两段，扫描和回测都按这里的腿跑。
+        live_box = self.cfg.get("live")
+        live_box = live_box if isinstance(live_box, dict) else {}
+        ms_box = live_box.get("multi_symbol")
+        ms_box = ms_box if isinstance(ms_box, dict) else {}
+        self.ms_enabled_var = ctk.BooleanVar(value=bool(ms_box.get("enabled", False)))
+        self.ms_allow_live_var = ctk.BooleanVar(value=bool(ms_box.get("allow_live", False)))
+        self.ms_interval_var = ctk.StringVar(value=str(ms_box.get("scan_interval_sec", 15)))
+        self.legs_enabled_var = ctk.BooleanVar(value=bool(st.get("legs")))
+        self._leg_rows: list[dict[str, Any]] = []
+        self._leg_rows_host: ctk.CTkFrame | None = None
+        self._leg_engine_choices: list[str] = []
         self._pick_baseline: dict[str, Any] | None = None
         self._pick_running = False
         self._pick_cancel = threading.Event()
@@ -477,6 +489,11 @@ class ConfigVarsMixin:
         self.pk_limits_on_var = ctk.BooleanVar(value=True)
         self.pk_sizing_var = ctk.StringVar(value="fixed")
         self.pk_capital_var = ctk.StringVar(value=self.bt_capital_var.get())
+        self.pk_capital_mode_var = ctk.BooleanVar(value=False)
+        self.pk_weight_var = ctk.StringVar(value="等权")
+        self.pk_cap_var = ctk.StringVar(value="40")
+        # 勾上后组合回测按配置里的 strategy.legs 跑：每腿可用不同策略和周期。
+        self.pk_legs_var = ctk.BooleanVar(value=False)
         self.pk_risk_pct_var = ctk.StringVar(value=self.bt_risk_pct_var.get())
         self.pk_volume_var = ctk.StringVar(value=self.bt_volume_var.get())
         self.pk_min_vol_var = ctk.StringVar(value=self.bt_min_vol_var.get())
@@ -872,6 +889,15 @@ class ConfigVarsMixin:
         self.symbols_var.set(",".join(str(x) for x in st.get("symbols", ["bu", "c"])))
         # 这是从文件读回来，不要再写一遍，免得把刚读到的名单覆盖掉。
         self._set_watch_codes(self._parse_list(self.symbols_var.get()), save=False)
+        live_box = self.cfg.get("live")
+        live_box = live_box if isinstance(live_box, dict) else {}
+        ms_box = live_box.get("multi_symbol")
+        ms_box = ms_box if isinstance(ms_box, dict) else {}
+        self.ms_enabled_var.set(bool(ms_box.get("enabled", False)))
+        self.ms_allow_live_var.set(bool(ms_box.get("allow_live", False)))
+        self.ms_interval_var.set(str(ms_box.get("scan_interval_sec", 15)))
+        self.legs_enabled_var.set(bool(st.get("legs")))
+        self._rebuild_leg_rows()
         self.volume_var.set(str(trade.get("volume", 1)))
         self.max_slip_var.set(str(trade.get("max_entry_slip_atr", 0.5)))
         self.max_slip_points_var.set(str(trade.get("max_entry_slip_points", 0)))
@@ -1095,3 +1121,21 @@ class ConfigVarsMixin:
         self.kelly_win_var.set(win_rate_pct_display(_kr))
         self.kelly_payoff_var.set("" if _kp is None else f"{_kp:g}")
         self._refresh_kelly_status()
+
+    def _rebuild_leg_rows(self) -> None:
+        """按当前配置重画策略腿输入行；页面还没建好时什么都不做。"""
+        host = getattr(self, "_leg_rows_host", None)
+        if host is None:
+            return
+        from src.backtest.portfolio import parse_legs
+        from src.ui.config_tab_sections import add_leg_row, clear_leg_rows
+
+        clear_leg_rows(self)
+        for leg in parse_legs(self.cfg):
+            add_leg_row(
+                self,
+                leg["symbol"],
+                leg["engine"],
+                leg["timeframe"],
+                leg["trail_timeframe"],
+            )

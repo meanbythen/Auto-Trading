@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any
 
 from src.domain.pnl_stats import summarize_pnl
@@ -61,6 +62,14 @@ class Performance:
     expectancy: float = 0.0
     max_drawdown: float = 0.0
     max_drawdown_pct: float = 0.0
+    # 批次1可信度底座新增：每笔盈亏口径的风险指标。样本不足时为 0，展示处标注「算不出」。
+    sharpe: float = 0.0  # 每笔盈亏均值÷标准差；有时间跨度时已按 sqrt(年成交笔数) 年化
+    sortino: float = 0.0  # 均值÷下行标准差（min(pnl,0) 的均方根）
+    sharpe_annualized: bool = False  # True 表示 sharpe/sortino 已年化；False 为未年化原始值
+    ulcer: float = 0.0  # Ulcer Index：权益回撤百分比的平方均值开方
+    exposure: float = 0.0  # 持仓暴露：持仓时长之和÷数据总跨度（0~1）
+    turnover: float = 0.0  # 换手率：年成交笔数；无时间跨度时为 0
+    cost_ratio: float = 0.0  # 成本占比：总手续费÷毛盈利
     score: float = 0.0
 
     def to_dict(self) -> dict[str, Any]:
@@ -79,6 +88,13 @@ class Performance:
             "expectancy": round(self.expectancy, 4),
             "max_drawdown": round(self.max_drawdown, 2),
             "max_drawdown_pct": round(self.max_drawdown_pct, 4),
+            "sharpe": round(self.sharpe, 4),
+            "sortino": round(self.sortino, 4),
+            "sharpe_annualized": self.sharpe_annualized,
+            "ulcer": round(self.ulcer, 4),
+            "exposure": round(self.exposure, 4),
+            "turnover": round(self.turnover, 4),
+            "cost_ratio": round(self.cost_ratio, 4),
             "score": round(self.score, 4),
         }
 
@@ -114,6 +130,64 @@ def format_payoff_lines(
         )
     else:
         lines.append("盈亏比    —（没有亏损笔，算不出；不能填凯利）")
+    return lines
+
+
+def format_risk_metrics_lines(perf: Any) -> list[str]:
+    """渲染批次1新增风险指标：Sharpe / Sortino / Ulcer / 持仓暴露 / 换手率 / 成本占比。
+
+    perf 可以是 Performance 或带这些键的 dict（旧数据缺键时安全降级）。
+    值为 0/None 时写明「算不出/样本不足」，避免把缺失误读成真实 0。
+    只展示，不参与排名或评估结论。
+    """
+
+    def pick(key: str, default: float = 0.0) -> float:
+        if isinstance(perf, dict):
+            v = perf.get(key, default)
+        else:
+            v = getattr(perf, key, default)
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return default
+
+    sharpe = pick("sharpe")
+    sortino = pick("sortino")
+    ulcer = pick("ulcer")
+    exposure = pick("exposure")
+    turnover = pick("turnover")
+    cost_ratio = pick("cost_ratio")
+    if isinstance(perf, dict):
+        annualized = bool(perf.get("sharpe_annualized", False))
+    else:
+        annualized = bool(getattr(perf, "sharpe_annualized", False))
+
+    lines = ["—— 风险指标（每笔盈亏口径）——"]
+    ann = "（年化）" if annualized else "（未年化）"
+    if abs(sharpe) > 1e-9:
+        lines.append(f"Sharpe   {sharpe:.3f}{ann}（每笔盈亏均值÷标准差；越大越稳）")
+    else:
+        lines.append("Sharpe   —（样本不足或无波动，算不出）")
+    if abs(sortino) > 1e-9:
+        lines.append(f"Sortino  {sortino:.3f}{ann}（只惩罚下行波动；>=1 较好）")
+    else:
+        lines.append("Sortino  —（没有下行波动或样本不足，算不出）")
+    if ulcer > 1e-9:
+        lines.append(f"Ulcer    {ulcer:.4f}（权益回撤深度的均方根；越低越平缓）")
+    else:
+        lines.append("Ulcer    —（无回撤数据，算不出）")
+    if exposure > 1e-9:
+        lines.append(f"持仓暴露 {exposure * 100:.1f}%（持仓时长÷数据总跨度）")
+    else:
+        lines.append("持仓暴露 —（无持仓时长/时间轴，算不出）")
+    if turnover > 1e-9:
+        lines.append(f"换手率   {turnover:.1f} 笔/年（年成交笔数）")
+    else:
+        lines.append("换手率   —（无时间跨度，算不出）")
+    if cost_ratio > 1e-9:
+        lines.append(f"成本占比 {cost_ratio * 100:.1f}%（总手续费÷毛盈利；越低越好）")
+    else:
+        lines.append("成本占比 —（毛盈利为 0 或无手续费，算不出）")
     return lines
 
 
@@ -165,13 +239,65 @@ def format_expectancy_line(
     )
 
 
+def _parse_ts(value: Any) -> datetime | None:
+    """解析成交/权益时间戳；失败返回 None，不抛异常。"""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(text[:19], fmt)
+        except ValueError:
+            continue
+    return None
+
+
+def _trade_risk_stats(pnls: list[float]) -> tuple[float, float, float]:
+    """返回 (均值, 总体标准差, 下行偏差)。下行偏差 = sqrt(mean(min(pnl,0)^2))。"""
+    n = len(pnls)
+    if n == 0:
+        return 0.0, 0.0, 0.0
+    mean = sum(pnls) / n
+    var = sum((x - mean) ** 2 for x in pnls) / n
+    std = math.sqrt(var)
+    dd_var = sum(min(x, 0.0) ** 2 for x in pnls) / n
+    downside = math.sqrt(dd_var)
+    return mean, std, downside
+
+
+def _span_years(times: list[str] | None) -> float | None:
+    """从权益时间轴首尾估算跨度（年）；不足返回 None。"""
+    if not times or len(times) < 2:
+        return None
+    first = _parse_ts(times[0])
+    last = _parse_ts(times[-1])
+    if first is None or last is None or last <= first:
+        return None
+    days = (last - first).total_seconds() / 86400.0
+    if days <= 0:
+        return None
+    return days / 365.0
+
+
 def calc_performance(
     trades: list[TradeRecord],
     equity: list[float],
     *,
     min_trades: int = 5,
+    times: list[str] | None = None,
 ) -> Performance:
-    """根据成交列表与权益曲线算绩效，并给出综合得分。"""
+    """根据成交列表与权益曲线算绩效，并给出综合得分。
+
+    times：可选，与 equity 平行的时间戳列表。提供后 sharpe/sortino 会按
+    sqrt(年成交笔数) 年化，并计算 turnover（年成交笔数）与 exposure（持仓暴露）。
+    不提供时这些指标退化为未年化值或 0，不抛异常。
+    """
     p = Performance(trades=len(trades))
     if not trades:
         return p
@@ -195,20 +321,65 @@ def calc_performance(
     p.payoff = payoff_ratio(p.avg_win, p.avg_loss)
     p.expectancy = unit_expectancy(p.win_rate, p.avg_win, p.avg_loss)
 
-    # 最大回撤（按权益曲线）
+    # 最大回撤（按权益曲线），同时累计 Ulcer Index 需要的回撤平方均值。
     if equity:
         peak = equity[0]
         max_dd = 0.0
         max_dd_pct = 0.0
+        dd_sq_sum = 0.0
+        dd_count = 0
         for e in equity:
             peak = max(peak, e)
             dd = peak - e
             dd_pct = dd / peak if peak > 1e-9 else 0.0
+            dd_sq_sum += dd_pct * dd_pct
+            dd_count += 1
             if dd > max_dd:
                 max_dd = dd
                 max_dd_pct = dd_pct
         p.max_drawdown = float(max_dd)
         p.max_drawdown_pct = float(max_dd_pct)
+        if dd_count:
+            p.ulcer = math.sqrt(dd_sq_sum / dd_count)
+
+    # 批次1可信度底座：每笔盈亏口径的风险指标 + 持仓暴露 + 换手率 + 成本占比。
+    mean_pnl, std_pnl, downside_dev = _trade_risk_stats(pnls)
+    p.sharpe = (mean_pnl / std_pnl) if std_pnl > 1e-12 else 0.0
+    p.sortino = (mean_pnl / downside_dev) if downside_dev > 1e-12 else 0.0
+    years = _span_years(times)
+    if years is not None and years > 0 and std_pnl > 1e-12:
+        annual_factor = math.sqrt(p.trades / years)
+        p.sharpe = p.sharpe * annual_factor
+        if downside_dev > 1e-12:
+            p.sortino = p.sortino * annual_factor
+        p.sharpe_annualized = True
+        p.turnover = p.trades / years
+
+    # 持仓暴露：持仓时长之和 ÷ 数据总跨度。
+    holding_seconds = 0.0
+    for t in trades:
+        en = _parse_ts(getattr(t, "entry_time", None))
+        ex = _parse_ts(getattr(t, "exit_time", None))
+        if en is not None and ex is not None and ex > en:
+            holding_seconds += (ex - en).total_seconds()
+    if holding_seconds > 0:
+        first = _parse_ts(times[0]) if times and len(times) >= 2 else None
+        last = _parse_ts(times[-1]) if times and len(times) >= 2 else None
+        if first is not None and last is not None and last > first:
+            total_span = (last - first).total_seconds()
+            p.exposure = min(max(holding_seconds / total_span, 0.0), 1.0)
+        else:
+            entry_times = [_parse_ts(getattr(t, "entry_time", None)) for t in trades]
+            exit_times = [_parse_ts(getattr(t, "exit_time", None)) for t in trades]
+            starts = [x for x in entry_times if x is not None]
+            ends = [x for x in exit_times if x is not None]
+            if starts and ends and max(ends) > min(starts):
+                span = (max(ends) - min(starts)).total_seconds()
+                p.exposure = min(max(holding_seconds / span, 0.0), 1.0)
+
+    # 成本占比：总手续费 ÷ 毛盈利。毛盈利为 0 时记 0，展示处标注。
+    total_commission = sum(float(getattr(t, "commission", 0) or 0) for t in trades)
+    p.cost_ratio = (total_commission / p.gross_profit) if p.gross_profit > 1e-9 else 0.0
 
     # 综合得分不看胜率。胜率高只说明赚的笔数多，不说明实盘更能赚钱。
     # 看两件好事：盈利因子到 2 为止，再高也不加分；净赚能不能盖住最大回撤。

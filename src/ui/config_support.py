@@ -293,6 +293,12 @@ class ConfigSupportMixin:
         )
 
     def _on_save(self) -> None:
+        problem = self._legs_ui_problem()
+        if problem:
+            from tkinter import messagebox
+
+            messagebox.showerror("策略腿配置", problem)
+            return
         try:
             old_limit = float((self.cfg.get("risk") or {}).get("max_daily_loss") or 0)
         except (TypeError, ValueError):

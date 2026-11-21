@@ -81,6 +81,50 @@ def _bot() -> TradingBot:
     return bot
 
 
+def test_gui_open_skips_symbols_other_than_selected() -> None:
+    """GUI 通道只交易当前选中品种：扫描清单里的旧仓合约只允许平仓，不允许开新仓。"""
+    class _GuiTrader:
+        capabilities = DEFAULT_CAPABILITIES["gui"]
+
+        def buy_open(self, symbol: str, volume: int, price: object = None) -> object:
+            raise AssertionError("非当前选中品种不应该开仓")
+
+    bot = _bot()
+    bot.trader = _GuiTrader()  # type: ignore[assignment]
+    bot.symbols = ["fu2701", "lh2701"]
+
+    ok = bot._execute(
+        StrategyDecision(
+            StrategyAction.BUY_OPEN,
+            "lh2701",
+            "多因子做多",
+            entry_price=12000,
+            meta={"bar_id": "2026-11-05 09:35"},
+        )
+    )
+
+    assert ok is False
+    assert bot._events[-1][0] == "gui_open_skip_not_selected"  # type: ignore[attr-defined]
+
+
+def test_gui_close_still_allowed_for_non_selected_symbol() -> None:
+    """非选中品种的旧仓必须还能平，否则会平不掉。"""
+    class _GuiTrader:
+        capabilities = DEFAULT_CAPABILITIES["gui"]
+
+        def close_position(self, symbol: str, volume: int, price: object = None) -> None:
+            raise AssertionError("无仓时不应该发平仓单")
+
+    bot = _bot()
+    bot.trader = _GuiTrader()  # type: ignore[assignment]
+    bot.symbols = ["fu2701", "lh2701"]
+
+    ok = bot._execute(StrategyDecision(StrategyAction.CLOSE, "lh2701", "到点平仓"))
+
+    assert ok is False
+    assert bot._events[-1][0] == "close_skip_no_position"  # type: ignore[attr-defined]
+
+
 def test_close_books_when_broker_already_empty() -> None:
     """手机把仓平了以后，程序只补记账，不再向柜台报平仓。"""
     from src.strategy.types import PositionState

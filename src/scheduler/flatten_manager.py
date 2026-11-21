@@ -38,11 +38,14 @@ class FlattenManagerMixin:
         策略自己在拿到收盘K线时也会平，这里是按时钟的兜底。
         """
         now = now or datetime.now()
-        try:
-            in_window = bool(self.strategy.is_flatten_time())
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("检查收盘清仓钟点失败: {}", exc)
-            in_window = False
+        if self._multi_symbol_enabled():
+            in_window = self._any_flatten_due(now)
+        else:
+            try:
+                in_window = bool(self.strategy.is_flatten_time())
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("检查收盘清仓钟点失败: {}", exc)
+                in_window = False
         due = bool(force or self._flatten_pending or in_window)
         if not due:
             self._flatten_try.clear()
@@ -66,8 +69,12 @@ class FlattenManagerMixin:
             }
         # 已经过了 10 分钟窗口、但仓位还没平：只在交易时段内继续重试。
         # 收盘后的夜里不再反复点同花顺，待办保留到下一节开盘再平。
-        if not in_window and self.sessions and not in_trading_session(self.sessions):
-            return
+        if not in_window:
+            if self._multi_symbol_enabled():
+                if not self._any_symbol_in_session(self.scan_symbols, now):
+                    return
+            elif self.sessions and not in_trading_session(self.sessions):
+                return
 
         mono = time.monotonic()
         remaining = False
@@ -76,6 +83,13 @@ class FlattenManagerMixin:
                 self._flatten_attempts.pop(symbol, None)
                 self._flatten_sent.discard(symbol)
                 self._flatten_try.pop(symbol, None)
+                continue
+            # 多品种：每个品种只在自己的清仓钟点平。燃油夜盘 22:55 不能带着生猪一起点。
+            if (
+                self._multi_symbol_enabled()
+                and not force
+                and not self._symbol_flatten_due(symbol, now)
+            ):
                 continue
             too_fresh = getattr(self, "_own_fill_too_fresh", None)
             fill_kind = getattr(self, "_own_fill_kind", None)
@@ -168,7 +182,20 @@ class FlattenManagerMixin:
         """下一次收盘清仓的钟点。向后找下一个真正会清仓的交易日，周末和节假日不预约。"""
         if not getattr(self.strategy, "flatten_at_close", False):
             return None
-        clocks: list[Any] = list(getattr(self.strategy, "flatten_times", []) or [])
+        clocks: list[Any] = []
+        if self._multi_symbol_enabled():
+            # 多品种取各品种清仓钟点的并集：生猪 14:55、燃油 14:55 与 22:55。
+            from src.utils.session_clock import parse_hhmm
+
+            seen: set[str] = set()
+            for name in self.scan_symbols:
+                for text in self._symbol_flatten_clocks(name):
+                    key = str(text)[:5]
+                    if key and key not in seen:
+                        seen.add(key)
+                        clocks.append(parse_hhmm(key))
+        else:
+            clocks = list(getattr(self.strategy, "flatten_times", []) or [])
         if not clocks:
             return None
         now = now or datetime.now()
@@ -198,6 +225,9 @@ class FlattenManagerMixin:
 
     def _strategy_would_flatten_at(self, when: datetime) -> bool:
         """这个钟点策略会不会真的清仓。问 is_flatten_time(when)，不要只看 flatten_times。"""
+        if self._multi_symbol_enabled():
+            # 策略的 flatten_times 绑的是选中品种；多品种按各品种并集预约，不能再让它否掉。
+            return True
         checker = getattr(self.strategy, "is_flatten_time", None)
         if checker is None:
             return True

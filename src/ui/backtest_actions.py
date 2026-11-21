@@ -30,6 +30,29 @@ def _source_line(snap: dict) -> str:
     return f"{label}（本地库存名不带后缀）"
 
 
+def _cost_calibration_lines(snap: dict) -> list[str]:
+    """本次回测实际滑点与实盘校准记录的对照，只读展示。"""
+    source = str(snap.get("slippage_source") or "配置默认")
+    lines = [
+        "—— 成本校准 ——",
+        f"本次滑点  {float(snap.get('slippage_ticks') or 0):g} 跳（来源：{source}）",
+    ]
+    if snap.get("slippage_calibrated"):
+        lines.append(
+            f"实盘建议  {float(snap.get('slippage_live_suggested') or 0):g} 跳 vs "
+            f"回测假设 {float(snap.get('slippage_backtest_assumed') or 0):g} 跳；"
+            f"diff {float(snap.get('slippage_diff') or 0):+g} 跳"
+        )
+        lines.append(
+            f"生效日期  {snap.get('slippage_effective_date') or '—'}；"
+            f"样本数 {int(snap.get('slippage_sample_n') or 0)} 笔"
+        )
+    else:
+        reason = str(snap.get("slippage_calibration_reason") or "使用配置默认")
+        lines.append(f"未校准：{reason}")
+    return lines
+
+
 class BacktestActionsMixin:
     """Methods mixed into AutoTradingApp; UI state remains on the app instance."""
 
@@ -77,7 +100,12 @@ class BacktestActionsMixin:
         """把一次回测结果写成绩效报告文本。历史回测页和策略编辑器共用这一份。"""
         from src.backtest.evaluation import format_evaluation_lines
         from src.backtest.live_gates import format_mirror_gate_lines
-        from src.backtest.metrics import format_expectancy_line, format_payoff_lines
+        from src.backtest.metrics import (
+            format_expectancy_line,
+            format_payoff_lines,
+            format_risk_metrics_lines,
+        )
+        from src.backtest.robustness import analyze_experiment, format_robustness_lines
         from src.backtest.rollover import format_rollover_lines
         from src.backtest.slippage import build_ladder, ladder_lines
         from src.screen.picker import format_cover_lines
@@ -122,6 +150,7 @@ class BacktestActionsMixin:
             str(snap.get("coverage_note") or "").strip(),
             *([rollover_text] if rollover_text else []),
             str(snap.get("fill_note") or "").strip(),
+            *_cost_calibration_lines(snap),
             *(
                 [f"口径差异  {snap['live_gap_note']}"]
                 if snap.get("live_gap_note")
@@ -155,6 +184,16 @@ class BacktestActionsMixin:
             ),
             stress_note,
             *format_evaluation_lines(result.evaluation),
+            # 批次1可信度底座：风险指标 + 稳健性分区（只展示，不改变评估结论）。
+            *format_risk_metrics_lines(p),
+            *format_robustness_lines(
+                analyze_experiment(
+                    {
+                        "trades": [{"pnl": float(t.pnl)} for t in result.trades],
+                        "trials": [],
+                    }
+                )
+            ),
             f"报告      {report_path}",
             note.strip(),
             "",

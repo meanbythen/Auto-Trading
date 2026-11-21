@@ -23,7 +23,7 @@ TAB_NAMES = [
     "账户分析",
 ]
 
-RESEARCH_TAB_NAMES = ["历史回测", "交叉测试", "策略优化", "复盘", "规律候选"]
+RESEARCH_TAB_NAMES = ["历史回测", "交叉测试", "策略优化", "复盘", "规律候选", "研究治理"]
 
 
 def test_real_app_builds_all_tabs_and_backtest_initial_state(real_app) -> None:
@@ -503,6 +503,84 @@ def test_config_mapping_save_and_reload_round_trip(real_app) -> None:
     assert "apply_limits" not in loaded["risk"]
 
 
+def test_config_page_edits_multi_symbol_legs(real_app) -> None:
+    """配置页能改多品种开关、扫描间隔和每条腿的策略/周期。"""
+    real_app._set_watch_codes(["fu2701", "lh2701"], select="fu2701", save=False)
+    strategy = real_app.cfg.setdefault("strategy", {})
+    strategy.pop("legs", None)
+    strategy["symbols"] = ["fu2701", "lh2701"]
+    real_app._rebuild_leg_rows()
+    assert [row["symbol_var"].get() for row in real_app._leg_rows] == ["fu2701", "lh2701"]
+
+    real_app.ms_enabled_var.set(True)
+    real_app.ms_allow_live_var.set(False)
+    real_app.ms_interval_var.set("20")
+    real_app.legs_enabled_var.set(True)
+    first = real_app._leg_rows[0]
+    first["engine_var"].set("daily_body")
+    real_app._set_period_vars("60", first["tf_var"], first["tf_custom_var"])
+    real_app._set_period_vars("D", first["trail_var"], first["trail_custom_var"])
+
+    cfg = real_app._apply_ui_to_cfg()
+    live = cfg["live"]["multi_symbol"]
+    assert live["enabled"] is True
+    assert live["allow_live"] is False
+    assert live["scan_interval_sec"] == 20
+    assert live["symbols"] == ["fu2701", "lh2701"]
+    legs = cfg["strategy"]["legs"]
+    assert [leg["symbol"] for leg in legs] == ["fu2701", "lh2701"]
+    assert legs[0]["engine"] == "daily_body"
+    assert legs[0]["timeframe"] == "60"
+    assert legs[0]["trail_timeframe"] == "D"
+    assert real_app._legs_ui_problem() == ""
+
+    real_app.legs_enabled_var.set(False)
+    cfg = real_app._apply_ui_to_cfg()
+    assert "legs" not in cfg["strategy"]
+
+
+def test_legs_editor_blocks_duplicate_and_unwatched_symbols(real_app) -> None:
+    """腿里的合约不在关注名单，或同一合约重复时，保存前给出提示。"""
+    from src.ui.config_tab_sections import add_leg_row
+
+    real_app._set_watch_codes(["fu2701"], select="fu2701", save=False)
+    strategy = real_app.cfg.setdefault("strategy", {})
+    strategy.pop("legs", None)
+    strategy["symbols"] = ["fu2701"]
+    real_app._rebuild_leg_rows()
+    real_app.legs_enabled_var.set(False)
+    add_leg_row(
+        real_app,
+        symbol="lh2701",
+        engine=real_app.engine_var.get(),
+        timeframe="15",
+        trail_timeframe="15",
+    )
+    assert "关注品种" in real_app._legs_ui_problem()
+
+    real_app._leg_rows[-1]["symbol_var"].set("fu2701")
+    assert "只能出现一次" in real_app._legs_ui_problem()
+
+
+def test_live_scan_cfg_keeps_whitelist_when_multi_enabled(real_app) -> None:
+    """常驻启动时不能把多品种白名单裁成当前品种一个。"""
+    real_app._set_watch_codes(["fu2701", "lh2701"], select="lh2701", save=False)
+    strategy = real_app.cfg.setdefault("strategy", {})
+    strategy.pop("legs", None)
+    strategy["symbols"] = ["fu2701", "lh2701"]
+    real_app._rebuild_leg_rows()
+    real_app.ms_enabled_var.set(True)
+    real_app.legs_enabled_var.set(True)
+
+    cfg = real_app._cfg_for_live_scan()
+    assert cfg["strategy"]["symbols"] == ["lh2701", "fu2701"]
+    assert cfg["trade"]["symbol"] == "lh2701"
+
+    real_app.ms_enabled_var.set(False)
+    cfg = real_app._cfg_for_live_scan()
+    assert cfg["strategy"]["symbols"] == ["lh2701"]
+
+
 def test_ctp_max_volume_display_uses_effective_min(real_app) -> None:
     """公共 3 / 档案 20 时，界面显示实际拦单值 3，而不是档案的 20。"""
     from src.trader.ctp_profile import selected_profile_name
@@ -699,6 +777,7 @@ def test_picker_settings_keeps_page_values(real_app) -> None:
     real_app.pk_start_var.set("2026-01-02")
     real_app.pk_end_var.set("2026-02-03")
     real_app.pk_source_var.set("天勤")
+    real_app.pk_capital_mode_var.set(True)
 
     settings = real_app._picker_settings()
 
@@ -711,6 +790,7 @@ def test_picker_settings_keeps_page_values(real_app) -> None:
     assert settings["min_order_interval_sec"] == 10
     assert settings["max_orders_per_day"] == 8
     assert settings["capital"] == 50000
+    assert settings["capital_mode"] is True
 
 
 def test_copy_risk_without_button_does_not_touch_backtest_page(real_app) -> None:

@@ -98,6 +98,24 @@ def test_fill_model_reads_config_and_defaults_to_one_tick() -> None:
     assert off.buy(100) == 100
 
 
+def test_symbol_slippage_overrides_global_ticks() -> None:
+    """品种级滑点优先于全局；没写的品种照旧用全局，默认配置不改历史成绩。"""
+    cfg = {"backtest": {"slippage_ticks": 1, "slippage_by_symbol": {"fu": 3}}}
+    assert FillModel.from_cfg(cfg, "fu2701").slippage_ticks == 3.0
+    assert FillModel.from_cfg(cfg, "lh2701").slippage_ticks == 1.0
+    assert FillModel.from_cfg({"backtest": {"slippage_ticks": 2}}).slippage_ticks == 2.0
+
+
+def test_symbol_slippage_matches_contract_product_and_lowercase_keys() -> None:
+    """键可写合约、品种代码或小写，三种写法都要能命中。"""
+    cfg = {"backtest": {"slippage_by_symbol": {"FU2705": 2, "lh": 4, "c": 0}}}
+    assert FillModel.from_cfg(cfg, "fu2705").slippage_ticks == 2.0
+    assert FillModel.from_cfg(cfg, "lh2701").slippage_ticks == 4.0
+    assert FillModel.from_cfg(cfg, "c2701").slippage_ticks == 0.0
+    # 没配的品种退回全局 1 跳。
+    assert FillModel.from_cfg(cfg, "bu2612").slippage_ticks == 1.0
+
+
 def test_stop_fill_uses_stop_price_and_gap_open() -> None:
     """没跳空时按止损价成交；跳空时按更差的开盘价成交。"""
     bar = _frame([("2026-10-16 09:00", 101, 102, 99)])

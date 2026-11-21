@@ -590,6 +590,8 @@ class OptimizeTabMixin:
                     optimize_strategy,
                     save_optimization_report,
                 )
+                from src.backtest.metrics import format_risk_metrics_lines
+                from src.backtest.robustness import analyze_experiment, format_robustness_lines
 
                 result = optimize_strategy(
                     cfg,
@@ -742,6 +744,8 @@ class OptimizeTabMixin:
                         data_from=str(result.holdout_start or result.start_date or ""),
                         data_to=str(result.end_date or ""),
                     ),
+                    # 批次1可信度底座：冠军（训练段）的风险指标，只展示。
+                    *format_risk_metrics_lines(train),
                 ]
                 lines.append("")
                 lines.append("—— 稳健性（公开渠道常用）——")
@@ -757,6 +761,15 @@ class OptimizeTabMixin:
                     stab = str(getattr(result, "param_stability", "") or "")
                     if stab:
                         lines.append(f"参数稳定  {stab}")
+                # 批次1可信度底座：bootstrap 置信区间 / DSR / PBO / 参数平原。
+                # 只展示，不产生新的 FAIL/WATCH，不改变评估结论。
+                robust_summary = analyze_experiment(
+                    {
+                        "trials": list(result.trials or []),
+                        "trades": [{"pnl": float(x)} for x in (result.best_pnls or [])],
+                    }
+                )
+                lines.extend(format_robustness_lines(robust_summary))
                 if result.walk_folds:
                     lines.append("")
                     lines.append("—— 滚动每一段 ——")

@@ -893,6 +893,8 @@ class OptimizationResult:
     best_score: float
     best_performance: dict[str, Any]
     trials: list[dict[str, Any]] = field(default_factory=list)
+    # 批次1可信度底座：冠军那组参数的逐笔盈亏，供优化页算 bootstrap 置信区间与 DSR。
+    best_pnls: list[float] = field(default_factory=list)
     bars: int = 0
     engine: str = ""
     start_date: str = ""
@@ -948,6 +950,7 @@ class OptimizationResult:
             "best_score": self.best_score,
             "best_performance": self.best_performance,
             "trials": self.trials,
+            "best_pnls": list(self.best_pnls),
             "bars": self.bars,
             "best_limits": self.best_limits,
             "accepted": self.accepted,
@@ -2283,6 +2286,9 @@ def optimize_strategy(
         best_score=float(best_score) if best_params else -999.0,
         best_performance=train_perf,
         trials=trials,
+        best_pnls=(
+            [float(t.pnl) for t in best_result.trades] if best_result is not None else []
+        ),
         bars=len(bars_signal),
         engine=engine_name,
         start_date=str(start_date or ""),
@@ -2462,16 +2468,20 @@ def apply_params_to_config(
 
 def save_optimization_report(result: OptimizationResult, out_path: Path | str) -> Path:
     path = Path(out_path)
-    # 报告太大时只保留前 30 名明细
+    # 批次1可信度底座：归档全量 trials（含失败组合），供 PBO/参数平原回放；
+    # 结果页展示仍可只取前 N 名，但落盘文件必须保留全部，否则无法判断是不是挑出来的运气。
     payload = result.to_dict()
-    payload["trials"] = payload["trials"][:30]
     # 跑完时刻写进结果文件；导出 Excel 时作为「测试时间」，用来分清是哪一次优化。
     payload["finished_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    all_trials = payload.get("trials") or []
+    failed_count = sum(1 for t in all_trials if isinstance(t, dict) and t.get("error"))
     details = {
         "symbol": result.symbol,
         "engine": result.engine,
         "mode": result.mode,
         "depth": result.depth,
+        "trial_count": len(all_trials),
+        "failed_count": failed_count,
         "costs": {
             "slippage_ticks": result.best_limits.get("slippage_ticks"),
             "price_tick": result.best_limits.get("price_tick"),

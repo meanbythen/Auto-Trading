@@ -9,6 +9,7 @@ import customtkinter as ctk
 from src.ui import theme as T
 from src.ui.config_tab_controls import choice_row
 from src.ui.config_tab_controls import param_entry
+from src.ui.config_tab_controls import switch_row
 
 if TYPE_CHECKING:
     from src.ui.app import AutoTradingApp
@@ -185,6 +186,221 @@ def build_entry_stop_sections(app: AutoTradingApp, scroll: ctk.CTkFrame) -> None
     except Exception:  # noqa: BLE001
         pass
     app._refresh_generic_stop_param_panel()
+
+
+def clear_leg_rows(app: AutoTradingApp) -> None:
+    """清空策略腿输入行，重载配置时用。"""
+    for record in list(getattr(app, "_leg_rows", [])):
+        frame = record.get("frame")
+        if frame is not None:
+            try:
+                frame.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+    app._leg_rows = []
+
+
+def remove_leg_row(app: AutoTradingApp, record: dict) -> None:
+    """点「移出」时只删这一行，不影响其他腿。"""
+    rows = getattr(app, "_leg_rows", [])
+    if record in rows:
+        rows.remove(record)
+    frame = record.get("frame")
+    if frame is not None:
+        try:
+            frame.destroy()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def add_leg_row(
+    app: AutoTradingApp,
+    symbol: str = "",
+    engine: str = "",
+    timeframe: str = "",
+    trail_timeframe: str = "",
+) -> None:
+    """加一行策略腿：合约 + 策略 + 信号周期 + 止损周期。"""
+    host = getattr(app, "_leg_rows_host", None)
+    if host is None:
+        return
+    choices = list(getattr(app, "_leg_engine_choices", []) or [app.engine_var.get()])
+    if engine and engine not in choices:
+        # 配置里的旧引擎不在候选表时也要能显示，避免下拉框变空。
+        choices.insert(0, engine)
+    if not symbol:
+        used = {
+            str(item.get("symbol_var").get()).lower()  # type: ignore[union-attr]
+            for item in getattr(app, "_leg_rows", [])
+        }
+        symbol = next(
+            (item for item in getattr(app, "_watch_symbols", []) if item.lower() not in used),
+            "",
+        )
+    if not timeframe:
+        timeframe = app._period_code(app.tf_var, app.tf_custom_var)
+    if not trail_timeframe:
+        trail_timeframe = app._period_code(app.trail_var, app.trail_custom_var)
+    from src.data.periods import PERIOD_MENU, ui_parts
+
+    tf_label, tf_custom = ui_parts(str(timeframe))
+    trail_label, trail_custom = ui_parts(str(trail_timeframe))
+
+    row = ctk.CTkFrame(host, fg_color="transparent")
+    row.pack(fill="x", pady=2, padx=4)
+    record: dict[str, object] = {"frame": row}
+
+    symbol_var = ctk.StringVar(value=symbol)
+    ctk.CTkEntry(
+        row,
+        textvariable=symbol_var,
+        width=110,
+        fg_color=T.BG_ELEVATED,
+        border_color=T.BORDER,
+        text_color=T.TEXT,
+        placeholder_text="fu2701",
+    ).pack(side="left", padx=(0, 6))
+    record["symbol_var"] = symbol_var
+
+    engine_var = ctk.StringVar(value=engine or choices[0])
+    app._option(row, engine_var, choices, width=160).pack(side="left", padx=(0, 6))
+    record["engine_var"] = engine_var
+
+    tf_var = ctk.StringVar(value=tf_label)
+    tf_custom_var = ctk.StringVar(value=tf_custom)
+    app._option(row, tf_var, PERIOD_MENU, width=90).pack(side="left")
+    ctk.CTkEntry(
+        row,
+        textvariable=tf_custom_var,
+        width=52,
+        fg_color=T.BG_ELEVATED,
+        border_color=T.BORDER,
+        text_color=T.TEXT,
+        placeholder_text="120",
+    ).pack(side="left", padx=(0, 6))
+    record["tf_var"] = tf_var
+    record["tf_custom_var"] = tf_custom_var
+
+    trail_var = ctk.StringVar(value=trail_label)
+    trail_custom_var = ctk.StringVar(value=trail_custom)
+    app._option(row, trail_var, PERIOD_MENU, width=90).pack(side="left")
+    ctk.CTkEntry(
+        row,
+        textvariable=trail_custom_var,
+        width=52,
+        fg_color=T.BG_ELEVATED,
+        border_color=T.BORDER,
+        text_color=T.TEXT,
+        placeholder_text="120",
+    ).pack(side="left", padx=(0, 6))
+    record["trail_var"] = trail_var
+    record["trail_custom_var"] = trail_custom_var
+
+    ctk.CTkButton(
+        row,
+        text="移出",
+        width=56,
+        fg_color=T.BG_PANEL,
+        hover_color=T.ACCENT_HOVER,
+        border_width=1,
+        border_color=T.BORDER,
+        text_color=T.TEXT,
+        command=lambda: remove_leg_row(app, record),
+    ).pack(side="left")
+    app._leg_rows.append(record)
+
+
+def build_multi_symbol_section(
+    app: AutoTradingApp,
+    scroll: ctk.CTkFrame,
+    engine_choices: list[str],
+) -> None:
+    """多品种实盘开关、白名单与逐腿策略/周期。"""
+    app._section(scroll, "多品种策略腿（实盘 + 组合回测）")
+    card = app._card(scroll)
+    switch_row(
+        app,
+        card,
+        "启用多品种实盘",
+        app.ms_enabled_var,
+        hint="开=按下面的腿扫描下单；关=只做当前选中品种。CTP 只支持单品种时必须关",
+    )
+    switch_row(
+        app,
+        card,
+        "真实账户放行",
+        app.ms_allow_live_var,
+        hint="真实账户要多品种，再开这一道；仿真账户不用。关掉时真实账户自动退回单品种",
+    )
+    param_entry(
+        app,
+        card,
+        "扫描间隔(秒)",
+        app.ms_interval_var,
+        hint="多品种轮询间隔，5~600 秒，默认 15",
+    )
+    switch_row(
+        app,
+        card,
+        "按策略腿分策略/周期",
+        app.legs_enabled_var,
+        hint="开=每条腿各用自己的策略和周期；关=所有品种共用上面的全局策略/周期",
+    )
+
+    head = ctk.CTkFrame(card, fg_color="transparent")
+    head.pack(fill="x", padx=4, pady=(8, 2))
+    for text, width in (
+        ("合约", 110),
+        ("策略", 160),
+        ("信号周期", 90),
+        ("自定义", 52),
+        ("止损周期", 90),
+        ("自定义", 52),
+        ("", 56),
+    ):
+        ctk.CTkLabel(
+            head,
+            text=text,
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            width=width,
+            anchor="w",
+        ).pack(side="left", padx=(0, 6))
+
+    host = ctk.CTkFrame(card, fg_color="transparent")
+    host.pack(fill="x")
+    app._leg_rows_host = host
+    app._leg_engine_choices = list(engine_choices)
+    app._leg_rows = []
+    from src.backtest.portfolio import parse_legs
+
+    for leg in parse_legs(app.cfg):
+        add_leg_row(app, leg["symbol"], leg["engine"], leg["timeframe"], leg["trail_timeframe"])
+
+    ctk.CTkButton(
+        card,
+        text="＋ 添加一条腿",
+        width=130,
+        fg_color=T.BG_PANEL,
+        hover_color=T.ACCENT_HOVER,
+        border_width=1,
+        border_color=T.BORDER,
+        text_color=T.TEXT,
+        command=lambda: add_leg_row(app, engine=app.engine_var.get()),
+    ).pack(anchor="w", padx=4, pady=(8, 2))
+    ctk.CTkLabel(
+        card,
+        text=(
+            "腿里的合约必须先在「关注品种」里；同一合约只能出现一次。\n"
+            "白名单按腿里的合约自动生成，保存时写回 live.multi_symbol.symbols。\n"
+            "关掉「按策略腿分策略/周期」后不写 strategy.legs，所有品种回到全局策略与周期。"
+        ),
+        font=T.FONT_SMALL,
+        text_color=T.TEXT_DIM,
+        wraplength=760,
+        justify="left",
+        anchor="w",
+    ).pack(fill="x", padx=4, pady=(2, 0))
 
 
 def build_tail_sections(app: AutoTradingApp, scroll: ctk.CTkFrame) -> None:

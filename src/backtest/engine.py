@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Any
 import pandas as pd
 from loguru import logger
 
+from src.account.slippage_log import resolve_backtest_slippage
 from src.backtest.bar_cursor import BarCursor, _ts_to_dt
 from src.backtest.bar_cursor import _trend_frame_for_signal  # noqa: F401  旧调用方仍从 engine 取这个名字
 from src.backtest.evaluation import EvaluationThresholds, evaluate_backtest
@@ -513,6 +514,7 @@ class _BacktestSetup:
     max_bars: int
     warmup: int
     fill: FillModel
+    slippage_calibration: dict[str, Any]
     liquidity: LiquidityModel
     bars_signal: pd.DataFrame
     bars_trail: pd.DataFrame | None
@@ -624,6 +626,8 @@ def _prepare_backtest(
     start_date: str | None,
     end_date: str | None,
     engine: str | None,
+    timeframe: str | None = None,
+    trail_timeframe: str | None = None,
     chain_capital: bool | None,
     inherit_position: dict[str, Any] | None,
 ) -> _BacktestSetup:
@@ -639,6 +643,11 @@ def _prepare_backtest(
 
     if engine:
         st["engine"] = str(engine)
+    # 逐腿回测：同一份配置里不同腿可以用不同周期。只改本次深拷贝，不写回磁盘配置。
+    if timeframe:
+        st["timeframe"] = str(timeframe)
+    if trail_timeframe:
+        st["trail_timeframe"] = str(trail_timeframe)
 
     symbol = symbol or (st.get("symbols") or [trade.get("symbol", "bu2612")])[0]
     st["symbols"] = [symbol]
@@ -687,6 +696,10 @@ def _prepare_backtest(
             warmup = max(warmup, int(need))
         except (TypeError, ValueError):
             pass
+    # 仅显式开启且校准记录达标时覆盖本次副本；默认仍按原配置构造成交模型。
+    slippage_calibration = resolve_backtest_slippage(cfg.get("_project_root") or ".", cfg)
+    if slippage_calibration["calibrated"]:
+        bt["slippage_ticks"] = float(slippage_calibration["value"])
     # 成交近似：下一根开盘、破止损按止损价、按跳滑点。
     fill = FillModel.from_cfg(cfg, symbol)
     # 涨跌停/部分成交/挂单超时：默认开启，让成交笔数和净盈亏更贴近实盘。
@@ -779,6 +792,7 @@ def _prepare_backtest(
         max_bars=max_bars,
         warmup=warmup,
         fill=fill,
+        slippage_calibration=slippage_calibration,
         liquidity=liquidity,
         bars_signal=bars_signal,
         bars_trail=bars_trail,
@@ -1665,6 +1679,14 @@ def _params_snapshot(setup: _BacktestSetup, run: _BacktestRun) -> dict[str, Any]
         # 成交近似参数，结果区会原样说明，避免历史结果和新规则混在一起看不出原因。
         "fill_on_next_open": fill.on_next_open,
         "slippage_ticks": fill.slippage_ticks,
+        "slippage_source": setup.slippage_calibration.get("source", "配置默认"),
+        "slippage_calibrated": bool(setup.slippage_calibration.get("calibrated", False)),
+        "slippage_diff": setup.slippage_calibration.get("diff", 0.0),
+        "slippage_live_suggested": setup.slippage_calibration.get("live_suggested", 0.0),
+        "slippage_backtest_assumed": setup.slippage_calibration.get("backtest_assumed", fill.slippage_ticks),
+        "slippage_effective_date": setup.slippage_calibration.get("effective_date", ""),
+        "slippage_sample_n": setup.slippage_calibration.get("sample_n", 0),
+        "slippage_calibration_reason": setup.slippage_calibration.get("reason", ""),
         "price_tick": fill.price_tick,
         "fill_note": fill.describe() + "\n" + run.liquidity.describe(),
         # 回测没有模拟的实盘环节，集中写清楚，避免拿回测净盈亏直接对上实盘。
@@ -1723,6 +1745,8 @@ def run_backtest(
     start_date: str | None = None,
     end_date: str | None = None,
     engine: str | None = None,
+    timeframe: str | None = None,
+    trail_timeframe: str | None = None,
     chain_capital: bool | None = None,
     inherit_position: dict[str, Any] | None = None,
     source: str = "backtest",
@@ -1759,6 +1783,8 @@ def run_backtest(
         start_date=start_date,
         end_date=end_date,
         engine=engine,
+        timeframe=timeframe,
+        trail_timeframe=trail_timeframe,
         chain_capital=chain_capital,
         inherit_position=inherit_position,
     )
@@ -1859,7 +1885,8 @@ def run_backtest(
 
     # 样本过少时胜率没有统计意义；门槛随实际成交略放宽
     min_trades = 3 if len(trades) >= 3 else 2
-    perf = calc_performance(trades, equity, min_trades=min_trades)
+    # 传时间轴给绩效：Sharpe/Sortino 据此年化，并算换手率与持仓暴露。
+    perf = calc_performance(trades, equity, min_trades=min_trades, times=equity_times)
     snap = _params_snapshot(setup, run)
     logger.info(
         "回测结束 {} | bars={} 成交{}笔 胜率{:.0%} 盈亏比{:.2f} 净盈亏{:.0f}",

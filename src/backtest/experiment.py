@@ -133,7 +133,11 @@ def new_experiment(
     *,
     details: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """创建内存 manifest；K 线文件信息在归档时补齐。"""
+    """创建内存 manifest；K 线文件信息在归档时补齐。
+
+    ``details`` 是自由 dict，可携带治理字段（如 ``hypothesis_id`` / ``failure_reason``），
+    归档与索引重建时会从 ``manifest.details`` 透传到实验索引。
+    """
     now = datetime.now().astimezone()
     snapshot = sanitize_config(cfg)
     return {
@@ -249,9 +253,34 @@ def _write_bars(path: Path, frame: pd.DataFrame) -> None:
             frame.to_csv(zipped, index_label="datetime", encoding="utf-8")
 
 
-def _index_row(manifest: dict[str, Any]) -> dict[str, Any]:
+def _trial_counts(manifest: dict[str, Any], base: Path | None = None) -> tuple[int, int]:
+    """取试验次数与失败数：优先 details，旧实验回退读 report.json 现场数，失败回退 0。
+
+    只读，不抛异常。trial_count = 全部参数组合数；failed_count = 含 error 的组合数。
+    """
+    details = manifest.get("details") or {}
+    tc = details.get("trial_count")
+    fc = details.get("failed_count")
+    if isinstance(tc, int) and isinstance(fc, int):
+        return tc, fc
+    if base is not None:
+        exp_id = manifest.get("experiment_id")
+        report_path = base / "experiments" / str(exp_id) / "report.json"
+        try:
+            report = json.loads(report_path.read_text(encoding="utf-8"))
+            trials = report.get("trials") or []
+            if isinstance(trials, list):
+                failed = sum(1 for t in trials if isinstance(t, dict) and t.get("error"))
+                return len(trials), failed
+        except (OSError, json.JSONDecodeError):
+            pass
+    return 0, 0
+
+
+def _index_row(manifest: dict[str, Any], base: Path | None = None) -> dict[str, Any]:
     """一条实验索引。归档和重建索引共用同一份字段。"""
     details = manifest.get("details") or {}
+    trial_count, failed_count = _trial_counts(manifest, base)
     return {
         "experiment_id": manifest["experiment_id"],
         "kind": manifest.get("kind", ""),
@@ -262,6 +291,12 @@ def _index_row(manifest: dict[str, Any]) -> dict[str, Any]:
         "config_sha256": (manifest.get("config") or {}).get("sha256", ""),
         "data_sha256": [item.get("sha256", "") for item in (manifest.get("data") or {}).get("files", [])],
         "snapshot_complete": (manifest.get("review_gate") or {}).get("snapshot_complete", False),
+        # 批次1可信度底座：试验留痕。旧实验缺字段时回退 0，不阻塞加载。
+        "trial_count": trial_count,
+        "failed_count": failed_count,
+        # 批次3治理：假设编号与失败原因。旧实验缺 details 键时回退空串，不阻塞重建。
+        "hypothesis_id": details.get("hypothesis_id", ""),
+        "failure_reason": details.get("failure_reason", ""),
         "report": f"{manifest['experiment_id']}/report.json",
     }
 
@@ -273,7 +308,7 @@ def _update_index(root: Path, manifest: dict[str, Any]) -> None:
     else:
         index = {"schema_version": SCHEMA_VERSION, "experiments": []}
     rows = [row for row in index.get("experiments", []) if row.get("experiment_id") != manifest["experiment_id"]]
-    rows.append(_index_row(manifest))
+    rows.append(_index_row(manifest, root.parent))
     rows.sort(key=lambda row: str(row.get("created_at") or ""))
     index["experiments"] = rows
     _atomic_json(index_path, index)
@@ -299,7 +334,7 @@ def rebuild_index(root: Path | str) -> int:
         if not isinstance(manifest, dict) or not manifest.get("experiment_id"):
             skipped += 1
             continue
-        rows.append(_index_row(manifest))
+        rows.append(_index_row(manifest, base))
     if not rows:
         return 0
     rows.sort(key=lambda row: str(row.get("created_at") or ""))

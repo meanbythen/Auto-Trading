@@ -765,6 +765,8 @@ class ConfigCollectMixin:
         except Exception as exc:  # noqa: BLE001
             # 读表失败不影响收集，保证金沿用配置里的值。
             logger.warning("读取品种与合约表失败: {}", exc)
+        # 多品种白名单和策略腿：和关注名单同一份口径，保存时一起写回。
+        self._apply_legs_to_cfg(self.cfg.setdefault("strategy", {}))
         # 「启用限制」只属于回测和优化这一次。留在这里的话，下次保存会把回测开关写进实盘配置。
         risk_pre.pop("apply_limits", None)
 
@@ -836,3 +838,78 @@ class ConfigCollectMixin:
         副本上改策略或开仓限制，不会改到界面上的配置，也不会改到已经在跑的程序。
         """
         return copy.deepcopy(self._merge_disk_gui_coords(self._apply_ui_to_cfg()))
+
+    def _legs_from_ui(self) -> list[dict[str, str]]:
+        """把界面上的策略腿收成配置列表；空合约跳过，重复合约留给保存前检查。"""
+        legs: list[dict[str, str]] = []
+        for record in list(getattr(self, "_leg_rows", [])):
+            symbol = str(record["symbol_var"].get()).strip()  # type: ignore[union-attr]
+            if not symbol:
+                continue
+            legs.append(
+                {
+                    "symbol": symbol,
+                    "engine": str(record["engine_var"].get()).strip(),  # type: ignore[union-attr]
+                    "timeframe": self._period_code(  # type: ignore[arg-type]
+                        record["tf_var"], record["tf_custom_var"]
+                    ),
+                    "trail_timeframe": self._period_code(  # type: ignore[arg-type]
+                        record["trail_var"], record["trail_custom_var"]
+                    ),
+                }
+            )
+        return legs
+
+    def _legs_ui_problem(self) -> str:
+        """保存前检查腿和关注名单；有问题返回提示文本，没问题返回空串。"""
+        legs = self._legs_from_ui()
+        symbols = [leg["symbol"] for leg in legs]
+        if self.legs_enabled_var.get() and len(legs) < 2:
+            return "启用「按策略腿分策略/周期」时，至少要填两条腿。"
+        if self.ms_enabled_var.get() and not symbols:
+            return "启用多品种实盘时，至少要填一条策略腿的合约。"
+        if len({item.lower() for item in symbols}) != len(symbols):
+            return "同一合约只能出现一次，请删掉重复的策略腿。"
+        watch = {str(item).lower() for item in self._watch_symbols}
+        missing = [item for item in symbols if item.lower() not in watch]
+        if missing:
+            return f"这些合约还不在关注品种里：{'、'.join(missing)}。请先在「关注品种」添加。"
+        return ""
+
+    def _apply_legs_to_cfg(self, st: dict[str, Any]) -> None:
+        """写回策略腿与多品种白名单。开关关掉时不写 legs，回到全局策略。"""
+        live = self.cfg.get("live")
+        if not isinstance(live, dict):
+            live = {}
+            self.cfg["live"] = live
+        ms = live.get("multi_symbol")
+        if not isinstance(ms, dict):
+            ms = {}
+            live["multi_symbol"] = ms
+        ms["enabled"] = bool(self.ms_enabled_var.get())
+        ms["allow_live"] = bool(self.ms_allow_live_var.get())
+        try:
+            interval = int(float(self.ms_interval_var.get()))
+        except (TypeError, ValueError):
+            interval = 15
+        ms["scan_interval_sec"] = max(5, min(600, interval))
+
+        legs: list[dict[str, str]] = []
+        seen: set[str] = set()
+        for leg in self._legs_from_ui():
+            key = leg["symbol"].lower()
+            if key in seen:
+                logger.warning("策略腿 {} 重复，保存时只留第一条", leg["symbol"])
+                continue
+            seen.add(key)
+            legs.append(leg)
+        if self.legs_enabled_var.get() and len(legs) >= 2:
+            st["legs"] = legs
+        else:
+            st.pop("legs", None)
+
+        if ms["enabled"]:
+            names = [leg["symbol"] for leg in legs]
+            ms["symbols"] = names or list(self._watch_symbols)
+        else:
+            ms.pop("symbols", None)

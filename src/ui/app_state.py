@@ -12,8 +12,8 @@ class AppStateMixin:
         """
         给常驻和单次扫描用的配置。
 
-        关注列表可以有好几个具体合约，但同花顺一次只盯下拉框里选中的那一个。
-        其余合约仍保存在配置里，下次可以再选，这一次不会一起扫描。
+        默认只看下拉框选中的那一个合约；多品种开关打开时保留完整名单，
+        让白名单里的其他合约也能一起扫描，选中品种仍排第一。
         """
         cfg = self._clone_cfg()
         current = self.watch_choice_var.get().strip()
@@ -21,6 +21,17 @@ class AppStateMixin:
         if not current or current == "（还没有）":
             return cfg
         st = cfg.setdefault("strategy", {})
+        ms_box = (cfg.get("live") or {}).get("multi_symbol") or {}
+        if ms_box.get("enabled"):
+            ordered = [current] + [item for item in symbols if item.lower() != current.lower()]
+            st["symbols"] = ordered
+            cfg.setdefault("trade", {})["symbol"] = current
+            if len(ordered) > 1:
+                self._append_log(
+                    f"多品种已启用，本次扫描：{'、'.join(ordered)}。"
+                    "真实账户还需打开「真实账户放行」才会生效。"
+                )
+            return cfg
         st["symbols"] = [current]
         cfg.setdefault("trade", {})["symbol"] = current
         extras = [item for item in symbols if item.lower() != current.lower()]

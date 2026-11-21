@@ -46,6 +46,13 @@ class PickerTabMixin:
             width=160,
         )
         self._entry_row(
+            box,
+            "单品种上限%",
+            self.pk_cap_var,
+            hint="「固定上限」权重用；每个品种最多占初始资金的这个比例",
+            width=160,
+        )
+        self._entry_row(
             box, "每笔风险%", self.pk_risk_pct_var, hint="本页显示值；点「按配置页重新填入」才从交易配置抄来", width=160, readonly=True
         )
         self._entry_row(
@@ -146,6 +153,15 @@ class PickerTabMixin:
         self._date_row(box, "结束日期", self.pk_end_var, hint="点日历；清空=到最新。只算到当天 20:59")
         self._pick_switch_row(box, "含当晚夜盘", self.pk_include_night_var)
         self._pick_switch_row(box, "收盘清仓", self.pk_flatten_var)
+        self._pick_switch_row(box, "资金口径（按保证金效率排名）", self.pk_capital_mode_var)
+        self._pick_switch_row(box, "按策略腿配置（不同策略/周期）", self.pk_legs_var)
+        self._option_row(
+            box,
+            "组合权重",
+            self.pk_weight_var,
+            ["等权", "波动率倒数", "风险预算", "固定上限"],
+            width=160,
+        )
         ctk.CTkLabel(
             box,
             text="每个组合都用上面勾选的周期（信号=止损），以及下面的开仓限制。点开始就按本页收盘清仓，不会被交易配置改回去。趋势跟随、SuperTrend、均线波段仍用它们自己的设置。",
@@ -175,6 +191,17 @@ class PickerTabMixin:
             border_color=T.ACCENT,
             text_color=T.ACCENT,
             command=self._on_pick_opt_cross,
+        ).pack(fill="x", padx=4, pady=(0, 8))
+        ctk.CTkButton(
+            left,
+            text="组合回测（勾选的品种）",
+            height=36,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_portfolio_run,
         ).pack(fill="x", padx=4, pady=(0, 8))
         ctk.CTkLabel(
             left,
@@ -617,6 +644,7 @@ class PickerTabMixin:
             "min_order_interval_sec": interval,
             "max_orders_per_day": max_orders,
             "capital": capital,
+            "capital_mode": bool(self.pk_capital_mode_var.get()),
             "data_source": self.pk_source_var.get(),
         }
 
@@ -823,6 +851,105 @@ class PickerTabMixin:
                 self._post_to_main(_fail)
 
         threading.Thread(target=_run, daemon=True).start()
+
+
+    def _on_portfolio_run(self) -> None:
+        """按勾选的品种跑组合回测：共享资金、按权重汇总保证金和回撤。只读，不改配置。"""
+        from tkinter import messagebox
+
+        from src.backtest.portfolio import MODE_LABELS, format_portfolio_lines, run_portfolio_backtest
+        from src.screen.picker import contracts_for_cross
+
+        if self._pick_running:
+            messagebox.showinfo("正在测试", "上一轮还没结束。可以点「停止测试」。")
+            return
+        use_legs = bool(self.pk_legs_var.get()) if hasattr(self, "pk_legs_var") else False
+        legs = None
+        if use_legs:
+            from src.backtest.portfolio import parse_legs
+
+            legs = parse_legs(self.cfg)
+            if len(legs) < 2:
+                messagebox.showwarning(
+                    "策略腿不够",
+                    "配置里的 strategy.legs 至少要有 2 条腿（合约 + 策略 + 周期各不相同）。\n"
+                    "没写 legs 时，会按关注品种各生成一条腿。",
+                )
+                return
+            symbols = [item["symbol"] for item in legs]
+        else:
+            symbols = [code for code, _name, _mult, _thin in contracts_for_cross(self._pk_checked_symbols())]
+            if len(symbols) < 2:
+                messagebox.showwarning("品种不够", "组合回测至少勾 2 个品种，才能看同时持仓和相关性。")
+                return
+        try:
+            settings = self._picker_settings()
+            cap_pct = float(self.pk_cap_var.get())
+        except ValueError as exc:
+            messagebox.showerror("数字不对", str(exc))
+            return
+        if cap_pct <= 0 or cap_pct > 100:
+            messagebox.showerror("数字不对", "单品种上限要在 0～100 之间。")
+            return
+        label = str(self.pk_weight_var.get() or "等权")
+        mode = {text: key for key, text in MODE_LABELS.items()}.get(label, "equal")
+        caps = {code: cap_pct / 100.0 for code in symbols} if mode == "fixed" else None
+        cfg = self._clone_cfg()
+        from src.data.quote_check import normalize_source
+
+        cfg.setdefault("data", {})["source"] = normalize_source(self.pk_source_var.get())
+        st = cfg.setdefault("strategy", {})
+        st["timeframe"] = str(settings.get("timeframe") or st.get("timeframe") or "15")
+        st["trail_timeframe"] = str(settings.get("trail_timeframe") or st.get("timeframe"))
+        bt = cfg.setdefault("backtest", {})
+        roll_var = getattr(self, "bt_rollover_var", None)
+        chain_var = getattr(self, "bt_rollover_chain_var", None)
+        bt["rollover_main"] = bool(roll_var.get()) if roll_var is not None else True
+        bt["chain_capital"] = bool(chain_var.get()) if chain_var is not None else False
+        capital = float(settings.get("capital") or 0) or None
+        start = str(settings.get("start_date") or "") or None
+        end = str(settings.get("end_date") or "") or None
+        self._pick_running = True
+        self._pick_cancel.clear()
+        self._reset_pick_progress()
+        self._render_pick_board(
+            f"正在跑组合回测（{len(symbols)} 条腿 · {label}）…",
+            [],
+        )
+
+        def _run() -> None:
+            try:
+                out = run_portfolio_backtest(
+                    cfg,
+                    symbols,
+                    legs=legs,
+                    mode=mode,
+                    caps=caps,
+                    initial_capital=capital,
+                    start_date=start,
+                    end_date=end,
+                    on_progress=lambda index, total, symbol: self._post_to_main(
+                        lambda: self._append_log(f"组合回测 {index}/{total} {symbol}")
+                    ),
+                    cancel=self._pick_cancel.is_set,
+                )
+                text = "\n".join(format_portfolio_lines(out))
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("组合回测失败")
+                err = str(exc)
+                self._post_to_main(lambda: self._portfolio_done(f"组合回测失败：{err}"))
+                return
+            self._post_to_main(lambda: self._portfolio_done(text))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+
+    def _portfolio_done(self, text: str) -> None:
+        """组合回测结束：结果只贴在结果区，不写配置、不改正在用的策略。"""
+        self._reset_pick_progress()
+        self._pick_running = False
+        self._append_log(text)
+        self._render_pick_board(text, [])
 
 
     def _on_pick_start(self) -> None:

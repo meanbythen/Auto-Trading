@@ -662,9 +662,10 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
         with (lock if lock is not None else nullcontext()):
             return self._execute_locked(decision)
 
-    def _order_session_open(self) -> bool:
-        """当前是否在可下单的交易时段内。没配时段时放行。"""
-        sessions = getattr(self, "sessions", None)
+    def _order_session_open(self, symbol: str = "") -> bool:
+        """当前是否在该品种可下单的交易时段内。没配时段时放行。"""
+        picker = getattr(self, "_symbol_sessions_for", None)
+        sessions = picker(symbol) if (symbol and callable(picker)) else getattr(self, "sessions", None)
         if not sessions:
             return True
         from src.utils.session_clock import in_trading_sessions
@@ -678,9 +679,28 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
         if decision.action == StrategyAction.HOLD:
             logger.debug("{}: {}", decision.symbol, decision.reason)
             return False
+        # GUI 通道只交易「当前选中」品种：扫描清单里的其它合约（旧仓）只允许平仓，不在这里开新仓。
+        if (
+            decision.action in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN)
+            and self.trader_capabilities.window_driven
+            and getattr(self, "symbols", None)
+            and decision.symbol != self.symbols[0]
+        ):
+            logger.warning(
+                "GUI 通道只交易当前选中品种 {}，跳过 {} 的开仓信号",
+                self.symbols[0],
+                decision.symbol,
+            )
+            self._record_event(
+                "gui_open_skip_not_selected",
+                symbol=decision.symbol,
+                side=decision.action.value,
+                selected=self.symbols[0],
+            )
+            return False
         self._start_decision_timeline(decision)
         # 收盘后 / 周末不下单：挂着的老信号不能拿到已收盘的市场上去点。
-        if not self._order_session_open():
+        if not self._order_session_open(decision.symbol):
             logger.warning(
                 "现在不在交易时段，本笔不下单 | {} {} {}",
                 decision.action.value,
@@ -1091,7 +1111,8 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
                 fill_price = float(decision.entry_price or 0.0)
                 df = None
                 try:
-                    df = self.kline.fetch(decision.symbol, period=str(self.strategy.timeframe))
+                    leg = self._strategy_for(decision.symbol)
+                    df = self.kline.fetch(decision.symbol, period=str(leg.timeframe))
                 except Exception as exc:  # noqa: BLE001
                     logger.warning("平仓取最新价失败，回退持仓开仓价: {}", exc)
                 if df is not None and len(df) > 0:

@@ -158,9 +158,10 @@ def _probe_open(
     trail_prefix: pd.DataFrame | None,
     trend_prefix: pd.DataFrame | None,
     bar_time: datetime,
+    strategy_cfg: dict[str, Any] | None = None,
 ) -> StrategyDecision | None:
     """临时策略实例评估前缀；只有开仓动作才返回。"""
-    probe = create_strategy(cfg)
+    probe = create_strategy(strategy_cfg or cfg)
     kwargs: dict[str, Any] = {"trail_bars": trail_prefix, "now": bar_time}
     if getattr(probe, "uses_trend_bars", False):
         kwargs["trend_bars"] = trend_prefix
@@ -184,6 +185,7 @@ def find_catch_up_open(
     forming: pd.DataFrame | None = None,
     settings: CatchUpSettings | None = None,
     now: datetime | None = None,
+    strategy_cfg: dict[str, Any] | None = None,
 ) -> CatchUpHit | None:
     """
     从新到旧最多看 lookback_bars 根，找第一笔仍合格的开仓。
@@ -220,7 +222,9 @@ def find_catch_up_open(
 
         trail_prefix = _truncate_by_end(trail_closed, bar_time)
         trend_prefix = _truncate_by_end(trend_closed, bar_time)
-        decision = _probe_open(cfg, symbol, prefix, trail_prefix, trend_prefix, bar_time)
+        decision = _probe_open(
+            cfg, symbol, prefix, trail_prefix, trend_prefix, bar_time, strategy_cfg
+        )
         if decision is None:
             continue
 

@@ -1,7 +1,7 @@
 """
-上线评审单：把五项证据收成一页。
+上线评审单：把六项证据收成一页。
 
-功能：数据门禁、样本外、镜像差异率、仿真滑点、人工签字，逐项给「通过 / 注意 / 不通过 / 未记录」。
+功能：数据门禁、样本外、镜像差异率、仿真滑点、成本校准、人工签字，逐项给「通过 / 注意 / 不通过 / 未记录」。
 原理：只读现有文件（回测、优化、事件、滑点、两本 CTP 账），不跑新回测、不改配置。
       签字写在 data/release_sheet.json，正文存 data/release_sheet.md；签字不会自动开仓或放宽风控。
 """
@@ -11,11 +11,11 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
-from src.account.slippage_log import load_rows, product_of, reject_summary, summarize
+from src.account.slippage_log import load_rows, load_slippage_calibration, product_of, reject_summary, summarize
 from src.backtest.audit import audit_results
 from src.data.periods import period_label
 from src.strategy.types import config_flag
@@ -322,9 +322,106 @@ def _sim_slippage(root: Path, cfg: dict[str, Any] | None) -> SheetSection:
     return section
 
 
+def _cost_calibration(root: Path, cfg: dict[str, Any] | None) -> SheetSection:
+    section = SheetSection("成本校准", WATCH)
+    uncalibrated = "未校准：当前评审用的是配置里的假设滑点，没有实盘来源。先补真实成交样本，再在复盘页生成校准记录。"
+    try:
+        record = load_slippage_calibration(root)
+        if not record or not record.get("calibrated"):
+            section.lines.append(uncalibrated)
+            reason = str(record.get("reason") or "").strip()
+            if reason:
+                section.lines.append(f"原因：{reason}")
+            return section
+
+        live = _number(record.get("live_suggested")) or 0.0
+        assumed = _number(record.get("backtest_assumed")) or 0.0
+        diff = _number(record.get("diff"))
+        if diff is None:
+            diff = live - assumed
+        sample_n = int(_number(record.get("sample_n")) or 0)
+        effective_date = str(record.get("effective_date") or "").strip() or "—"
+        section.status = PASS
+        section.lines.append(f"实盘建议滑点 {live:g} 跳 / 回测假设 {assumed:g} 跳")
+        if diff > 0:
+            comparison = f"回测滑点比实盘乐观 {diff:g} 跳"
+        elif diff < 0:
+            comparison = f"回测滑点比实盘保守 {-diff:g} 跳"
+        else:
+            comparison = "回测滑点与实盘建议一致"
+        section.lines.append(f"差值 {diff:+g} 跳（正=实盘比回测假设更不利）：{comparison}")
+        section.lines.append(f"生效日期 {effective_date} / 样本 {sample_n} 笔")
+
+        calibrated_at = None
+        for value in (record.get("generated_at"), record.get("effective_date")):
+            stamp = str(value or "").strip()
+            if not stamp:
+                continue
+            try:
+                parsed = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+                if parsed.tzinfo is not None:
+                    parsed = parsed.astimezone().replace(tzinfo=None)
+                calibrated_at = parsed
+                break
+            except (TypeError, ValueError, OverflowError, OSError):
+                continue
+        if calibrated_at is None:
+            if record.get("generated_at") or record.get("effective_date"):
+                section.lines.append("校准时间无法判定，请核对 generated_at / effective_date。")
+        elif datetime.now() - calibrated_at > timedelta(days=30):
+            section.status = WATCH
+            section.lines.append("校准记录已超 30 天，建议重新校准")
+    except Exception:  # noqa: BLE001 - 评审单只读引用，异常记录不能阻断其它证据
+        section.status = WATCH
+        section.lines = [uncalibrated, "校准记录读取或解析失败，按未校准处理。"]
+    return section
+
+
+def _governance_trace(root: Path, cfg: dict[str, Any] | None) -> SheetSection:
+    """治理追踪：展示假设 / 实验 / 样本外 / 评审单 / 上线策略 / 变更 / 冻结。
+
+    只展示不改变既有结论；无治理数据时标「未记录」，读失败也不抛异常。
+    """
+    section = SheetSection("治理追踪", MISSING)
+    try:
+        from src.research import governance
+
+        engine, cfg_symbol, _ = _cfg_scope(cfg)
+        backtest = _read_json(root / "data" / "backtest_last.json")
+        snap = _box(backtest.get("params_snapshot"))
+        bt_engine = str(snap.get("engine") or "").strip()
+        bt_symbol = str(backtest.get("symbol") or snap.get("symbol") or "").strip()
+        strategy = engine or bt_engine
+        symbol = cfg_symbol or bt_symbol
+        if not strategy or not symbol:
+            section.lines.append("治理数据不可用：缺少策略或品种，无法追踪。")
+            return section
+        trace = governance.trace_strategy(root, strategy, symbol)
+        lines = list(governance.format_trace_lines(trace))
+        frozen = trace.get("frozen")
+        if isinstance(frozen, (tuple, list)) and len(frozen) >= 2 and frozen[0]:
+            lines.append(f"提示：{frozen[1]}")
+        section.lines = lines
+        has_data = (
+            isinstance(trace.get("hypothesis"), dict)
+            or bool(trace.get("changes"))
+            or isinstance(trace.get("live_strategy"), dict)
+            or bool(trace.get("experiments"))
+        )
+        section.status = PASS if has_data else MISSING
+    except Exception:  # noqa: BLE001 - 评审单只读引用，治理读失败不能阻断其它证据
+        section.status = MISSING
+        section.lines = ["治理数据不可用"]
+    return section
+
+
 def _evidence_sections(sections: list[SheetSection]) -> list[SheetSection]:
-    """签名字节以外的证据节。签字动作本身不能改变摘要。"""
-    return [item for item in sections if item.title != "人工签字"]
+    """签名字节以外的证据节。签字动作本身不能改变摘要。
+
+    「治理追踪」只展示、不纳入证据摘要：避免无治理数据时改变既有签字行为
+    （缺证据会阻止签「允许小资金挂机」），也避免治理数据波动触发重签。
+    """
+    return [item for item in sections if item.title not in ("人工签字", "治理追踪")]
 
 
 def _evidence_digest(sections: list[SheetSection]) -> str:
@@ -404,6 +501,8 @@ def build_release_sheet(
         _out_of_sample(base),
         _mirror_gate(backtest, base),
         _sim_slippage(base, cfg),
+        _cost_calibration(base, cfg),
+        _governance_trace(base, cfg),
     ]
     sections.append(_signature_section(signature, _evidence_digest(sections)))
     return ReleaseSheet(

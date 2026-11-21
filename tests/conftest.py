@@ -89,6 +89,12 @@ def _real_app_module(tmp_path_factory):
                 app._on_close()
         except tk.TclError:
             pass
+        # 兜底销毁：同一进程里下一个 UI 测试模块还要新建窗口。若这里没真正销毁，
+        # Windows 的菜单/窗口句柄会一路累积，最后报「No more menus can be allocated」。
+        try:
+            app.destroy()
+        except tk.TclError:
+            pass
         patcher.undo()
 
 

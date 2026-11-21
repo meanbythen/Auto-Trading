@@ -901,8 +901,12 @@ def screen_strategies(
     }
 
 
-def _assign_ranks(rows: list[dict[str, Any]]) -> None:
-    """成交够 3 笔的按得分从高到低写上第几名。样本不够和没测成的不占名次。"""
+def _assign_ranks(rows: list[dict[str, Any]], *, rank_by: str = "score") -> None:
+    """成交够 3 笔的按得分从高到低写上第几名。样本不够和没测成的不占名次。
+
+    rank_by="return_rate" 时改按「净盈亏 ÷ 保证金占用」排名，缺这个值的排最后。
+    资金口径只换排名依据，不重算任何回测结果。
+    """
     pool: list[dict[str, Any]] = []
     for row in rows:
         if row.get("error"):
@@ -914,21 +918,30 @@ def _assign_ranks(rows: list[dict[str, Any]]) -> None:
             row["rank"] = 0
             continue
         pool.append(row)
-    pool.sort(key=lambda row: float(row.get("score") or -999), reverse=True)
+    if rank_by == "return_rate":
+        def _rate_key(row: dict[str, Any]) -> tuple[int, float]:
+            value = row.get("return_rate")
+            # 没有保证金数据的行没有资金效率，稳定地排最后；0% 仍然高于负收益。
+            return (0, 0.0) if value is None else (1, float(value))
+
+        pool.sort(key=_rate_key, reverse=True)
+    else:
+        pool.sort(key=lambda row: float(row.get("score") or -999), reverse=True)
     for index, row in enumerate(pool, start=1):
         row["rank"] = index
         row["picked"] = f"第{index}名"
 
 
-def mark_relative_better(rows: list[dict[str, Any]]) -> None:
+def mark_relative_better(rows: list[dict[str, Any]], *, rank_by: str = "score") -> None:
     """
     在这一轮已经测完的组合里，标出相对较好的那些。
 
-    先按得分排名。然后只在「净赚、盈利因子大于 1、成交不少于 5 笔」的组合里，
-    取得分最高的前四分之一，标成「较好」。至少留 1 个，避免一个都不标。
+    先按得分排名（rank_by="return_rate" 时按资金效率排名）。然后只在
+    「净赚、盈利因子大于 1、成交不少于 5 笔」的组合里，按当前排名依据取最好的前四分之一，
+    标成「较好」。至少留 1 个，避免一个都不标。
     其余有成交的标成「一般」。这只是这一轮里相对好看，不代表以后会赚钱。
     """
-    _assign_ranks(rows)
+    _assign_ranks(rows, rank_by=rank_by)
     eligible = [
         row
         for row in rows
@@ -937,7 +950,14 @@ def mark_relative_better(rows: list[dict[str, Any]]) -> None:
         and float(row.get("net_pnl") or 0) > 0
         and float(row.get("profit_factor") or 0) > 1
     ]
-    eligible.sort(key=lambda row: float(row.get("score") or -999), reverse=True)
+    key_name = "return_rate" if rank_by == "return_rate" else "score"
+    default = -1e18 if key_name == "return_rate" else -999.0
+
+    def _metric(row: dict[str, Any]) -> float:
+        value = row.get(key_name)
+        return default if value is None else float(value)
+
+    eligible.sort(key=_metric, reverse=True)
     keep = max(1, (len(eligible) + 3) // 4) if eligible else 0
     better = {id(row) for row in eligible[:keep]}
     for row in rows:
@@ -1067,7 +1087,8 @@ def screen_cross(
                 row["picked"] = "没测成" if row.get("error") else ""
                 rows.append(row)
 
-    mark_relative_better(rows)
+    capital_mode = bool(spec.get("capital_mode"))
+    mark_relative_better(rows, rank_by="return_rate" if capital_mode else "score")
     candidates = [row for row in rows if row.get("picked") == "较好"]
     candidates.sort(key=lambda row: int(row.get("rank") or 999))
     spec["strategies"] = [engine for engine, _label in strategies]
@@ -1082,6 +1103,7 @@ def screen_cross(
         "candidates": candidates,
         "stopped": stopped,
         "mode": "cross",
+        "capital_mode": capital_mode,
         "settings": spec,
         "skipped_thin": skipped_thin,
         "ran_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1508,7 +1530,8 @@ def screen_cross_parallel(
             )
         except Exception:  # noqa: BLE001
             row["market_note"] = "取数失败"
-    mark_relative_better(ordered)
+    capital_mode = bool(spec.get("capital_mode"))
+    mark_relative_better(ordered, rank_by="return_rate" if capital_mode else "score")
     candidates = [row for row in ordered if row.get("picked") == "较好"]
     candidates.sort(key=lambda row: int(row.get("rank") or 999))
     spec["strategies"] = [engine for engine, _label in strategies]
@@ -1523,6 +1546,7 @@ def screen_cross_parallel(
         "candidates": candidates,
         "stopped": stopped,
         "mode": "cross",
+        "capital_mode": capital_mode,
         "settings": spec,
         "skipped_thin": skipped_thin,
         "ran_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),

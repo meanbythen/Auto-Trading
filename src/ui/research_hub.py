@@ -16,10 +16,10 @@ class ResearchHubMixin:
     """Methods mixed into AutoTradingApp; UI state remains on the app instance."""
 
     # 属于「策略研究」的二级页签。跳页时先切一级，再切这里。
-    _RESEARCH_TABS = ("历史回测", "交叉测试", "策略优化", "复盘", "规律候选")
+    _RESEARCH_TABS = ("历史回测", "交叉测试", "策略优化", "复盘", "规律候选", "研究治理")
 
     def _build_research_hub(self, tab: ctk.CTkFrame) -> None:
-        """外层只留一个入口，五个研究页作为二级页签，各自布局不变。"""
+        """外层只留一个入口，六个研究页作为二级页签，各自布局不变。"""
         tab.grid_columnconfigure(0, weight=1)
         tab.grid_rowconfigure(0, weight=1)
 
@@ -44,6 +44,7 @@ class ResearchHubMixin:
         self._build_optimize_tab(sub.tab("策略优化"))
         self._build_review_tab(sub.tab("复盘"))
         self._build_research_tab(sub.tab("规律候选"))
+        self._build_governance_tab(sub.tab("研究治理"))
         sub.configure(command=self._on_research_tab_change)
 
     def _on_research_tab_change(self) -> None:

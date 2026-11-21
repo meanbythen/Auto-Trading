@@ -11,6 +11,27 @@ from typing import Any
 from src.strategy.types import config_flag
 
 
+def _symbol_slippage(bt: dict[str, Any], symbol: str | None) -> float | None:
+    """品种级滑点：按「合约 → 品种代码 → 小写」取值；没配返回 None，退回全局。"""
+    mapping = bt.get("slippage_by_symbol")
+    if not isinstance(mapping, dict) or not symbol:
+        return None
+    from src.risk.universe_table import product_key
+
+    keys = [str(symbol), str(symbol).lower(), product_key(str(symbol))]
+    lowered = {str(key).lower(): value for key, value in mapping.items()}
+    for key in keys:
+        for candidate in (key, str(key).lower()):
+            if candidate not in mapping and candidate not in lowered:
+                continue
+            raw = mapping[candidate] if candidate in mapping else lowered[candidate]
+            try:
+                return max(0.0, float(raw))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
 @dataclass(frozen=True)
 class FillModel:
     """
@@ -49,7 +70,9 @@ class FillModel:
             tick = 1.0
         if tick <= 0:
             tick = 1.0
-        raw_slip = bt.get("slippage_ticks", 1)
+        raw_slip = _symbol_slippage(bt, symbol)
+        if raw_slip is None:
+            raw_slip = bt.get("slippage_ticks", 1)
         try:
             slip_ticks = max(0.0, float(raw_slip))
         except (TypeError, ValueError):
