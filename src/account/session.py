@@ -43,7 +43,7 @@ class ResolvedSession:
         if connection:
             pieces.append(f"连接 {connection}")
         if self.book_id:
-            pieces.append(f"账本 {self.book_id}")
+            pieces.append(f"账本{self.book_id}")
         return " · ".join(piece for piece in pieces if piece)
 
 
