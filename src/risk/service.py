@@ -149,7 +149,7 @@ class RiskService:
         )
 
     def evaluate_portfolio(self, intent: Any) -> tuple[bool, str, str]:
-        """组合闸门：observe 只留痕，enforce 才拦截。读取失败不改变交易结果。"""
+        """组合闸门：observe 只留痕，enforce 才拦截；读取失败时开仓失败关闭。"""
         if self.portfolio is None:
             return True, "", ""
         try:
@@ -157,9 +157,21 @@ class RiskService:
                 symbol=str(intent.symbol or ""),
                 side=str(intent.side or ""),
                 volume=int(intent.volume or 0),
+                entry_price=float(getattr(intent, "entry_price", 0.0) or 0.0),
+                stop_price=float(getattr(intent, "stop_price", 0.0) or 0.0),
             )
-        except Exception as exc:  # noqa: BLE001 - 组合检查是旁路，不能反过来拦单
-            logger.warning("组合风控检查失败，已放行: {}", exc)
+        except Exception as exc:  # noqa: BLE001 - 开仓检查失败要拒绝，平仓仍放行
+            logger.warning("组合风控检查失败: {}", exc)
+            mode = str(getattr(getattr(self.portfolio, "limits", None), "mode", "") or "")
+            is_open = str(intent.side or "") in {"buy_open", "sell_open"}
+            if is_open and mode != "off":
+                reason = "组合风控检查异常，按开仓失败关闭；平仓不受影响"
+                self.record_decision(
+                    "portfolio",
+                    intent,
+                    {"ok": False, "code": "portfolio_error", "reason": reason},
+                )
+                return False, "portfolio_error", reason
             return True, "", ""
         # 只在规则命中时留痕：未超限不写决策，避免每笔单都多一条 pass 记录。
         if not decision.blocked:
@@ -174,6 +186,9 @@ class RiskService:
                 "reason": decision.reason,
                 "symbol_net": decision.symbol_net,
                 "gross": decision.gross,
+                "heat": decision.heat,
+                "heat_budget": decision.heat_budget,
+                "risk_cash": decision.risk_cash,
                 "snapshot": decision.digest,
             },
         )
@@ -256,6 +271,9 @@ class RiskService:
         now: float | None = None,
     ) -> None:
         self.guardian.on_order_filled(side, volume, symbol, now=now)
+        # 开仓已成交，释放同品种的在途热度预留。
+        if self.portfolio is not None and str(side) in {"buy_open", "sell_open"}:
+            self.portfolio.release(str(symbol or ""), str(side))
         self.save_state()
 
     def update_pnl(self, pnl_delta: float) -> None:

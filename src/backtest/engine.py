@@ -653,10 +653,10 @@ def _prepare_backtest(
     st["symbols"] = [symbol]
     trade["symbol"] = symbol
 
-    # 默认跟实盘同一套：按权益和止损距离算手数。只有调用方明确传入 volume 时才改成固定手数。
+    # 显式传入 volume 是回测对照用的强制手数，不再改 sizing_mode；
+    # 配置里的 fixed 只作为风险算仓的策略上限，不能拿来绕过风险。
     if volume is not None:
         trade["volume"] = int(volume)
-        risk["sizing_mode"] = "fixed"
         # 固定手数对照时不要再走凯利，否则 1 手测试会被凯利改掉。
         box = dict(risk.get("kelly") or {}) if isinstance(risk.get("kelly"), dict) else {}
         box["enabled"] = False
@@ -1257,7 +1257,12 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
             key=skip_reason_key(size_reason),
         )
         return None
-    allowed, block_reason = run.limits.allow_open(now, open_vol)
+    allowed, block_reason = run.limits.allow_open(
+        now,
+        open_vol,
+        side="buy_open" if decision.action == StrategyAction.BUY_OPEN else "sell_open",
+        symbol=symbol,
+    )
     if not allowed:
         run.limits.note_skip(block_reason)
         run.note_reject(
@@ -1801,6 +1806,7 @@ def run_backtest(
     # 通用止损：和策略自身止损相互独立，谁先触发就按谁平。
     generic_stop = GenericStopOverlay(cfg)
     limits = BacktestLimits(cfg)
+    limits.force_volume = int(volume) if volume is not None else None
     limits.note_equity(capital0)
     n = len(bars_signal)
     # 评估用的开仓 ADX。算不出来就留空，不影响回测本身。

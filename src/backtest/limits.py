@@ -69,6 +69,8 @@ class BacktestLimits:
         self.day: Any = None
         self.last_open_at: datetime | None = None
         self.skipped: dict[str, int] = {}
+        # 回测对照：调用方明确给了 volume 时强制用这个手数，不参与风险算仓。
+        self.force_volume: int | None = None
         self.closed_pnls: list[float] = []
         self.closed_ats: list[datetime] = []
         # 和实盘 matched_closes 同构的净平仓样本；空列表也代表本回测真实零样本。
@@ -107,6 +109,8 @@ class BacktestLimits:
         """按每笔风险和止损距离算手数。算不出 1 手就返回 0。限制关掉时固定 1 手。"""
         if not self.apply:
             return 1, "未启用开仓限制，固定1手"
+        if self.force_volume is not None:
+            return max(0, self.force_volume), f"回测指定{self.force_volume}手（对照用）"
         # 真实账户口径开：这一笔按当前剩余权益算（前面赚了可能多开、亏多了可能开不了）。
         # 关：这一段从头到尾都用起始资金，便于和当时实盘、和单合约对照。净值曲线仍跟着盈亏走。
         if self.chain_capital and self.equity > 1e-9:
@@ -124,22 +128,27 @@ class BacktestLimits:
         )
         return int(sized.volume), sized.reason
 
-    def allow_open(self, now: datetime, volume: int) -> tuple[bool, str]:
-        """日亏损、开仓次数、两笔之间的间隔。平仓不走这里。限制关掉时直接放行。"""
+    def allow_open(
+        self,
+        now: datetime,
+        volume: int,
+        side: str = "",
+        symbol: str = "",
+    ) -> tuple[bool, str]:
+        """日亏损、开仓次数、两笔之间的间隔。平仓不走这里。限制关掉时直接放行。
+
+        直接调用实盘同一个 RiskGuardian，只在时间轴上换成K线自己的时间。
+        """
         if not self.apply:
             return True, "未启用开仓限制"
         if volume <= 0:
             return False, "手数必须大于 0"
-        if self.guard.halted:
-            return False, f"已熔断: {self.guard.halt_reason}"
-        if self.guard.open_orders_today >= self.guard.max_orders_per_day:
-            return False, f"今日开仓次数已达上限 {self.guard.max_orders_per_day}"
-        if self.last_open_at is not None:
-            gap = (now - self.last_open_at).total_seconds()
-            need = self.guard.min_order_interval_sec
-            if gap < need:
-                return False, f"开仓间隔不足 {need} 秒"
-        return True, "通过"
+        return self.guard.allow(
+            side,
+            int(volume),
+            symbol=symbol or None,
+            now=now.timestamp(),
+        )
 
     def note_skip(self, reason: str) -> None:
         """记下没开成的原因，回测结果里汇总给用户看。"""
@@ -149,10 +158,16 @@ class BacktestLimits:
     def on_open(self, now: datetime, side: str, volume: int, symbol: str) -> None:
         self.last_open_at = now
         self.guard.on_order_filled(side, volume, symbol=symbol)
+        # Guardian 默认用墙上时钟记上一笔；回测必须改成K线时间，否则下一根永远被间隔挡住。
+        self.guard.last_order_ts = now.timestamp()
+        self.guard.last_open_ts = now.timestamp()
 
     def on_close(self, pnl: float, volume: int, symbol: str, at: datetime | None = None) -> None:
         self.guard.update_pnl(pnl)
         self.guard.on_order_filled("close", volume, symbol=symbol)
+        if at is not None:
+            # 平仓也按K线时间记最后一笔，否则下一根会被墙上时钟的间隔挡住。
+            self.guard.last_order_ts = at.timestamp()
         self.closed_pnls.append(float(pnl))
         self.closed_ats.append(at if at is not None else datetime.now())
         # on_close 的 pnl 已由回测引擎扣过手续费和滑点，直接作为凯利净样本。

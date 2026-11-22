@@ -76,11 +76,14 @@ def test_consecutive_losses_do_not_cut_size() -> None:
     assert note == ""
 
 
-def test_atr_pause_skips_open() -> None:
-    dyn = DynamicExposure(enabled=True, atr_half_mult=1.8, atr_pause_mult=2.5)
-    vol, note = dyn.adjust_open(2, ratio=3.0, dd=0.0)
-    assert vol == 0
-    assert "波动" in note
+def test_atr_high_vol_halves_but_never_pauses() -> None:
+    """波动放大最多减半，不再硬暂停开仓。"""
+    dyn = DynamicExposure(enabled=True, atr_half_mult=1.8)
+    vol, note = dyn.adjust_open(4, ratio=3.0, dd=0.0)
+    assert vol == 2
+    assert "减半" in note
+    one, _ = dyn.adjust_open(1, ratio=3.0, dd=0.0)
+    assert one == 1
 
 
 def test_disabled_does_nothing() -> None:

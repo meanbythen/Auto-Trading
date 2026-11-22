@@ -304,6 +304,43 @@ def test_shared_capital_accepts_all_when_budget_ample():
     assert out["final_equity"] == pytest.approx(out["unconstrained_equity"])
 
 
+def test_shared_capital_enforces_portfolio_heat():
+    """组合风险热度超限时拒开，并输出热度峰值。"""
+    days = ["2024-01-02"]
+    a = _leg(
+        "a", [100.0], days,
+        [_trade("a", "2024-01-02 09:00", "2024-01-02 15:00", pnl=100.0, atr=10.0)],
+    )
+    b = _leg(
+        "b", [100.0], days,
+        [_trade("b", "2024-01-02 09:00", "2024-01-02 15:00", pnl=10.0, atr=10.0)],
+    )
+    # 每笔预计风险 = ATR 10 × 乘数 10 × 1 手 = 100；热度上限 1% × 10000 = 100，只够一笔。
+    out = simulate_shared_capital([a, b], initial_capital=10_000.0, max_heat_pct=1.0)
+
+    assert out["heat_budget"] == pytest.approx(100.0)
+    assert out["heat_peak"] == pytest.approx(100.0)
+    assert out["trades_accepted"] == 1
+    assert out["trades_rejected"] == 1
+    assert out["rejected"][0]["reason"] == "组合风险热度超限"
+
+
+def test_shared_capital_heat_is_disabled_by_default():
+    days = ["2024-01-02"]
+    a = _leg(
+        "a", [100.0], days,
+        [_trade("a", "2024-01-02 09:00", "2024-01-02 15:00", pnl=100.0, atr=10.0)],
+    )
+    b = _leg(
+        "b", [100.0], days,
+        [_trade("b", "2024-01-02 09:00", "2024-01-02 15:00", pnl=10.0, atr=10.0)],
+    )
+    out = simulate_shared_capital([a, b], initial_capital=10_000.0)
+
+    assert out["heat_budget"] == 0.0
+    assert out["trades_rejected"] == 0
+
+
 def test_shared_capital_daily_loss_limit_blocks_new_opens():
     """当天已实现亏损达到上限后，当天后续开仓一律拒绝。"""
     days = ["2024-01-01", "2024-01-02"]

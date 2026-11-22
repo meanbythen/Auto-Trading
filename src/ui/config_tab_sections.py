@@ -506,13 +506,7 @@ def build_tail_sections(app: AutoTradingApp, scroll: ctk.CTkFrame) -> None:
         box4,
         "波动几倍减半",
         app.dyn_atr_half_var,
-        hint="当前波动相对近20根中位，默认1.8倍",
-    )
-    app._entry_row(
-        box4,
-        "波动几倍暂停",
-        app.dyn_atr_pause_var,
-        hint="默认2.5倍。不会因为晃就把最后1手强平",
+        hint="当前波动相对近20根中位，默认1.8倍；只减半，不会暂停开仓",
     )
     app._entry_row(
         box4,

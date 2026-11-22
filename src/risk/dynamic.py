@@ -5,8 +5,8 @@
 1. 日最大亏损：在 RiskGuardian 里，当天亏到限额就停开。这里不再做一遍。
 2. 账户从最高点回撤：掉到减半线就少开；掉到停手线就暂停开新仓。
    余额再创新高，或回撤收回到减半线以下，手数自己恢复。不要求再赚一笔。
-3. 波动比近段中位大很多：下一笔少开或暂停。晃完自己解除。
-   不因为波动变大就把最后 1 手强平。
+3. 波动比近段中位大很多：下一笔少开。晃完自己解除。
+   不因为波动变大就暂停开仓，也不把最后 1 手强平。
 
 已经拿着的 2 手及以上，只在账户回撤触发时减到一半或留 1 手。
 连亏几笔、影子单、必须再赢一笔，都不再用来改手数。
@@ -84,7 +84,6 @@ class DynamicExposure:
     dd_half_pct: float = 5.0
     dd_pause_pct: float = 10.0
     atr_half_mult: float = 1.8
-    atr_pause_mult: float = 2.5
     atr_period: int = 14
     atr_lookback: int = 20
     reduce_held: bool = True
@@ -112,7 +111,6 @@ class DynamicExposure:
             dd_half_pct=half,
             dd_pause_pct=pause,
             atr_half_mult=max(1.01, float(raw.get("atr_half_mult", 1.8) or 1.8)),
-            atr_pause_mult=max(1.01, float(raw.get("atr_pause_mult", 2.5) or 2.5)),
             atr_period=max(2, int(raw.get("atr_period", 14) or 14)),
             atr_lookback=max(5, int(raw.get("atr_lookback", 20) or 20)),
             reduce_held=bool(raw.get("reduce_held", True)),
@@ -125,7 +123,6 @@ class DynamicExposure:
             "dd_half_pct": float(self.dd_half_pct),
             "dd_pause_pct": float(self.dd_pause_pct),
             "atr_half_mult": float(self.atr_half_mult),
-            "atr_pause_mult": float(self.atr_pause_mult),
             "atr_period": int(self.atr_period),
             "atr_lookback": int(self.atr_lookback),
             "reduce_held": bool(self.reduce_held),
@@ -139,7 +136,7 @@ class DynamicExposure:
         """
         下一笔开仓用的倍数：1=不改，0.5=减半，0=暂停开仓。
 
-        账户回撤和波动放大取更严的那一档。
+        暂停只由账户回撤触发；波动放大最多减半。两者取更严的那一档。
         """
         if not self.enabled:
             return 1.0, ""
@@ -160,14 +157,9 @@ class DynamicExposure:
                 bits.append(
                     f"账户从最高点回撤{pct:.1f}%，已达减半线{self.dd_half_pct:.0f}%，下一笔手数减半"
                 )
-        if ratio is not None:
-            pause_m = max(self.atr_half_mult, self.atr_pause_mult)
-            if ratio >= pause_m:
-                scale = 0.0
-                bits.append(f"波动约是近段的{ratio:.1f}倍，暂停开新仓")
-            elif ratio >= self.atr_half_mult:
-                scale = min(scale, 0.5)
-                bits.append(f"波动约是近段的{ratio:.1f}倍，下一笔手数减半")
+        if ratio is not None and ratio >= self.atr_half_mult:
+            scale = min(scale, 0.5)
+            bits.append(f"波动约是近段的{ratio:.1f}倍，下一笔手数减半")
         return scale, "；".join(bits)
 
     def adjust_open(
@@ -176,7 +168,7 @@ class DynamicExposure:
         ratio: float | None,
         dd: float | None,
     ) -> tuple[int, str]:
-        """把已经算好的手数再压一档。1 手减半仍是 1 手，只有暂停才会变成 0 手。"""
+        """把已经算好的手数再压一档。1 手减半仍是 1 手，只有账户回撤到停手线才会变成 0 手。"""
         vol = int(volume)
         if vol <= 0 or not self.enabled:
             return vol, ""

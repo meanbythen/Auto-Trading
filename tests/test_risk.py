@@ -391,3 +391,135 @@ def test_portfolio_enforce_blocks_over_limit(tmp_path) -> None:
 
     assert result.ok is False
     assert result.code == "portfolio_symbol_limit"
+
+
+def test_portfolio_limits_read_heat_and_ttl() -> None:
+    from src.risk.portfolio import PortfolioLimits
+
+    limits = PortfolioLimits.from_config(
+        {
+            "risk": {
+                "portfolio": {
+                    "mode": "enforce",
+                    "max_heat_pct": 6,
+                    "pending_ttl_sec": 15,
+                }
+            }
+        }
+    )
+    assert limits.max_heat_pct == 6.0
+    assert limits.pending_ttl_sec == 15.0
+    # 总手数敞口已被风险热度替换，旧键不再参与判断。
+    assert not hasattr(limits, "max_gross_lots")
+
+
+def _heat_cfg(mode: str = "enforce", max_heat_pct: float = 10) -> dict:
+    return {
+        "risk": {
+            "capital": 100_000,
+            "risk_per_trade_pct": 1,
+            "portfolio": {"mode": mode, "max_heat_pct": max_heat_pct, "pending_ttl_sec": 60},
+        }
+    }
+
+
+def test_portfolio_heat_reserves_pending_open_and_release() -> None:
+    """第一笔通过后先占热度，第二笔同轮会被在途预留挡住；释放后恢复。"""
+    from src.risk.portfolio import PortfolioLimits, PortfolioRisk, PortfolioSnapshot
+
+    cfg = _heat_cfg()
+    now = [1000.0]
+    risk = PortfolioRisk(
+        PortfolioLimits.from_config(cfg),
+        snapshot=PortfolioSnapshot.from_rows([]),
+        cfg=cfg,
+        clock=lambda: now[0],
+    )
+    first = risk.check(
+        symbol="bu2612", side="buy_open", volume=10, entry_price=4000, stop_price=3900
+    )
+    second = risk.check(
+        symbol="fu2701", side="buy_open", volume=10, entry_price=4000, stop_price=3900
+    )
+
+    assert first.blocked is False
+    assert first.risk_cash == 10_000
+    assert second.blocked is True
+    assert second.code == "portfolio_heat_limit"
+
+    risk.release("bu2612", "buy_open")
+    again = risk.check(
+        symbol="fu2701", side="buy_open", volume=10, entry_price=4000, stop_price=3900
+    )
+    assert again.blocked is False
+
+
+def test_portfolio_heat_observe_records_without_blocking() -> None:
+    from src.risk.portfolio import PortfolioLimits, PortfolioRisk, PortfolioSnapshot
+
+    cfg = _heat_cfg(mode="observe")
+    risk = PortfolioRisk(
+        PortfolioLimits.from_config(cfg),
+        snapshot=PortfolioSnapshot.from_rows(
+            [{"book_id": "acc_b", "symbol": "fu2701", "side": "long", "volume": 10,
+              "entry_price": 4000, "stop_price": 3900}]
+        ),
+        cfg=cfg,
+    )
+    decision = risk.check(
+        symbol="bu2612", side="buy_open", volume=10, entry_price=4000, stop_price=3900
+    )
+
+    assert decision.blocked is True
+    assert decision.enforced is False
+    assert decision.code == "portfolio_heat_limit"
+
+
+def test_portfolio_read_failure_blocks_open_but_allows_close(tmp_path) -> None:
+    """持仓读不到时开仓失败关闭；平仓不读库，照常放行。"""
+    from src.risk.portfolio import PortfolioLimits, PortfolioRisk
+
+    cfg = {
+        "risk": {
+            "capital": 100_000,
+            "portfolio": {"mode": "enforce", "max_symbol_lots": 2},
+        }
+    }
+    risk = PortfolioRisk(PortfolioLimits.from_config(cfg), root=tmp_path, cfg=cfg)
+
+    opened = risk.check(symbol="bu2612", side="buy_open", volume=1)
+    closed = risk.check(symbol="bu2612", side="close", volume=1)
+
+    assert opened.blocked is True
+    assert opened.code == "portfolio_unavailable"
+    assert closed.blocked is False
+    assert closed.code == "portfolio_skip"
+
+
+def test_risk_service_blocks_open_on_portfolio_error(tmp_path) -> None:
+    from src.kernel.risk_chain import TradeIntent, run_send_gates
+    from src.risk.portfolio import PortfolioLimits, PortfolioRisk
+    from src.risk.service import RiskService
+
+    cfg = {
+        "risk": {
+            "min_order_interval_sec": 0,
+            "capital": 100_000,
+            "portfolio": {"mode": "enforce", "max_symbol_lots": 2},
+        }
+    }
+    service = RiskService.from_config(cfg, root=tmp_path, account_id="acc_a")
+    service.write_alerts = False
+    service.portfolio = PortfolioRisk(
+        PortfolioLimits.from_config(cfg), root=tmp_path / "missing", cfg=cfg
+    )
+    service.on_order_filled("buy_open", 1, "bu2612", now=0)
+
+    result = run_send_gates(TradeIntent(symbol="bu2612", side="buy_open", volume=1), service)
+    close_result = run_send_gates(
+        TradeIntent(symbol="bu2612", side="close", volume=1), service
+    )
+
+    assert result.ok is False
+    assert result.code == "portfolio_unavailable"
+    assert close_result.ok is True

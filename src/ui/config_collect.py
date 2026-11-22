@@ -34,16 +34,11 @@ class ConfigCollectMixin:
             atr_half = max(1.01, float(self.dyn_atr_half_var.get() or fallback.atr_half_mult))
         except ValueError:
             atr_half = fallback.atr_half_mult
-        try:
-            atr_pause = max(1.01, float(self.dyn_atr_pause_var.get() or fallback.atr_pause_mult))
-        except ValueError:
-            atr_pause = fallback.atr_pause_mult
         return {
             "enabled": bool(self.dyn_enabled_var.get()),
             "dd_half_pct": dd_half,
             "dd_pause_pct": dd_pause,
             "atr_half_mult": atr_half,
-            "atr_pause_mult": atr_pause,
             "atr_period": fallback.atr_period,
             "atr_lookback": fallback.atr_lookback,
             "reduce_held": False,

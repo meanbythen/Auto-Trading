@@ -22,6 +22,9 @@ class TradeIntent:
     symbol: str
     side: str
     volume: int
+    # 组合风险热度按「入场价到止损价」算这一笔的最大亏损；平仓不看这两个值。
+    entry_price: float = 0.0
+    stop_price: float = 0.0
     bar_id: str = ""
     orders_paused: bool = False
     ledger_failed: bool = False

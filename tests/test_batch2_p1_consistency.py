@@ -211,6 +211,7 @@ def test_portfolio_excludes_self_test_positions(tmp_path: Path) -> None:
         )
 
     snap = PortfolioRisk._read(tmp_path)
+    assert snap is not None
     books = snap.books
     assert SELF_TEST_BOOK_ID not in books
     assert "acc_huatai_live_01" in books

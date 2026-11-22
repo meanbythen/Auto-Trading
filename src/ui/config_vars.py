@@ -142,7 +142,6 @@ class ConfigVarsMixin:
         self.dyn_dd_half_var = ctk.StringVar(value=str(_dyn.dd_half_pct))
         self.dyn_dd_pause_var = ctk.StringVar(value=str(_dyn.dd_pause_pct))
         self.dyn_atr_half_var = ctk.StringVar(value=str(_dyn.atr_half_mult))
-        self.dyn_atr_pause_var = ctk.StringVar(value=str(_dyn.atr_pause_mult))
         from src.risk.kelly import (
             DEFAULT_FRACTION,
             DEFAULT_MAX_F_PCT,
@@ -1103,7 +1102,6 @@ class ConfigVarsMixin:
         self.dyn_dd_half_var.set(str(_dyn.dd_half_pct))
         self.dyn_dd_pause_var.set(str(_dyn.dd_pause_pct))
         self.dyn_atr_half_var.set(str(_dyn.atr_half_mult))
-        self.dyn_atr_pause_var.set(str(_dyn.atr_pause_mult))
         from src.risk.kelly import (
             DEFAULT_FRACTION,
             DEFAULT_MAX_F_PCT,

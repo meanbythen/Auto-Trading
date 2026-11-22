@@ -10,7 +10,7 @@
    - risk_pct：floor(权益 × 每笔风险% ÷ 每手完整风险)
    - 每手完整风险 = 止损距离×乘数 + 开平手续费 + 开平各一次预计滑点
    - 固定风险%永远是硬上限，凯利不能把它调大
-   - fixed：固定手数
+   - fixed：固定手数只作为策略上限，仍先按风险%算仓再取较小值，不能绕过止损
 
 2) 仓位上限（保证金占用，公共设置）
    - 填了保证金比例：每手占用 = 开仓价 × 每手数量 × 比例%
@@ -196,10 +196,7 @@ class PositionSizer:
             )
 
         if vol < self.min_volume:
-            from src.risk.kelly import kelly_enabled
-
-            using_pct = self.mode != "fixed" or kelly_enabled(self._cfg)
-            if using_pct and intent < self.min_volume and stop_dist > 0:
+            if intent < self.min_volume and stop_dist > 0:
                 why = (
                     f"按风险{(risk_cash / self.capital * 100 if self.capital > 0 else 0):g}%只允许约{intent}手，低于最小{self.min_volume}手"
                     f"（止损距{stop_dist:.2f}点，每手亏≈{risk_per_lot:.0f}元，"
@@ -262,18 +259,14 @@ class PositionSizer:
             risk_pct = min(plan.risk_pct, self.risk_pct)
             kelly_note = plan.reason + "；"
 
-        if self.mode == "fixed" and not kelly_enabled(self._cfg):
-            vol = max(0, self.fixed_volume)
-            return vol, f"固定手数模式 volume={vol}", 0.0, 0.0, 0.0
-
         if (
             entry_price is None
             or stop_price is None
             or float(entry_price) <= 0
             or float(stop_price) == 0
         ):
-            # 按风险百分比开仓必须有止损价（0 也视为没设），否则等于开一张没有保护的上限仓位。
-            return 0, "缺少有效的入场价/止损价，risk_pct 模式不开无止损仓", 0.0, 0.0, 0.0
+            # 按风险算仓必须有止损价（0 也视为没设），fixed 上限模式也一样。
+            return 0, "缺少有效的入场价/止损价，按风险算仓不开无止损仓", 0.0, 0.0, 0.0
 
         stop_dist = abs(float(entry_price) - float(stop_price))
         if stop_dist <= 0:
@@ -302,6 +295,11 @@ class PositionSizer:
             f"/ 每手≈{risk_per_lot:.0f}元 → 意图{raw}手"
             f"（止损距{stop_dist:.2f}，乘数{mult}，开平费{fee_cost:.2f}，双边滑点{slippage_cost:.2f}）"
         )
+        if self.mode == "fixed":
+            # fixed 不再绕过风险算仓：固定手数只是策略上限，风险手数更小时按风险。
+            cap = max(0, self.fixed_volume)
+            raw = min(raw, cap)
+            note = f"固定手数上限{cap}手；" + note
         return raw, note, risk_cash, risk_per_lot, stop_dist
 
     def _lots_by_margin_cap(

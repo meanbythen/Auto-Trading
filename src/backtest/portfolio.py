@@ -362,6 +362,7 @@ def simulate_shared_capital(
     risk_pct: float = 0.01,
     slippage_by_symbol: dict[str, float] | None = None,
     allowed_slip_ticks: float = 2.0,
+    max_heat_pct: float | None = None,
 ) -> dict[str, Any]:
     """共享资金账：所有腿抢同一个保证金池，开不起就记「拒开」。
 
@@ -373,6 +374,7 @@ def simulate_shared_capital(
     风险预算占用率（高→低）→ 资金效率（高→低）→ 相关性惩罚（高相关排后）
     → 滑点余量（预计滑点 ÷ 允许滑点，大的先做）→「交易日 + 品种」稳定哈希。
     日亏达到 daily_loss_limit 后，当天后续开仓全部拒绝（对应 D6 只做日亏熔断）。
+    配置 max_heat_pct 后，已持仓 + 本笔的预计风险不得超过该比例权益，超了拒开。
     """
     capital = _number(initial_capital)
     lot_margins = dict(margin_by_lot or {})
@@ -384,6 +386,8 @@ def simulate_shared_capital(
     loss_limit = _number(daily_loss_limit)
     risk_rate = max(0.0, _number(risk_pct))
     risk_budget = capital * risk_rate
+    heat_rate = max(0.0, _number(max_heat_pct))
+    heat_budget = capital * heat_rate / 100.0
     slip_allow = max(1e-9, _number(allowed_slip_ticks))
     returns_by_symbol: dict[str, dict[str, float]] = {}
 
@@ -422,6 +426,7 @@ def simulate_shared_capital(
                     "pnl": pnl,
                     "efficiency": (pnl / margin) if margin > 0 else 0.0,
                     "risk_usage": (projected_risk / risk_budget) if risk_budget > 0 else 0.0,
+                    "risk": projected_risk,
                     "slip_ratio": (slip_ticks / slip_allow) if slip_ticks is not None else 0.0,
                     "rank": int(
                         hashlib.md5(
@@ -448,6 +453,9 @@ def simulate_shared_capital(
             "unconstrained_equity": capital,
             "margin_peak": 0.0,
             "margin_peak_pct": 0.0,
+            "heat_budget": heat_budget,
+            "heat_peak": 0.0,
+            "heat_peak_pct": 0.0,
             "blocked_days": [],
             "rejected": [],
             "by_symbol": {},
@@ -478,6 +486,7 @@ def simulate_shared_capital(
     rejected: list[dict[str, Any]] = []
     realized = 0.0
     peak = 0.0
+    heat_peak = 0.0
     blocked_days: list[str] = []
     equity: list[float] = []
     equity_days: list[str] = []
@@ -486,6 +495,7 @@ def simulate_shared_capital(
         # 昨天及以前已平仓的，今天释放保证金。
         open_items = [item for item in open_items if item["exit"] >= day]
         used = sum(item["margin"] for item in open_items)
+        used_heat = sum(_number(item.get("risk")) for item in open_items)
         day_realized = sum(
             item["pnl"] for item in items if item["id"] in accepted and item["exit"] == day
         )
@@ -519,11 +529,22 @@ def simulate_shared_capital(
                     }
                 )
                 continue
+            if heat_budget > 0 and used_heat + _number(item.get("risk")) > heat_budget + 1e-9:
+                rejected.append(
+                    {
+                        **item,
+                        "reason": "组合风险热度超限",
+                        "heat_available": max(0.0, heat_budget - used_heat),
+                    }
+                )
+                continue
             accepted.add(item["id"])
             open_items.append(item)
             open_symbols.add(item["symbol"])
             used += item["margin"]
+            used_heat += _number(item.get("risk"))
         peak = max(peak, used)
+        heat_peak = max(heat_peak, used_heat)
         equity.append(capital + realized)
         equity_days.append(day.strftime("%Y-%m-%d"))
 
@@ -556,6 +577,7 @@ def simulate_shared_capital(
                 "required_margin": round(item["margin"], 2),
                 "available": round(_number(item.get("available")), 2),
                 "risk_usage": round(item["risk_usage"], 4),
+                "risk_cash": round(_number(item.get("risk")), 2),
                 "slip_ratio": round(item["slip_ratio"], 4),
                 "reason": item["reason"],
             }
@@ -575,6 +597,9 @@ def simulate_shared_capital(
         "unconstrained_equity": round(capital + total_pnl, 2),
         "margin_peak": round(peak, 2),
         "margin_peak_pct": (peak / capital) if capital > 1e-9 else 0.0,
+        "heat_budget": round(heat_budget, 2),
+        "heat_peak": round(heat_peak, 2),
+        "heat_peak_pct": (heat_peak / capital) if capital > 1e-9 else 0.0,
         "equity": equity,
         "equity_times": equity_days,
         "blocked_days": blocked_days,
@@ -599,6 +624,7 @@ def combine_results(
     risk_pct: float = 0.01,
     slippage_by_symbol: dict[str, float] | None = None,
     allowed_slip_ticks: float = 2.0,
+    max_heat_pct: float | None = None,
     note: str = "",
 ) -> dict[str, Any]:
     """按权重合并多条单品种权益，输出组合层面的汇总。
@@ -828,6 +854,7 @@ def combine_results(
         risk_pct=risk_pct,
         slippage_by_symbol=slippage_by_symbol,
         allowed_slip_ticks=allowed_slip_ticks,
+        max_heat_pct=max_heat_pct,
     )
     result["risk"] = risk_summary(portfolio_equity, days, correlation)
     return result
@@ -991,6 +1018,8 @@ def run_portfolio_backtest(
     raw_slip = backtest_box.get("slippage_by_symbol")
     slip_map = raw_slip if isinstance(raw_slip, dict) else None
     allowed_slip = _number(backtest_box.get("allowed_slip_ticks")) or 2.0
+    portfolio_box = _box(_box((cfg or {}).get("risk")).get("portfolio"))
+    heat_value = _number(portfolio_box.get("max_heat_pct"))
     by_lot, by_rate = _margin_inputs(cfg, [leg.symbol for leg in legs])
     combined = combine_results(
         legs,
@@ -1004,6 +1033,7 @@ def run_portfolio_backtest(
         risk_pct=risk_pct,
         slippage_by_symbol=slip_map,
         allowed_slip_ticks=allowed_slip,
+        max_heat_pct=heat_value if heat_value > 0 else None,
         note=str(allocated.get("note") or ""),
     )
     combined["skipped"] = skipped + list(combined.get("skipped") or [])
@@ -1104,6 +1134,14 @@ def format_portfolio_lines(portfolio: dict[str, Any]) -> list[str]:
             risk_pct = _number(shared.get("risk_per_trade_pct"))
             suffix = f"（单笔风险 {risk_pct:.2f}%）" if risk_pct > 0 else ""
             lines.append(f"优先级    {shared.get('priority')}{suffix}")
+        heat_budget = _number(shared.get("heat_budget"))
+        if heat_budget > 0:
+            heat_peak = _number(shared.get("heat_peak"))
+            heat_pct = _number(shared.get("heat_peak_pct"))
+            lines.append(
+                f"风险热度  峰值 {heat_peak:,.0f} 元（上限 {heat_budget:,.0f} 元，"
+                f"占初始资金 {heat_pct:.1%}）"
+            )
         blocked = list(shared.get("blocked_days") or [])
         if blocked:
             lines.append(f"日亏熔断  {len(blocked)} 个交易日停止开仓：{'、'.join(blocked[:5])}")

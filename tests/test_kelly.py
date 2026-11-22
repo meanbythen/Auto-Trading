@@ -84,7 +84,7 @@ def test_legacy_snapshot_still_reads() -> None:
     assert abs((payoff or 0) - 1.5) < 1e-9
 
 
-def test_valid_kelly_replaces_fixed_lots() -> None:
+def test_valid_kelly_lifts_risk_but_fixed_still_caps() -> None:
     cfg = _live_cfg(
         {
             "enabled": True,
@@ -97,9 +97,14 @@ def test_valid_kelly_replaces_fixed_lots() -> None:
     plan = plan_from_config(cfg)
     assert plan.ok
     sized = PositionSizer(cfg).calc_open("bu2701", 3000, 2990)
-    assert sized.volume >= 1
-    assert sized.volume != 3
+    assert sized.volume == 3
     assert "凯利" in sized.reason
+    assert "固定手数上限3手" in sized.reason
+    # fixed 只是上限：把上限放宽后，凯利算出的风险手数才能体现出来。
+    cfg["trade"]["volume"] = 10
+    lifted = PositionSizer(cfg).calc_open("bu2701", 3000, 2990)
+    assert lifted.volume == 4
+    assert "凯利" in lifted.reason
 
 
 def test_zero_samples_use_fixed_risk_not_manual_factors() -> None:

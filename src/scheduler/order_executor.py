@@ -587,6 +587,8 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
             symbol=decision.symbol,
             side=decision.action.value,
             volume=int(volume),
+            entry_price=float(decision.entry_price or 0),
+            stop_price=float(decision.stop_price or 0),
             bar_id=bar_key,
             orders_paused=bool(getattr(self, "_orders_paused", False)),
             ledger_failed=bool(getattr(self, "_ledger_failed", False)),

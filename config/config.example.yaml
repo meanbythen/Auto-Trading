@@ -674,7 +674,7 @@ risk:
   # 手数取小：①动态目标（凯利或固定风险）②保证金/柜台可用资金 ③单笔委托上限。
   # 每手风险 = 止损距离×乘数 + 开平手续费 + 开平各一次预计滑点。
   # risk_per_trade_pct 是固定风险硬上限；凯利只能低于它，不能突破它。
-  # fixed 只给策略意图手数，凯利开启时仍受统一风险上限约束。
+  # fixed 只把固定手数当作策略上限：仍先按风险%和止损距离算仓，再取较小值；缺止损仍不开。
   sizing_mode: risk_pct
   # 分策略腿凯利：从当前账本已平仓记录滚动统计；样本不足退回固定风险，负期望拒绝新开。
   # auto_from_ledger=false 时才使用下面手工填写的全账户胜率/盈亏比（兼容旧研究口径）。
@@ -697,20 +697,23 @@ risk:
   max_daily_loss: 5000
   min_order_interval_sec: 60
   max_orders_per_day: 20
-  # 组合风控（跨品种/跨账号敞口）。默认 observe：只记录「本应拦截」，不改变报单。
+  # 组合风控（跨品种/跨账号）。默认 observe：只记录「本应拦截」，不改变报单。
   # mode: off 关闭 | observe 只留痕 | enforce 真正拦单。上限为 0 表示该维度不限。
+  # 组合风险热度 = 各持仓「入场价到止损价」的最大亏损之和 ÷ 权益；取代原来的总手数敞口。
+  # 开仓通过后会先记一笔在途预留（pending_ttl_sec 秒），同轮其它品种也会被这笔未成交风险挡住。
+  # 读取持仓失败时开仓失败关闭；平仓始终放行。
   portfolio:
     mode: observe
     max_symbol_lots: 0
-    max_gross_lots: 0
-  # 账户从最高点回撤、或波动突然放大时少开/暂停。日最大亏损仍只看当天。
+    max_heat_pct: 0
+    pending_ttl_sec: 60
+  # 账户从最高点回撤时少开/暂停；波动突然放大时只减半，不暂停开仓。日最大亏损仍只看当天。
   # 1 手账户减半仍是 1 手，不会被强平。enabled: false 就不再压这一层。
   dynamic:
     enabled: true
     dd_half_pct: 5
     dd_pause_pct: 10
     atr_half_mult: 1.8
-    atr_pause_mult: 2.5
     atr_period: 14
     atr_lookback: 20
     reduce_held: false      # 默认只限制新增风险，不在回撤底部强制减已有持仓

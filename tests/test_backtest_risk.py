@@ -107,23 +107,65 @@ def test_limits_off_keeps_one_lot_even_if_stop_is_wide() -> None:
     assert result.params_snapshot["skipped_opens"] == {}
 
 
-def test_fixed_volume_still_opens() -> None:
-    """改成固定手数后，同一段行情可以开出来。"""
+def test_fixed_volume_no_longer_bypasses_risk() -> None:
+    """fixed 只当策略上限：止损很宽、权益很小，仍然不开裸仓。"""
     result = run_backtest(
-        _cfg(sizing_mode="fixed"),
+        _cfg(sizing_mode="fixed", capital=100, risk_per_trade_pct=0.5),
         symbol="bu",
         bars_signal=_wide_stop_bars(),
         warmup=20,
     )
-    assert result.performance.trades >= 1
-    assert result.trades[0].volume == 1
+    assert result.performance.trades == 0
+    assert result.params_snapshot["skipped_opens"].get("止损过宽，手数不够", 0) >= 1
+
+
+def test_fixed_volume_caps_risk_sized_lots() -> None:
+    """固定手数是上限：风险预算能开更多时也压到固定手数。"""
+    from src.risk.sizing import PositionSizer
+
+    sizer = PositionSizer(
+        {
+            "risk": {
+                "sizing_mode": "fixed",
+                "capital": 100_000,
+                "risk_per_trade_pct": 2,
+                "contracts": {"bu": {"multiplier": 10}},
+            },
+            "trade": {"volume": 2},
+            "backtest": {"slippage_ticks": 0},
+        }
+    )
+    result = sizer.calc_open("bu2612", 4000.0, 3950.0)
+
+    assert result.volume == 2
+    assert "固定手数上限2手" in result.reason
+    assert sizer.calc_open("bu2612", 4000.0, None).volume == 0
+
+
+def test_allow_open_uses_guardian_interval() -> None:
+    """回测开仓判定直接走同一个 Guardian，间隔和实盘一致。"""
+    limits = BacktestLimits(_cfg(min_order_interval_sec=60))
+    now = datetime(2026, 10, 16, 10, 0)
+    limits.on_bar(now)
+    limits.on_open(now, "buy_open", 1, "bu")
+
+    ok, reason = limits.allow_open(
+        now + timedelta(seconds=30), 1, side="buy_open", symbol="bu"
+    )
+    allowed, _ = limits.allow_open(
+        now + timedelta(seconds=61), 1, side="buy_open", symbol="bu"
+    )
+
+    assert ok is False
+    assert "不足" in reason
+    assert allowed is True
 
 
 def test_daily_loss_halt_clears_on_next_day() -> None:
     limits = BacktestLimits(_cfg(max_daily_loss=50))
     now = datetime(2026, 10, 16, 10, 0)
     limits.on_bar(now)
-    limits.on_close(-80, 1, "bu")
+    limits.on_close(-80, 1, "bu", at=now)
     ok, reason = limits.allow_open(now, 1)
     assert ok is False
     assert "亏损" in reason
@@ -157,7 +199,7 @@ def test_night_session_does_not_reset_counters_at_midnight() -> None:
     """夜盘和次日日盘是一个交易日，跨过零点不能清掉熔断。"""
     limits = BacktestLimits(_cfg(max_daily_loss=50))
     limits.on_bar(datetime(2026, 10, 27, 21, 30))
-    limits.on_close(-80, 1, "bu")
+    limits.on_close(-80, 1, "bu", at=datetime(2026, 10, 27, 21, 30))
     assert limits.guard.halted is True
     # 同一个夜盘跨到凌晨 00:30，仍是周三这个交易日。
     limits.on_bar(datetime(2026, 10, 28, 0, 30))
