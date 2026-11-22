@@ -1126,11 +1126,18 @@ def _walk_matches(
     table = multipliers or {}
     for row in book.get("trades") or []:
         if row.get("offset") == "开仓":
-            opens.append({**row, "left": int(row.get("volume") or 0)})
+            opens.append(
+                {
+                    **row,
+                    "left": int(row.get("volume") or 0),
+                    "fee_left": max(0.0, float(row.get("commission") or 0)),
+                }
+            )
             continue
         if row.get("offset") != "平仓":
             continue
         need = int(row.get("volume") or 0)
+        close_fee_left = max(0.0, float(row.get("commission") or 0))
         price = float(row.get("price") or 0)
         for held in opens:
             if need <= 0:
@@ -1139,12 +1146,18 @@ def _walk_matches(
                 continue
             if int(held.get("left") or 0) <= 0:
                 continue
-            take = min(int(held["left"]), need)
+            held_left = int(held["left"])
+            take = min(held_left, need)
             diff = price - float(held.get("price") or 0)
             if row.get("direction") == "空":
                 diff = -diff
             mult = float(held.get("multiplier") or _lookup_multiplier(str(row.get("symbol") or ""), table))
             part = diff * take * mult
+            # 开、平手续费都按本次配对手数分摊；最后一段收走尾差，重复部分成交不漏费。
+            open_fee_left = max(0.0, float(held.get("fee_left") or 0))
+            open_fee = open_fee_left if take == held_left else open_fee_left * take / held_left
+            close_fee = close_fee_left if take == need else close_fee_left * take / need
+            commission = open_fee + close_fee
             pnl += part
             closed.append(part)
             details.append(
@@ -1155,12 +1168,17 @@ def _walk_matches(
                     "entry_time": str(held.get("time") or ""),
                     "entry_price": float(held.get("price") or 0),
                     "exit_price": price,
+                    # 账户统计原口径仍是毛 pnl；动态凯利单独使用扣费后的 net_pnl。
                     "pnl": round(part, 2),
+                    "commission": round(commission, 2),
+                    "net_pnl": round(part - commission, 2),
                     "volume": take,
                     "multiplier": mult,
                 }
             )
-            held["left"] = int(held["left"]) - take
+            held["left"] = held_left - take
+            held["fee_left"] = max(0.0, open_fee_left - open_fee)
+            close_fee_left = max(0.0, close_fee_left - close_fee)
             need -= take
         if need > 0:
             unmatched.append({**row, "volume": need})

@@ -105,8 +105,8 @@
     <h1>自动交易系统完整架构<br>与三条数据流</h1>
     <p class="sub">单进程、多线程的期货自动交易系统。界面下发命令，调度线程串行完成扫描、风控、报单与记账；行情与交易数据分库存储，账号与账本以文件为权威、SQLite 为可重建投影。本文给出分层架构、功能块职责，以及实盘、回测、模拟三条链路的数据流向与调用关系。</p>
     <div class="meta">
-      <span class="chip">版本 <b>49.38.0</b></span>
-      <span class="chip">规模 <b>264 个 Python 文件 · 107,939 行</b></span>
+      <span class="chip">版本 <b>49.39.0</b></span>
+      <span class="chip">规模 <b>264 个 Python 文件 · 108,081 行</b></span>
       <span class="chip">测试 <b>182 个测试文件</b></span>
       <span class="chip">基线日期 <b>2026-11-21</b></span>
       <span class="chip">运行形态 <b>单进程多线程</b></span>
@@ -258,7 +258,7 @@ flowchart TB
         <div class="card">
           <span class="tag">RISK</span>
           <h4>风控与仓位</h4>
-          <p>日亏、频率、未完成委托、持仓对账、组合敞口等规则集中在 <code>RiskGuardian</code>；<code>PositionSizer</code> 计算开仓手数；状态写 JSON 并同步 SQLite，重启可恢复。</p>
+          <p>日亏、频率、未完成委托、持仓对账、组合敞口等规则集中在 <code>RiskGuardian</code>；<code>PositionSizer</code> 统一计算开仓手数：分腿动态凯利只给目标，固定风险始终硬封顶，样本不足退回固定风险、负期望拒开。每手风险含止损距离×乘数、开平手续费和双边滑点，最终再与保证金/可用资金、柜台单笔上限取小。当前实盘回撤 5% 减半新开、10% 停开，不强平已有仓；状态写 JSON 并同步 SQLite，重启可恢复。</p>
           <p><strong>不负责：</strong>发单通道、策略方向。</p>
         </div>
         <div class="card">
@@ -396,9 +396,11 @@ flowchart LR
   ENG --> CUR["bar_cursor 逐根推进<br/>drop_forming_bar"]
   CUR --> EVAL["strategy.evaluate()<br/>与实盘同源"]
   EVAL --> SIG["信号"]
-  SIG --> SIZE["PositionSizer<br/>受 max_order_volume 约束"]
+  SIG --> SIZE["PositionSizer<br/>动态凯利 + 固定风险硬上限"]
   SIZE --> FILL["FillModel / Slippage<br/>Liquidity / rollover"]
-  FILL --> TRD["成交明细 trades<br/>lots 记录开仓时间与手数"]
+  FILL --> TRD["成交明细 trades<br/>净盈亏与手数"]
+  TRD --> KELLY["BacktestLimits<br/>本腿净平仓样本"]
+  KELLY --> SIZE
   TRD --> MET["calc_performance<br/>净盈亏 · 回撤 · 胜率 · 盈利因子"]
   MET --> SUM["result_summary<br/>统一结果口径"]
   CUR --> MAN["build_run_manifest<br/>data_sha256 · 参数哈希 · commit"]
@@ -415,7 +417,8 @@ flowchart LR
           <thead><tr><th>能力</th><th>实盘</th><th>回测</th><th>结论</th></tr></thead>
           <tbody>
             <tr><td>策略评估</td><td><code>strategy.evaluate()</code></td><td><code>strategy.evaluate()</code></td><td>同源</td></tr>
-            <tr><td>仓位计算</td><td><code>PositionSizer</code> + 单笔上限</td><td><code>PositionSizer</code> + 单笔上限</td><td>同源（49.21.0 起）</td></tr>
+            <tr><td>仓位计算</td><td><code>PositionSizer</code> + 单笔上限</td><td><code>PositionSizer</code> + 单笔上限</td><td>同源；49.39.0 起共用动态凯利、固定风险硬上限与完整每手成本</td></tr>
+            <tr><td>凯利统计</td><td>账本 <code>matched_closes()</code> 净平仓</td><td><code>BacktestLimits.kelly_rows</code></td><td>均按合约隔离、最近窗口和净盈亏；样本不足与负期望分开处理</td></tr>
             <tr><td>K 线口径</td><td>只认已收线；日线按交易日</td><td>逐根收盘处理</td><td>同源</td></tr>
             <tr><td>成交撮合</td><td>对手价、排队、部分成交</td><td>FillModel + 滑点/流动性模型</td><td>近似，结果页标注</td></tr>
             <tr><td>风控闸门</td><td>日亏、频率、持仓对账、组合敞口</td><td>不模拟</td><td>结果页标注</td></tr>
@@ -491,10 +494,11 @@ flowchart TB
             <tr><td><code>scan_symbol</code></td><td><code>order_executor</code></td><td>开/平仓意图</td><td>进入风控闸门</td></tr>
             <tr><td><code>order_executor</code></td><td><code>run_early_gates / run_send_gates</code></td><td><code>src/kernel/risk_chain.py</code></td><td>闸门顺序固定</td></tr>
             <tr><td>闸门</td><td><code>RiskService / RiskGuardian</code></td><td><code>src/risk/*</code></td><td>日亏、频率、持仓、组合敞口</td></tr>
-            <tr><td>闸门</td><td><code>PositionSizer</code></td><td><code>src/risk/sizing.py</code></td><td>手数与单笔上限</td></tr>
+            <tr><td>闸门</td><td><code>PositionSizer</code></td><td><code>src/risk/sizing.py</code></td><td>动态凯利目标、固定风险硬上限、完整每手成本与单笔上限</td></tr>
             <tr><td>执行器</td><td><code>CtpTrader / GuiTrader / SimTrader</code></td><td><code>src/trader/factory.py</code></td><td>按 <code>trade.executor</code> 选择</td></tr>
             <tr><td>CTP 回调</td><td><code>fill_reconcile</code></td><td><code>src/scheduler/fill_reconcile.py</code></td><td>委托/成交回报入账</td></tr>
-            <tr><td><code>fill_reconcile</code></td><td><code>signal_book.append_trade</code></td><td><code>src/account/signal_book.py</code></td><td>持账本锁，JSON 权威</td></tr>
+            <tr><td><code>fill_reconcile</code></td><td><code>signal_book.append_trade</code></td><td><code>src/account/signal_book.py</code></td><td>持账本锁，JSON 权威；配对平仓分摊手续费并生成净盈亏</td></tr>
+            <tr><td><code>order_executor</code></td><td><code>matched_closes</code></td><td><code>src/account/signal_book.py</code></td><td>读取当前账本的分腿净平仓样本，供下一次动态凯利算仓</td></tr>
             <tr><td><code>signal_book</code></td><td><code>data/trading.db</code></td><td><code>sqlite_ledger</code></td><td>可重建投影</td></tr>
             <tr><td><code>fill_reconcile</code></td><td><code>RiskService.on_order_filled</code></td><td><code>src/risk/service.py</code></td><td>同步净仓与日亏</td></tr>
             <tr><td>回测页</td><td><code>BacktestEngine.run_backtest</code></td><td><code>src/backtest/engine.py</code></td><td>逐根 K 线撮合</td></tr>
@@ -557,6 +561,7 @@ flowchart TB
             <tr><td>依赖方向 2</td><td>业务层不得依赖 <code>src.scheduler</code>、<code>src.ui</code></td><td>研究、风控、账本可独立测试与复用</td></tr>
             <tr><td>依赖方向 3</td><td><code>src.scheduler</code> 不得依赖 <code>src.ui</code></td><td>交易编排不依赖界面，便于无头运行</td></tr>
             <tr><td>闸门顺序</td><td>手数 → 上线阶段 → 未完成委托 → 持仓对账 → 日亏/频率 → 组合敞口</td><td>先廉价、后昂贵；先本账户、后组合</td></tr>
+            <tr><td>双保险算仓</td><td><code>min(全凯利×fraction, max_f_pct, risk_per_trade_pct)</code>；再除以完整每手风险，并与保证金/可用资金、单笔上限取小</td><td>凯利只降目标、不放大固定风险；样本不足可交易，负期望拒开</td></tr>
             <tr><td>幂等</td><td><code>fill_key</code>、<code>event_id</code>、<code>(account_id, symbol, bar_ts, action)</code></td><td>回报重放不重复记账、不重复报单</td></tr>
             <tr><td>账本锁</td><td>读改写统一在 <code>book_lock()</code> 内完成</td><td>避免交易线程与界面互相覆盖</td></tr>
             <tr><td>未知发单</td><td><code>order_dispatch_unknown</code> 熔断，停开新仓，保护性平仓继续</td><td>无法确认是否已报单时，优先防重复</td></tr>

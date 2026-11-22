@@ -71,6 +71,8 @@ class BacktestLimits:
         self.skipped: dict[str, int] = {}
         self.closed_pnls: list[float] = []
         self.closed_ats: list[datetime] = []
+        # 和实盘 matched_closes 同构的净平仓样本；空列表也代表本回测真实零样本。
+        self.kelly_rows: list[dict[str, Any]] = []
         # 账户权益最高点，给回撤减仓用。开跑时用初始资金垫上。
         self.start_capital: float = float(self.sizer.capital)
         self.equity: float = 0.0
@@ -118,6 +120,7 @@ class BacktestLimits:
             current_abs_position=self.guard.total_abs_position(),
             positions=self.guard.positions,
             max_per_order=self.max_per_order,
+            kelly_rows=self.kelly_rows,
         )
         return int(sized.volume), sized.reason
 
@@ -152,6 +155,8 @@ class BacktestLimits:
         self.guard.on_order_filled("close", volume, symbol=symbol)
         self.closed_pnls.append(float(pnl))
         self.closed_ats.append(at if at is not None else datetime.now())
+        # on_close 的 pnl 已由回测引擎扣过手续费和滑点，直接作为凯利净样本。
+        self.kelly_rows.append({"symbol": symbol, "pnl": float(pnl), "volume": int(volume)})
 
 
 def cap_open_volume(allowed: int, meta_volume: Any, *, limits_apply: bool) -> tuple[int, str]:

@@ -417,7 +417,7 @@ def build_tail_sections(app: AutoTradingApp, scroll: ctk.CTkFrame) -> None:
     ).pack(side="left", padx=(0, 8))
     ctk.CTkSwitch(
         kelly_sw,
-        text="打开后由凯利算意图手数",
+        text="打开后由凯利给目标，固定风险仍封顶",
         variable=app.kelly_enabled_var,
         progress_color=T.OK,
         font=T.FONT_SMALL,
@@ -435,7 +435,7 @@ def build_tail_sections(app: AutoTradingApp, scroll: ctk.CTkFrame) -> None:
         box4,
         "凯利每笔最多%",
         app.kelly_max_var,
-        hint="默认2。全凯利再大，每笔也不超过本金的这么多",
+        hint="默认1。与「每笔风险%」一起取更小值，不能突破固定风险",
     )
     app._entry_row(
         box4,
@@ -468,7 +468,7 @@ def build_tail_sections(app: AutoTradingApp, scroll: ctk.CTkFrame) -> None:
         box4,
         "每笔风险%",
         app.risk_pct_var,
-        hint="推荐0.5~1，止损远时自动少开；凯利打开时不用这项",
+        hint="固定风险硬上限。凯利样本不足也用它；止损远时自动少开",
     )
     app._entry_row(
         box4,

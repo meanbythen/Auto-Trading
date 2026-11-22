@@ -143,7 +143,7 @@ footer .sources .src-url { display: block; margin-top: .15rem; font-size: .82rem
   <div class="meta-row">
     <span class="chip">复核基线 49.23.1</span>
     <span class="chip">264 个 Python 文件</span>
-    <span class="chip">107,939 行</span>
+    <span class="chip">108,081 行</span>
     <span class="chip">7 个主页签 + 研究子页</span>
     <span class="chip">182 个测试文件</span>
     <span class="chip">复核日期 2026-11-21</span>
@@ -179,6 +179,10 @@ footer .sources .src-url { display: block; margin-top: .15rem; font-size: .82rem
 
 <div class="callout">
   <p><strong>2026-11-21 复核（49.23.1）：</strong>本页正文保留 44.11.0 的审查现场，结论已按后续版本更新。4 项 P0 于 44.11.0 修复；Q1（热更新绕过档案取小）、Q2（界面改账本覆盖并发成交）于 49.20.3 修复；§7.2 账本/投影/一致性于 49.20.4 完成；§7.3 回测与实盘一致性于 49.21.0 修正或标注；§7.4 规范与文档于 49.22.0 完成；§7.5 的 `result_summary`、K 线内容哈希、`trace_events`/`metrics_snapshot`、启动目录刷新、参数 schema 校验于 49.23.0 完成。当前全量 `pytest`、`lint-imports`、`ruff`、`mypy` 均通过。详细问题清单与验收记录见 <a href="../项目全面审查报告-2026-11-21.md">项目全面审查报告</a>。</p>
+</div>
+
+<div class="callout">
+  <p><strong>2026-11-22 风险配置复核（49.39.0）：</strong>针对「凯利可能单笔冒险 10%、动态回撤保护关闭」的实盘配置，P0 已改为固定风险 1%、回撤 5% 减半新开仓、10% 暂停新开仓，且不强平已有仓。P1 已统一为分策略腿动态凯利定目标、固定风险硬上限：默认四分之一凯利、30 笔最小样本、50 笔窗口，样本不足退回固定风险，负期望拒开；每手风险包含止损、合约乘数、开平手续费与双边滑点，回测和实盘共用公式及净平仓统计。全量 <code>pytest</code> 与 <code>ruff</code> 通过，但尚未据此提交真实订单。P2 组合热度/在途风险预留和 P3 大规模闸门拆除不在本轮范围。</p>
 </div>
 
 <div class="score">
@@ -806,14 +810,14 @@ flowchart LR
 <thead><tr><th style="width:26%">文档</th><th style="width:18%">定位</th><th>内容</th><th style="width:14%">状态</th></tr></thead>
 <tbody>
 <tr><td><a href="../../README.md">README.md</a></td><td>项目介绍</td><td>能做什么、怎么装、路线选择、配置、FAQ、文档索引</td><td><span class="badge b-ok">现行</span></td></tr>
-<tr><td><a href="../../CHANGELOG.md">CHANGELOG.md</a></td><td>版本日志</td><td>逐版本记录功能、修复与行为变化，最新 49.23.1</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../../CHANGELOG.md">CHANGELOG.md</a></td><td>版本日志</td><td>逐版本记录功能、修复与行为变化，最新 49.39.0</td><td><span class="badge b-ok">现行</span></td></tr>
 <tr><td><a href="../实盘交易简易说明书.md">实盘交易简易说明书.md</a></td><td>操作手册</td><td>盘前到收盘五步、CTP 四步上线、对账处理、止损边界、排错</td><td><span class="badge b-ok">现行</span></td></tr>
 <tr><td><a href="../配置说明书.md">配置说明书.md</a></td><td>控件字典</td><td>七个主页签逐项编号说明；44.12.0 新增日历、告警外发、冷备守护配置（HD-14～HD-23）</td><td><span class="badge b-ok">现行</span></td></tr>
 <tr><td><a href="../策略编辑器使用说明.md">策略编辑器使用说明.md</a></td><td>DSL 手册</td><td>YAML 语法、指标库、五个内置模板、与 vnpy 原版对照</td><td><span class="badge b-ok">现行</span></td></tr>
 <tr><td><a href="../扩展能力规划.md">扩展能力规划.md</a></td><td>未来设计</td><td>重构方案第六条五项能力的详细设计，尚未实施</td><td><span class="badge b-ok">现行</span></td></tr>
 <tr><td><a href="../项目全面审查报告-2026-11-21.md">项目全面审查报告-2026-11-21.md</a></td><td>最新审查</td><td>49.20.1 基线；交易链路、回测一致性、账本投影、架构落地核对，§0.2～§0.5 为四批修复复核</td><td><span class="badge b-ok">现行</span></td></tr>
-<tr><td><a href="../auto-trading-architecture/自动交易系统完整架构.html">auto-trading-architecture</a></td><td>架构图</td><td>五层架构、功能块职责、实盘/回测/模拟三条数据流与调用关系（49.23.1）</td><td><span class="badge b-ok">现行</span></td></tr>
-<tr><td><a href="../TODO.md">TODO.md</a></td><td>唯一待办</td><td>人工验收、CTP 上线、策略增强、评估缺口、运维与文档补齐（对应 49.23.1）</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../auto-trading-architecture/自动交易系统完整架构.html">auto-trading-architecture</a></td><td>架构图</td><td>五层架构、功能块职责、实盘/回测/模拟三条数据流与调用关系（49.39.0）</td><td><span class="badge b-ok">现行</span></td></tr>
+<tr><td><a href="../TODO.md">TODO.md</a></td><td>唯一待办</td><td>人工验收、CTP 上线、策略增强、评估缺口、运维与文档补齐（对应 49.39.0）</td><td><span class="badge b-ok">现行</span></td></tr>
 <tr><td><a href="../archive/">archive/</a></td><td>存档</td><td>系统蓝图、代码重构方案、策略基础逻辑、CTP 上线流程、旧操作说明书、specs 等</td><td><span class="badge">归档</span></td></tr>
 <tr><td>已删除</td><td>过时</td><td>4 套日内策略、多因子复合 CTA、凯利突破、以损定开、长线箱体突破等策略说明（有效内容已并入编辑器手册与 TODO）</td><td><span class="badge">删除</span></td></tr>
 </tbody>
@@ -833,8 +837,8 @@ flowchart LR
 <thead><tr><th style="width:14%">优先级</th><th>事项</th><th style="width:20%">详见</th></tr></thead>
 <tbody>
 <tr><td>P0 收尾</td><td>T5.3 / T5.4 人工演练；华泰条件单能力确认；冷备守护演练；CTP 主通道自动降级</td><td><a href="../TODO.md">TODO 第一、二节</a></td></tr>
-<tr><td>P1</td><td>成交质量回流、连续偏离禁开总闸；策略增强（多因子相关性、凯利滚动胜率、箱体加仓/移仓、VPVR）</td><td><a href="../TODO.md">TODO 第一、三节</a></td></tr>
-<tr><td>P2</td><td>评估体系补齐（组合相关性/保证金/蒙特卡洛）、多账户 A/B、告警通道扩展（微信/钉钉/邮件）、故障恢复手册</td><td><a href="../TODO.md">TODO 第四、五节</a></td></tr>
+<tr><td>P1</td><td>成交质量回流、连续偏离禁开总闸；策略增强（多因子相关性、箱体加仓/移仓、VPVR）；分腿动态凯利与固定风险双保险已于 49.39.0 完成</td><td><a href="../TODO.md">TODO 第一、三节</a></td></tr>
+<tr><td>P2</td><td>组合热度与在途风险预留、评估体系补齐（组合相关性/保证金/蒙特卡洛）、多账户 A/B、告警通道扩展（微信/钉钉/邮件）、故障恢复手册</td><td><a href="../TODO.md">TODO 第三至五节</a></td></tr>
 </tbody>
 </table>
 

@@ -39,6 +39,23 @@ def test_margin_zero_does_not_block() -> None:
     assert sized.margin_lots is None
 
 
+def test_complete_risk_includes_fees_and_two_sided_symbol_slippage() -> None:
+    """每手风险 = 止损金额 + 开平费 + 开平各一次滑点。"""
+    cfg = _cfg(0, capital=100_000)
+    cfg["risk"]["risk_per_trade_pct"] = 1
+    cfg["risk"]["contracts"]["bu"].update(
+        {"commission": 1.5, "commission_close": 0.5, "commission_close_today": 2.5, "price_tick": 0.5}
+    )
+    cfg["backtest"] = {"slippage_ticks": 9, "slippage_by_symbol": {"BU2612": 2}}
+    sized = PositionSizer(cfg).calc_open("bu2612", 1000, 990)
+    # 10点×10 + 开1.5 + 平今2.5 + 双边2跳×0.5×10 = 124元/手。
+    assert sized.risk_per_lot == 124
+    assert sized.risk_cash == 1000
+    assert sized.volume == 8
+    assert "开平费4.00" in sized.reason
+    assert "双边滑点20.00" in sized.reason
+
+
 def test_margin_usage_pct_keeps_buffer() -> None:
     """
     权益 21373、每手 10500：按全部权益能开 2 手；

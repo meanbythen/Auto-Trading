@@ -1481,6 +1481,77 @@ def test_strategy_volume_cannot_exceed_risk_sized_lots(tmp_path: Path) -> None:
     assert vol == 0
 
 
+def test_live_size_open_uses_current_books_net_kelly_samples(tmp_path: Path, monkeypatch) -> None:
+    """实盘和回测走同一个 plan_from_config，账本净样本足够且负期望时停开。"""
+    from types import SimpleNamespace
+
+    from src.risk.sizing import PositionSizer
+    from src.scheduler.runner import TradingBot
+    from src.strategy.types import StrategyAction, StrategyDecision
+
+    book = {
+        "trades": [
+            row
+            for day in (1, 2)
+            for row in (
+                {
+                    "time": f"2026-11-{day:02d} 09:00:00",
+                    "symbol": "bu2701",
+                    "offset": "开仓",
+                    "direction": "多",
+                    "price": 100,
+                    "volume": 1,
+                    "multiplier": 10,
+                    "commission": 1,
+                },
+                {
+                    "time": f"2026-11-{day:02d} 10:00:00",
+                    "symbol": "bu2701",
+                    "offset": "平仓",
+                    "direction": "多",
+                    "price": 90,
+                    "volume": 1,
+                    "multiplier": 10,
+                    "commission": 1,
+                },
+            )
+        ]
+    }
+    monkeypatch.setattr("src.account.signal_book.load_book", lambda _root: book)
+    cfg = {
+        "trade": {"volume": 1},
+        "backtest": {"slippage_ticks": 0},
+        "risk": {
+            "sizing_mode": "risk_pct",
+            "capital": 100_000,
+            "risk_per_trade_pct": 1,
+            "min_volume": 1,
+            "margin_per_lot": 0,
+            "contracts": {"bu": {"multiplier": 10}},
+            "dynamic": {"enabled": False},
+            "kelly": {"enabled": True, "auto_from_ledger": True, "min_samples": 2},
+        },
+    }
+
+    class FakeRisk:
+        positions: dict[str, int] = {}
+
+        @staticmethod
+        def total_abs_position() -> int:
+            return 0
+
+    stub = SimpleNamespace(
+        sizer=PositionSizer(cfg), risk=FakeRisk(), root=tmp_path, cfg=cfg, trader=None
+    )
+    decision = StrategyDecision(
+        StrategyAction.BUY_OPEN, "bu2701", "测试", entry_price=100, stop_price=99
+    )
+    volume, reason = TradingBot._size_open(stub, decision)
+    assert volume == 0
+    assert "最近2笔净平仓" in reason
+    assert "正期望" in reason
+
+
 def test_order_volume_cap_reads_the_ctp_settings() -> None:
     """算仓前先读交易对象的单笔上限；GUI 没有 settings 时不压手数。"""
     from types import SimpleNamespace

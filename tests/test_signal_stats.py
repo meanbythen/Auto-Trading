@@ -2,7 +2,7 @@
 
 from datetime import date
 
-from src.account.signal_book import append_trade, new_book
+from src.account.signal_book import append_trade, matched_closes, new_book
 from src.account.signal_stats import analyze_book, format_factor, format_win_rate, span_bounds
 
 
@@ -110,3 +110,43 @@ def test_ctp_calendar_follows_broker_equity_not_matched_closes() -> None:
     assert report.daily_pnl == {date(2026, 11, 18): -44.0}
     assert report.account.net_pnl == -44.0
     assert report.symbols[0].stat.net_pnl == -44.0
+
+
+def test_matched_closes_allocate_open_and_close_commission_to_net_pnl() -> None:
+    """部分平仓按手数分摊两侧手续费；毛盈亏口径不变，同笔开平由凯利再合并。"""
+    book = new_book(10000, version="test", started_at="2026-10-01 09:00:00")
+    append_trade(
+        book,
+        symbol="bu2612",
+        offset="开仓",
+        direction="多",
+        price=100,
+        volume=2,
+        multiplier=10,
+        commission=2,
+        bar_id="open",
+        when="2026-10-02 09:00:00",
+    )
+    for bar_id in ("close-a", "close-b"):
+        append_trade(
+            book,
+            symbol="bu2612",
+            offset="平仓",
+            direction="多",
+            price=110,
+            volume=1,
+            multiplier=10,
+            commission=1,
+            bar_id=bar_id,
+            when="2026-10-02 15:00:00",
+        )
+    rows = matched_closes(book)
+    assert [row["pnl"] for row in rows] == [100, 100]
+    assert [row["commission"] for row in rows] == [2, 2]
+    assert [row["net_pnl"] for row in rows] == [98, 98]
+    assert sum(row["commission"] for row in rows) == 4
+    from src.risk.kelly import summarize_closed_rows
+
+    stats = summarize_closed_rows(rows, "bu2612")
+    assert stats["sample_count"] == 1
+    assert stats["win_rate"] == 1.0

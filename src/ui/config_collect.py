@@ -46,7 +46,7 @@ class ConfigCollectMixin:
             "atr_pause_mult": atr_pause,
             "atr_period": fallback.atr_period,
             "atr_lookback": fallback.atr_lookback,
-            "reduce_held": True,
+            "reduce_held": False,
         }
 
     def _scan_interval_value(self) -> int:

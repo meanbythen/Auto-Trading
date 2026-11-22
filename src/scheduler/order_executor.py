@@ -455,6 +455,16 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
         每笔风险%和仓位上限，否则小权益下会开出买不起的仓。
         """
         meta = decision.meta or {}
+        kelly_rows: list[dict[str, Any]] | None = None
+        from src.risk.kelly import kelly_box
+
+        kelly_cfg = kelly_box(getattr(self, "cfg", None))
+        if kelly_cfg.get("enabled") and kelly_cfg.get("auto_from_ledger", True):
+            from src.account.signal_book import load_book, matched_closes
+
+            # 自动模式没有账本也按真实零样本处理，绝不能退回手工全账户统计。
+            book = load_book(getattr(self, "root", Path(".")))
+            kelly_rows = matched_closes(book) if book is not None else []
         sized = self.sizer.calc_open(
             decision.symbol,
             decision.entry_price,
@@ -462,6 +472,7 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
             current_abs_position=self.risk.total_abs_position(),
             positions=self.risk.positions,
             max_per_order=order_volume_cap(getattr(self, "trader", None)),
+            kelly_rows=kelly_rows,
         )
         raw = meta.get("volume")
         if raw is None:

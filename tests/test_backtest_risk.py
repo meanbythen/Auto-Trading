@@ -133,6 +133,26 @@ def test_daily_loss_halt_clears_on_next_day() -> None:
     assert limits.guard.write_alerts is False
 
 
+def test_backtest_kelly_consumes_net_closed_samples_and_blocks_negative_edge() -> None:
+    """回测先用固定风险度过样本不足，净样本足够且负期望后停开。"""
+    limits = BacktestLimits(
+        _cfg(
+            capital=100_000,
+            risk_per_trade_pct=1,
+            kelly={"enabled": True, "auto_from_ledger": True, "min_samples": 2, "window": 10},
+        )
+    )
+    first, reason = limits.size_open("bu", 100, 99)
+    assert first > 0
+    assert "暂用固定风险1%" in reason
+    limits.on_close(-100, 1, "bu")
+    limits.on_close(-120, 1, "bu")
+    assert [row["pnl"] for row in limits.kelly_rows] == [-100, -120]
+    blocked, reason = limits.size_open("bu", 100, 99)
+    assert blocked == 0
+    assert "正期望" in reason
+
+
 def test_night_session_does_not_reset_counters_at_midnight() -> None:
     """夜盘和次日日盘是一个交易日，跨过零点不能清掉熔断。"""
     limits = BacktestLimits(_cfg(max_daily_loss=50))

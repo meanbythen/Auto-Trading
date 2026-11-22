@@ -671,19 +671,22 @@ trade:
     close_btn: [1250, 560]
 
 risk:
-  # 手数取小：①意图（risk_pct 或 fixed）②仓位上限%
-  # risk_pct：意图手数 = capital × risk_per_trade_pct% ÷ (止损距离 × 乘数)
-  # fixed：意图手数 = trade.volume
-  # 仓位上限：floor((权益×margin_usage_pct% − 已占用) ÷ 每手保证金)；≤0 按全部权益估
+  # 手数取小：①动态目标（凯利或固定风险）②保证金/柜台可用资金 ③单笔委托上限。
+  # 每手风险 = 止损距离×乘数 + 开平手续费 + 开平各一次预计滑点。
+  # risk_per_trade_pct 是固定风险硬上限；凯利只能低于它，不能突破它。
+  # fixed 只给策略意图手数，凯利开启时仍受统一风险上限约束。
   sizing_mode: risk_pct
-  # 凯利公式（可选）：打开后意图手数改用你手填的胜率、盈亏比，不再用每笔风险%或固定手数。
-  # 自己跑完历史回测，把摘要里的胜率和「平均盈利÷平均亏损」填进来。仓位上限、日亏损、波动暂停仍有效。
+  # 分策略腿凯利：从当前账本已平仓记录滚动统计；样本不足退回固定风险，负期望拒绝新开。
+  # auto_from_ledger=false 时才使用下面手工填写的全账户胜率/盈亏比（兼容旧研究口径）。
   kelly:
     enabled: false
-    fraction: 0.5          # 0.25=四分之一 0.5=一半 1=全凯利
-    max_f_pct: 2           # 每笔最多拿本金的百分之几去冒险
-    win_rate_pct: 46       # 胜率，46 表示 46%
-    payoff: 1.2            # 盈亏比 = 平均盈利 ÷ 平均亏损（不是盈利因子）
+    auto_from_ledger: true
+    min_samples: 30        # 至少这么多笔净平仓才启用动态凯利
+    window: 50             # 每条腿只取最近这么多笔
+    fraction: 0.25         # 实盘默认四分之一凯利，降低估计误差和回撤
+    max_f_pct: 1           # 凯利自身封顶；还会与 risk_per_trade_pct 取更小值
+    win_rate_pct: 46       # 仅 auto_from_ledger=false 时使用
+    payoff: 1.2            # 平均盈利 ÷ 平均亏损，不是盈利因子
   # 当前账户余额。配置页只显示，不在这里手改。要改去账户分析。
   # 历史回测和策略优化可以另填一个数，用来测保证金高的品种，也可以再从配置页抄回当前余额。
   capital: 1000000
@@ -710,7 +713,7 @@ risk:
     atr_pause_mult: 2.5
     atr_period: 14
     atr_lookback: 20
-    reduce_held: true
+    reduce_held: false      # 默认只限制新增风险，不在回撤底部强制减已有持仓
   # 每手保证金。0 表示不看。表里没写的品种用这个数。
   margin_per_lot: 0
   # 关注合约+保证金/乘数只认这张总表（配置页可打开/重新读取）。同品种保证金必须相同。

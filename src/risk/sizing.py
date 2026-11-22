@@ -6,10 +6,11 @@
 开仓手数最终取下面几项的最小值（算出来少于最小手数就不开）：
 
 1) 意图手数（想开多少）
-   - 凯利开关打开：用回测胜率/盈亏比算出每笔风险%，再按止损距离换手数
-   - risk_pct：floor(权益 × 每笔风险% ÷ (止损距离 × 合约乘数))
+   - 凯利开关打开：按该腿最近净平仓算动态目标，样本不足用固定风险，负期望不开
+   - risk_pct：floor(权益 × 每笔风险% ÷ 每手完整风险)
+   - 每手完整风险 = 止损距离×乘数 + 开平手续费 + 开平各一次预计滑点
+   - 固定风险%永远是硬上限，凯利不能把它调大
    - fixed：固定手数
-   - 缺入场/止损价：退回固定手数
 
 2) 仓位上限（保证金占用，公共设置）
    - 填了保证金比例：每手占用 = 开仓价 × 每手数量 × 比例%
@@ -150,6 +151,7 @@ class PositionSizer:
         current_abs_position: int = 0,
         positions: dict[str, int] | None = None,
         max_per_order: int | None = None,
+        kelly_rows: list[dict[str, Any]] | None = None,
     ) -> SizeResult:
         """
         计算开仓手数。
@@ -161,10 +163,10 @@ class PositionSizer:
             current_abs_position: 当前已持手数绝对值（用于已占用保证金）
             positions: 各品种净持仓。用来按各自的保证金扣掉已经占用的钱。
             max_per_order: 本机单笔上限（交易对象的 max_order_volume）。
-                回测不传；实盘传了就直接压到手数里，避免算完再被柜台前拦下。
+            kelly_rows: 当前账本已平仓配对；传入空列表也表示这条腿确实没有样本。
         """
         intent, intent_note, risk_cash, risk_per_lot, stop_dist = self._intent_for_symbol(
-            symbol, entry_price, stop_price
+            symbol, entry_price, stop_price, kelly_rows=kelly_rows
         )
         margin_lots, lot_margin, margin_note = self._lots_by_margin_cap(
             symbol, current_abs_position, positions, entry_price
@@ -199,7 +201,7 @@ class PositionSizer:
             using_pct = self.mode != "fixed" or kelly_enabled(self._cfg)
             if using_pct and intent < self.min_volume and stop_dist > 0:
                 why = (
-                    f"按风险{self.risk_pct}%只允许约{intent}手，低于最小{self.min_volume}手"
+                    f"按风险{(risk_cash / self.capital * 100 if self.capital > 0 else 0):g}%只允许约{intent}手，低于最小{self.min_volume}手"
                     f"（止损距{stop_dist:.2f}点，每手亏≈{risk_per_lot:.0f}元，"
                     f"本笔预算{risk_cash:.0f}元）。止损过宽时宁可不做。"
                 )
@@ -244,6 +246,8 @@ class PositionSizer:
         symbol: str,
         entry_price: float | None,
         stop_price: float | None,
+        *,
+        kelly_rows: list[dict[str, Any]] | None = None,
     ) -> tuple[int, str, float, float, float]:
         """意图手数：风险百分比或固定手数。返回 (手数, 说明, 风险预算, 每手风险, 止损距)。"""
         from src.risk.kelly import kelly_enabled, plan_from_config
@@ -251,11 +255,11 @@ class PositionSizer:
         risk_pct = self.risk_pct
         kelly_note = ""
         if kelly_enabled(self._cfg):
-            plan = plan_from_config(self._cfg)
+            plan = plan_from_config(self._cfg, symbol=symbol, closed_rows=kelly_rows)
             if not plan.ok:
                 return 0, plan.reason, 0.0, 0.0, 0.0
-            risk_pct = plan.risk_pct
-            self.risk_pct = risk_pct
+            # 固定风险只读配置，不把某次凯利结果写回运行状态，避免污染下一品种。
+            risk_pct = min(plan.risk_pct, self.risk_pct)
             kelly_note = plan.reason + "；"
 
         if self.mode == "fixed" and not kelly_enabled(self._cfg):
@@ -275,8 +279,19 @@ class PositionSizer:
         if stop_dist <= 0:
             return 0, "止损距离为0，无法按风险算仓，跳过开仓", 0.0, 0.0, 0.0
 
+        from src.backtest.fill import FillModel
+        from src.risk.commission import close_commission_per_lot, open_commission_per_lot
+
         mult = self.multiplier_for(symbol)
-        risk_per_lot = stop_dist * mult
+        # build_contracts 只保留乘数/保证金；手续费必须读同一份原始品种表，不能在这里被丢成 0。
+        fee_contracts = (self._cfg.get("risk") or {}).get("contracts") or {}
+        open_fee = open_commission_per_lot(fee_contracts, symbol)
+        # 开仓时还不知道持有多久，按平今费率预估，和账本/回测手续费配置保持同源。
+        close_fee = close_commission_per_lot(fee_contracts, symbol, close_today=True)
+        fill = FillModel.from_cfg(self._cfg, symbol)
+        slippage_cost = 2 * fill.slippage_ticks * fill.price_tick * mult
+        fee_cost = open_fee + close_fee
+        risk_per_lot = stop_dist * mult + fee_cost + slippage_cost
         risk_cash = self.capital * (risk_pct / 100.0)
         if risk_per_lot <= 0:
             return 0, "每手风险异常，跳过开仓", risk_cash, 0.0, stop_dist
@@ -285,7 +300,7 @@ class PositionSizer:
         note = (
             f"{kelly_note}风险仓位: 权益{self.capital:.0f}×{risk_pct:g}%={risk_cash:.0f}元 "
             f"/ 每手≈{risk_per_lot:.0f}元 → 意图{raw}手"
-            f"（止损距{stop_dist:.2f}，乘数{mult}）"
+            f"（止损距{stop_dist:.2f}，乘数{mult}，开平费{fee_cost:.2f}，双边滑点{slippage_cost:.2f}）"
         )
         return raw, note, risk_cash, risk_per_lot, stop_dist
 
