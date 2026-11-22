@@ -554,6 +554,14 @@ evaluation:
   perturbation_pf_ratio: 0.8
   perturbation_pf_min: 1.1
   mc_runs: 500
+  # 成交层蒙特卡洛：在「成交打乱」之外，给每笔成交再叠执行噪声，看净盈亏/回撤分布。
+  # 每边多付 slip±jitter 跳，外加 0～delay 跳的延迟；partial_fill_prob 默认 0（不做部分成交）。
+  # 只供对照，不参与写入闸；噪声应随实盘滑点日志校准。
+  exec_mc_slip_ticks: 0.5
+  exec_mc_jitter_ticks: 1.0
+  exec_mc_delay_ticks: 0.5
+  exec_mc_partial_fill_prob: 0.0
+  exec_mc_ruin_pct: 20.0
 
 # ---------- 执行通道（见文件顶部路线菜单） ----------
 trade:

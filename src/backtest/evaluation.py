@@ -754,6 +754,38 @@ def check_perturbation(
     )
 
 
+def check_joint_perturbation(
+    *,
+    cliff: bool,
+    worst_pf: float,
+    points: int,
+    thresholds: EvaluationThresholds,
+    error: str = "",
+) -> EvaluationCheck:
+    """多个参数一起扰动后的最差盈利因子。"""
+    if error:
+        return EvaluationCheck(
+            key="joint_perturbation",
+            label="联合扰动",
+            value="—",
+            threshold="不出现断崖",
+            status=SKIP,
+            note=error,
+        )
+    if cliff:
+        status, note = FAIL, "两个参数一起动就崩"
+    else:
+        status, note = PASS, f"{points} 组组合都还站得住"
+    return EvaluationCheck(
+        key="joint_perturbation",
+        label="联合扰动",
+        value=f"最差PF {worst_pf:.2f}",
+        threshold="不出现断崖",
+        status=status,
+        note=note,
+    )
+
+
 def _evaluate_core(
     perf: Performance,
     trades: list[TradeRecord],
@@ -940,6 +972,8 @@ def mark_stress_not_run(report: EvaluationReport, *, reason: str) -> EvaluationR
         report.add_check(_skip_check("slippage", "滑点压力", reason))
     if "perturbation" not in existing:
         report.add_check(_skip_check("perturbation", "参数扰动", reason))
+    if "joint_perturbation" not in existing:
+        report.add_check(_skip_check("joint_perturbation", "联合扰动", reason))
     # 跳过项不参与结论。不要 recompute：测试/外部可能只写了 conclusion、还没填检查项。
     return report
 
@@ -949,9 +983,10 @@ def apply_stress(
     *,
     slippage: dict[str, Any] | None = None,
     perturbation: dict[str, Any] | None = None,
+    joint: dict[str, Any] | None = None,
     thresholds: EvaluationThresholds | None = None,
 ) -> EvaluationReport:
-    """把外部跑出来的滑点/扰动结果并进评估，再重算结论。"""
+    """把外部跑出来的滑点/扰动/联合扰动结果并进评估，再重算结论。"""
     th = thresholds or EvaluationThresholds()
     # 只替换本次传入的压力项。连续调用滑点和扰动时，不能把上一次的结果一起删掉。
     drop = set()
@@ -959,6 +994,8 @@ def apply_stress(
         drop.add("slippage")
     if perturbation is not None:
         drop.add("perturbation")
+    if joint is not None:
+        drop.add("joint_perturbation")
     report.checks = [c for c in report.checks if c.key not in drop]
     if slippage is not None:
         report.add_check(
@@ -993,6 +1030,20 @@ def apply_stress(
         if perturbation.get("worst_pf") is not None:
             report.metrics["perturbation_worst_pf"] = float(
                 perturbation.get("worst_pf") or 0
+            )
+    if joint is not None:
+        report.add_check(
+            check_joint_perturbation(
+                cliff=bool(joint.get("cliff")),
+                worst_pf=float(joint.get("worst_pf") or 0),
+                points=int(joint.get("points_count") or 0),
+                thresholds=th,
+                error=str(joint.get("error") or ""),
+            )
+        )
+        if joint.get("worst_pf") is not None:
+            report.metrics["joint_perturbation_worst_pf"] = float(
+                joint.get("worst_pf") or 0
             )
     report.recompute()
     return report

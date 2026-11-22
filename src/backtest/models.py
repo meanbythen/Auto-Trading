@@ -46,6 +46,8 @@ class BacktestResult:
     rejected: list[RejectedSignal] = field(default_factory=list)
     # 同一根 OHLC 内止损与离场先后不明时，保守成交及其相对乐观口径的影响。
     ambiguities: list[dict[str, Any]] = field(default_factory=list)
+    # 多参数联合扰动结果。没跑或参数不足两个时为空。
+    joint_perturbation: dict[str, Any] = field(default_factory=dict)
     # 这次回测跑完的本地时间。导出 Excel 时原样写进每一行，用来区分前后几次回测。
     ran_at: str = ""
     # 实验清单与归档前暂存的 K 线副本。老结果不填也能继续读取和导出。
@@ -66,8 +68,12 @@ class BacktestResult:
             "rejected": [r.to_dict() for r in self.rejected],
             "ambiguities": self.ambiguities,
             "equity_last": self.equity[-1] if self.equity else None,
+            # 完整权益曲线随归档保存，复盘页和审计视图不用重跑回测。
+            "equity": [round(float(value), 2) for value in self.equity],
+            "equity_times": self.equity_times,
             "params_snapshot": self.params_snapshot,
             "evaluation": self.evaluation.to_dict() if self.evaluation else {},
+            "joint_perturbation": self.joint_perturbation,
             "experiment": self.experiment,
             "run": self.run,
         }

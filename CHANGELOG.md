@@ -4,6 +4,19 @@
 
 规则写在 README 的「版本」一节。已经写在这里的旧版本不再改写，新的改动加在最上面。
 
+## 50.1.0 — 2026-11-22
+
+功能更新。补齐评估体系里一直没做的三项：成交层蒙特卡洛、多参数联合扰动、参数曲面。
+
+- **成交层蒙特卡洛（执行噪声重跑）**：优化结果在原有「成交打乱 + 有放回重抽」之外，新增 `run_execution_monte_carlo`。给每笔成交的开仓和平仓各叠一次执行噪声（滑点 `±jitter` 跳 + `0～delay` 跳延迟），可选按概率部分成交，输出净盈亏中位/5%～95% 分位、回撤中位/95% 分位、回撤超过权益 `exec_mc_ruin_pct` 的概率。只供对照，不参与写入闸。
+- 配置新增 `evaluation.exec_mc_slip_ticks`、`exec_mc_jitter_ticks`、`exec_mc_delay_ticks`、`exec_mc_partial_fill_prob`、`exec_mc_ruin_pct`；默认部分成交关闭，噪声值需按实盘滑点日志校准。
+- **多参数联合扰动**：`stress.py` 新增 `joint_perturb_patches` / `run_joint_perturbation`。取前两个数值参数同时按 ±10% 组成四个角点，逐组回测，最差盈利因子跌破门槛或净亏即判「断崖」。评估新增 `joint_perturbation` 检查项，历史回测、优化冠军复跑都会带上；交叉测试等不跑压力的场景标「—」。
+- 顺带修正参数扰动写回位置：按 `param_section` 落到真实参数节（`macd_swing → ema_swing`），以前个别引擎的扰动没有真正生效。
+- **参数曲面**：新增 `src/backtest/surface.py`，只读优化 trials 生成两参数得分网格，同格取最高分；优化页新增「参数曲面」按钮，弹窗选横纵轴画出热力图，可导出 `data/param_surface.csv`。
+- **完整权益持久化**：`BacktestResult.to_dict()` 现在同时保存完整 `equity` 曲线和 `equity_times`（保留两位小数），归档与 `data/backtest_last.json` 都能直接读；复盘页新增「看最近一次回测权益曲线」，画最近一次回测的权益折线，旧报告缺曲线时提示重跑。
+- 新增测试：`tests/test_execution_monte_carlo.py`、`tests/test_param_surface.py`，并更新优化冠军复跑的调用次数断言。
+- 全量 `pytest`、`ruff check src tests tools`、`mypy src` 通过。
+
 ## 50.0.0 — 2026-11-22
 
 大更新。按仿真对照结论删除 ATR 硬暂停，开仓规则因此变化：高波动时不再停开，只把下一笔手数减半。

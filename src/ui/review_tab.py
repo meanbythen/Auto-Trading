@@ -151,6 +151,17 @@ class ReviewTabMixin:
             text_color=T.TEXT,
             command=self._fill_review_from_config,
         ).pack(fill="x", padx=4, pady=(0, 8))
+        ctk.CTkButton(
+            left,
+            text="看最近一次回测权益曲线",
+            height=34,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._show_backtest_equity,
+        ).pack(fill="x", padx=4, pady=(0, 8))
 
         right = ctk.CTkFrame(tab, fg_color=T.BG_ELEVATED, corner_radius=12)
         right.grid(row=0, column=1, sticky="nsew", padx=(8, 8), pady=8)
@@ -192,6 +203,83 @@ class ReviewTabMixin:
         symbol = str(self.rv_symbol_var.get() or "").strip()
         return "" if symbol in {"", "（还没有）"} else symbol
 
+
+    def _show_backtest_equity(self) -> None:
+        """画最近一次回测的完整权益曲线。只读 data/backtest_last.json，不改任何东西。"""
+        import json
+        import tkinter as tk
+        from tkinter import messagebox
+
+        path = self.root_dir / "data" / "backtest_last.json"
+        if not path.exists():
+            messagebox.showinfo("还没有回测", "先到回测页跑一次，再来看权益曲线。")
+            return
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except Exception as exc:  # noqa: BLE001
+            messagebox.showerror("读不出来", f"{path} 解析失败：{exc}")
+            return
+        values = [float(value) for value in payload.get("equity") or []]
+        times = [str(value) for value in payload.get("equity_times") or []]
+        if len(values) < 2:
+            messagebox.showinfo(
+                "没有完整曲线",
+                "这份回测是旧版本保存的，只存了最后一个权益值。\n重新跑一次回测就会带上完整曲线。",
+            )
+            return
+        step = max(1, len(values) // 2000)
+        points = list(range(0, len(values), step))
+        if points[-1] != len(values) - 1:
+            points.append(len(values) - 1)
+
+        win = ctk.CTkToplevel(self)
+        win.title("回测权益曲线")
+        win.geometry("900x520")
+        win.transient(self)
+        head = ctk.CTkLabel(
+            win,
+            text=(
+                f"{payload.get('symbol') or '—'} · {payload.get('timeframe') or '—'} 分钟 · "
+                f"{len(values)} 个点 · 末值 {values[-1]:,.0f} 元"
+            ),
+            font=T.FONT_BODY,
+            text_color=T.TEXT,
+        )
+        head.pack(anchor="w", padx=14, pady=(12, 4))
+        canvas = tk.Canvas(win, bg=T.BG, highlightthickness=0)
+        canvas.pack(fill="both", expand=True, padx=14, pady=(0, 6))
+        footer = ctk.CTkLabel(
+            win,
+            text=f"{times[0] if times else ''}  ～  {times[-1] if times else ''}    纵轴：权益（元）",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+        )
+        footer.pack(anchor="w", padx=14, pady=(0, 12))
+
+        def _paint(_event: object | None = None) -> None:
+            canvas.delete("all")
+            width = max(480, int(canvas.winfo_width()))
+            height = max(260, int(canvas.winfo_height()))
+            left, right_pad, top, bottom = 70, 18, 18, 34
+            plot_w = max(60, width - left - right_pad)
+            plot_h = max(60, height - top - bottom)
+            low = min(values)
+            high = max(values)
+            if high - low < 1e-9:
+                high, low = high + 1.0, low - 1.0
+            coords: list[float] = []
+            for index in points:
+                x = left + plot_w * index / max(1, len(values) - 1)
+                y = top + plot_h * (high - values[index]) / (high - low)
+                coords.extend([x, y])
+            canvas.create_line(*coords, fill=T.ACCENT, width=2)
+            canvas.create_text(left - 6, top, anchor="e", text=f"{high:,.0f}", fill=T.TEXT_DIM, font=("Consolas", 9))
+            canvas.create_text(left - 6, top + plot_h, anchor="e", text=f"{low:,.0f}", fill=T.TEXT_DIM, font=("Consolas", 9))
+            canvas.create_text(left, top + plot_h + 6, anchor="nw", text=times[0] if times else "起点", fill=T.TEXT_DIM, font=("Consolas", 9))
+            canvas.create_text(left + plot_w, top + plot_h + 6, anchor="ne", text=times[-1] if times else "终点", fill=T.TEXT_DIM, font=("Consolas", 9))
+
+        canvas.bind("<Configure>", _paint)
+        win.after(120, _paint)
 
     def _on_release_sheet(self) -> None:
         """生成上线评审单：五项证据一页，签字另存，不改任何交易参数。"""

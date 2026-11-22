@@ -48,7 +48,12 @@ from src.backtest.frozen_oos import (
 )
 from src.backtest.monte_carlo import (
     DEFAULT_MC_RUNS,
+    DEFAULT_EXEC_DELAY_TICKS,
+    DEFAULT_EXEC_JITTER_TICKS,
+    DEFAULT_EXEC_RUIN_PCT,
+    DEFAULT_EXEC_SLIP_TICKS,
     judge_monte_carlo,
+    run_execution_monte_carlo,
     run_trade_monte_carlo,
     trade_pnls,
 )
@@ -836,6 +841,31 @@ def _gate_freeze_and_monte_carlo(
     )
     mc_ok, mc_reason = judge_monte_carlo(mc_box)
     mc_box["reason"] = mc_reason
+    if report is not None:
+        report("执行噪声重跑")
+    try:
+        from src.backtest.fill import FillModel
+        from src.domain.contracts import DEFAULT_MULTIPLIER, contract_multipliers
+        from src.risk.universe_table import product_key
+
+        fill = FillModel.from_cfg(cfg, symbol=symbol)
+        tick = fill.price_tick
+        mult = contract_multipliers(cfg).get(product_key(symbol), DEFAULT_MULTIPLIER)
+    except Exception:  # noqa: BLE001 - 取不到合约参数就按 1 跳/10 倍兜底
+        tick, mult = 1.0, DEFAULT_MULTIPLIER
+    mc_box["execution"] = run_execution_monte_carlo(
+        mc_trades,
+        capital=capital,
+        tick_size=tick,
+        multiplier=mult,
+        n_runs=mc_runs,
+        seed=42,
+        slip_ticks=ev.get("exec_mc_slip_ticks", DEFAULT_EXEC_SLIP_TICKS),
+        jitter_ticks=ev.get("exec_mc_jitter_ticks", DEFAULT_EXEC_JITTER_TICKS),
+        delay_ticks=ev.get("exec_mc_delay_ticks", DEFAULT_EXEC_DELAY_TICKS),
+        partial_fill_prob=ev.get("exec_mc_partial_fill_prob", 0.0),
+        ruin_pct=ev.get("exec_mc_ruin_pct", DEFAULT_EXEC_RUIN_PCT),
+    )
     if (not mc_box.get("skipped")) and gate and not mc_ok:
         accepted = False
     if mc_reason:

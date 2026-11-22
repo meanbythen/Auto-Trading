@@ -367,7 +367,25 @@ class OptimizeTabMixin:
         self.opt_result_box = ctk.CTkTextbox(
             right, font=T.FONT_MONO, fg_color=T.BG, text_color=T.TEXT, corner_radius=10, wrap="word"
         )
-        self.opt_result_box.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 12))
+        self.opt_result_box.grid(row=3, column=0, sticky="nsew", padx=12, pady=(0, 8))
+        surface_bar = ctk.CTkFrame(right, fg_color="transparent")
+        surface_bar.grid(row=4, column=0, sticky="ew", padx=12, pady=(0, 12))
+        self.opt_surface_btn = ctk.CTkButton(
+            surface_bar,
+            text="参数曲面",
+            width=110,
+            fg_color=T.BG,
+            hover_color=T.BG_ELEVATED,
+            text_color=T.TEXT,
+            command=self._open_opt_surface,
+        )
+        self.opt_surface_btn.pack(side="left")
+        ctk.CTkLabel(
+            surface_bar,
+            text="用本轮试验画两个参数的得分热力图，不重跑回测",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+        ).pack(side="left", padx=10)
         self.opt_result_box.insert(
             "end",
             "点左侧「开始策略优化」。第一次选旋钮：开关关掉即可。\n"
@@ -377,6 +395,197 @@ class OptimizeTabMixin:
         # 打开界面时刷新一次历史下拉
         self.after(200, self._refresh_opt_history)
 
+
+    def _open_opt_surface(self) -> None:
+        """用本轮 trials 打开参数曲面窗口，不重跑回测。"""
+        from tkinter import messagebox
+
+        trials = list(getattr(self, "_last_opt_trials", []) or [])
+        if not trials:
+            messagebox.showinfo("还没有试验", "先跑一轮策略优化，再用这一轮的参数组合画曲面。")
+            return
+        from src.backtest.surface import numeric_param_keys
+
+        keys = numeric_param_keys(trials)
+        if len(keys) < 2:
+            messagebox.showinfo("参数不足", "本轮试验里不足两个数值参数，画不出二维曲面。")
+            return
+        old = getattr(self, "_opt_surface_win", None)
+        if old is not None:
+            try:
+                old.destroy()
+            except Exception:  # noqa: BLE001
+                pass
+
+        win = ctk.CTkToplevel(self)
+        win.title("参数曲面")
+        win.geometry("820x620")
+        win.transient(self)
+        top = ctk.CTkFrame(win, fg_color="transparent")
+        top.pack(fill="x", padx=12, pady=(12, 6))
+        ctk.CTkLabel(top, text="横轴", font=T.FONT_SMALL, text_color=T.TEXT_DIM).pack(side="left")
+        x_var = ctk.StringVar(value=keys[0])
+        ctk.CTkOptionMenu(top, values=keys, variable=x_var, width=150).pack(side="left", padx=(6, 16))
+        ctk.CTkLabel(top, text="纵轴", font=T.FONT_SMALL, text_color=T.TEXT_DIM).pack(side="left")
+        y_var = ctk.StringVar(value=keys[1])
+        ctk.CTkOptionMenu(top, values=keys, variable=y_var, width=150).pack(side="left", padx=(6, 16))
+        status = ctk.CTkLabel(top, text="", font=T.FONT_SMALL, text_color=T.TEXT_DIM)
+        status.pack(side="left", padx=6)
+
+        import tkinter as tk
+
+        canvas = tk.Canvas(win, bg=T.BG, highlightthickness=0)
+        canvas.pack(fill="both", expand=True, padx=12, pady=(0, 6))
+        bottom = ctk.CTkFrame(win, fg_color="transparent")
+        bottom.pack(fill="x", padx=12, pady=(0, 12))
+        state: dict[str, Any] = {"surface": None}
+
+        def _draw() -> None:
+            from src.backtest.surface import build_surface
+
+            surface = build_surface(trials, x_var.get(), y_var.get())
+            state["surface"] = surface
+            if not surface.get("ok"):
+                canvas.delete("all")
+                canvas.create_text(
+                    20,
+                    20,
+                    anchor="nw",
+                    text=str(surface.get("error") or "画不出来"),
+                    fill=T.TEXT_DIM,
+                    font=("Microsoft YaHei UI", 12),
+                )
+                status.configure(text="")
+                return
+            self._paint_surface(canvas, surface)
+            status.configure(
+                text=f"{len(surface['cells'])} 格 · 最高 {float(surface['best']['score']):.3f}"
+            )
+
+        def _export() -> None:
+            from src.backtest.surface import save_surface_csv
+
+            surface = state.get("surface")
+            if not surface or not surface.get("ok"):
+                messagebox.showinfo("还没有曲面", "先点「画图」，再导出。")
+                return
+            path = self.root_dir / "data" / "param_surface.csv"
+            save_surface_csv(surface, path)
+            status.configure(text=f"已导出 {path}")
+
+        ctk.CTkButton(bottom, text="画图", width=90, command=_draw).pack(side="left")
+        ctk.CTkButton(
+            bottom,
+            text="导出 CSV",
+            width=100,
+            fg_color=T.BG,
+            hover_color=T.BG_ELEVATED,
+            text_color=T.TEXT,
+            command=_export,
+        ).pack(side="left", padx=8)
+        ctk.CTkLabel(
+            bottom,
+            text="颜色越绿得分越高，灰格表示这组参数没跑到",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+        ).pack(side="left", padx=8)
+        self._opt_surface_win = win
+        win.after(120, _draw)
+
+    def _paint_surface(self, canvas: Any, surface: dict[str, Any]) -> None:
+        """把曲面画成热力图。行=纵轴，列=横轴，颜色只表达得分高低。"""
+        canvas.delete("all")
+        xs = [float(value) for value in surface.get("x_values") or []]
+        ys = [float(value) for value in surface.get("y_values") or []]
+        if len(xs) < 2 or len(ys) < 2:
+            return
+        cells = {
+            (float(cell["x"]), float(cell["y"])): float(cell["score"])
+            for cell in surface.get("cells") or []
+        }
+        canvas.update_idletasks()
+        width = max(520, int(canvas.winfo_width()))
+        height = max(320, int(canvas.winfo_height()))
+        left, right_pad, top, bottom = 86, 24, 34, 62
+        plot_w = max(80, width - left - right_pad)
+        plot_h = max(80, height - top - bottom)
+        cell_w = plot_w / len(xs)
+        cell_h = plot_h / len(ys)
+        values = list(cells.values())
+        low = min(values) if values else 0.0
+        high = max(values) if values else 1.0
+        best = surface.get("best") or {}
+
+        def _color(value: float | None) -> str:
+            if value is None:
+                return "#2A2E35"
+            t = 0.0 if high - low < 1e-12 else max(0.0, min(1.0, (value - low) / (high - low)))
+            red = int(196 + (86 - 196) * t)
+            green = int(88 + (160 - 88) * t)
+            blue = int(80 + (96 - 80) * t)
+            return f"#{red:02x}{green:02x}{blue:02x}"
+
+        canvas.create_text(
+            left,
+            12,
+            anchor="nw",
+            text=f"{surface.get('x_key')} × {surface.get('y_key')}（行=纵轴，列=横轴）",
+            fill=T.TEXT,
+            font=("Microsoft YaHei UI", 11),
+        )
+        for row, y in enumerate(ys):
+            # 纵轴从下往上，第一行贴在绘图区底部。
+            y0 = top + plot_h - (row + 1) * cell_h
+            canvas.create_text(
+                left - 8,
+                y0 + cell_h / 2,
+                anchor="e",
+                text=f"{y:g}",
+                fill=T.TEXT_DIM,
+                font=("Consolas", 9),
+            )
+            for col, x in enumerate(xs):
+                x0 = left + col * cell_w
+                score = cells.get((x, y))
+                canvas.create_rectangle(
+                    x0,
+                    y0,
+                    x0 + cell_w,
+                    y0 + cell_h,
+                    fill=_color(score),
+                    outline=T.BG,
+                    width=1,
+                )
+                if best and abs(float(best.get("x") or 0) - x) < 1e-9 and abs(
+                    float(best.get("y") or 0) - y
+                ) < 1e-9:
+                    canvas.create_rectangle(
+                        x0 + 1,
+                        y0 + 1,
+                        x0 + cell_w - 1,
+                        y0 + cell_h - 1,
+                        outline=T.ACCENT,
+                        width=3,
+                    )
+                if score is not None and cell_w >= 44 and cell_h >= 20:
+                    canvas.create_text(
+                        x0 + cell_w / 2,
+                        y0 + cell_h / 2,
+                        text=f"{score:.2f}",
+                        fill="#101418",
+                        font=("Consolas", 9),
+                    )
+        for col, x in enumerate(xs):
+            if len(xs) > 12 and col % 2:
+                continue
+            canvas.create_text(
+                left + col * cell_w + cell_w / 2,
+                top + plot_h + 8,
+                anchor="n",
+                text=f"{x:g}",
+                fill=T.TEXT_DIM,
+                font=("Consolas", 9),
+            )
 
     def _show_opt_progress(self, done: int, total: int, phase: str = "", *, force: bool = False) -> None:
         """
@@ -801,14 +1010,21 @@ class OptimizeTabMixin:
                         )
                 from src.backtest.evaluation import format_evaluation_lines
                 from src.backtest.frozen_oos import format_freeze_lines
-                from src.backtest.monte_carlo import format_monte_carlo_lines
+                from src.backtest.monte_carlo import (
+                    format_execution_monte_carlo_lines,
+                    format_monte_carlo_lines,
+                )
 
+                mc_box = getattr(result, "monte_carlo", None) or {}
                 lines.extend(
                     [
                         "",
                         *format_freeze_lines(getattr(result, "freeze", None)),
                         "",
-                        *format_monte_carlo_lines(getattr(result, "monte_carlo", None)),
+                        *format_monte_carlo_lines(mc_box),
+                        *format_execution_monte_carlo_lines(
+                            mc_box.get("execution") if isinstance(mc_box, dict) else None
+                        ),
                         *(
                             format_evaluation_lines(result.evaluation, title="策略评估")
                             if result.evaluation

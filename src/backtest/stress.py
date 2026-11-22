@@ -1,15 +1,17 @@
 """
 回测压力测试
-功能：滑点加压和参数扰动。都用同一套回测，只改一个条件，看绩效会不会掉下门槛。
+功能：滑点加压、单参数扰动和多参数联合扰动。都用同一套回测，只改条件，看绩效会不会掉下门槛。
 原理：
   - 滑点压力：在当前滑点上再加 N 跳重跑一遍，看盈利因子还剩多少。
   - 参数扰动：把当前策略的数值参数各按 ±10% 动一下，任何一点都不许出现断崖。
+  - 联合扰动：取前两个数值参数，同时按 ±10% 组合成四个角点，看一起动会不会崩。
 这两项只在历史回测和策略优化里跑；交叉测试组合太多，不在这里跑。
 """
 
 from __future__ import annotations
 
 import copy
+import itertools
 from typing import Any, Callable
 
 from loguru import logger
@@ -186,6 +188,11 @@ def _apply_patch(cfg: dict[str, Any], patch: dict[str, Any], engine: str | None)
     out = copy.deepcopy(cfg)
     st = out.setdefault("strategy", {})
     name = str(engine or st.get("engine") or "").strip()
+    if name:
+        from src.strategy.factory import param_section
+
+        # 引擎名和参数节不一定同名（macd_swing → ema_swing），写到参数节才真的生效。
+        name = param_section(name) or name
     box = st.get(name) if name else None
     if not isinstance(box, dict):
         box = st.setdefault(name, {}) if name else st
@@ -282,6 +289,160 @@ def run_perturbation(
     return out
 
 
+JOINT_MAX_PARAMS = 2
+
+
+def _numeric_keys(
+    box: dict[str, Any],
+    param_keys: list[str] | None,
+    limit: int,
+) -> list[str]:
+    """先按指定顺序，再按配置顺序，凑够 limit 个数值参数。"""
+    keys: list[str] = []
+    for key in [str(item) for item in (param_keys or []) if str(item)]:
+        if key in box and _is_number(box.get(key)) and key not in keys:
+            keys.append(key)
+    for key in box:
+        if len(keys) >= limit:
+            break
+        if key not in keys and _is_number(box.get(key)):
+            keys.append(key)
+    return keys[:limit]
+
+
+def joint_perturb_patches(
+    cfg: dict[str, Any],
+    param_keys: list[str] | None = None,
+    *,
+    step_pct: float = 0.10,
+    max_params: int = JOINT_MAX_PARAMS,
+) -> list[dict[str, Any]]:
+    """
+    取前几个数值参数，同时上下扰动，生成所有角点组合。
+
+    默认两个参数 × 上下 = 4 组。参数不足两个时返回空，交给调用方跳过。
+    """
+    box = _engine_box(cfg, None)
+    if not box:
+        return []
+    step = max(0.0, float(step_pct or 0))
+    if step <= 0:
+        return []
+    keys = _numeric_keys(box, param_keys, max(2, int(max_params)))
+    if len(keys) < 2:
+        return []
+    patches: list[dict[str, Any]] = []
+    seen: set[tuple[tuple[str, float], ...]] = set()
+    for signs in itertools.product((1.0, -1.0), repeat=len(keys)):
+        patch: dict[str, Any] = {}
+        for key, sign in zip(keys, signs):
+            current = box.get(key)
+            raw = float(current) * (1.0 + sign * step)
+            if isinstance(current, int) and not isinstance(current, bool):
+                value: float | int = max(1, int(round(raw)))
+                if value == int(current):
+                    continue
+            else:
+                value = round(raw, 6)
+                if abs(float(value) - float(current)) < 1e-9:
+                    continue
+            patch[key] = value
+        if not patch:
+            continue
+        mark = tuple(sorted((key, float(value)) for key, value in patch.items()))
+        if mark in seen:
+            continue
+        seen.add(mark)
+        patches.append(patch)
+    return patches
+
+
+def run_joint_perturbation(
+    cfg: dict[str, Any],
+    *,
+    symbol: str,
+    param_keys: list[str] | None = None,
+    base_pf: float = 0.0,
+    thresholds: EvaluationThresholds | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    engine: str | None = None,
+    chain_capital: bool | None = None,
+    runner: Runner | None = None,
+    on_step: Callable[[int, int, str], None] | None = None,
+    cancel: Callable[[], bool] | None = None,
+) -> dict[str, Any]:
+    """两个参数一起往两边动，逐组回测；判定口径与单参数扰动相同。"""
+    th = thresholds or EvaluationThresholds()
+    patches = joint_perturb_patches(
+        cfg,
+        param_keys,
+        step_pct=th.perturbation_step_pct,
+    )
+    out: dict[str, Any] = {
+        "ok": False,
+        "cliff": False,
+        "points": [],
+        "points_count": 0,
+        "worst_pf": None,
+        "error": "",
+    }
+    if not patches:
+        out["error"] = "不足两个可扰动的数值参数"
+        return out
+    fn = runner or run_backtest
+    floor = max(th.perturbation_pf_min, th.perturbation_pf_ratio * float(base_pf or 0))
+    cliff = False
+    worst = float("inf")
+    details: list[dict[str, Any]] = []
+    total = len(patches)
+    for index, patch in enumerate(patches, start=1):
+        if cancel is not None and cancel():
+            out["error"] = "已取消"
+            break
+        label = "，".join(f"{key}={value:g}" for key, value in patch.items())
+        if on_step is not None:
+            on_step(index, total, label)
+        local = _apply_patch(cfg, patch, engine)
+        try:
+            result = _runner_call(
+                fn,
+                local,
+                symbol=symbol,
+                start_date=start_date,
+                end_date=end_date,
+                engine=engine,
+                chain_capital=chain_capital,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("联合扰动 {} 没跑成: {}", label, exc)
+            out["error"] = str(exc)
+            continue
+        perf = getattr(result, "performance", None)
+        if perf is None:
+            continue
+        pf = float(getattr(perf, "profit_factor", 0) or 0)
+        net = float(getattr(perf, "net_pnl", 0) or 0)
+        worst = min(worst, pf)
+        if net <= 0 or pf < floor:
+            cliff = True
+        details.append(
+            {
+                "label": label,
+                "params": dict(patch),
+                "profit_factor": round(pf, 4),
+                "net_pnl": round(net, 2),
+                "trades": int(getattr(perf, "trades", 0) or 0),
+            }
+        )
+    out["points"] = details
+    out["points_count"] = len(details)
+    out["cliff"] = cliff
+    out["worst_pf"] = round(worst, 4) if details else None
+    out["ok"] = bool(details) and not cliff and not out["error"]
+    return out
+
+
 def evaluate_with_stress(
     cfg: dict[str, Any],
     result: Any,
@@ -298,11 +459,11 @@ def evaluate_with_stress(
     on_start: Callable[[], None] | None = None,
 ) -> tuple[EvaluationReport | None, dict[str, Any], dict[str, Any], str]:
     """
-    对一次回测结果做完整评估：基础检查 + 滑点压力 + 参数扰动。
+    对一次回测结果做完整评估：基础检查 + 滑点压力 + 单参数扰动 + 联合扰动。
 
     历史回测页和策略优化的冠军复跑都走这里。样本门槛、压力开关、执行顺序和提示文案
     只维护这一份，避免两边各写一套后慢慢跑偏。
-    返回 (评估报告, 滑点结果, 扰动结果, 压力说明)。
+    返回 (评估报告, 滑点结果, 扰动结果, 压力说明)。联合扰动结果同时写到 result 上。
     """
     th = thresholds or EvaluationThresholds.from_cfg(cfg)
     report = report if report is not None else getattr(result, "evaluation", None)
@@ -348,5 +509,22 @@ def evaluate_with_stress(
         runner=fn,
     )
     report = apply_stress(report, perturbation=pert, thresholds=th)
+    joint = run_joint_perturbation(
+        cfg,
+        symbol=symbol,
+        param_keys=list(param_keys) if param_keys else None,
+        base_pf=float(getattr(perf, "profit_factor", 0) or 0),
+        thresholds=th,
+        start_date=start_date,
+        end_date=end_date,
+        engine=engine,
+        chain_capital=chain_capital,
+        runner=fn,
+    )
+    report = apply_stress(report, joint=joint, thresholds=th)
+    try:
+        result.joint_perturbation = joint
+    except AttributeError:
+        pass
     result.evaluation = report
     return report, slip, pert, ""

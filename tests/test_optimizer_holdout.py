@@ -823,12 +823,19 @@ def test_champion_evaluation_and_stress_share_full_range_config(monkeypatch) -> 
     assert not report.skipped
     assert slip["profit_factor"] == 1.6
     assert pert["points_count"] == 4
-    assert len(full_calls) == 1
+    # 1 次冠军复跑 + 4 组联合扰动；都必须在全区间上跑。
+    assert len(full_calls) == 5
     full_cfg, full_kwargs = full_calls[0]
     assert full_cfg["strategy"]["trend_follow"] == {"entry_bars": 48, "atr_mult": 2.5}
     assert full_kwargs["start_date"] == "2026-10-01"
     assert full_kwargs["end_date"] == "2026-10-31"
     assert "bars_signal" not in full_kwargs
+    for joint_cfg, joint_kwargs in full_calls[1:]:
+        assert joint_kwargs["start_date"] == "2026-10-01"
+        assert joint_kwargs["end_date"] == "2026-10-31"
+        assert joint_cfg["strategy"]["trend_follow"]["entry_bars"] in (43, 48, 53)
+        assert joint_cfg["strategy"]["trend_follow"]["atr_mult"] in (2.25, 2.5, 2.75)
+    assert any(check.key == "joint_perturbation" for check in report.checks)
     assert cfg == original
     assert training_snapshot == {"segment": "train", "entry_bars": 48}
 
