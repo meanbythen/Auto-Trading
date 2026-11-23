@@ -87,6 +87,7 @@ FACTORY_DEFAULT_SNAPSHOT: dict[str, Any] = {
         "slope_ema": 120,
         "slope_min_deg": 3.0,
         "slope_lookback": 20,
+        "slope_method": "reg",
         "slope_exit": False,
         "no_open_before_close_min": 30,
         "flatten_at_close": False,

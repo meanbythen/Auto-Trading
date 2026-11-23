@@ -171,13 +171,13 @@ def test_create_dual_ma() -> None:
     assert isinstance(create_strategy(_cfg("ma_cross")), DualMaStrategy)
 
 
-def test_create_macd_swing() -> None:
+def test_create_ema_swing() -> None:
     """均线波段是单独的一套，不能掉回日内实体，也不能当成已删的 macd。旧名 macd_swing 仍能打开。"""
-    from src.strategy.macd_swing import MacdSwingStrategy
+    from src.strategy.ema_swing import EmaSwingStrategy
 
     strategy = create_strategy(_cfg("ema_swing"))
-    assert isinstance(strategy, MacdSwingStrategy)
-    assert isinstance(create_strategy(_cfg("macd_swing")), MacdSwingStrategy)
+    assert isinstance(strategy, EmaSwingStrategy)
+    assert isinstance(create_strategy(_cfg("macd_swing")), EmaSwingStrategy)
     assert not strategy.flatten_at_close
     assert strategy.fast_ma == 60
     assert strategy.slow_ma == 120

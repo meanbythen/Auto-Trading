@@ -2,7 +2,7 @@
 from .base import StrategyBase
 from .daily_body import DailyBodyStrategy
 from .dual_ma import DualMaStrategy
-from .macd_swing import MacdSwingStrategy
+from .ema_swing import EmaSwingStrategy
 from .factory import (
     CROSS_TEST_ENGINE_ORDER,
     ENGINE_ALIASES,
@@ -40,7 +40,7 @@ __all__ = [
     "DailyBodyStrategy",
     "SuperTrendStrategy",
     "DualMaStrategy",
-    "MacdSwingStrategy",
+    "EmaSwingStrategy",
     "TrendFollowStrategy",
     "SwingTrendStrategy",
     "SwingBoxStrategy",

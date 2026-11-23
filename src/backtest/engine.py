@@ -1865,7 +1865,7 @@ def run_backtest(
         "src.strategy.trend_follow",
         "src.strategy.supertrend",
         "src.strategy.dual_ma",
-        "src.strategy.macd_swing",
+        "src.strategy.ema_swing",
         "src.strategy.bollinger_break",
         "src.strategy.sar_trend",
         "src.strategy.multi_factor",

@@ -36,10 +36,10 @@ from .types import (
 )
 
 
-class MacdSwingStrategy(StrategyBase):
+class EmaSwingStrategy(StrategyBase):
     """均线波段：方向均线定多空，信号均线排好就开，止损跟指定均线。
 
-    类名仍叫 MacdSwingStrategy，只是历史文件名没改；界面和下单记录用 ema_swing / 「均线波段」。
+    引擎名、配置节、下单记录都用 ema_swing / 「均线波段」。
     """
 
     SIGNAL_NAME = "ema_swing"  # 成交记录、回测表上的引擎名
@@ -92,6 +92,9 @@ class MacdSwingStrategy(StrategyBase):
         except (TypeError, ValueError):
             self.slope_lookback = 20
         self.slope_lookback = max(2, min(120, self.slope_lookback))
+        # 斜率估计方式：reg=最近 N 根线性回归（抗端点毛刺，默认），diff=首尾两点差（旧口径）。
+        method = str(box.get("slope_method", "reg") or "reg").strip().lower()
+        self.slope_method = method if method in {"reg", "diff"} else "reg"
         # 出厂关：倾角只拦新开仓。打开后倾角不够也会平掉已有仓，方便对照收益。
         self.slope_exit = config_flag(box.get("slope_exit", False), default=False)
         # 尾盘空仓不开：填 0 等于关掉这一条。
@@ -359,6 +362,7 @@ class MacdSwingStrategy(StrategyBase):
             lookback=self.slope_lookback,
             min_deg=self.slope_min_deg,
             period=self.slope_ema,
+            method=self.slope_method,
         )
         if blocked:
             return StrategyDecision(StrategyAction.HOLD, symbol, slope_msg)
@@ -418,6 +422,7 @@ class MacdSwingStrategy(StrategyBase):
                 lookback=self.slope_lookback,
                 min_deg=self.slope_min_deg,
                 period=self.slope_ema,
+                method=self.slope_method,
             )
             if blocked:
                 return self._close_decision(
@@ -620,24 +625,44 @@ def _stop_ma_too_flat(
     lookback: int,
     min_deg: float,
     period: int,
+    method: str = "reg",
 ) -> tuple[bool, str]:
-    """倾角均线走平或斜反了，拦新开仓。已经持仓的不管。"""
+    """倾角均线走平或斜反了，拦新开仓。已经持仓的不管。
+
+    method="reg" 默认：最近 N+1 根做一元线性回归，用拟合斜率换算 N 根累计涨幅；
+    method="diff" 旧口径：只看首尾两点。两种都按 N × ATR 归一化。
+    """
     if min_deg <= 0:
         return False, ""
     n = max(2, int(lookback))
     if len(ema_stop) <= n:
         return True, f"EMA{period} 还不够 {n} 根，算不出倾角，先不开"
-    prev = ema_stop.iloc[-1 - n]
     now_v = ema_stop.iloc[-1]
-    if pd.isna(prev) or pd.isna(now_v):
+    if pd.isna(now_v):
         return True, f"EMA{period} 倾角还没算稳，先不开"
+    use_reg = str(method or "").strip().lower() != "diff"
+    if use_reg:
+        vals = [float(v) for v in pd.to_numeric(ema_stop.iloc[-(n + 1) :], errors="coerce")]
+        if any(pd.isna(v) for v in vals):
+            return True, f"EMA{period} 倾角还没算稳，先不开"
+        m = len(vals)
+        mean_x = (m - 1) / 2.0
+        mean_y = sum(vals) / m
+        den = sum((i - mean_x) ** 2 for i in range(m))
+        slope = sum((i - mean_x) * (v - mean_y) for i, v in enumerate(vals)) / den
+        rise = slope * n
+    else:
+        prev = ema_stop.iloc[-1 - n]
+        if pd.isna(prev):
+            return True, f"EMA{period} 倾角还没算稳，先不开"
+        rise = float(now_v) - float(prev)
     high = pd.to_numeric(bars["high"], errors="coerce") if "high" in bars.columns else close_s
     low = pd.to_numeric(bars["low"], errors="coerce") if "low" in bars.columns else close_s
     atr_s = average_true_range(high, low, close_s, 14).dropna()
     atr = float(atr_s.iloc[-1]) if len(atr_s) else 0.0
     if atr <= 1e-12:
         atr = max(abs(float(now_v)) * 0.001, 1e-6)
-    ang = ema_angle_deg(float(now_v), float(prev), n, atr)
+    ang = ema_angle_deg(float(now_v), float(now_v) - rise, n, atr)
     if side == "long" and ang < min_deg:
         return True, (
             f"EMA{period} 近 {n} 根倾角 {ang:.1f}°，不够往上（要 ≥ {min_deg:g}°），"

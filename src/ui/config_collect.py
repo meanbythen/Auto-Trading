@@ -259,7 +259,7 @@ class ConfigCollectMixin:
         for dead in ("macd_fast", "macd_slow", "macd_signal", "macd_combo"):
             macd_box.pop(dead, None)
         macd_box["flatten_at_close"] = False
-        from src.strategy.macd_swing import (
+        from src.strategy.ema_swing import (
             format_sig_triple,
             parse_close_guard_min,
             parse_dir_pair,

@@ -4,10 +4,11 @@ from datetime import datetime
 
 import pandas as pd
 
-from src.strategy.macd_swing import (
-    MacdSwingStrategy,
+from src.strategy.ema_swing import (
+    EmaSwingStrategy,
     _broke_ema120,
     _fast_stacked,
+    _stop_ma_too_flat,
     parse_dir_pair,
     parse_ema_len,
     parse_sig_triple,
@@ -61,7 +62,7 @@ def test_trail_timeframe_follows_public_stop_period() -> None:
     cfg = _cfg()
     cfg["strategy"]["timeframe"] = "15"
     cfg["strategy"]["trail_timeframe"] = "5"
-    s = MacdSwingStrategy(cfg)
+    s = EmaSwingStrategy(cfg)
     assert s.timeframe == "15"
     assert s.trail_timeframe == "5"
 
@@ -82,7 +83,7 @@ def test_parse_free_ema_numbers() -> None:
     assert parse_ema_len("EMA122") == 122
     assert parse_dir_pair("EMA(21) / EMA(122)", 60, 120) == (21, 122)
     assert parse_dir_pair(None, 122, 21) == (21, 122)
-    s = MacdSwingStrategy(_cfg(dir_ema_fast=21, dir_ema_slow=122, dir_ema_pair="", sig_ema_a=8, sig_ema_b=21, sig_ema_c=55))
+    s = EmaSwingStrategy(_cfg(dir_ema_fast=21, dir_ema_slow=122, dir_ema_pair="", sig_ema_a=8, sig_ema_b=21, sig_ema_c=55))
     assert (s.fast_ma, s.slow_ma) == (21, 122)
     assert (s.sig_a, s.sig_b, s.sig_c) == (8, 21, 55)
 
@@ -102,7 +103,7 @@ def test_fast_stack_and_break() -> None:
 
 def test_opens_long_when_fast_lines_stacked_after_golden_cross() -> None:
     closes = _steady_up()
-    s = MacdSwingStrategy(_cfg())
+    s = EmaSwingStrategy(_cfg())
     opened = None
     for i in range(122, len(closes)):
         bars = _frame(closes[: i + 1])
@@ -126,7 +127,7 @@ def test_opens_after_gap_even_if_cross_bar_skipped() -> None:
     bounce = [down[-1] + i * 1.2 for i in range(8)]
     gap = [bounce[-1] - 25]
     closes = down + bounce + gap
-    s = MacdSwingStrategy(_cfg())
+    s = EmaSwingStrategy(_cfg())
     opened = None
     for i in range(122, len(closes)):
         bars = _frame(closes[: i + 1])
@@ -142,7 +143,7 @@ def test_opens_after_gap_even_if_cross_bar_skipped() -> None:
 
 def test_stop_is_ema120_and_then_follows() -> None:
     closes = _steady_up()
-    s = MacdSwingStrategy(_cfg())
+    s = EmaSwingStrategy(_cfg())
     opened = None
     cut = 0
     for i in range(122, len(closes)):
@@ -167,7 +168,7 @@ def test_keeps_short_bias_when_price_pokes_above_ema120() -> None:
     down = [200 - i * 0.7 for i in range(160)]
     bounce = [down[-1] + i * 0.4 for i in range(20)]
     closes = down + bounce
-    s = MacdSwingStrategy(_cfg())
+    s = EmaSwingStrategy(_cfg())
     for i in range(122, len(closes)):
         bars = _frame(closes[: i + 1])
         now = bars.index[-1].to_pydatetime()
@@ -185,7 +186,7 @@ def test_flat_blocks_open_last_30_minutes_before_close() -> None:
     cfg["schedule"]["trading_sessions"] = _commodity_sessions()
     closes = _steady_up()
     opened_i = None
-    probe = MacdSwingStrategy(cfg)
+    probe = EmaSwingStrategy(cfg)
     for i in range(122, len(closes)):
         bars = _frame(closes[: i + 1])
         decision = probe.evaluate(
@@ -195,7 +196,7 @@ def test_flat_blocks_open_last_30_minutes_before_close() -> None:
             opened_i = i
             break
     assert opened_i is not None
-    blocked = MacdSwingStrategy(cfg)
+    blocked = EmaSwingStrategy(cfg)
     late = blocked.evaluate(
         "bu2612",
         _frame(closes[: opened_i + 1]),
@@ -211,7 +212,7 @@ def test_close_guard_minutes_from_config() -> None:
     cfg["schedule"]["trading_sessions"] = _commodity_sessions()
     closes = _steady_up()
     opened_i = None
-    probe = MacdSwingStrategy(cfg)
+    probe = EmaSwingStrategy(cfg)
     for i in range(122, len(closes)):
         bars = _frame(closes[: i + 1])
         decision = probe.evaluate(
@@ -221,7 +222,7 @@ def test_close_guard_minutes_from_config() -> None:
             opened_i = i
             break
     assert opened_i is not None
-    late = MacdSwingStrategy(cfg).evaluate(
+    late = EmaSwingStrategy(cfg).evaluate(
         "bu2612",
         _frame(closes[: opened_i + 1]),
         now=datetime(2026, 10, 21, 14, 51),
@@ -231,7 +232,7 @@ def test_close_guard_minutes_from_config() -> None:
 
     off_cfg = _cfg(no_open_before_close_min=0)
     off_cfg["schedule"]["trading_sessions"] = _commodity_sessions()
-    still = MacdSwingStrategy(off_cfg).evaluate(
+    still = EmaSwingStrategy(off_cfg).evaluate(
         "bu2612",
         _frame(closes[: opened_i + 1]),
         now=datetime(2026, 10, 21, 14, 51),
@@ -244,7 +245,7 @@ def test_existing_position_still_managed_before_close() -> None:
     cfg = _cfg()
     cfg["schedule"]["trading_sessions"] = _commodity_sessions()
     closes = _steady_up()
-    s = MacdSwingStrategy(cfg)
+    s = EmaSwingStrategy(cfg)
     s.positions["bu2612"] = PositionState(
         symbol="bu2612",
         side="long",
@@ -265,7 +266,7 @@ def test_lunch_break_is_not_session_close() -> None:
     cfg = _cfg()
     cfg["schedule"]["trading_sessions"] = _commodity_sessions()
     closes = _steady_up()
-    s = MacdSwingStrategy(cfg)
+    s = EmaSwingStrategy(cfg)
     opened = None
     for i in range(122, len(closes)):
         bars = _frame(closes[: i + 1])
@@ -280,7 +281,7 @@ def test_lunch_break_is_not_session_close() -> None:
 
 def test_side_stop_slope_can_be_different_lines() -> None:
     """多空分界线、止损、倾角可以不是同一根均线。"""
-    s = MacdSwingStrategy(_cfg(side_ema=60, stop_ema=120, slope_ema=60))
+    s = EmaSwingStrategy(_cfg(side_ema=60, stop_ema=120, slope_ema=60))
     assert s.side_ema == 60
     assert s.stop_ema == 120
     assert s.slope_ema == 60
@@ -303,7 +304,7 @@ def test_old_stop_ema_only_config_keeps_three_in_sync() -> None:
 
 
 def test_ignores_root_flatten_switch() -> None:
-    s = MacdSwingStrategy(_cfg())
+    s = EmaSwingStrategy(_cfg())
     assert s.flatten_at_close is False
     assert s.is_flatten_time(datetime(2026, 10, 23, 14, 55)) is False
 
@@ -312,7 +313,7 @@ def test_create_via_factory() -> None:
     from src.strategy.factory import create_strategy
 
     s = create_strategy(_cfg())
-    assert isinstance(s, MacdSwingStrategy)
+    assert isinstance(s, EmaSwingStrategy)
     assert not hasattr(s, "cluster_width")
     assert s.slope_min_deg == 0.0
 
@@ -320,7 +321,7 @@ def test_create_via_factory() -> None:
 def test_slope_exit_off_keeps_position_when_flat() -> None:
     """开关关掉时，倾角不够只拦新开仓，已有多单继续拿。"""
     closes = _steady_up()
-    s = MacdSwingStrategy(_cfg(slope_min_deg=80.0, slope_exit=False))
+    s = EmaSwingStrategy(_cfg(slope_min_deg=80.0, slope_exit=False))
     s.positions["bu2612"] = PositionState(
         symbol="bu2612",
         side="long",
@@ -337,7 +338,7 @@ def test_slope_exit_off_keeps_position_when_flat() -> None:
 def test_slope_exit_on_closes_when_flat() -> None:
     """开关打开且倾角门槛很高时，已有仓因为倾角不够而平，不反手。"""
     closes = _steady_up()
-    s = MacdSwingStrategy(_cfg(slope_min_deg=80.0, slope_exit=True))
+    s = EmaSwingStrategy(_cfg(slope_min_deg=80.0, slope_exit=True))
     s.positions["bu2612"] = PositionState(
         symbol="bu2612",
         side="long",
@@ -355,7 +356,7 @@ def test_slope_exit_on_closes_when_flat() -> None:
 def test_rollover_carry_opens_even_when_slope_blocks() -> None:
     """换月移仓不再等倾角和三线。倾角门槛很高时，普通开仓不开，移仓仍开。"""
     closes = _steady_up()
-    s = MacdSwingStrategy(_cfg(slope_min_deg=80.0, slope_lookback=20))
+    s = EmaSwingStrategy(_cfg(slope_min_deg=80.0, slope_lookback=20))
     bars = _frame(closes)
     now = bars.index[-1].to_pydatetime()
     blocked = s.evaluate("bu2612", bars, now=now)
@@ -370,13 +371,46 @@ def test_rollover_carry_opens_even_when_slope_blocks() -> None:
 def test_blocks_open_when_ema120_flat() -> None:
     """门槛填很大时，黄线再怎么斜也不够，不开仓。"""
     closes = _steady_up()
-    s = MacdSwingStrategy(_cfg(slope_min_deg=80.0, slope_lookback=20))
+    s = EmaSwingStrategy(_cfg(slope_min_deg=80.0, slope_lookback=20))
     for i in range(122, len(closes)):
         bars = _frame(closes[: i + 1])
         now = bars.index[-1].to_pydatetime()
         decision = s.evaluate("bu2612", bars, now=now)
         assert decision.action != StrategyAction.BUY_OPEN, decision.reason
         assert decision.action != StrategyAction.SELL_OPEN, decision.reason
+
+
+def test_slope_method_switch() -> None:
+    """默认用回归；填 diff 回旧口径；填错也退回回归。"""
+    assert EmaSwingStrategy(_cfg()).slope_method == "reg"
+    assert EmaSwingStrategy(_cfg(slope_method="diff")).slope_method == "diff"
+    assert EmaSwingStrategy(_cfg(slope_method="DIFF")).slope_method == "diff"
+    assert EmaSwingStrategy(_cfg(slope_method="other")).slope_method == "reg"
+
+
+def test_slope_reg_ignores_last_bar_spike() -> None:
+    """EMA 前 40 根走平、最后一根突然抬高：首尾差会误判成陡峭，回归不会。"""
+    frame = _frame([100.0] * 41)
+    ema = pd.Series([100.0] * 40 + [120.0], index=frame.index)
+    blocked_diff, _ = _stop_ma_too_flat(
+        "long", ema, frame, frame["close"], lookback=20, min_deg=15.0, period=120, method="diff"
+    )
+    blocked_reg, _ = _stop_ma_too_flat(
+        "long", ema, frame, frame["close"], lookback=20, min_deg=15.0, period=120, method="reg"
+    )
+    assert blocked_diff is False
+    assert blocked_reg is True
+
+
+def test_slope_reg_passes_steady_rise() -> None:
+    """均线稳定上行时，回归口径也要放行。"""
+    frame = _frame([100.0] * 41)
+    ema = pd.Series([100.0 + i for i in range(41)], index=frame.index)
+    for method in ("reg", "diff"):
+        blocked, msg = _stop_ma_too_flat(
+            "long", ema, frame, frame["close"], lookback=20, min_deg=3.0, period=120, method=method
+        )
+        assert blocked is False, msg
 
 
 def test_old_macd_engine_still_falls_back() -> None:
@@ -392,7 +426,7 @@ def test_death_cross_flattens_long() -> None:
     """拿着多单时 60/120 死叉，平掉。"""
     closes = [180 - i * 0.8 for i in range(160)]
     bars = _frame(closes)
-    s = MacdSwingStrategy(_cfg())
+    s = EmaSwingStrategy(_cfg())
     s.positions["bu2612"] = PositionState(
         symbol="bu2612",
         side="long",
@@ -432,7 +466,7 @@ def test_optimizer_accepts_free_ema_numbers() -> None:
     assert box["side_ema"] == 60
     assert box["stop_ema"] == 90
     assert box["slope_ema"] == 45
-    s = MacdSwingStrategy(out)
+    s = EmaSwingStrategy(out)
     assert (s.fast_ma, s.slow_ma) == (21, 122)
     assert (s.sig_a, s.sig_b, s.sig_c) == (8, 21, 55)
     assert s.side_ema == 60

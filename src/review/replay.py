@@ -297,7 +297,7 @@ def _walk(
         "src.strategy.trend_follow",
         "src.strategy.supertrend",
         "src.strategy.dual_ma",
-        "src.strategy.macd_swing",
+        "src.strategy.ema_swing",
         "src.strategy.swing_trend",
         "src.strategy.swing_box",
         "src.strategy.dual_donchian",

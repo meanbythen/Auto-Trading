@@ -250,7 +250,7 @@ class ConfigVarsMixin:
         self.dual_long_var = ctk.StringVar(value=str(dual_box.get("long_period", 60)))
         self.dual_reverse_var = ctk.BooleanVar(value=bool(dual_box.get("reverse_on_cross", True)))
         macd_box = st.get("ema_swing") or st.get("macd_swing") or {}
-        from src.strategy.macd_swing import (
+        from src.strategy.ema_swing import (
             parse_close_guard_min,
             parse_dir_pair,
             parse_ema_len,
@@ -1000,7 +1000,7 @@ class ConfigVarsMixin:
         self.dual_long_var.set(str(dual_box.get("long_period", 60)))
         self.dual_reverse_var.set(bool(dual_box.get("reverse_on_cross", True)))
         macd_box = st.get("ema_swing") or st.get("macd_swing") or {}
-        from src.strategy.macd_swing import (
+        from src.strategy.ema_swing import (
             parse_close_guard_min,
             parse_dir_pair,
             parse_ema_len,

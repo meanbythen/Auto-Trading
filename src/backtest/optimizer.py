@@ -1132,7 +1132,7 @@ def _apply_params(cfg: dict[str, Any], params: dict[str, Any], engine: str | Non
                 "dir_ema_fast",
                 "dir_ema_slow",
             ):
-                from src.strategy.macd_swing import parse_dir_pair, parse_ema_len
+                from src.strategy.ema_swing import parse_dir_pair, parse_ema_len
 
                 # 优化表可写 21/122，也可分开写两根。短的会排到前面。
                 if k == "dir_ema_pair":
@@ -1161,7 +1161,7 @@ def _apply_params(cfg: dict[str, Any], params: dict[str, Any], engine: str | Non
                 "sig_ema_b",
                 "sig_ema_c",
             ):
-                from src.strategy.macd_swing import format_sig_triple, parse_ema_len, parse_sig_triple
+                from src.strategy.ema_swing import format_sig_triple, parse_ema_len, parse_sig_triple
 
                 if k == "sig_ema_triple":
                     a, b, c = parse_sig_triple(v)
@@ -1182,12 +1182,12 @@ def _apply_params(cfg: dict[str, Any], params: dict[str, Any], engine: str | Non
                 box["slope_exit"] = _opt_bool(v, False)
                 continue
             if engine in ("ema_swing", "macd_swing") and k == "no_open_before_close_min":
-                from src.strategy.macd_swing import parse_close_guard_min
+                from src.strategy.ema_swing import parse_close_guard_min
 
                 box["no_open_before_close_min"] = parse_close_guard_min(v, 30)
                 continue
             if engine in ("ema_swing", "macd_swing") and k in ("stop_ema", "side_ema", "slope_ema"):
-                from src.strategy.macd_swing import parse_ema_len
+                from src.strategy.ema_swing import parse_ema_len
 
                 box[k] = parse_ema_len(v, 120)
                 continue

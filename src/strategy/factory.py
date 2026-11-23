@@ -26,7 +26,7 @@ from .daily_body import DailyBodyStrategy
 from .kelly_break import KellyBreakStrategy
 from .liq_stop import LiquidityStopStrategy
 from .dual_ma import DualMaStrategy
-from .macd_swing import MacdSwingStrategy
+from .ema_swing import EmaSwingStrategy
 from .multi_factor import MultiFactorStrategy
 from .params import DEFAULT_ENGINE, ENGINE_SECTION_DEFAULTS, StrategyParams
 from .rule_dsl import RuleConfigError, RuleStrategy, rule_engine_stem
@@ -259,8 +259,8 @@ REGISTRY: dict[str, StrategyFactory] = {
     "dual_ma": DualMaStrategy,
     "ma_cross": DualMaStrategy,
     # 均线波段：界面名「均线波段」。macd_swing 是旧配置别名，不是已删的 macd。
-    "ema_swing": MacdSwingStrategy,
-    "macd_swing": MacdSwingStrategy,
+    "ema_swing": EmaSwingStrategy,
+    "macd_swing": EmaSwingStrategy,
     # 布林带趋势突破（不做轨道反转）
     "bollinger": BollingerBreakStrategy,
     "boll": BollingerBreakStrategy,
