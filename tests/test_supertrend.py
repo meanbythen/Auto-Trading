@@ -8,7 +8,7 @@ import pandas as pd
 
 from src.strategy.indicators import supertrend
 from src.strategy.supertrend import SuperTrendStrategy
-from src.strategy.types import StrategyAction
+from src.strategy.types import PositionState, StrategyAction
 
 
 def _cfg() -> dict:
@@ -90,3 +90,17 @@ def test_trail_timeframe_follows_public_stop_period() -> None:
     s = SuperTrendStrategy(cfg)
     assert s.timeframe == "15"
     assert s.trail_timeframe == "5"
+
+
+def test_close_decision_accepts_explicit_stop_price() -> None:
+    """翻转/止损离场会带上当根 ST 线；以前少这个参数会直接抛 TypeError。"""
+    strat = SuperTrendStrategy(_cfg())
+    pos = PositionState(symbol="bu2612")
+    pos.side = "long"
+    pos.entry_price = 3000.0
+    pos.initial_stop = 2950.0
+    decision = strat._close_decision(
+        "bu2612", pos, datetime(2026, 1, 5, 15, 0), "2026-01-05", "测试离场", stop_price=2960.0
+    )
+    assert decision.action == StrategyAction.CLOSE
+    assert decision.stop_price == 2960.0

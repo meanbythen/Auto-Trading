@@ -4,6 +4,133 @@
 
 规则写在 README 的「版本」一节。已经写在这里的旧版本不再改写，新的改动加在最上面。
 
+## 53.6.0 — 2026-11-23
+
+斜率门统一「0=关闭」：`slope_gate` 的 `min_deg` 与 `min_t` 都为 0 时视同关闭。现有配置阈值非 0，开仓行为不变，属于功能更新。
+
+- `SlopeGate.enabled` 改为有效开关：`enabled=true` 但 `min_deg=0` 且 `min_t=0` 时返回 false，`check()` 直接放行、不读 K 线，`need_bars` 也不再占用预热。
+- 只开 t 值门（`min_deg=0`、`min_t>0`）仍算启用，不会被误关。
+- `ema_swing` 原本就是 `slope_min_deg=0` 且 `slope_min_t=0` 时直接放行；本次统一了两套门的语义。自适应 `slope_adaptive` / `adaptive` 仍是独立开关，关掉即回到固定 `min_deg`。
+- 新增 2 项测试：0/0 视为关闭且不拦开仓；0 角度 + t 值门仍启用。
+- 研究文档 3.4 与阶段表补阶段 9。
+
+## 53.5.0 — 2026-11-23
+
+斜率对照工具支持自适应维度，并完成 EMA60/6° 的 3 折样本外验收。配置未变，开仓行为与 53.4.0 一致，属于功能更新。
+
+- `tools/slope_gate_compare.py` 新增 `--adaptive`（如 `0,1`）和 `--adaptive-daily`（如 `1`）：`ema_swing` 写 `slope_adaptive` / `slope_adaptive_daily`，`trend_follow` / `supertrend` 写 `slope_gate.adaptive` / `adaptive_daily`；基线始终强制为固定阈值，不受配置里的自适应开关影响。
+- 邻域判定按「t 值 + 自适应 + 日冻结」分组，避免固定阈值和自适应阈值混在一起比较；控制台和 JSON 明细增加 `adaptive`、`adaptive_daily` 字段。
+- 3 折样本外 A/B（15 分钟，EMA60、20 根回看，lh2701 + fu2701）：
+  - 固定 6°：76 笔，全段净盈亏 +38209 / 回撤 45349，样本内 Calmar 0.32，样本外 +23612 / Calmar 1.78，3/3 折为正。
+  - 6° + 自适应 + 日冻结：62 笔，全段净盈亏 +36373 / 回撤 35752，样本内 Calmar 0.54，样本外 +16894 / Calmar 1.11，3/3 折为正。
+  - 判定：唯一未过的是「样本外净盈亏不输基线」（16894 < 23612）；成交数、正收益折、样本外 Calmar 比例、全段 Calmar（1.02 > 0.84）都合格。回撤降低约 21%，全段风险收益比更好。
+- 按用户决定保留 `slope_adaptive: true` + `slope_adaptive_daily: true`，记为「未过单条验收线但主动取舍」；明细在 `data/斜率闸门对照_ema_swing_自适应.json`。
+
+## 53.4.0 — 2026-11-23
+
+自适应阈值增加「日线开盘冻结」开关，并把均线波段切到 EMA60/6° 方案。
+
+- 新增 `adaptive_threshold_from_bars()`：按期货交易日缓存阈值，同一交易日只算一次；夜盘 21:00 起算下一交易日。冻结命中时直接复用，不再逐根重算角度序列；不同合约按 `symbol` 分开缓存。
+- `ema_swing` 新增 `slope_adaptive_daily`（默认 true）；`slope_gate` 新增 `adaptive_daily`（默认 true）。要恢复逐根更新，把它设为 false。
+- `ema_swing` 当前配置切到 `slope_ema: 60`、`slope_min_deg: 6.0`、`slope_adaptive: true`，对应分布分析里唯一真正浮动的场景。
+- `SlopeGate.check()` 增加 `symbol` 参数，`trend_follow`、`supertrend` 调用时传入，保证多品种各自冻结。
+- 默认值同步 `params.py`、`param_history.py`、`config.yaml`、`config.example.yaml`、两份策略说明；配置说明书增加 CF-67f6。
+- 单段实测（15 分钟，EMA60/6°，日线冻结）：lh 关闭 28 笔 +36830/回撤 22228，开启 26 笔 +34570/回撤 16604；fu 关闭 48 笔 +1380/回撤 23121，开启 36 笔 +1804/回撤 19148。净盈亏合计略降 5%，回撤和胜率改善。
+- 新增 4 项测试：交易日切换、同日冻结与跨日重算、gate 缓存开关、`_stop_ma_too_flat` 冻结后阈值不变。
+
+## 53.3.0 — 2026-11-23
+
+新增自适应斜率阈值的分布分析工具，只读本地 K 线，不改配置、不下单。
+
+- `tools/slope_adaptive_report.py`：按「场景（均线:基准角度）× 合约」输出阈值均值/中位/标准差/q10/q90/最小/最大、抬高与降低占比、触顶/触底占比、覆盖率变化、单根变动；结果写入 `data/自适应斜率阈值分布.xlsx`（说明 / 分布 / 品种汇总）。
+- 默认场景 `20:4.5,60:6,120:3`，对应「当前配置 / EMA60 基准 / 设计基准」。
+- 实测结论（15 分钟，lh/fu 共 13 个合约、2395~5498 根）：
+  - EMA20/4.5°：98%~99% 的 K 线阈值触顶 5.85°，标准差 0.13~0.19，自适应退化成固定 5.85°；覆盖率从 49.5%~68.3% 降到 39.4%~59.3%。
+  - EMA60/6°：阈值真正波动，fu 均值 7.22~7.54°、lh 5.63~6.56°，q10 4.2~6.75，覆盖率从 20.9%~40.8% 收敛到 23.4%~29.9%，接近 20%~25% 的目标。
+  - EMA120/3°：fu 97%~99% 触顶 3.9°，lh2701 均值 3.52°（60% 触顶），多数合约仍退化成固定值。
+- 因此自适应要真正起作用，基准 `T0` 必须接近该品种的 q80；基准远低于 q80 时，夹紧上限会把它变成另一个固定阈值。
+
+## 53.2.0 — 2026-11-23
+
+实现设计文档 3.4 的自适应斜率阈值，默认关闭，固定阈值下逐根行为不变，所以是功能更新。
+
+- `slope.py` 新增 `slope_angle_series()`：逐根算均线倾角，reg 用滚动回归闭式解，diff 用首尾两点差，口径与 `measure_slope` 完全一致（单测逐点对齐最后几根）。自适应阈值需要看历史角度分布，不能只算最后一根。
+- 新增 `adaptive_angle_threshold()`：取过去 `window` 根 |角度| 的 `quantile` 分位，夹在基准的 0.7~1.3 倍内；当前这根已收盘，允许计入；有效角度不足 50 根时退回固定阈值，避免预热期乱跳。
+- `ema_swing` 新增 `slope_adaptive`（默认 false）、`slope_adaptive_quantile`（0.8）、`slope_adaptive_window`（500）；开启后 `slope_min_deg` 变成基准值，开仓与 `slope_exit` 共用同一套有效阈值，拦截原因会写「自适应阈值 x°，基准 y°」。
+- `SlopeGateConfig` 与 `load_slope_gate()` 新增 `adaptive / adaptive_quantile / adaptive_window`，`trend_follow`、`supertrend` 的 `slope_gate` 可直接开启；关闭时不做任何额外计算。
+- `params.py`、`param_history.py`、`config.yaml`、`config.example.yaml`、`strategies/ema_swing.yaml`、`strategies/supertrend.yaml` 同步默认值；`docs/配置说明书.md` 增加 CF-67f3~CF-67f5；研究文档 3.4 标注已实现，第 7 节增加阶段 6。
+- 新增 `tests/test_slope_adaptive.py` 9 项：角度序列与单点口径一致（reg/diff）、分位夹紧、样本不足回退、窗口截取、门在历史很陡+当前 3.2° 时由放行变拦截、`ema_swing` 同样由放行变拦截、配置解析与默认关闭。
+- 单段实测（15 分钟，4.5°+EMA20）：lh 关闭 39 笔 +60762/回撤 13946、开启 35 笔 +60554/回撤 12274；fu 关闭 71 笔 +3983、开启 65 笔 -1062。合计不如固定阈值，默认保持关闭，等待 3 折样本外 A/B。
+
+## 53.1.0 — 2026-11-23
+
+把 P0 的斜率 t 值质量门接进 `ema_swing`，与原有的 ATR 角度并存。默认 `slope_min_t: 0`，等于关闭，原有配置和逐根开仓行为不变，所以是功能更新。
+
+- `ema_swing` 新增配置 `slope_min_t`（`strategy.ema_swing.slope_min_t`，默认 0）：角度门槛管「陡不陡」，t 值门槛管「这条均线可不可信」。两个门槛同时开启时都要通过才放行；`slope_exit` 打开时也按同一套判离场。
+- t 值来自现有 `measure_slope` 的回归结果（斜率 ÷ 标准误），20 根回看的临界值约 2.09；配置里填负数按绝对值处理，填错退回 0。
+- `diff` 口径没有 t 值，开了 `slope_min_t` 会一直按「算不出」拦下，提示文字会写明原因。
+- `params.py`、`param_history.py`、`config.yaml`、`config.example.yaml`、`strategies/ema_swing.yaml` 同步新键默认值；`docs/配置说明书.md` 增加 CF-67f2。
+- 新增 `tests/test_ema_swing.py` 6 项：配置解析、锯齿角度够但 t 值低被拦、干净上涨双门放行、diff 口径提示算不出、只开 t 值门也能拦住开仓、默认 0 保持原开仓行为。
+- `tools/slope_gate_compare.py` 新增 `--min-t`：`ema_swing` 可对照 `slope_min_deg` × `slope_min_t` 网格，`trend_follow`/`supertrend` 可对照 `min_deg` × `min_t`；判定按 `min_t` 分组做邻域检查。实跑 lh2701 3° 与 3°+t2.1 结果完全一致（入场时 t 值本来就高），t=1000 时 26 笔全被拦，确认接入生效。
+
+## 53.0.0 — 2026-11-23
+
+执行斜率阶段 4：把可选的 `slope_gate` 接进其他趋势策略，按真实回测 A/B 决定是否启用。`supertrend` 默认启用，属于开仓行为变化，所以升大版本。
+
+- 共用门新增 `SlopeGateConfig` / `load_slope_gate()` / `SlopeGate`（`src/strategy/slope.py`）：可配置 `enabled`、`ema_period`、`lookback`、`method`、`min_deg`、`min_t`、`price_side`；关闭时不读 K 线、零开销。
+- `trend_follow` 接入可选门（默认关闭）：突破方向与 EMA 斜率不一致时不开仓；A/B 显示开闸后样本外净盈亏和全段 Calmar 都变差，保持关闭。
+- `supertrend` 接入可选门并默认开启 `min_deg=2.5°`：lh+fu 15 分钟 3 折 A/B 中，关闭时全段亏 1028，开启后全段 +23765、回撤从 37262 降到 13210、三折全正、样本外 Calmar 1.68，通过全部验收线。日线周期未标定，启用前需重新跑对照。
+- `tools/slope_gate_compare.py` 支持 `--engine trend_follow|supertrend`：自动跑「关闭」基线 + 多个 `min_deg`，复用时间折和验收线，输出 `data/斜率闸门对照_<引擎>.json`。
+- 修复 `supertrend._close_decision()` 不接收 `stop_price` 的旧 bug：此前一回测到平仓就抛 `TypeError`，导致 supertrend 的回测只有 4~6 笔，A/B 数据不可信。
+- 新增 `tests/test_slope_gate_strategy.py`（门开关、方向、K 线不足、两个策略的接入）和 `tests/test_supertrend.py` 的离场回归测试；`params.py`、`config.yaml`、`strategies/supertrend.yaml` 同步新默认值。
+- `ema_swing` 仍维持 3°，t 值闸门仍未接入开仓。
+
+## 52.3.0 — 2026-11-23
+
+执行斜率阶段 3：用真实回测做阈值 A/B，实测未达标，维持 `ema_swing` 的 3° 默认值，不改开仓行为。
+
+- 新增 `src/backtest/slope_gate.py`：把多品种权益曲线按共同起止时间等分成 N 折；前 N-1 折算样本内，最后一折算样本外；计算净盈亏、回撤和 Calmar；验收线含样本外 Calmar ≥0.7×样本内、至少 2/3 折为正、成交 ≥30 笔、邻域不翻转，以及全段 Calmar 和样本外净盈亏不输基线。
+- 新增 `tools/slope_gate_compare.py`：`python tools/slope_gate_compare.py` 在 `ema_swing` 真实换月回测里对照 2.5°/3°/4°/5°，结果写入 `data/斜率闸门对照.json`；没有候选达标时明确打印「维持基线」。
+- 本地实测（lh + fu 15 分钟，3 折）：2.5° 样本外 Calmar 最高但全段 Calmar 1.44 低于 3° 的 1.58；4°、5° 的成交和收益逐档下降；5° 样本外净盈亏只有 22049，明显低于 3° 的 29159。
+- 结论：提高斜率阈值只会减少交易，不会提高信号质量，与阶段 2 的样本外 AUC≈0.5 一致；不改变任何默认配置，3° 继续保留，后续换阈值改为逐策略真实盈亏 A/B。
+- 新增 `tests/test_slope_gate.py`：时间折、Calmar、验收线、邻域翻转、全段 Calmar 回退、阈值选择。
+
+## 52.2.0 — 2026-11-23
+
+新增斜率阈值标定脚本和报告，不改默认配置、不改开仓行为。
+
+- 新增 `src/strategy/slope_calibration.py`：向量化计算整段 EMA 的角度、t 值和 R²（与 `measure_slope` 口径一致）；按未来 20 根 K 线的趋势标签（同向净移动 ≥2×ATR 且逆向回撤 <1×ATR）统计覆盖率、精确率、召回率、AUC 和假信号率；按前 70% 标定、后 30% 样本外验证。
+- 新增 `tools/slope_calibrate.py`：`python tools/slope_calibrate.py --periods 15,D` 生成 `data/斜率标定.xlsx`，含「说明」「明细」「推荐」三张表；只读本地 K 线，不改配置。
+- 推荐值只在样本外 AUC ≥ 0.55 时采用数据驱动阈值；否则回退到标定段 q80，并在「标定结论」写明「区分度不足，建议维持现阈值并继续观察」，避免把噪声当结论。
+- 本地 15 分钟数据结果：12 个合约、数千根样本的样本外 AUC 普遍在 0.46~0.55，`|角度|` 对未来趋势几乎没有区分度；54 个品种×周期中只有 14 个达到可用/偏弱。这说明现 3° 门槛的「过滤震荡」作用无法用该标签证实，阶段 3 必须用真实策略回测的盈亏做 A/B，不能只按分位数或 AUC 直接改默认。
+- 新增 `tests/test_slope_calibration.py`：未来标签、AUC、向量化与单根一致性、时间切分覆盖率单调、Excel 三表、优先选 `@tq` 合约。
+- 本版本没有新增配置项，`ema_swing` 仍用 3° 和 `reg` 回归口径；t 值闸门仍未接入开仓。
+
+## 52.1.0 — 2026-11-23
+
+新增共用斜率模块，策略行为不变。
+
+- 新增 `src/strategy/slope.py`：回归/首尾差两种斜率估计、ATR 归一化角度、斜率 t 值、R²、三态判定与滞回带（`SlopeConfig`/`SlopeState`/`SlopeFilter`）。
+- `ema_swing` 的倾角计算改为调用共用 `measure_slope`/`latest_atr`，判定门槛、提示文字和逐根结果保持不变。
+- 新增 `tests/test_slope.py`：直线/走平、端点毛刺、t 值区分噪声、三态与滞回、价格位置、t 值闸门、未知状态，以及与旧 `ema_swing` 公式逐根一致性。
+- 本阶段没有新增配置项，也没有改动默认阈值（仍是 3°）。其他策略暂未接入斜率闸门。
+
+## 52.0.3 — 2026-11-23
+
+设计文档补充，不改程序。
+
+- `docs/K线斜率研究/4.斜率体系设计与阈值标定.md` 增加第 9 节「业界做法对照与改进结论」：对照 TA-Lib 线性回归斜率、斜率 t 值、Kaufman ER、CHOP、ADX 和趋势扫描。
+- 结论：现有「回归 + ATR 归一化 + 三态」方向正确，不需要改用 ADX/ER 做主判断；应补 P0 的斜率 t 值质量门和以未来趋势为标签的样本外标定，P1 再加 ER 或 CHOP 正交确认、高周期斜率同向。
+- 修改 3.2 标定原则：分位数覆盖率只作体检，标定目标改为未来趋势标签区分度，并要求按时间切分样本，避免分位数含未来信息。
+
+## 52.0.2 — 2026-11-23
+
+文档更新，不改程序。
+
+- 新增 `docs/K线斜率研究/4.斜率体系设计与阈值标定.md`：统一斜率算法（回归 + ATR 归一化 + 滞回三态）、按品种/周期标定阈值、样本外与稳健性检验、跨策略接入和分阶段落地计划。
+- 用本地 15 分钟数据核对：3° 在 lh 上覆盖约 42%、fu 约 60%，作为趋势门槛偏松；目标覆盖 20%~25% 对应约 q75~q80（lh 5°、fu 6.5°）。
+- README 文档索引加入该设计。
+
 ## 52.0.1 — 2026-11-23
 
 代码重命名，不改变策略行为。

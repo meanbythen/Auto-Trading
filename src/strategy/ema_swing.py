@@ -17,14 +17,20 @@
 from __future__ import annotations
 
 from datetime import datetime
+import math
 from typing import Any
 
 import pandas as pd
 from loguru import logger
 
 from .base import StrategyBase
-from .indicators import average_true_range, ema_angle_deg, ema_series
+from .indicators import ema_series
 from .session_scope import scope_allows, scope_from_cfg
+from .slope import (
+    adaptive_threshold_from_bars,
+    latest_atr,
+    measure_slope,
+)
 from .types import (
     STOP_MODE_TOUCH,
     PositionState,
@@ -95,6 +101,27 @@ class EmaSwingStrategy(StrategyBase):
         # 斜率估计方式：reg=最近 N 根线性回归（抗端点毛刺，默认），diff=首尾两点差（旧口径）。
         method = str(box.get("slope_method", "reg") or "reg").strip().lower()
         self.slope_method = method if method in {"reg", "diff"} else "reg"
+        # 斜率的 t 值门槛：0=关（默认）。角度管陡不陡，t 值管这条线可不可信。
+        try:
+            self.slope_min_t = abs(float(box.get("slope_min_t", 0.0) or 0))
+        except (TypeError, ValueError):
+            self.slope_min_t = 0.0
+        # 自适应阈值：0 关闭时完全走固定角度；打开后阈值 = 过去窗口 |角度| 的分位数，
+        # 夹在基准的 0.7~1.3 倍内，每天不跳、逐根都能算。
+        self.slope_adaptive = config_flag(box.get("slope_adaptive", False), default=False)
+        try:
+            self.slope_adaptive_quantile = float(box.get("slope_adaptive_quantile", 0.80) or 0.80)
+        except (TypeError, ValueError):
+            self.slope_adaptive_quantile = 0.80
+        self.slope_adaptive_quantile = min(max(self.slope_adaptive_quantile, 0.05), 0.95)
+        try:
+            self.slope_adaptive_window = int(float(box.get("slope_adaptive_window", 500) or 500))
+        except (TypeError, ValueError):
+            self.slope_adaptive_window = 500
+        self.slope_adaptive_window = max(50, min(5000, self.slope_adaptive_window))
+        # 日线开盘冻结：同一交易日只算一次阈值；夜盘 21:00 起算下一交易日。
+        self.slope_adaptive_daily = config_flag(box.get("slope_adaptive_daily", True), default=True)
+        self._adaptive_cache: dict[str, tuple[str, float]] = {}
         # 出厂关：倾角只拦新开仓。打开后倾角不够也会平掉已有仓，方便对照收益。
         self.slope_exit = config_flag(box.get("slope_exit", False), default=False)
         # 尾盘空仓不开：填 0 等于关掉这一条。
@@ -363,6 +390,13 @@ class EmaSwingStrategy(StrategyBase):
             min_deg=self.slope_min_deg,
             period=self.slope_ema,
             method=self.slope_method,
+            min_t=self.slope_min_t,
+            adaptive=self.slope_adaptive,
+            adaptive_quantile=self.slope_adaptive_quantile,
+            adaptive_window=self.slope_adaptive_window,
+            adaptive_daily=self.slope_adaptive_daily,
+            adaptive_cache=self._adaptive_cache,
+            symbol=symbol,
         )
         if blocked:
             return StrategyDecision(StrategyAction.HOLD, symbol, slope_msg)
@@ -423,6 +457,13 @@ class EmaSwingStrategy(StrategyBase):
                 min_deg=self.slope_min_deg,
                 period=self.slope_ema,
                 method=self.slope_method,
+                min_t=self.slope_min_t,
+                adaptive=self.slope_adaptive,
+                adaptive_quantile=self.slope_adaptive_quantile,
+                adaptive_window=self.slope_adaptive_window,
+                adaptive_daily=self.slope_adaptive_daily,
+                adaptive_cache=self._adaptive_cache,
+                symbol=symbol,
             )
             if blocked:
                 return self._close_decision(
@@ -626,54 +667,76 @@ def _stop_ma_too_flat(
     min_deg: float,
     period: int,
     method: str = "reg",
+    min_t: float = 0.0,
+    adaptive: bool = False,
+    adaptive_quantile: float = 0.80,
+    adaptive_window: int = 500,
+    adaptive_daily: bool = True,
+    adaptive_cache: dict[str, tuple[str, float]] | None = None,
+    symbol: str = "",
 ) -> tuple[bool, str]:
     """倾角均线走平或斜反了，拦新开仓。已经持仓的不管。
 
     method="reg" 默认：最近 N+1 根做一元线性回归，用拟合斜率换算 N 根累计涨幅；
     method="diff" 旧口径：只看首尾两点。两种都按 N × ATR 归一化。
+    min_t 是斜率 t 值的下限：角度够陡但拟合不可信（噪声大）时仍按震荡处理。
+    adaptive=True 时阈值改成过去 window 根 |角度| 的分位数，夹在基准 0.7~1.3 倍内。
     """
-    if min_deg <= 0:
+    if min_deg <= 0 and min_t <= 0:
         return False, ""
     n = max(2, int(lookback))
     if len(ema_stop) <= n:
         return True, f"EMA{period} 还不够 {n} 根，算不出倾角，先不开"
-    now_v = ema_stop.iloc[-1]
-    if pd.isna(now_v):
+    atr = latest_atr(bars, close_s)
+    measure = measure_slope(ema_stop, atr, lookback=n, method=method)
+    if measure is None:
         return True, f"EMA{period} 倾角还没算稳，先不开"
-    use_reg = str(method or "").strip().lower() != "diff"
-    if use_reg:
-        vals = [float(v) for v in pd.to_numeric(ema_stop.iloc[-(n + 1) :], errors="coerce")]
-        if any(pd.isna(v) for v in vals):
-            return True, f"EMA{period} 倾角还没算稳，先不开"
-        m = len(vals)
-        mean_x = (m - 1) / 2.0
-        mean_y = sum(vals) / m
-        den = sum((i - mean_x) ** 2 for i in range(m))
-        slope = sum((i - mean_x) * (v - mean_y) for i, v in enumerate(vals)) / den
-        rise = slope * n
-    else:
-        prev = ema_stop.iloc[-1 - n]
-        if pd.isna(prev):
-            return True, f"EMA{period} 倾角还没算稳，先不开"
-        rise = float(now_v) - float(prev)
-    high = pd.to_numeric(bars["high"], errors="coerce") if "high" in bars.columns else close_s
-    low = pd.to_numeric(bars["low"], errors="coerce") if "low" in bars.columns else close_s
-    atr_s = average_true_range(high, low, close_s, 14).dropna()
-    atr = float(atr_s.iloc[-1]) if len(atr_s) else 0.0
-    if atr <= 1e-12:
-        atr = max(abs(float(now_v)) * 0.001, 1e-6)
-    ang = ema_angle_deg(float(now_v), float(now_v) - rise, n, atr)
-    if side == "long" and ang < min_deg:
-        return True, (
-            f"EMA{period} 近 {n} 根倾角 {ang:.1f}°，不够往上（要 ≥ {min_deg:g}°），"
-            f"走平或在往下，当震荡不开多"
+    ang = measure.angle_deg
+    threshold = min_deg
+    note = ""
+    if adaptive and min_deg > 0:
+        threshold = adaptive_threshold_from_bars(
+            bars,
+            ema_stop,
+            base_deg=min_deg,
+            lookback=n,
+            method=method,
+            quantile=adaptive_quantile,
+            window=adaptive_window,
+            daily=adaptive_daily,
+            cache=adaptive_cache,
+            key=symbol,
         )
-    if side == "short" and ang > -min_deg:
-        return True, (
-            f"EMA{period} 近 {n} 根倾角 {ang:.1f}°，不够往下（要 ≤ -{min_deg:g}°），"
-            f"走平或在往上，当震荡不开空"
-        )
-    return False, f"EMA{period} 倾角 {ang:.1f}°"
+        if abs(threshold - min_deg) > 1e-9:
+            note = f"（自适应阈值 {threshold:.1f}°，基准 {min_deg:g}°）"
+    if min_deg > 0:
+        if side == "long" and ang < threshold:
+            return True, (
+                f"EMA{period} 近 {n} 根倾角 {ang:.1f}°，不够往上（要 ≥ {threshold:g}°），"
+                f"走平或在往下，当震荡不开多{note}"
+            )
+        if side == "short" and ang > -threshold:
+            return True, (
+                f"EMA{period} 近 {n} 根倾角 {ang:.1f}°，不够往下（要 ≤ -{threshold:g}°），"
+                f"走平或在往上，当震荡不开空{note}"
+            )
+    if min_t > 0:
+        t_val = measure.t_stat
+        want = "多" if side == "long" else "空"
+        if math.isnan(t_val):
+            return True, (
+                f"EMA{period} 近 {n} 根斜率 t 值算不出（{method} 口径），"
+                f"这条线不够可信，当震荡不开{want}"
+            )
+        if abs(t_val) < min_t:
+            return True, (
+                f"EMA{period} 近 {n} 根斜率 t 值 {t_val:.2f}，绝对值低于 {min_t:g}，"
+                f"这条线不够可信，当震荡不开{want}"
+            )
+    msg = f"EMA{period} 倾角 {ang:.1f}°{note}"
+    if min_t > 0:
+        msg += f"，t 值 {measure.t_stat:.2f}"
+    return False, msg
 
 
 def _fast_stacked(side: str, e_a: float, e_b: float, e_c: float) -> bool:

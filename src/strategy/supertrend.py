@@ -19,6 +19,7 @@ from .base import StrategyBase
 from .indicators import supertrend as calc_supertrend
 from .market_state import MarketFilter, trend_params_for_section
 from .session_scope import scope_allows, scope_from_cfg
+from .slope import SlopeGate, load_slope_gate
 from .types import (
     STOP_MODE_TOUCH,
     PositionState,
@@ -63,6 +64,8 @@ class SuperTrendStrategy(StrategyBase):
         self.reverse_on_flip = config_flag(box.get("reverse_on_flip", True), default=True)
         # SuperTrend 自己的趋势过滤：震荡里通道会来回翻。
         self.market_filter = MarketFilter(trend_params_for_section(cfg, "supertrend"))
+        # 可选斜率环境门：默认关闭，开启后只做均线斜率同向的翻转。
+        self.slope_gate = SlopeGate(load_slope_gate(box))
 
         from src.utils.session_clock import flatten_clocks_for_symbol, session_tuples
 
@@ -148,6 +151,8 @@ class SuperTrendStrategy(StrategyBase):
         need = self.atr_period + 5
         if self.market_filter.enabled:
             need = max(need, self.market_filter.params.need_bars)
+        if self.slope_gate.enabled:
+            need = max(need, self.slope_gate.need_bars)
         if bars is None or len(bars) < need:
             return StrategyDecision(StrategyAction.HOLD, symbol, "K线不足，SuperTrend 还算不出来")
 
@@ -211,8 +216,14 @@ class SuperTrendStrategy(StrategyBase):
             )
 
         if dir_now > 0 and dir_prev < 0:
+            allowed, why = self.slope_gate.check(bars, "long", symbol=symbol)
+            if not allowed:
+                return StrategyDecision(StrategyAction.HOLD, symbol, why, stop_price=st_now)
             return self._open(symbol, now, bar_id, close, "long", st_now)
         if dir_now < 0 and dir_prev > 0:
+            allowed, why = self.slope_gate.check(bars, "short", symbol=symbol)
+            if not allowed:
+                return StrategyDecision(StrategyAction.HOLD, symbol, why, stop_price=st_now)
             return self._open(symbol, now, bar_id, close, "short", st_now)
         return StrategyDecision(StrategyAction.HOLD, symbol, "SuperTrend 方向未变")
 
@@ -343,6 +354,7 @@ class SuperTrendStrategy(StrategyBase):
         now: datetime,
         bar_id: str,
         reason: str,
+        stop_price: float | None = None,
     ) -> StrategyDecision:
         self._pending[symbol] = {"time": now, "bar_id": bar_id}
         self._signaled_bar[symbol] = bar_id
@@ -352,6 +364,6 @@ class SuperTrendStrategy(StrategyBase):
             StrategyAction.CLOSE,
             symbol,
             reason,
-            stop_price=pos.trail_stop or pos.initial_stop,
+            stop_price=stop_price if stop_price is not None else (pos.trail_stop or pos.initial_stop),
             entry_price=pos.entry_price,
         )

@@ -10,6 +10,8 @@ principle:
   - 多空分界线（出厂 120）：做多要在上面、做空要在下面
   - 止损均线（出厂 120）开仓后跟着走
   - 倾角均线（出厂 120）走平不开；三根可以分开填
+  - 可选斜率 t 值下限（出厂关）：角度够陡但拟合不可信时也不开
+  - 可选自适应阈值（出厂关）：按过去 500 根的 |角度| 分位自动调门槛，夹在基准 0.7~1.3 倍内
   - 「倾角不够就平仓」出厂关；打开后手里的仓也会平，方便对照收益
   - 空仓时日盘/夜盘收盘前若干分钟不开新仓（出厂 30，可改；午休不算）
   - 默认可拿到隔夜
@@ -21,6 +23,11 @@ defaults:
   stop_ema: 120
   slope_ema: 120
   slope_min_deg: 3.0
+  slope_min_t: 0.0
+  slope_adaptive: false
+  slope_adaptive_quantile: 0.8
+  slope_adaptive_window: 500
+  slope_adaptive_daily: true
   slope_lookback: 20
   slope_method: reg
   slope_exit: false

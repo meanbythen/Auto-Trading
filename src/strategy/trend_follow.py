@@ -32,6 +32,7 @@ from loguru import logger
 from .base import StrategyBase
 from .market_state import MarketFilter, trend_params_for_section
 from .session_scope import scope_allows, scope_from_cfg
+from .slope import SlopeGate, load_slope_gate
 from .types import (
     STOP_MODE_TOUCH,
     PositionState,
@@ -85,6 +86,9 @@ class TrendFollowStrategy(StrategyBase):
 
         live = self.symbols[0] if self.symbols else ""
         self.flatten_times = flatten_clocks_for_symbol(cfg, live)
+        # 可选斜率环境门：默认关闭，开启后只做均线斜率同向的突破。
+        self.slope_gate = SlopeGate(load_slope_gate(box))
+
         # 不读 strategy.flatten_at_close。那个总开关管日内实体/均线。
         # 这里默认关掉：到点不平仓，才能把一段行情拿过收盘。
         self.flatten_at_close = config_flag(box.get("flatten_at_close", False), default=False)
@@ -174,6 +178,8 @@ class TrendFollowStrategy(StrategyBase):
         need = max(self.entry_bars, self.exit_bars, self.atr_period) + 2
         if self.market_filter.enabled:
             need = max(need, self.market_filter.params.need_bars)
+        if self.slope_gate.enabled:
+            need = max(need, self.slope_gate.need_bars)
         if bars is None or len(bars) < need:
             return StrategyDecision(StrategyAction.HOLD, symbol, "K线不足，趋势通道还算不出来")
 
@@ -205,11 +211,17 @@ class TrendFollowStrategy(StrategyBase):
         entry_low = float(past["low"].iloc[-self.entry_bars :].min())
         close = float(bar["close"])
         if close > entry_high:
+            allowed, why = self.slope_gate.check(bars, "long", symbol=symbol)
+            if not allowed:
+                return StrategyDecision(StrategyAction.HOLD, symbol, why)
             stop = close - self.atr_mult * atr
             self._signaled_bar[symbol] = bar_id
             # 极值从进场价起算，不用这根突破 K 线自己的影线，避免一开仓止损就被拉到贴着最高价。
             return self._open(symbol, now, bar_id, close, "long", stop, close, entry_high)
         if close < entry_low:
+            allowed, why = self.slope_gate.check(bars, "short", symbol=symbol)
+            if not allowed:
+                return StrategyDecision(StrategyAction.HOLD, symbol, why)
             stop = close + self.atr_mult * atr
             self._signaled_bar[symbol] = bar_id
             return self._open(symbol, now, bar_id, close, "short", stop, close, entry_low)

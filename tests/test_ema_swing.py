@@ -413,6 +413,80 @@ def test_slope_reg_passes_steady_rise() -> None:
         assert blocked is False, msg
 
 
+def test_slope_t_gate_parsing() -> None:
+    """t 值下限只从配置读，负数按绝对值，填错退回 0（关）。"""
+    assert EmaSwingStrategy(_cfg()).slope_min_t == 0.0
+    assert EmaSwingStrategy(_cfg(slope_min_t="2.1")).slope_min_t == 2.1
+    assert EmaSwingStrategy(_cfg(slope_min_t=-2.0)).slope_min_t == 2.0
+    assert EmaSwingStrategy(_cfg(slope_min_t="abc")).slope_min_t == 0.0
+
+
+def test_slope_t_gate_blocks_noisy_angle() -> None:
+    """角度够陡但均线锯齿太多、t 值很低时，按震荡拦下。"""
+    frame = _frame([100.0] * 41)
+    ema = pd.Series([100 + i * 0.05 + (3.0 if i % 2 == 0 else -3.0) for i in range(41)], index=frame.index)
+    angle_only, _ = _stop_ma_too_flat(
+        "long", ema, frame, frame["close"], lookback=20, min_deg=1.0, period=120
+    )
+    assert angle_only is False
+    blocked, msg = _stop_ma_too_flat(
+        "long", ema, frame, frame["close"], lookback=20, min_deg=1.0, period=120, min_t=2.0
+    )
+    assert blocked is True
+    assert "t 值" in msg
+
+
+def test_slope_t_gate_passes_clean_rise() -> None:
+    """干净直线上涨时 t 值很大，角度和 t 值两道门都放行。"""
+    frame = _frame([100.0] * 41)
+    ema = pd.Series([100.0 + i for i in range(41)], index=frame.index)
+    blocked, msg = _stop_ma_too_flat(
+        "long", ema, frame, frame["close"], lookback=20, min_deg=3.0, period=120, min_t=2.1
+    )
+    assert blocked is False, msg
+    assert "t 值" in msg
+
+
+def test_slope_t_gate_blocks_diff_method() -> None:
+    """diff 口径没有 t 值；开了 t 值下限就不放行，提示算不出。"""
+    frame = _frame([100.0] * 41)
+    ema = pd.Series([100.0 + i for i in range(41)], index=frame.index)
+    blocked, msg = _stop_ma_too_flat(
+        "long", ema, frame, frame["close"], lookback=20, min_deg=3.0, period=120,
+        method="diff", min_t=2.1,
+    )
+    assert blocked is True
+    assert "算不出" in msg
+
+
+def test_slope_t_gate_alone_blocks_entry() -> None:
+    """角度门槛关掉、只开 t 值门槛，也能拦住开仓（说明真接进了开仓判定）。"""
+    closes = _steady_up()
+    s = EmaSwingStrategy(_cfg(slope_min_deg=0.0, slope_min_t=1e6))
+    saw_t_reason = False
+    for i in range(122, len(closes)):
+        bars = _frame(closes[: i + 1])
+        decision = s.evaluate("bu2612", bars, now=bars.index[-1].to_pydatetime())
+        assert decision.action not in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN), decision.reason
+        if "t 值" in decision.reason:
+            saw_t_reason = True
+    assert saw_t_reason
+
+
+def test_slope_t_gate_default_off_keeps_old_entry() -> None:
+    """出厂 t 值门槛为 0，和原来一样能开多。"""
+    closes = _steady_up()
+    s = EmaSwingStrategy(_cfg(slope_min_t=0.0))
+    opened = None
+    for i in range(122, len(closes)):
+        bars = _frame(closes[: i + 1])
+        decision = s.evaluate("bu2612", bars, now=bars.index[-1].to_pydatetime())
+        if decision.action == StrategyAction.BUY_OPEN:
+            opened = decision
+            break
+    assert opened is not None
+
+
 def test_old_macd_engine_still_falls_back() -> None:
     from src.strategy.daily_body import DailyBodyStrategy
     from src.strategy.factory import create_strategy

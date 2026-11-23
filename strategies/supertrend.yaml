@@ -16,7 +16,21 @@ defaults:
   multiplier: 3.0
   reverse_on_flip: true
   flatten_at_close: false
+  # 可选斜率环境门：15 分钟 A/B 通过，默认开启 2.5°；日线请先重新 A/B。
+  slope_gate:
+    enabled: true
+    ema_period: 120
+    lookback: 20
+    method: reg
+    min_deg: 2.5
+    min_t: 0.0
+    price_side: false
+    adaptive: false
+    adaptive_quantile: 0.8
+    adaptive_window: 500
+    adaptive_daily: true
 
 notes:
   - 适合日线或较长分钟线拿趋势；5 分钟会交易更勤，可把倍数调大（如 3.5～4）减假信号
   - 「更稳」是相对双均线交叉而言：波动带宽一点，窄幅震荡里少抽打
+  - 斜率闸门只做 EMA 斜率同向的翻转；2.5° 是 15 分钟标定结果，日线用前先用 slope_gate_compare 重新对照
