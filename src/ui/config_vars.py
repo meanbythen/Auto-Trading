@@ -282,6 +282,18 @@ class ConfigVarsMixin:
         self.macd_swing_slope_var = ctk.StringVar(value=str(macd_box.get("slope_min_deg", 3)))
         self.macd_swing_slope_lookback_var = ctk.StringVar(value=str(macd_box.get("slope_lookback", 20)))
         self.macd_swing_slope_exit_var = ctk.BooleanVar(value=bool(macd_box.get("slope_exit", False)))
+        self.macd_swing_slope_adaptive_var = ctk.BooleanVar(
+            value=bool(macd_box.get("slope_adaptive", False))
+        )
+        self.macd_swing_slope_adaptive_quantile_var = ctk.StringVar(
+            value=str(macd_box.get("slope_adaptive_quantile", 0.8))
+        )
+        self.macd_swing_slope_adaptive_window_var = ctk.StringVar(
+            value=str(macd_box.get("slope_adaptive_window", 500))
+        )
+        self.macd_swing_slope_adaptive_daily_var = ctk.BooleanVar(
+            value=bool(macd_box.get("slope_adaptive_daily", True))
+        )
         self.macd_swing_close_guard_var = ctk.StringVar(
             value=str(parse_close_guard_min(macd_box.get("no_open_before_close_min", 30), 30))
         )
@@ -1032,6 +1044,16 @@ class ConfigVarsMixin:
         self.macd_swing_slope_var.set(str(macd_box.get("slope_min_deg", 3)))
         self.macd_swing_slope_lookback_var.set(str(macd_box.get("slope_lookback", 20)))
         self.macd_swing_slope_exit_var.set(bool(macd_box.get("slope_exit", False)))
+        self.macd_swing_slope_adaptive_var.set(bool(macd_box.get("slope_adaptive", False)))
+        self.macd_swing_slope_adaptive_quantile_var.set(
+            str(macd_box.get("slope_adaptive_quantile", 0.8))
+        )
+        self.macd_swing_slope_adaptive_window_var.set(
+            str(macd_box.get("slope_adaptive_window", 500))
+        )
+        self.macd_swing_slope_adaptive_daily_var.set(
+            bool(macd_box.get("slope_adaptive_daily", True))
+        )
         self.macd_swing_close_guard_var.set(
             str(parse_close_guard_min(macd_box.get("no_open_before_close_min", 30), 30))
         )

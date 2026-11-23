@@ -307,6 +307,20 @@ class ConfigCollectMixin:
         except (TypeError, ValueError):
             macd_box["slope_lookback"] = 20
         macd_box["slope_exit"] = bool(self.macd_swing_slope_exit_var.get())
+        macd_box["slope_adaptive"] = bool(self.macd_swing_slope_adaptive_var.get())
+        try:
+            macd_box["slope_adaptive_quantile"] = min(
+                0.95, max(0.05, float(self.macd_swing_slope_adaptive_quantile_var.get()))
+            )
+        except (TypeError, ValueError):
+            macd_box["slope_adaptive_quantile"] = 0.8
+        try:
+            macd_box["slope_adaptive_window"] = max(
+                50, min(5000, int(float(self.macd_swing_slope_adaptive_window_var.get())))
+            )
+        except (TypeError, ValueError):
+            macd_box["slope_adaptive_window"] = 500
+        macd_box["slope_adaptive_daily"] = bool(self.macd_swing_slope_adaptive_daily_var.get())
         macd_box["no_open_before_close_min"] = parse_close_guard_min(
             self.macd_swing_close_guard_var.get(), 30
         )

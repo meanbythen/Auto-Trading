@@ -417,6 +417,34 @@ def build_strategy_section(
     switch_row(
         app,
         macd_swing_box,
+        "自适应阈值",
+        app.macd_swing_slope_adaptive_var,
+        hint="开=阈值改成过去若干根倾角绝对值的中高分位；关=固定用最小倾角。出厂开",
+    )
+    param_entry(
+        app,
+        macd_swing_box,
+        "自适应分位",
+        app.macd_swing_slope_adaptive_quantile_var,
+        hint="0.05~0.95，0.8 表示约 20% 的 K 线算趋势。出厂 0.8",
+    )
+    param_entry(
+        app,
+        macd_swing_box,
+        "自适应窗口",
+        app.macd_swing_slope_adaptive_window_var,
+        hint="用过去多少根算分位，50~5000。出厂 500",
+    )
+    switch_row(
+        app,
+        macd_swing_box,
+        "日线开盘冻结",
+        app.macd_swing_slope_adaptive_daily_var,
+        hint="开=同一交易日只算一次阈值，盘内不再跳；关=逐根更新。出厂开",
+    )
+    switch_row(
+        app,
+        macd_swing_box,
         "倾角不够就平仓",
         app.macd_swing_slope_exit_var,
         hint="关=只拦新开仓。开=倾角不够也平掉已有仓，不反手。用来对照收益。出厂关",
