@@ -39,6 +39,9 @@ from .swing_trend import SwingTrendStrategy
 from .trend_follow import TrendFollowStrategy
 from .types import StrategyAction, StrategyDecision
 
+# 已打印过「策略引擎已加载」的引擎组合；回测/优化反复建实例时不再重复写 INFO。
+_LOGGED_ENGINES: set[tuple[str, str, str, str]] = set()
+
 
 class StrategyLike(Protocol):
     """策略统一接口：主循环只依赖这些能力。"""
@@ -724,13 +727,22 @@ def create_strategy(cfg: dict[str, Any]) -> StrategyLike:
     strategy.stop_mode = stop_mode_from_cfg(cfg)
     strategy.stop_on_touch = strategy.stop_mode == "touch"
     strategy.entry_mode = entry_mode_from_cfg(cfg)
-    logger.info(
-        "策略引擎已加载: engine={} class={} stop_mode={} entry_mode={}",
+    # 回测/参数优化会反复 create_strategy，同一套引擎只报一次，避免刷屏。
+    key = (
         name,
         type(strategy).__name__,
-        strategy.stop_mode,
-        strategy.entry_mode,
+        str(strategy.stop_mode),
+        str(strategy.entry_mode),
     )
+    if key not in _LOGGED_ENGINES:
+        _LOGGED_ENGINES.add(key)
+        logger.info(
+            "策略引擎已加载: engine={} class={} stop_mode={} entry_mode={}",
+            name,
+            type(strategy).__name__,
+            strategy.stop_mode,
+            strategy.entry_mode,
+        )
     return strategy
 
 

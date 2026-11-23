@@ -1027,6 +1027,14 @@ class AccountTabMixin:
         except OSError:
             self._signal_book_mtime = 0.0
         balance = shown_equity(book, multiplier_map(self.cfg))
+        # 启动或切换账本后，账户分析先刷新时也要把配置页权益同步过来；
+        # 否则 _pull_signal_balance 会因 mtime 已记录而跳过，配置页一直停在旧值。
+        try:
+            shown_cfg = float(self.capital_var.get())
+        except (TypeError, ValueError):
+            shown_cfg = None
+        if shown_cfg is None or abs(float(balance) - shown_cfg) > 0.01:
+            self._apply_book_balance(float(balance))
         shown = str(int(balance)) if float(balance) == int(balance) else f"{float(balance):.2f}"
         if hasattr(self, "ac_balance_label"):
             self.ac_balance_label.configure(text=f"当前余额  {shown} 元")
