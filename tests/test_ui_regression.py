@@ -23,7 +23,7 @@ TAB_NAMES = [
     "账户分析",
 ]
 
-RESEARCH_TAB_NAMES = ["历史回测", "交叉测试", "策略优化", "复盘", "规律候选", "研究治理"]
+RESEARCH_TAB_NAMES = ["历史回测", "交叉测试", "策略优化", "复盘", "因子挖掘", "研究治理"]
 
 
 def test_real_app_builds_all_tabs_and_backtest_initial_state(real_app) -> None:

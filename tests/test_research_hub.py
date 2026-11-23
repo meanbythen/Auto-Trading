@@ -7,7 +7,7 @@ import pytest
 from src.strategy.factory import ENGINE_LABELS
 
 
-RESEARCH_TABS = ["历史回测", "交叉测试", "策略优化", "复盘", "规律候选"]
+RESEARCH_TABS = ["历史回测", "交叉测试", "策略优化", "复盘", "因子挖掘"]
 
 
 def _inside(widget, tab) -> bool:
@@ -29,7 +29,7 @@ def test_each_research_page_is_built_in_its_own_sub_tab(real_app) -> None:
         "交叉测试": real_app.pk_engine_list,
         "策略优化": real_app.opt_result_box,
         "复盘": real_app.rv_result_box,
-        "规律候选": real_app.rs_result_box,
+        "因子挖掘": real_app.rs_result_box,
     }
     for name, widget in pages.items():
         assert _inside(widget, real_app.research_tabs.tab(name))

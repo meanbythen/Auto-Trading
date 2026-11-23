@@ -172,8 +172,8 @@ def _session_minutes(day: str, segments: list[tuple[str, str]]) -> pd.DataFrame:
     )
 
 
-def test_sixty_minute_bars_follow_session_clock() -> None:
-    """商品 60 分钟日盘按时段内整点收，休市断开，没有 12:00、11:15、14:15。"""
+def test_sixty_minute_bars_use_continuous_trading_minutes() -> None:
+    """商品 60 分钟按连续交易分钟累计：10:15-10:30、11:30-13:30 不计入。"""
     minutes = _session_minutes(
         "2026-10-27",
         [("09:00", "10:15"), ("10:30", "11:30"), ("13:30", "15:00")],
@@ -181,49 +181,45 @@ def test_sixty_minute_bars_follow_session_clock() -> None:
     built = bars_from_minutes(minutes, "60", symbol="lh2701")
     assert list(built.index.strftime("%H:%M")) == [
         "10:00",
-        "10:15",
-        "11:00",
-        "11:30",
-        "14:00",
+        "11:15",
+        "14:15",
         "15:00",
     ]
-    assert int(built.loc[pd.Timestamp("2026-10-27 10:00")]["minute_count"]) == 60
-    assert int(built.loc[pd.Timestamp("2026-10-27 10:15")]["minute_count"]) == 15
-    assert int(built.loc[pd.Timestamp("2026-10-27 11:00")]["minute_count"]) == 30
-    assert int(built.loc[pd.Timestamp("2026-10-27 11:30")]["minute_count"]) == 30
-    assert int(built.loc[pd.Timestamp("2026-10-27 14:00")]["minute_count"]) == 30
-    assert int(built.loc[pd.Timestamp("2026-10-27 15:00")]["minute_count"]) == 60
+    assert [int(v) for v in built["minute_count"]] == [60, 60, 60, 45]
 
     native = pd.DataFrame(
         {
-            "open": [1.0, 2.0, 3.0, 4.0],
-            "high": [1.0, 2.0, 3.0, 4.0],
-            "low": [1.0, 2.0, 3.0, 4.0],
-            "close": [1.0, 2.0, 3.0, 4.0],
-            "volume": [1.0, 1.0, 1.0, 1.0],
+            "open": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "high": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "low": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "close": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            "volume": [1.0] * 6,
         },
         index=pd.to_datetime(
             [
+                "2026-10-27 09:00:00",
                 "2026-10-27 11:00:00",
                 "2026-10-27 12:00:00",
                 "2026-10-27 13:00:00",
                 "2026-10-27 14:00:00",
+                "2026-10-27 15:30:00",
             ]
         ),
     )
     merged, _complete = overlay_minute_bars(native, built, 60)
+    # 覆盖区间 [10:00, 15:00] 内的旧原生时间清掉；区间外的 09:00、15:30 保留。
     assert list(merged.index.strftime("%H:%M")) == [
+        "09:00",
         "10:00",
-        "10:15",
-        "11:00",
-        "11:30",
-        "14:00",
+        "11:15",
+        "14:15",
         "15:00",
+        "15:30",
     ]
 
 
-def test_thirty_minute_bars_do_not_span_tea_or_lunch() -> None:
-    """30 分钟在 10:15、11:30 截断；10:30、13:30 是开盘不是收线。"""
+def test_thirty_minute_bars_use_continuous_trading_minutes() -> None:
+    """30 分钟余量跨 10:15-10:30、11:30-13:30 结转，只有尾盘 15:00 是半根。"""
     minutes = _session_minutes(
         "2026-10-27",
         [("09:00", "10:15"), ("10:30", "11:30"), ("13:30", "15:00")],
@@ -232,13 +228,34 @@ def test_thirty_minute_bars_do_not_span_tea_or_lunch() -> None:
     assert list(built.index.strftime("%H:%M")) == [
         "09:30",
         "10:00",
-        "10:15",
-        "11:00",
-        "11:30",
-        "14:00",
-        "14:30",
+        "10:45",
+        "11:15",
+        "13:45",
+        "14:15",
+        "14:45",
         "15:00",
     ]
+    assert [int(v) for v in built["minute_count"]] == [30, 30, 30, 30, 30, 30, 30, 15]
+
+
+def test_night_thirty_and_sixty_are_continuous() -> None:
+    """夜盘 21:00-23:00 连续累计：30 分钟 4 根，60 分钟 2 根。"""
+    minutes = _session_minutes("2026-10-26", [("21:00", "23:00")])
+    thirty = bars_from_minutes(minutes, "30", symbol="fu2701")
+    assert list(thirty.index.strftime("%H:%M")) == ["21:30", "22:00", "22:30", "23:00"]
+    sixty = bars_from_minutes(minutes, "60", symbol="fu2701")
+    assert list(sixty.index.strftime("%H:%M")) == ["22:00", "23:00"]
+
+
+def test_partial_tail_bar_only_flags_half_bucket() -> None:
+    """尾盘判定：30/60 的 15:00 是半根；完整桶和 5 分钟一律不算。"""
+    from src.data.periods import partial_tail_bar
+
+    assert partial_tail_bar(pd.Timestamp("2026-10-27 15:00"), "30", symbol="lh2701")
+    assert partial_tail_bar(pd.Timestamp("2026-10-27 15:00"), "60", symbol="lh2701")
+    assert not partial_tail_bar(pd.Timestamp("2026-10-27 14:45"), "30", symbol="lh2701")
+    assert not partial_tail_bar(pd.Timestamp("2026-10-27 14:15"), "60", symbol="lh2701")
+    assert not partial_tail_bar(pd.Timestamp("2026-10-27 15:00"), "5", symbol="lh2701")
 
 
 def test_hog_sixty_has_no_night_bars() -> None:
@@ -256,15 +273,30 @@ def test_hog_sixty_has_no_night_bars() -> None:
 
 
 def test_silver_sixty_keeps_0230_stub() -> None:
-    """黄金白银夜盘 02:00～02:30 是一根不足 60 分钟的短 K。"""
-    minutes = _session_minutes("2026-10-27", [("21:00", "23:59")])
-    extra = _session_minutes("2026-10-28", [("00:00", "02:30")])
-    built = bars_from_minutes(pd.concat([minutes, extra]), "60", symbol="ag2702")
+    """黄金白银夜盘连续跨零点：00:00 也在组内，02:30 是一根 30 分钟的短 K。"""
+    index = pd.date_range("2026-10-27 21:00", "2026-10-28 02:30", freq="1min")[1:]
+    n = len(index)
+    minutes = pd.DataFrame(
+        {
+            "open": list(range(n)),
+            "high": list(range(n)),
+            "low": list(range(n)),
+            "close": list(range(n)),
+            "volume": [1.0] * n,
+        },
+        index=index,
+    )
+    built = bars_from_minutes(minutes, "60", symbol="ag2702")
     times = list(built.index.strftime("%Y-%m-%d %H:%M"))
-    assert "2026-10-27 22:00" in times
-    assert "2026-10-28 02:00" in times
-    assert "2026-10-28 02:30" in times
-    assert int(built.loc[pd.Timestamp("2026-10-28 02:30")]["minute_count"]) == 30
+    assert times == [
+        "2026-10-27 22:00",
+        "2026-10-27 23:00",
+        "2026-10-28 00:00",
+        "2026-10-28 01:00",
+        "2026-10-28 02:00",
+        "2026-10-28 02:30",
+    ]
+    assert [int(v) for v in built["minute_count"]] == [60, 60, 60, 60, 60, 30]
 
 
 def test_five_and_ten_minute_follow_clock_with_gaps() -> None:
@@ -331,11 +363,11 @@ def test_session_clock_rebuild_is_fast_on_long_minutes() -> None:
     assert elapsed < 2.5
 
 
-def test_session_close_times_sixty_matches_clock_bars() -> None:
-    """缺口检查用的应收时刻，要和拼出来的 60 分钟一致。"""
+def test_session_close_times_sixty_matches_continuous_bars() -> None:
+    """缺口检查用的应收时刻，要和连续累计拼出来的 60 分钟一致。"""
     day = date(2026, 10, 27)
     times = [stamp.strftime("%H:%M") for stamp in session_close_times(day, 60, include_night=False)]
-    assert times == ["10:00", "10:15", "11:00", "11:30", "14:00", "15:00"]
+    assert times == ["10:00", "11:15", "14:15", "15:00"]
 
 
 def test_drop_forming_keeps_complete_afternoon_bar_after_lunch() -> None:

@@ -12,6 +12,17 @@ from src.ui.app_common import ENGINE_LABELS, format_exec_card
 import customtkinter as ctk
 
 
+def symbol_card_text(current: str, scan_symbols: list[str]) -> str:
+    """多品种时状态卡显示扫描清单，单品种仍显示当前选中的关注品种。"""
+    names = [str(item).strip() for item in (scan_symbols or []) if str(item).strip()]
+    if len(names) <= 1:
+        return current
+    text = " / ".join(names[:2])
+    if len(names) > 2:
+        text += f" 等{len(names)}个"
+    return text
+
+
 def reconcile_needs_human(rec: dict[str, Any] | None) -> bool:
     """
     程序持仓卡下的「认领仓单 / 拒绝仓单」要不要点亮。
@@ -193,7 +204,12 @@ class DashboardMixin:
         current = self.watch_choice_var.get().strip()
         if current in ("", "（还没有）"):
             current = self._watch_symbols[0] if self._watch_symbols else "-"
-        self.card_symbols.configure(text=current)
+        scan_symbols = list(snap.get("scan_symbols") or []) if running else []
+        if not scan_symbols:
+            multi_cfg = (self.cfg.get("live") or {}).get("multi_symbol") or {}
+            if multi_cfg.get("enabled"):
+                scan_symbols = [str(item) for item in (multi_cfg.get("symbols") or [])]
+        self.card_symbols.configure(text=symbol_card_text(current, scan_symbols))
         if hasattr(self, "hero_sub"):
             broker = str((self.cfg.get("account") or {}).get("broker") or "期货公司").strip()
             syms = self._watch_symbols

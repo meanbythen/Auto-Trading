@@ -242,10 +242,11 @@ def test_load_with_limit_returns_only_recent_bars_and_keeps_history(tmp_path) ->
     assert len(store.load("bu2612", "5")) == 3
 
 
-def test_aligned_bars_drop_lunch_and_old_ths_sixty() -> None:
-    """60 分钟丢掉午休整点和跨休市的 11:15/14:15，留下时段内收线。"""
+def test_aligned_bars_drop_old_clock_sixty() -> None:
+    """60 分钟只留连续累计的收线时刻：10:00、11:15、14:15、15:00。"""
     frame = _frame(
         [
+            ("2026-01-05 09:05:00", 12990),
             ("2026-01-05 10:00:00", 13000),
             ("2026-01-05 11:00:00", 13010),
             ("2026-01-05 11:15:00", 13015),
@@ -255,18 +256,40 @@ def test_aligned_bars_drop_lunch_and_old_ths_sixty() -> None:
             ("2026-01-05 14:00:00", 13050),
             ("2026-01-05 14:15:00", 13045),
             ("2026-01-05 15:00:00", 13060),
-            ("2026-01-05 09:05:00", 12990),
         ]
     )
     kept = aligned_bars(
         frame, "60", session_opens=session_open_minutes("lh2701"), symbol="lh2701"
     )
     assert kept is not None
+    assert list(kept.index.strftime("%H:%M")) == ["10:00", "11:15", "14:15", "15:00"]
+
+
+def test_aligned_bars_keep_continuous_thirty_labels() -> None:
+    """30 分钟保留 10:45、13:45 等非整点收线，丢掉旧的 10:15、11:00、14:00。"""
+    frame = _frame(
+        [
+            ("2026-01-05 10:15:00", 12990),
+            ("2026-01-05 10:45:00", 13000),
+            ("2026-01-05 11:00:00", 13010),
+            ("2026-01-05 11:15:00", 13015),
+            ("2026-01-05 13:45:00", 13020),
+            ("2026-01-05 14:00:00", 13030),
+            ("2026-01-05 14:15:00", 13040),
+            ("2026-01-05 14:45:00", 13050),
+            ("2026-01-05 15:00:00", 13060),
+        ]
+    )
+    kept = aligned_bars(
+        frame, "30", session_opens=session_open_minutes("lh2701"), symbol="lh2701"
+    )
+    assert kept is not None
     assert list(kept.index.strftime("%H:%M")) == [
-        "10:00",
-        "11:00",
-        "11:30",
-        "14:00",
+        "10:45",
+        "11:15",
+        "13:45",
+        "14:15",
+        "14:45",
         "15:00",
     ]
 

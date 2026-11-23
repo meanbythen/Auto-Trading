@@ -13,8 +13,9 @@
 from __future__ import annotations
 
 import json
+import time
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
@@ -26,6 +27,9 @@ from src.data.tick.recorder import tick_settings
 from src.data.tick.synthesize import synthesize_symbol
 from src.data.tick.vnpy_store import save_ticks, ticks_from_frame
 from src.data.tq_source import config_symbol_from_tq, tq_symbol
+from src.utils.holidays import calendar_from_config
+from src.utils.session_clock import in_trading_sessions, sessions_for_symbol
+from src.utils.trading_day import is_trading_day
 
 _PERMISSION_HINT = "需要天勤专业版或试用权限才能下载历史 tick"
 
@@ -82,6 +86,12 @@ def download_settings(cfg: dict[str, Any]) -> dict[str, Any]:
     data_cfg = cfg.get("data", {}) or {}
     tq_cfg = data_cfg.get("tq", {}) or {}
     history = tq_cfg.get("history_tick") or {}
+    sessions: list[list[str]] = []
+    for symbol in base["symbols"]:
+        for row in sessions_for_symbol(cfg, symbol):
+            item = [str(row[0]), str(row[1])]
+            if item not in sessions:
+                sessions.append(item)
     return {
         **base,
         "enabled": bool(history.get("enabled", False)),
@@ -89,9 +99,34 @@ def download_settings(cfg: dict[str, Any]) -> dict[str, Any]:
         "start": str(history.get("start") or ""),
         "end": str(history.get("end") or ""),
         "chunk_days": max(1, int(history.get("chunk_days", 1))),
+        "chunk_pause_sec": max(0.0, float(history.get("chunk_pause_sec", 3))),
+        "policy": str(history.get("policy") or "off_hours_only").strip().lower(),
+        "auto_resume": bool(history.get("auto_resume", True)),
+        "resume_poll_sec": max(5.0, float(history.get("resume_poll_sec", 60))),
+        "lookback_days": max(1, int(history.get("lookback_days", 120))),
         "out_dir": root / str(history.get("out_dir", "data/ticks/history")),
         "keep_raw_csv": bool(history.get("keep_raw_csv", True)),
+        "trading_sessions": sessions,
+        "calendar": calendar_from_config(cfg, root),
     }
+
+
+def trading_pause_reason(settings: dict[str, Any], moment: datetime | None = None) -> str:
+    """off_hours_only 下，交易时段返回暂停原因；周末、节假日和 manual 不拦。"""
+    if str(settings.get("policy") or "off_hours_only").lower() != "off_hours_only":
+        return ""
+    now = moment or datetime.now()
+    sessions = settings.get("trading_sessions") or []
+    if not sessions:
+        return ""
+    day = now.date()
+    if now.time() < dtime(6, 0):
+        day -= timedelta(days=1)
+    if not is_trading_day(day, calendar=settings.get("calendar")):
+        return ""
+    if in_trading_sessions(sessions, now, grace_sec=0):
+        return "当前处于交易时段，历史 tick 已暂停；收盘后可从断点继续"
+    return ""
 
 
 def _parse_day(value: Any) -> date | None:
@@ -278,6 +313,15 @@ def forget_downloaded_chunks(
     }
 
 
+def _is_permission_error(exc: Exception) -> bool:
+    """天勤可能在创建任务或等待下载时才返回权限错误。"""
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in ("不支持下载历史数据", "历史数据权限", "tq_dl", "需要专业版")
+    )
+
+
 def _download_chunk(api: Any, chunk: DownloadChunk, on_progress: Callable[[float], None] | None = None) -> None:
     """阻塞下载一块。没有专业版权限时给出明确提示。"""
     from tqsdk.tools import DataDownloader
@@ -292,18 +336,18 @@ def _download_chunk(api: Any, chunk: DownloadChunk, on_progress: Callable[[float
             end_dt=chunk.end,
             csv_file_name=str(chunk.path),
         )
+        last = -1
+        while not task.is_finished():
+            api.wait_update()
+            progress = float(task.get_progress())
+            step = int(progress // 10) * 10
+            if on_progress is not None and step != last:
+                on_progress(progress)
+                last = step
     except Exception as exc:  # noqa: BLE001
-        if "不支持下载历史数据" in str(exc) or "tq_dl" in str(exc):
+        if _is_permission_error(exc):
             raise DownloadPermissionError(f"{_PERMISSION_HINT}：{exc}") from exc
         raise
-    last = -1
-    while not task.is_finished():
-        api.wait_update()
-        progress = float(task.get_progress())
-        step = int(progress // 10) * 10
-        if on_progress is not None and step != last:
-            on_progress(progress)
-            last = step
     if not chunk.path.exists():
         raise RuntimeError(f"下载结束但没有生成 csv：{chunk.path}")
 
@@ -328,14 +372,40 @@ def run_download(
     downloader_factory: Callable[[Any, DownloadChunk], None] | None = None,
     on_progress: Callable[[str], None] | None = None,
     dry_run: bool = False,
+    clock: Callable[[], datetime] | None = None,
 ) -> dict[str, Any]:
     """
     执行一轮批量下载。
 
     dry_run 只列计划，不下载、不入库。已完成的块（manifest 标记 done）整块跳过；
-    csv 已存在但还没入库的，直接进入清洗入库。下载完按合约整体合成一次 K 线。
+    csv 已存在但还没入库的，直接进入清洗入库。默认每块开始前检查交易时段，
+    开盘就暂停并保留断点，下一轮接着补。下载完按合约整体合成一次 K 线。
     """
-    chunks: list[DownloadChunk] = []
+    out_dir = Path(settings["out_dir"])
+    manifest_path = out_dir / "download_manifest.json"
+    status_path = out_dir / "download_status.json"
+    summary: dict[str, Any] = {
+        "status": "done",
+        "total": 0,
+        "downloaded": 0,
+        "reused": 0,
+        "skipped": 0,
+        "failed": 0,
+        "symbols": {},
+    }
+    now = clock or datetime.now
+    if not dry_run:
+        reason = trading_pause_reason(settings, now())
+        if reason:
+            summary.update({"status": "paused", "paused": True, "message": reason})
+            _write_json(
+                status_path,
+                {"state": "paused", "total": 0, "finished": 0, "percent": 0.0, "message": reason},
+            )
+            if on_progress is not None:
+                on_progress(reason)
+            return summary
+
     api: Any | None = None
     client = None
     try:
@@ -352,20 +422,26 @@ def run_download(
             api = client
         else:
             api = api_factory()
-        chunks = plan_chunks(api, settings)
+        try:
+            chunks = plan_chunks(api, settings)
+        except Exception as exc:  # noqa: BLE001
+            if not _is_permission_error(exc):
+                raise
+            _write_json(
+                status_path,
+                {"state": "permission_denied", "message": _PERMISSION_HINT, "total": 0},
+            )
+            raise DownloadPermissionError(f"{_PERMISSION_HINT}：{exc}") from exc
 
-        out_dir = Path(settings["out_dir"])
-        manifest_path = out_dir / "download_manifest.json"
         manifest = _load_manifest(out_dir)
-        status_path = out_dir / "download_status.json"
         total = len(chunks)
-        summary = {"total": total, "downloaded": 0, "reused": 0, "skipped": 0, "failed": 0, "symbols": {}}
+        summary["total"] = total
 
         if dry_run:
             for chunk in chunks:
                 if on_progress is not None:
                     on_progress(f"[计划] {chunk.contract} {chunk.start} ~ {chunk.end} → {chunk.path}")
-            summary["dry_run"] = True
+            summary.update({"status": "dry_run", "dry_run": True})
             return summary
 
         download = downloader_factory or (lambda _api, chunk: _download_chunk(_api, chunk))
@@ -374,6 +450,32 @@ def run_download(
             if done.get("status") == "done":
                 summary["skipped"] += 1
             else:
+                reason = trading_pause_reason(settings, now())
+                if reason:
+                    summary.update(
+                        {
+                            "status": "paused",
+                            "paused": True,
+                            "remaining": total - index + 1,
+                            "message": reason,
+                        }
+                    )
+                    _write_json(manifest_path, manifest)
+                    _write_json(
+                        status_path,
+                        {
+                            "state": "paused",
+                            "total": total,
+                            "finished": index - 1,
+                            "percent": round((index - 1) * 100.0 / total, 1),
+                            "next": chunk.contract,
+                            "message": reason,
+                            "updated": datetime.now().isoformat(timespec="seconds"),
+                        },
+                    )
+                    if on_progress is not None:
+                        on_progress(reason)
+                    return summary
                 try:
                     if chunk.path.exists() and chunk.path.stat().st_size > 0:
                         summary["reused"] += 1
@@ -429,6 +531,10 @@ def run_download(
             )
             if on_progress is not None:
                 on_progress(f"[{index}/{total}] {chunk.contract} {chunk.start} ~ {chunk.end}")
+            pause = float(settings.get("chunk_pause_sec") or 0)
+            if index < total and pause > 0:
+                # 单连接串行下载，块间留一点空档，别把行情通道占满。
+                time.sleep(pause)
 
         for contract in sorted({chunk.contract for chunk in chunks}):
             symbol = config_symbol_from_tq(contract)
@@ -457,3 +563,104 @@ def run_download(
                 client.close()
             except BaseException:  # noqa: BLE001
                 logger.debug("关闭下载连接时出错，已忽略")
+
+
+def run_download_auto_resume(
+    settings: dict[str, Any],
+    *,
+    api_factory: Callable[[], Any] | None = None,
+    downloader_factory: Callable[[Any, DownloadChunk], None] | None = None,
+    on_progress: Callable[[str], None] | None = None,
+    dry_run: bool = False,
+    clock: Callable[[], datetime] | None = None,
+    sleep: Callable[[float], None] | None = None,
+    stop: Callable[[], bool] | None = None,
+    on_pause: Callable[[str], None] | None = None,
+    on_wake: Callable[[], None] | None = None,
+) -> dict[str, Any]:
+    """
+    开盘暂停后等到下一个非交易时段自动续传，直到补完。
+
+    `auto_resume=false` 时只跑一轮，行为和 run_download 一致。等待期间不占天勤
+    连接，只按 resume_poll_sec 轮询交易时段；stop() 为真时停止等待并保留断点。
+    dry_run 只列计划，不等待。on_pause 在进入等待时调用，on_wake 在收盘续传前
+    调用，给调用方恢复/暂停实时采集用。
+    """
+    now = clock or datetime.now
+    nap = sleep or time.sleep
+    poll = max(5.0, float(settings.get("resume_poll_sec") or 60))
+    auto = bool(settings.get("auto_resume", True)) and not dry_run
+    status_path = Path(settings["out_dir"]) / "download_status.json"
+    # 失败块下一轮会重试，失败数取最后一轮，避免重复累计。
+    totals = {"downloaded": 0, "reused": 0}
+    rounds = 0
+
+    def _stopped() -> bool:
+        return bool(stop is not None and stop())
+
+    while True:
+        summary = run_download(
+            settings,
+            api_factory=api_factory,
+            downloader_factory=downloader_factory,
+            on_progress=on_progress,
+            dry_run=dry_run,
+            clock=now,
+        )
+        rounds += 1
+        for key in totals:
+            totals[key] += int(summary.get(key) or 0)
+        if summary.get("status") != "paused" or not auto:
+            if rounds > 1:
+                summary.update(totals)
+                summary["rounds"] = rounds
+            return summary
+
+        remaining = int(summary.get("remaining") or 0)
+        total = int(summary.get("total") or 0)
+        wait_text = str(summary.get("message") or "当前处于交易时段")
+        message = f"{wait_text}；已安排收盘后自动继续"
+        _write_json(
+            status_path,
+            {
+                "state": "waiting_resume",
+                "total": total,
+                "finished": max(0, total - remaining),
+                "percent": round(max(0, total - remaining) * 100.0 / total, 1) if total else 0.0,
+                "remaining": remaining,
+                "message": message,
+                "updated": now().isoformat(timespec="seconds"),
+            },
+        )
+        if on_progress is not None:
+            on_progress(message)
+        if on_pause is not None:
+            on_pause(message)
+        while True:
+            if _stopped():
+                summary.update(totals)
+                summary.update({"rounds": rounds, "resume_stopped": True})
+                _write_json(
+                    status_path,
+                    {
+                        "state": "paused",
+                        "total": total,
+                        "finished": max(0, total - remaining),
+                        "percent": round(max(0, total - remaining) * 100.0 / total, 1)
+                        if total
+                        else 0.0,
+                        "remaining": remaining,
+                        "message": "已停止自动续传，断点已保留",
+                        "updated": now().isoformat(timespec="seconds"),
+                    },
+                )
+                if on_progress is not None:
+                    on_progress("已停止自动续传，断点已保留；下次运行会接着补")
+                return summary
+            if not trading_pause_reason(settings, now()):
+                break
+            nap(poll)
+        if on_progress is not None:
+            on_progress("已收盘，自动继续补历史 tick")
+        if on_wake is not None:
+            on_wake()

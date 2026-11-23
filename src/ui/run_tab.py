@@ -1536,6 +1536,9 @@ class RunTabMixin:
 
     def _on_close(self) -> None:
         self._closing = True
+        stop_event = getattr(self, "_tick_download_stop", None)
+        if stop_event is not None:
+            stop_event.set()
         try:
             from src.ui.sim_counter import shutdown_owned_counter
 

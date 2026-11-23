@@ -8,7 +8,9 @@ from src.data.inventory import (
     collect_kline_inventory,
     inventory_message,
     preview_purge,
+    preview_rebuilt_klines,
     purge_klines,
+    purge_rebuilt_klines,
     split_stored_symbol,
     write_kline_inventory,
 )
@@ -213,6 +215,52 @@ def test_purge_deletes_leftover_csv_when_sqlite_already_empty(tmp_path) -> None:
     result = purge_klines(tmp_path, source="ths", symbol="fu2701")
     assert result["clean_deleted"] == 0
     assert not csv_path.exists()
+
+
+def test_purge_rebuilt_klines_keeps_one_minute_tick_and_raw(tmp_path) -> None:
+    """一键清拼合 K：只删 2 分钟及以上，1 分钟、日线、tick 原始和原样库都留着。"""
+    kline_dir = tmp_path / "data" / "klines"
+    kline_dir.mkdir(parents=True)
+    raw = RawBarStore(kline_dir / "raw.sqlite")
+    clean = BarStore(kline_dir / "market.sqlite")
+    tick = BarStore(kline_dir / "tick_bars.sqlite")
+    one = _frame([("2026-10-16 09:01:00", 100.0), ("2026-10-16 09:02:00", 101.0)])
+    five = _frame(
+        [
+            ("2026-10-16 09:05:00", 100.0),
+            ("2026-10-16 09:10:00", 101.0),
+            ("2026-10-16 09:15:00", 102.0),
+        ]
+    )
+    clean.upsert("fu2701", "1", one)
+    clean.upsert("fu2701", "5", five)
+    clean.upsert("fu2701", "30", five)
+    clean.upsert("fu2701", "D", five)
+    raw.upsert("fu2701", "30", "akshare", five)
+    tick.upsert("fu2701@tick", "1", one)
+    tick.upsert("fu2701@tick", "60", five)
+    one_csv = kline_dir / "fu2701_1m.csv"
+    five_csv = kline_dir / "fu2701_5m.csv"
+    one.to_csv(one_csv, encoding="utf-8-sig")
+    five.to_csv(five_csv, encoding="utf-8-sig")
+
+    seen = preview_rebuilt_klines(tmp_path)
+    assert seen["clean_n"] == 6
+    assert seen["tick_n"] == 3
+    assert seen["periods"] == ["5", "30", "60"]
+
+    result = purge_rebuilt_klines(tmp_path)
+    assert result["clean_deleted"] == 6
+    assert result["tick_deleted"] == 3
+    assert clean.count("fu2701", "1") == 2
+    assert clean.count("fu2701", "5") == 0
+    assert clean.count("fu2701", "30") == 0
+    assert clean.count("fu2701", "D") == 3
+    assert tick.count("fu2701@tick", "1") == 2
+    assert tick.count("fu2701@tick", "60") == 0
+    assert raw.count("fu2701", "30", "akshare") == 3
+    assert one_csv.exists()
+    assert not five_csv.exists()
 
 
 def test_purge_refuses_to_wipe_everything(tmp_path) -> None:

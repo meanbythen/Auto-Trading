@@ -25,6 +25,12 @@ import pandas as pd
 # 程序里统一的 K 线列。各家下载之后都收成这一张表，避免换源时列名、时区对不上。
 OHLC_COLUMNS = ("open", "high", "low", "close", "volume")
 
+_NS_PER_DAY = 24 * 60 * 60 * 1_000_000_000
+
+
+# 持仓量在不同行情源里的列名。统一收成 oi，缺了就是缺了，不填 0。
+OI_ALIASES = ("close_oi", "open_oi", "open_interest", "position", "hold")
+
 
 def canonicalize_ohlc(
     frame: pd.DataFrame | None,
@@ -64,6 +70,12 @@ def canonicalize_ohlc(
     for need in (*OHLC_COLUMNS, "oi"):
         if need in cols and cols[need] != need:
             rename[cols[need]] = need
+    # 各家的持仓量列名不一样，这里统一成 oi；已经有 oi 时不再覆盖。
+    if "oi" not in cols:
+        for alias in OI_ALIASES:
+            if alias in cols:
+                rename[cols[alias]] = "oi"
+                break
     if rename:
         out = out.rename(columns=rename)
     keep = [name for name in (*OHLC_COLUMNS, "oi") if name in out.columns]
@@ -448,6 +460,33 @@ def minute_in_session(stamp: datetime, symbol: Any = "") -> bool:
     return _segment_for_stamp(naive, trading_segments_for_symbol(symbol)) is not None
 
 
+def _continuous_group_labels(
+    base: date,
+    segments: list[tuple[dtime, dtime]],
+    step: int,
+) -> list[datetime]:
+    """一组交易分钟按连续累计切出来的右标签；末尾不足一个周期也保留。"""
+    minutes: list[datetime] = []
+    for start, end in sorted(segments, key=lambda pair: pair[0]):
+        begin = datetime.combine(base, start)
+        finish = (
+            datetime.combine(base + timedelta(days=1), end)
+            if start > end
+            else datetime.combine(base, end)
+        )
+        cursor = begin + timedelta(minutes=1)
+        while cursor <= finish:
+            minutes.append(cursor)
+            cursor += timedelta(minutes=1)
+    if not minutes:
+        return []
+    minutes.sort()
+    labels = minutes[step - 1 :: step]
+    if minutes[-1] not in labels:
+        labels.append(minutes[-1])
+    return labels
+
+
 def session_close_times(
     day: datetime | date,
     step: int,
@@ -458,16 +497,28 @@ def session_close_times(
     """
     这一天按交易时段应该出现的 K 线结束时刻。
 
-    和拼 K 同一套：段内墙上时钟，段尾截断。休市不生成。
+    5～29 分钟：段内墙上时钟，段尾截断；30 分钟及以上：连续交易分钟累计，
+    休息不计入、余量结转，夜盘/日盘分组各自重置。
     夜盘跨零点时，02:30 落在次日凌晨。
     """
     if isinstance(day, datetime):
         day = day.date()
     step = max(int(step), 1)
     segments = list(trading_segments_for_symbol(symbol))
+    if step >= 30:
+        night = [(start, end) for start, end in segments if start > end or start.hour >= 18]
+        daytime = [
+            (start, end) for start, end in segments if not (start > end or start.hour >= 18)
+        ]
+        closes: list[datetime] = []
+        if include_night and night:
+            closes.extend(_continuous_group_labels(day, night, step))
+        if daytime:
+            closes.extend(_continuous_group_labels(day, daytime, step))
+        return sorted(closes)
     if not include_night:
         segments = [(start, end) for start, end in segments if start <= end and start.hour < 16]
-    closes: list[datetime] = []
+    closes = []
     for start, end in segments:
         if start <= end:
             begin = datetime.combine(day, start)
@@ -563,14 +614,165 @@ def bars_from_session_clock(
     return out.sort_index()
 
 
+def _group_tags(
+    index: pd.DatetimeIndex,
+    segments: tuple[tuple[dtime, dtime], ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    """
+    给每根 1 分钟打组标记。
+
+    kind：0=夜盘，1=日盘，-1=不在任何交易时段（午休等，后面丢掉）。
+    base_days：0=当日，-1=前一日夜盘跨零点后的凌晨。
+    """
+    n = len(index)
+    kind = np.full(n, -1, dtype=np.int8)
+    base_days = np.zeros(n, dtype=np.int64)
+    hm = np.asarray(index.hour * 60 + index.minute, dtype=np.int64)
+    for start, end in segments:
+        start_m = start.hour * 60 + start.minute
+        end_m = end.hour * 60 + end.minute
+        overnight = start > end
+        if overnight:
+            mask = (hm > start_m) | (hm <= end_m)
+            early = hm <= end_m
+        else:
+            mask = (hm > start_m) & (hm <= end_m)
+            early = np.zeros(n, dtype=bool)
+        if not mask.any():
+            continue
+        kind[mask] = 0 if overnight or start.hour >= 18 else 1
+        if overnight:
+            base_days[mask] = np.where(early[mask], -1, 0)
+    return kind, base_days
+
+
 def bars_from_trading_minutes(
     minutes: pd.DataFrame,
     step: int,
     *,
     symbol: str = "",
 ) -> pd.DataFrame:
-    """旧名字：以前按交易分钟凑满 60 根，会跨午休。现在改走时段内时钟。"""
-    return bars_from_session_clock(minutes, step, symbol=symbol)
+    """
+    按连续交易分钟累计收线。
+
+    同一组（夜盘 / 日盘）内只看实际在盘的 1 分钟：休息不计入，余量结转，
+    `pos // step` 分桶，标签取桶内最后一分钟。夜盘、日盘两组各自清零，
+    不跨夜盘→日盘结转。30 分钟日盘因此是 09:30、10:00、10:45、11:15、
+    13:45、14:15、14:45、15:00；尾盘不足整周期的半根保留。
+    """
+    step = max(int(step), 1)
+    segments = trading_segments_for_symbol(symbol)
+    columns = [
+        name
+        for name in ("open", "high", "low", "close", "volume", "oi")
+        if name in getattr(minutes, "columns", [])
+    ]
+    empty = pd.DataFrame(columns=list(dict.fromkeys(columns + ["minute_count"])))
+    if minutes is None or len(minutes) == 0 or "close" not in columns:
+        return empty
+
+    data = minutes.sort_index()
+    index = pd.DatetimeIndex(data.index)
+    if index.tz is not None:
+        index = index.tz_convert("Asia/Shanghai").tz_localize(None)
+    index = index.floor("min")
+    if index.duplicated().any():
+        keep = ~index.duplicated(keep="last")
+        data = data.loc[keep]
+        index = index[keep]
+
+    kind, base_days = _group_tags(index, segments)
+    valid = kind >= 0
+    if not valid.any():
+        return empty
+
+    day_ord = (index.normalize().asi8 // _NS_PER_DAY).astype(np.int64) + base_days
+    group = day_ord * 2 + kind.astype(np.int64)
+    frame = data.loc[valid, columns].copy()
+    frame.insert(0, "ts", index[valid])
+    frame.insert(0, "group", group[valid])
+    frame = frame.sort_values(["group", "ts"], kind="mergesort")
+    frame["bucket"] = frame.groupby("group", sort=False).cumcount() // step
+    grouped = frame.groupby(["group", "bucket"], sort=False)
+    agg: dict[str, str] = {"open": "first", "high": "max", "low": "min", "close": "last"}
+    if "volume" in columns:
+        agg["volume"] = "sum"
+    if "oi" in columns:
+        agg["oi"] = "last"
+    out = grouped.agg(agg)
+    out["minute_count"] = grouped["close"].size()
+    out.index = pd.DatetimeIndex(grouped["ts"].last().to_numpy(), name="datetime")
+    out = out.dropna(subset=["close"]).sort_index()
+    return out
+
+
+def continuous_fill_minutes(
+    ts: Any,
+    step: int,
+    *,
+    symbol: Any = "",
+) -> int | None:
+    """
+    这根右标签 K 线所在组，从开盘到它为止一共走了多少连续交易分钟。
+
+    找不到所属交易组（休市、非交易时段）返回 None。只按交易时段推，不看行情数据。
+    """
+    try:
+        stamp = pd.Timestamp(ts)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(stamp):
+        return None
+    if stamp.tzinfo is not None:
+        stamp = stamp.tz_convert("Asia/Shanghai").tz_localize(None)
+    moment = stamp.to_pydatetime().replace(second=0, microsecond=0)
+    segments = trading_segments_for_symbol(symbol)
+    night = [(start, end) for start, end in segments if start > end or start.hour >= 18]
+    daytime = [
+        (start, end) for start, end in segments if not (start > end or start.hour >= 18)
+    ]
+    if moment.hour >= 18:
+        group, base = night, moment.date()
+    elif moment.hour < 8:
+        group, base = night, moment.date() - timedelta(days=1)
+    else:
+        group, base = daytime, moment.date()
+    if not group:
+        return None
+    cursor = 0
+    for start, end in sorted(group, key=lambda pair: pair[0]):
+        begin = datetime.combine(base, start)
+        finish = (
+            datetime.combine(base + timedelta(days=1), end)
+            if start > end
+            else datetime.combine(base, end)
+        )
+        if begin < moment <= finish:
+            return cursor + int((moment - begin).total_seconds() // 60)
+        cursor += int((finish - begin).total_seconds() // 60)
+    return None
+
+
+def partial_tail_bar(
+    ts: Any,
+    period: str,
+    *,
+    symbol: Any = "",
+) -> bool:
+    """
+    30/60 分钟里，它是不是组尾那根不足整周期的半根。
+
+    连续累计下只有组尾桶可能不满整周期，因此“不满”就等于“尾盘半根”。
+    5～29 分钟、日线周线一律返回 False，保持原口径。
+    """
+    code = canonical_period(period)
+    if not code.isdigit():
+        return False
+    step = int(code)
+    if step < 30:
+        return False
+    fill = continuous_fill_minutes(ts, step, symbol=symbol)
+    return bool(fill is not None and fill % step != 0)
 
 
 def _min_minutes_for_bar(step: int) -> int:
@@ -644,9 +846,10 @@ def bars_from_minutes(
 
     时间戳用这一段的结束时刻（右标签）：
     15 分钟的 21:15 = 约 21:00～21:15；5 分钟的 11:15 = 11:10～11:15。
-    5/15/30/60 都按交易时段内的自然时钟收，大休市断开，不把 10:15～10:30、
-    11:30～13:30 并进同一根。60 分钟日盘是 10:00、10:15、11:00、11:30、14:00、15:00。
-    最后一段分钟还没齐也先留着，扫描时当未收盘。
+    5～29 分钟按交易时段内的自然时钟收，大休市断开。
+    30 分钟及以上按连续交易分钟累计：10:15～10:30、11:30～13:30 不计入，
+    余量结转；夜盘、日盘分组各自重置。因此 60 分钟日盘是 10:00、11:15、
+    14:15、15:00。尾盘不足整周期的半根保留，扫描时当未收盘/不开新仓。
     开盘第一根允许略缺几分钟（夜盘常见），避免整根被丢掉。
     """
     if minutes is None or len(minutes) == 0:
@@ -654,6 +857,8 @@ def bars_from_minutes(
     step = int(canonical_period(period))
     if step <= 1:
         return minutes
+    if step >= 30:
+        return bars_from_trading_minutes(minutes, step, symbol=symbol)
     if step >= 5:
         return bars_from_session_clock(minutes, step, symbol=symbol)
     data = minutes.sort_index()
@@ -685,26 +890,37 @@ def bars_from_minutes(
     return kept
 
 
-def _drop_clock_hour_native_60(native: pd.DataFrame, persist: pd.DataFrame) -> pd.DataFrame:
+def _drop_conflicting_native(
+    native: pd.DataFrame,
+    persist: pd.DataFrame,
+    step: int,
+) -> pd.DataFrame:
     """
-    同一天已经用 1 分钟拼出时段内时钟 K 线时，删掉对不上的天勤整点。
+    重拼覆盖到的每一天，删掉区间内时间对不上的原生 K。
 
-    例如拼出了 10:15、11:30，就要拿掉午休里的 12:00、13:00，
-    也拿掉旧的 11:15、14:15。这一天 1 分钟不够、拼不出来时，先留着原生。
+    30 分钟连续累计后，原生 11:00、11:30、14:00、14:30 这些时间已不再成立，
+    留着会和 11:15、14:15 等新 K 重复。每天只处理
+    [拼图当日首标签, 当日末标签] 区间，区间外原生 K 保留，
+    避免某天 1 分钟不全时把未覆盖的原生 K 误删。
     """
-    if native is None or persist is None or len(native) == 0 or len(persist) == 0:
+    if int(step) < 30 or native is None or persist is None:
         return native
-    persist_days = pd.DatetimeIndex(persist.index).normalize()
-    native_days = pd.DatetimeIndex(native.index).normalize()
+    if len(native) == 0 or len(persist) == 0:
+        return native
+    native_index = pd.DatetimeIndex(native.index)
+    native_days = native_index.normalize()
+    persist_index = pd.DatetimeIndex(persist.index)
+    persist_days = persist_index.normalize()
+    native_hm = (native_index.hour * 60 + native_index.minute).to_numpy(dtype=np.int64)
     drop = np.zeros(len(native), dtype=bool)
-    native_hm = (native.index.hour * 60 + native.index.minute).to_numpy(dtype=np.int64)
     for day in persist_days.unique():
-        built = persist.loc[persist_days == day]
-        times = {int(h) * 60 + int(m) for h, m in zip(built.index.hour, built.index.minute)}
-        if not times:
+        built_pos = np.flatnonzero(persist_days == day)
+        if len(built_pos) == 0:
             continue
-        same = np.asarray(native_days == day)
-        drop |= same & ~np.isin(native_hm, np.fromiter(times, dtype=np.int64, count=len(times)))
+        built = persist_index[built_pos]
+        built_hm = (built.hour * 60 + built.minute).to_numpy(dtype=np.int64)
+        span = (native_days == day) & (native_index >= built.min()) & (native_index <= built.max())
+        drop |= np.asarray(span) & ~np.isin(native_hm, built_hm)
     if not drop.any():
         return native
     return native.loc[~drop]
@@ -746,9 +962,9 @@ def overlay_minute_bars(
         return visible, persist.index
 
     out = native.copy()
-    if step >= 60:
-        # 有拼好的时段内 60 分钟时，当天对不上的天勤整点（含午休 12:00）要拿掉。
-        out = _drop_clock_hour_native_60(out, persist)
+    if step >= 30:
+        # 30/60 连续累计后，原生 K 的整点/半点时间大多不再成立，覆盖区间内要清掉。
+        out = _drop_conflicting_native(out, persist, step)
     # 按时间戳逐根替换：只丢掉拼图里确实有的原生K线。
     # 原来按 [min,max] 整段删，区间内某天缺 1 分钟数据时该天原生 K 线会被误删且不回填。
     drop_mask = out.index.isin(persist.index)

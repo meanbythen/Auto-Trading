@@ -52,6 +52,7 @@ def _rebuildable_minute_period(period: str) -> bool:
     code = canonical_period(period)
     return str(code).isdigit() and int(code) >= 5
 
+
 # 实盘扫描和回测会同时来拉同一份行情。排队拉，避免两路请求缠在一起后其中一路永远不返回。
 _FETCH_LOCK = threading.Lock()
 # 连接最多等 5 秒，读数据最多等 20 秒。到点就失败，回测改用本地缓存，不再停在「请稍候」。
@@ -518,7 +519,7 @@ class KlineProvider:
                 local.attrs["from_cache"] = True
                 return local
             if self.source == "tq":
-                # 天勤 60 分钟常是墙上整点。本地有同一家的 1 分钟时，按交易时段重拼。
+                # 天勤 60 分钟常是墙上整点。本地有同一家的 1 分钟时，按连续交易时间重拼。
                 rebuilt = self._rebuild_from_local_minutes(symbol, period, local)
                 out = rebuilt if rebuilt is not None else local
                 out.attrs["from_cache"] = True
@@ -894,7 +895,8 @@ class KlineProvider:
             df = resample_ohlc(df, period)
         # 先把接口原样存下来，再拿 1 分钟重拼。开仓仍看拼好的那一份。
         self._save_vendor_raw(symbol_hint or sina_code, period, df)
-        # 5、15、30、60 分钟改用 1 分钟按交易时段内时钟来拼，休市断开。
+        # 5、15、30、60 分钟改用 1 分钟重拼。5～29 分钟按时段内时钟，休市断开；
+        # 30/60 按连续交易分钟累计，休息不计入、余量结转，尾盘半根保留。
         # symbol_hint 要用配置里的合约名（如 fu2701），才能对上本地 1 分钟库存；不要用新浪大写码。
         if not _rebuildable_minute_period(period):
             return df
@@ -1146,8 +1148,8 @@ class KlineProvider:
         if start < 0 or end <= start:
             raise RuntimeError("新浪返回的不是K线数据")
         table = pd.DataFrame(json.loads(text[start + 2 : end]))
-        # 新浪现在用单字母列名。收成和原来一样的开高低收，后面的整理才认得出收盘价。
-        short = {"d": "datetime", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume", "p": "hold", "s": "settle"}
+        # 新浪现在用单字母列名。p 是持仓量（不是价格），直接收成 oi，别再叫 hold 被后续整理丢掉。
+        short = {"d": "datetime", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume", "p": "oi", "s": "settle"}
         return table.rename(columns={key: name for key, name in short.items() if key in table.columns})
 
     def _fetch_ths(self, symbol: str, period: str, *, limit: int = 200) -> pd.DataFrame:

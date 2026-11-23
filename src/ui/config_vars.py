@@ -427,6 +427,9 @@ class ConfigVarsMixin:
         # 天勤 tick：采集心跳和本地 tick 库存摘要。
         self.tick_status_var = ctk.StringVar(value="tick 采集：未启动")
         self.tick_inventory_var = ctk.StringVar(value="tick 库存：未读取")
+        self.tick_backfill_var = ctk.StringVar(value="历史补齐：未运行")
+        tick_cfg = (self.cfg.get("data") or {}).get("tick") or {}
+        self.tick_auto_var = ctk.BooleanVar(value=bool(tick_cfg.get("enabled", False)))
         # 成交近似：下一根开盘成交与滑点跳数，只影响回测。配置页和历史回测页共用这一组。
         self.bt_fill_next_open_var = ctk.BooleanVar(value=bool(bt.get("fill_on_next_open", True)))
         self.bt_slippage_var = ctk.StringVar(value=str(bt.get("slippage_ticks", 1)))
@@ -594,7 +597,24 @@ class ConfigVarsMixin:
         self.rs_include_night_var = ctk.BooleanVar(value=bool(bt.get("include_end_night", False)))
         self.rs_scope_var = ctk.StringVar(value="扫关注名单全部")
         self.rs_cross_var = ctk.BooleanVar(value=True)
+        # 因子数据需求：模式决定根数门槛；OI 可关闭；补齐默认避开交易时段。
+        from src.research.data_requirements import MODE_BY_LABEL, MODE_LABELS, mode_key
+
+        fb_cfg = ((self.cfg.get("data") or {}).get("factor_backfill") or {})
+        fb_mode = mode_key(str(fb_cfg.get("target_mode") or "standard"))
+        self.rs_mode_var = ctk.StringVar(value=MODE_LABELS[fb_mode])
+        # 研究目标：只筛因子、只识别状态，或两条流水线一起跑。
+        self.rs_goal_var = ctk.StringVar(value="因子筛选")
+        self.rs_oi_var = ctk.BooleanVar(value=bool(fb_cfg.get("require_oi", True)))
+        self.rs_offhours_var = ctk.BooleanVar(
+            value=bool(fb_cfg.get("pause_when_trading", True))
+        )
+        if self.rs_mode_var.get() not in MODE_LABELS.values():
+            self.rs_mode_var.set(MODE_LABELS["standard"])
+        self._rs_mode_by_label = MODE_BY_LABEL
         self._rs_busy = False
+        self._rs_backfill_busy = False
+        self._rs_cancel = None
         self._rs_check_vars: dict[str, ctk.BooleanVar] = {}
 
     def _init_cta_filter_vars(
@@ -920,6 +940,8 @@ class ConfigVarsMixin:
         except Exception:  # noqa: BLE001
             pass
         self.scan_var.set(str(sch.get("scan_interval_sec", 30)))
+        tick_cfg = (self.cfg.get("data") or {}).get("tick") or {}
+        self.tick_auto_var.set(bool(tick_cfg.get("enabled", False)))
         from src.strategy.session_scope import scope_from_cfg, scope_label
 
         self.session_scope_var.set(scope_label(scope_from_cfg(self.cfg)))

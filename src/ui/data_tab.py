@@ -169,6 +169,23 @@ class DataTabMixin:
             font=T.FONT_TITLE,
             text_color=T.TEXT,
         ).pack(anchor="w", padx=4, pady=(8, 4))
+        auto_row = ctk.CTkFrame(left, fg_color="transparent")
+        auto_row.pack(fill="x", padx=4, pady=(0, 2))
+        ctk.CTkSwitch(
+            auto_row,
+            text="启动程序时自动采集",
+            variable=self.tick_auto_var,
+            progress_color=T.OK,
+            font=T.FONT_SMALL,
+            text_color=T.TEXT,
+            command=self._on_toggle_tick_auto,
+        ).pack(side="left")
+        ctk.CTkLabel(
+            auto_row,
+            text="只影响下次启动；本次采集用下面的按钮",
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+        ).pack(side="left", padx=(8, 0))
         ctk.CTkLabel(
             left,
             textvariable=self.tick_status_var,
@@ -209,6 +226,26 @@ class DataTabMixin:
             text_color=T.TEXT,
             command=self._on_download_history_tick,
         ).pack(fill="x", padx=4, pady=(0, 4))
+        ctk.CTkButton(
+            left,
+            text="补齐历史 tick（按回看天数）",
+            height=34,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_backfill_history_tick,
+        ).pack(fill="x", padx=4, pady=(0, 4))
+        self.tick_backfill_label = ctk.CTkLabel(
+            left,
+            textvariable=self.tick_backfill_var,
+            font=T.FONT_SMALL,
+            text_color=T.TEXT_DIM,
+            wraplength=380,
+            justify="left",
+        )
+        self.tick_backfill_label.pack(anchor="w", padx=4, pady=(0, 4))
         ctk.CTkButton(
             left,
             text="查看本地tick库存",
@@ -256,8 +293,12 @@ class DataTabMixin:
         ctk.CTkLabel(
             left,
             text=(
-                "合约名单空，自动用配置页关注品种。「启动tick采集」攒实时tick到数据库；"
-                "「下载历史tick」需天勤专业版/试用，免费账号提示没权限；tick只增删查、不修改；"
+                "合约名单空，自动用配置页关注品种。打开上面的「启动程序时自动采集」"
+                "（写入 data.tick.enabled）后，程序启动会自动采集："
+                "开盘前几十秒连接、收盘后断开并合成K线，非交易时段不占天勤连接。"
+                "「补齐历史tick」按回看天数一键补，自动暂停实时采集、可断点续传；"
+                "盘中暂停后收盘自动续传，再点一次按钮可停止。"
+                "「下载历史tick」需天勤专业版/试用。tick只增删查、不修改；"
                 "「删除本地tick」清掉乱段后重新下载。"
             ),
             font=T.FONT_SMALL,
@@ -339,6 +380,17 @@ class DataTabMixin:
         ).pack(side="left")
         ctk.CTkButton(
             left,
+            text="清除拼合K线（保留1分钟/tick）",
+            height=34,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_clear_rebuilt_klines,
+        ).pack(fill="x", padx=4, pady=(0, 4))
+        ctk.CTkButton(
+            left,
             text="查看这根K线",
             height=34,
             fg_color=T.BG_ELEVATED,
@@ -358,6 +410,17 @@ class DataTabMixin:
             border_color=T.BORDER,
             text_color=T.TEXT,
             command=self._on_check_quote_quality,
+        ).pack(fill="x", padx=4, pady=(0, 4))
+        ctk.CTkButton(
+            left,
+            text="持仓量覆盖审计",
+            height=34,
+            fg_color=T.BG_ELEVATED,
+            hover_color=T.BORDER,
+            border_width=1,
+            border_color=T.BORDER,
+            text_color=T.TEXT,
+            command=self._on_audit_oi_coverage,
         ).pack(fill="x", padx=4, pady=(0, 4))
         ctk.CTkLabel(
             left,
@@ -658,6 +721,50 @@ class DataTabMixin:
                 "打不开统计表",
                 f"表已经写好，但系统没能打开 Excel。\n请自己打开：\n{path}",
             )
+
+    def _on_clear_rebuilt_klines(self) -> None:
+        """一键清除 2 分钟及以上的拼合 K 线，保留 1 分钟、日线周线和 tick 原始数据。"""
+        from tkinter import messagebox
+
+        from src.data.inventory import preview_rebuilt_klines, purge_rebuilt_klines
+
+        tick_store = str(((self.cfg.get("data") or {}).get("tick") or {}).get("bar_store") or "")
+        try:
+            seen = preview_rebuilt_klines(self.root_dir, tick_store=tick_store or None)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("预览拼合K线失败")
+            messagebox.showerror("打不开本地库", str(exc))
+            return
+        if not seen["clean_n"] and not seen["tick_n"] and not seen["csv_keys"]:
+            messagebox.showinfo("没有可清的", "本地没有 2 分钟及以上的拼合K线。")
+            return
+        periods = "、".join(period_label(period) for period in seen["periods"]) or "无"
+        ask = (
+            f"将清除本地拼合K线：{periods}。\n\n"
+            f"清洗库 {seen['clean_n']} 根，tick 合成库 {seen['tick_n']} 根。\n"
+            "1 分钟 K 线、日线/周线、tick 原始数据都不会删除。\n\n"
+            "清完后需要重新拉取或合成这些周期，并重跑回测。继续？"
+        )
+        if not messagebox.askokcancel("清除拼合K线", ask):
+            return
+        try:
+            result = purge_rebuilt_klines(self.root_dir, tick_store=tick_store or None)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("清除拼合K线失败")
+            messagebox.showerror("清除失败", str(exc))
+            return
+        msg = (
+            f"已清除拼合K线：清洗库 {result['clean_deleted']} 根，"
+            f"tick 合成库 {result['tick_deleted']} 根。\n"
+            "1 分钟 K 线和 tick 原始数据已保留。"
+        )
+        if result["csv_locked"]:
+            msg += (
+                "\n以下 CSV 正被占用，已标记跳过；关掉 Excel 后再清一次：\n"
+                + "\n".join(result["csv_locked"])
+            )
+        self._dm_write(msg.replace("\n", " | "))
+        messagebox.showinfo("已清除", msg)
 
     def _on_purge_local_klines(self) -> None:
         """弹出删除窗口：可按数据源、合约、周期、时间段删，先数再删。"""
@@ -960,6 +1067,47 @@ class DataTabMixin:
         self._open_local_file(path)
         self._dm_write(f"行情质量 {symbol} {report.status} | {path}")
 
+    def _on_audit_oi_coverage(self) -> None:
+        """按合约和周期统计持仓量覆盖率，写成 CSV。只读本地库，不下载。"""
+        import csv
+        from pathlib import Path
+        from tkinter import messagebox
+
+        from src.data.bar_store import BarStore
+
+        data_cfg = self.cfg.get("data") or {}
+        store = BarStore(
+            Path(self.root_dir) / data_cfg.get("cache_dir", "data/klines") / "market.sqlite"
+        )
+        rows = [store.coverage(item["symbol"], item["period"]) for item in store.summarize()]
+        if not rows:
+            messagebox.showinfo("还没有K线", "本地K线库是空的，先补齐K线再审计持仓量。")
+            return
+        out = Path(self.root_dir) / "data" / "factor_mining" / "持仓量覆盖审计.csv"
+        out.parent.mkdir(parents=True, exist_ok=True)
+        with out.open("w", encoding="utf-8-sig", newline="") as fh:
+            writer = csv.writer(fh)
+            writer.writerow(["合约", "周期", "根数", "持仓量非空", "覆盖率", "首根", "末根"])
+            for row in rows:
+                writer.writerow(
+                    [
+                        row["symbol"],
+                        row["period"],
+                        row["n"],
+                        row["oi_n"],
+                        f"{row['oi_ratio']:.2%}",
+                        row["ts_from"],
+                        row["ts_to"],
+                    ]
+                )
+        ok = sum(1 for row in rows if row["oi_ratio"] >= 0.90)
+        messagebox.showinfo(
+            "持仓量覆盖",
+            f"{len(rows)} 组（合约+周期）中有 {ok} 组达到 90%。\n已保存 {out}",
+        )
+        self._open_local_file(out)
+        self._dm_write(f"持仓量覆盖审计 {ok}/{len(rows)} 组达标 | {out}")
+
     # ---------- 天勤 tick ----------
     def _on_show_tick_inventory(self) -> None:
         """写出 tick 统计 Excel 并打开。逐笔不进表，也不写进 K 线库存。"""
@@ -1187,14 +1335,40 @@ class DataTabMixin:
         )
 
 
+    def _set_tick_backfill_status(self, text: str, tone: str = "normal") -> None:
+        """历史补齐状态：权限不足持续黄灯，暂停黄灯，失败红灯，成功绿灯。"""
+        self.tick_backfill_var.set(text)
+        label = getattr(self, "tick_backfill_label", None)
+        if label is not None:
+            color = {
+                "normal": T.TEXT_DIM,
+                "success": T.OK,
+                "warning": T.WARN,
+                "error": T.DANGER,
+            }.get(tone, T.TEXT_DIM)
+            label.configure(text_color=color)
+
+    def _request_stop_tick_download(self) -> None:
+        """下载中再点一次：停止自动续传，已完成块和断点保留。"""
+        event = getattr(self, "_tick_download_stop", None)
+        if event is None:
+            self._dm_write("历史 tick 还在下载，等这一轮结束再点")
+            return
+        if not event.is_set():
+            event.set()
+            self._dm_write("已请求停止历史 tick：当前块结束后退出，断点会保留")
+            self._set_tick_backfill_status("历史 tick：正在停止，断点会保留…", "warning")
+
     def _refresh_tick_card(self) -> None:
         """刷 tick 采集心跳和本地库存摘要。每 2 秒由主心跳调用，只读文件。"""
-        from src.data.tick.recorder import read_status, tick_settings
+        from src.data.tick.downloader import download_settings
+        from src.data.tick.recorder import read_status
         from src.data.tick.vnpy_store import tick_overview
 
         try:
-            settings = tick_settings(self.cfg)
+            settings = download_settings(self.cfg)
             status = read_status(settings["status_file"])
+            history_status = read_status(Path(settings["out_dir"]) / "download_status.json")
         except Exception as exc:  # noqa: BLE001
             self.tick_status_var.set(f"tick 采集：状态读取失败 {exc}")
             return
@@ -1209,6 +1383,8 @@ class DataTabMixin:
             names = {
                 "running": "采集中",
                 "reconnecting": "重连中",
+                "waiting_open": "等开盘",
+                "closed": "已收盘",
                 "stopped": "已停止",
                 "idle": "未启动",
             }
@@ -1217,6 +1393,12 @@ class DataTabMixin:
                 f"tick 采集：{state}｜今日 {status.get('ticks_today', 0)} 条"
                 f"｜缓冲 {status.get('buffered', 0)}｜最后 {status.get('last_tick_at') or '—'}"
             )
+            if status.get("session_only"):
+                text += "｜自动：仅交易时段"
+                if status.get("next_open"):
+                    text += f"｜下次开盘 {str(status['next_open']).replace('T', ' ')}"
+            if status.get("last_synth_day"):
+                text += f"\n最近合成交易日：{status['last_synth_day']}"
             if status.get("symbols"):
                 text += f"\n订阅：{'、'.join(str(s) for s in status['symbols'])}"
             if status.get("error"):
@@ -1224,6 +1406,17 @@ class DataTabMixin:
         else:
             text = "tick 采集：未启动（还没有心跳文件）"
         self.tick_status_var.set(text)
+        history_state = str(history_status.get("state") or "")
+        if not getattr(self, "_tick_download_busy", False) and history_state == "permission_denied":
+            self._set_tick_backfill_status(
+                "历史补齐：需专业版权限；免费账号请保持实时 tick 累积",
+                "warning",
+            )
+        elif not getattr(self, "_tick_download_busy", False) and history_state == "waiting_resume":
+            self._set_tick_backfill_status(
+                "历史补齐：上次在等待收盘续传时中断，点「补齐历史 tick」继续",
+                "warning",
+            )
 
         try:
             overview = tick_overview(database=settings["database"])
@@ -1263,6 +1456,204 @@ class DataTabMixin:
         self._tick_recorder = recorder
         self._dm_write("天勤 tick 采集已启动：盘中挂机即可攒 tick，断线会自动重连")
         self._refresh_tick_card()
+
+    def _on_toggle_tick_auto(self) -> None:
+        """「启动程序时自动采集」写进 data.tick.enabled；打开时当前也立即开始采集。"""
+        from src.utils.config_loader import save_config
+
+        enabled = bool(self.tick_auto_var.get())
+        data_cfg = self.cfg.setdefault("data", {})
+        tick_cfg = data_cfg.get("tick")
+        if not isinstance(tick_cfg, dict):
+            tick_cfg = {}
+            data_cfg["tick"] = tick_cfg
+        tick_cfg["enabled"] = enabled
+        try:
+            path = save_config(self.cfg)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("自动采集开关写配置失败")
+            tick_cfg["enabled"] = not enabled
+            self.tick_auto_var.set(not enabled)
+            self._dm_write(f"自动采集开关没保存：{exc}")
+            return
+        if enabled:
+            self._auto_start_tick_if_enabled()
+            self._dm_write(f"已打开启动自动采集（写入 {path}），本次也已开始")
+        else:
+            self._dm_write(f"已关闭启动自动采集（写入 {path}）；本次采集不受影响")
+        self._refresh_tick_card()
+
+    def _auto_start_tick_if_enabled(self) -> None:
+        """程序启动后按 data.tick.enabled 自动开采集；非交易时段只等开盘，不连天勤。"""
+        from src.data.tick.recorder import TickRecorder, tick_settings
+
+        if getattr(self, "_tick_recorder", None) is not None:
+            return
+        try:
+            settings = tick_settings(self.cfg)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("自动 tick 采集配置读取失败：{}", exc)
+            return
+        if not settings.get("enabled"):
+            return
+        try:
+            recorder = TickRecorder(self.cfg)
+            recorder.start()
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("自动 tick 采集未启动：{}", exc)
+            self._dm_write(f"自动 tick 采集未启动：{exc}")
+            return
+        self._tick_recorder = recorder
+        self._dm_write("自动 tick 采集已启动：仅交易时段连接，收盘后自动合成K线")
+        self._refresh_tick_card()
+
+    def _on_backfill_history_tick(self) -> None:
+        """按 lookback_days 一键补齐历史 tick：暂停实时采集、断点续传、完成后恢复。"""
+        from datetime import date, timedelta
+        from tkinter import messagebox
+
+        from src.data.tick.downloader import (
+            DownloadPermissionError,
+            download_settings,
+            main_cont_list_from_symbols,
+            run_download_auto_resume,
+            trading_pause_reason,
+        )
+
+        if getattr(self, "_tick_download_busy", False):
+            self._request_stop_tick_download()
+            return
+
+        settings = download_settings(self.cfg)
+        symbols = [str(item).strip() for item in (settings.get("symbols") or []) if str(item).strip()]
+        if not symbols:
+            messagebox.showwarning("还不能补齐", "配置页还没有关注品种。")
+            return
+
+        auto = bool(settings.get("auto_resume", True))
+        reason = trading_pause_reason(settings)
+        if reason and not auto:
+            self._set_tick_backfill_status(f"历史补齐：{reason}", "warning")
+            messagebox.showwarning("交易时段不补齐", reason)
+            return
+
+        lookback = max(1, int(settings.get("lookback_days") or 120))
+        end = date.today()
+        start = end - timedelta(days=lookback)
+        settings["enabled"] = True
+        settings["start"] = start.isoformat()
+        settings["end"] = end.isoformat()
+        mains = [str(item) for item in (settings.get("main_cont_list") or []) if str(item).strip()]
+        if not mains:
+            mains = main_cont_list_from_symbols(symbols)
+        settings["main_cont_list"] = mains
+        if not mains:
+            messagebox.showwarning("还不能补齐", "关注品种转不出天勤主连代码，无法查历史主力。")
+            return
+
+        recorder = getattr(self, "_tick_recorder", None)
+        pause = bool(settings.get("pause_record_during_download", True))
+        was_running = bool(recorder is not None and recorder.running)
+        resume = pause and was_running and recorder is not None
+
+        stop_event = threading.Event()
+        self._tick_download_stop = stop_event
+        self._tick_download_busy = True
+        span = f"{settings['start']} ~ {settings['end']}"
+        if reason:
+            self._set_tick_backfill_status(
+                f"历史补齐：{span}，交易时段先排队，收盘后自动开始", "warning"
+            )
+            self._dm_write(f"补齐历史 tick 已排队：{span}，收盘后自动开始")
+        else:
+            self._set_tick_backfill_status(f"历史补齐：{span}，准备中…")
+            self._dm_write(f"开始补齐历史 tick：{span}，回看 {lookback} 天，{'、'.join(mains)}")
+
+        def pause_record() -> None:
+            """真正开始下载前才停实时采集，避免等待收盘的几个小时丢 tick。"""
+            if not (resume and recorder is not None):
+                return
+            try:
+                if recorder.running:
+                    recorder.stop(timeout=10)
+                self._post_to_main(
+                    lambda: self._dm_write("补齐历史 tick：实时采集已暂停，下载完自动恢复")
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("暂停实时 tick 采集失败：{}", exc)
+
+        def restore_record() -> None:
+            if not (resume and recorder is not None):
+                return
+            try:
+                if not recorder.running:
+                    recorder.start()
+                    logger.info("历史 tick 补齐暂停等待，实时采集已恢复")
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("恢复实时 tick 采集失败：{}", exc)
+
+        def work() -> None:
+            try:
+                if not reason:
+                    pause_record()
+                summary = run_download_auto_resume(
+                    settings,
+                    on_progress=lambda text: (
+                        logger.info("历史 tick {}", text),
+                        self._post_to_main(
+                            lambda t=text: self._set_tick_backfill_status(f"历史补齐：{t}")
+                        ),
+                    ),
+                    stop=stop_event.is_set,
+                    on_pause=lambda _message: restore_record(),
+                    on_wake=pause_record,
+                )
+                logger.info("历史 tick 补齐结束：{}", summary)
+                rounds = int(summary.get("rounds") or 1)
+                suffix = f"（分 {rounds} 轮）" if rounds > 1 else ""
+                if summary.get("resume_stopped"):
+                    text = f"历史补齐已停止{suffix}：断点已保留，收盘后再点继续"
+                elif summary.get("status") == "paused":
+                    text = f"历史补齐已暂停：{summary.get('message') or '当前处于交易时段'}"
+                    remaining = int(summary.get("remaining") or 0)
+                    if remaining:
+                        text += f"；剩余 {remaining} 块"
+                    text += "，收盘后自动继续" if auto else "，收盘后再点继续"
+                else:
+                    text = (
+                        f"历史补齐完成{suffix}：计划 {summary.get('total', 0)} 块，"
+                        f"新下 {summary.get('downloaded', 0)}，跳过 {summary.get('skipped', 0)}，"
+                        f"复用 {summary.get('reused', 0)}，失败 {summary.get('failed', 0)}"
+                    )
+                tone = "warning" if summary.get("status") == "paused" or summary.get("failed") else "success"
+                self._post_to_main(
+                    lambda t=text, color=tone: self._set_tick_backfill_status(t, color)
+                )
+                self._post_to_main(lambda t=text: self._dm_write(t))
+            except DownloadPermissionError as exc:
+                logger.warning("历史 tick 没有权限：{}", exc)
+                msg = str(exc)
+                text = "历史补齐：需专业版权限；免费账号请保持实时 tick 累积"
+                self._post_to_main(
+                    lambda t=text: self._set_tick_backfill_status(t, "warning")
+                )
+                self._post_to_main(lambda m=msg: messagebox.showerror("没有下载权限", m))
+                self._post_to_main(lambda m=msg: self._dm_write(m))
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("历史 tick 补齐失败")
+                msg = str(exc)
+                self._post_to_main(
+                    lambda m=msg: self._set_tick_backfill_status(f"历史补齐失败：{m}", "error")
+                )
+                self._post_to_main(lambda m=msg: messagebox.showerror("补齐失败", m))
+                self._post_to_main(lambda m=msg: self._dm_write(f"历史 tick 补齐失败：{m}"))
+            finally:
+                self._tick_download_stop = None
+                self._tick_download_busy = False
+                restore_record()
+                self._post_to_main(self._refresh_tick_card)
+
+        threading.Thread(target=work, name="TickBackfill", daemon=True).start()
 
     def _on_synth_tick_bars(self) -> None:
         """把本地 tick 合成为各周期 K 线。耗时长，放后台线程，日志进运行日志。"""
@@ -1317,12 +1708,12 @@ class DataTabMixin:
             DownloadPermissionError,
             download_settings,
             main_cont_list_from_symbols,
-            run_download,
+            run_download_auto_resume,
         )
         from src.ui.datetime_pickers import DateField
 
         if getattr(self, "_tick_download_busy", False):
-            self._dm_write("历史 tick 还在下载，等这一轮结束再点")
+            self._request_stop_tick_download()
             return
         recorder = getattr(self, "_tick_recorder", None)
         if recorder is not None and recorder.running:
@@ -1340,7 +1731,8 @@ class DataTabMixin:
         ctk.CTkLabel(
             dialog,
             text="需要天勤专业版或试用权限。先选一小段日期验证，成功后再拉长区间。\n"
-            "合约用配置页关注品种转成主连。已下过的天会跳过，可断点续传。",
+            "合约用配置页关注品种转成主连。已下过的天会跳过，可断点续传。\n"
+            "盘中开始会先排队，收盘后自动继续；下载中再点一次按钮可停止。",
             justify="left",
             text_color=T.TEXT_DIM,
             wraplength=380,
@@ -1367,8 +1759,12 @@ class DataTabMixin:
                 messagebox.showwarning("还不能下载", "配置页还没有关注品种，也无法从配置读到主连名单。")
                 return
             dry = bool(dry_var.get())
+            auto = bool(settings.get("auto_resume", True))
             dialog.destroy()
+            stop_event = threading.Event()
+            self._tick_download_stop = stop_event
             self._tick_download_busy = True
+            self._set_tick_backfill_status("历史 tick：准备中…")
             self._dm_write(
                 f"{'只列计划' if dry else '开始下载'}历史 tick：{settings['start']} ~ {settings['end']} "
                 f"{'、'.join(mains)}"
@@ -1376,30 +1772,65 @@ class DataTabMixin:
 
             def work() -> None:
                 try:
-                    summary = run_download(
+                    summary = run_download_auto_resume(
                         settings,
                         dry_run=dry,
-                        on_progress=lambda text: logger.info("历史 tick {}", text),
+                        on_progress=lambda text: (
+                            logger.info("历史 tick {}", text),
+                            self._post_to_main(
+                                lambda t=text: self._set_tick_backfill_status(f"历史 tick：{t}")
+                            ),
+                        ),
+                        stop=stop_event.is_set,
                     )
                     logger.info("历史 tick 结束：{}", summary)
-                    self._post_to_main(
-                        lambda: self._dm_write(
-                            f"历史 tick 结束：计划 {summary.get('total', 0)} 块，"
+                    rounds = int(summary.get("rounds") or 1)
+                    suffix = f"（分 {rounds} 轮）" if rounds > 1 else ""
+                    if summary.get("resume_stopped"):
+                        text = f"历史下载已停止{suffix}：断点已保留，收盘后再点继续"
+                        tone = "warning"
+                    elif summary.get("status") == "paused":
+                        text = f"历史下载已暂停：{summary.get('message') or '当前处于交易时段'}"
+                        remaining = int(summary.get("remaining") or 0)
+                        if remaining:
+                            text += f"；剩余 {remaining} 块"
+                        text += "，收盘后自动继续" if auto else "，收盘后再点继续"
+                        tone = "warning"
+                    elif dry:
+                        text = f"历史 tick 计划：共 {summary.get('total', 0)} 块，未下载"
+                        tone = "normal"
+                    else:
+                        text = (
+                            f"历史 tick 完成{suffix}：计划 {summary.get('total', 0)} 块，"
                             f"新下 {summary.get('downloaded', 0)}，跳过 {summary.get('skipped', 0)}，"
-                            f"失败 {summary.get('failed', 0)}"
+                            f"复用 {summary.get('reused', 0)}，失败 {summary.get('failed', 0)}"
                         )
+                        tone = "warning" if summary.get("failed") else "success"
+                    self._post_to_main(
+                        lambda t=text, color=tone: self._set_tick_backfill_status(t, color)
                     )
-                    self._post_to_main(self._refresh_tick_card)
+                    self._post_to_main(lambda t=text: self._dm_write(t))
                 except DownloadPermissionError as exc:
                     logger.warning("历史 tick 没有权限：{}", exc)
-                    self._post_to_main(lambda m=str(exc): messagebox.showerror("没有下载权限", m))
-                    self._post_to_main(lambda m=str(exc): self._dm_write(m))
+                    msg = str(exc)
+                    text = "历史补齐：需专业版权限；免费账号请保持实时 tick 累积"
+                    self._post_to_main(
+                        lambda t=text: self._set_tick_backfill_status(t, "warning")
+                    )
+                    self._post_to_main(lambda m=msg: messagebox.showerror("没有下载权限", m))
+                    self._post_to_main(lambda m=msg: self._dm_write(m))
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("历史 tick 下载失败")
-                    self._post_to_main(lambda m=str(exc): messagebox.showerror("下载失败", m))
-                    self._post_to_main(lambda m=str(exc): self._dm_write(f"历史 tick 失败：{m}"))
+                    msg = str(exc)
+                    self._post_to_main(
+                        lambda m=msg: self._set_tick_backfill_status(f"历史 tick 失败：{m}", "error")
+                    )
+                    self._post_to_main(lambda m=msg: messagebox.showerror("下载失败", m))
+                    self._post_to_main(lambda m=msg: self._dm_write(f"历史 tick 失败：{m}"))
                 finally:
+                    self._tick_download_stop = None
                     self._tick_download_busy = False
+                    self._post_to_main(self._refresh_tick_card)
 
             threading.Thread(target=work, name="TickDownload", daemon=True).start()
 

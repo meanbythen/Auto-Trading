@@ -16,6 +16,17 @@ import numpy as np
 import pandas as pd
 
 from src.research.factors import FACTOR_BY_ID, FACTORS, PAIRS, compute_factor_frame
+from src.research.stats import (
+    bh_fdr,
+    factor_wfa,
+    fdr_pass,
+    ic_summary,
+    layered_stats,
+    lock_ic,
+    mutual_info_test,
+    permutation_ic_p,
+    rank_ic_series,
+)
 
 # 往后看几根。3/6/12 覆盖很短、短、稍长三档，避免只盯一根的噪声。
 HORIZONS: tuple[int, ...] = (3, 6, 12)
@@ -50,6 +61,12 @@ class SymbolHit:
     second: HalfStats
     windows_ok: int = 0
     windows_total: int = 0
+    perm_p: float = 1.0
+    ic: dict[str, Any] = field(default_factory=dict)
+    mi: dict[str, Any] = field(default_factory=dict)
+    layer: dict[str, Any] = field(default_factory=dict)
+    wfa: dict[str, Any] = field(default_factory=dict)
+    lock: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -65,6 +82,7 @@ class Regularity:
     symbols: list[str]
     selected: bool = False
     details: dict[str, Any] = field(default_factory=dict)
+    group: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """写成候选池 JSON 里的一项。"""
@@ -73,6 +91,7 @@ class Regularity:
             "title": self.title,
             "logic": self.logic,
             "kind": self.kind,
+            "group": self.group,
             "horizon": self.horizon,
             "evidence": self.evidence,
             "symbols": list(self.symbols),
@@ -222,6 +241,20 @@ def scan_one_symbol(df: pd.DataFrame, symbol: str) -> dict[str, SymbolHit]:
     frame = compute_factor_frame(work)
     close = work["close"].astype(float)
     hits: dict[str, SymbolHit] = {}
+    cache: dict[tuple[int, int, int], Any] = {}
+
+    def _stats(series: pd.Series, horizon: int) -> dict[str, Any]:
+        """补上 IC 序列、互信息、分层和置换 p。"""
+        fwd = forward_return(close, horizon)
+        perm = permutation_ic_p(series, fwd, horizon, cache=cache)
+        return {
+            "perm_p": float(perm.get("p", 1.0)),
+            "ic": ic_summary(rank_ic_series(series, fwd)),
+            "mi": mutual_info_test(series, fwd, horizon, cache=cache),
+            "layer": layered_stats(series, fwd),
+            "wfa": factor_wfa(series, fwd),
+            "lock": lock_ic(series, fwd),
+        }
 
     for spec in FACTORS:
         series = frame[spec.id]
@@ -234,12 +267,14 @@ def scan_one_symbol(df: pd.DataFrame, symbol: str) -> dict[str, SymbolHit]:
             sign_ref = (first.t + second.t) / 2.0
             fwd = forward_return(close, horizon)
             win_ok, win_total = _window_agreement(series, fwd, sign_ref)
+            stats = _stats(series, horizon)
             hits[key] = SymbolHit(
                 symbol=symbol,
                 first=first,
                 second=second,
                 windows_ok=win_ok,
                 windows_total=win_total,
+                **stats,
             )
 
     for pair in PAIRS:
@@ -255,12 +290,14 @@ def scan_one_symbol(df: pd.DataFrame, symbol: str) -> dict[str, SymbolHit]:
             sign_ref = (first.t + second.t) / 2.0
             fwd = forward_return(close, horizon)
             win_ok, win_total = _window_agreement(combo, fwd, sign_ref)
+            stats = _stats(combo, horizon)
             hits[key] = SymbolHit(
                 symbol=symbol,
                 first=first,
                 second=second,
                 windows_ok=win_ok,
                 windows_total=win_total,
+                **stats,
             )
     return hits
 
@@ -276,6 +313,43 @@ def _mean_half(hits: list[SymbolHit], which: str) -> HalfStats:
     )
 
 
+def _aggregate_stats(hits: list[SymbolHit]) -> dict[str, Any]:
+    """多个品种的统计量做平均；置换 p 取最保守的那个（最大）。"""
+
+    def avg(section: str, field: str) -> float:
+        values = []
+        for hit in hits:
+            payload = getattr(hit, section, None)
+            if not isinstance(payload, dict):
+                continue
+            value = payload.get(field)
+            if isinstance(value, (int, float)) and not pd.isna(value):
+                values.append(float(value))
+        return float(sum(values) / len(values)) if values else 0.0
+
+    windows = sum(int(hit.ic.get("ic_windows", 0) or 0) for hit in hits)
+    return {
+        "perm_p": max(float(hit.perm_p) for hit in hits),
+        "ic_mean": avg("ic", "ic_mean"),
+        "ic_std": avg("ic", "ic_std"),
+        "icir": avg("ic", "icir"),
+        "ic_pos": avg("ic", "ic_pos"),
+        "ic_t": avg("ic", "ic_t"),
+        "ic_windows": windows,
+        "mi": avg("mi", "mi"),
+        "mi_p": avg("mi", "mi_p"),
+        "mi_z": avg("mi", "mi_z"),
+        "monotonic": avg("layer", "monotonic"),
+        "top_bottom": avg("layer", "top_bottom"),
+        "layers": next((hit.layer.get("layers", []) for hit in hits if hit.layer), []),
+        "wfa_eff": avg("wfa", "wfa_eff"),
+        "wfa_consistency": avg("wfa", "wfa_consistency"),
+        "wfa_test_ic": avg("wfa", "wfa_test_ic"),
+        "lock_ic": avg("lock", "lock_ic"),
+        "lock_n": int(sum(int(hit.lock.get("lock_n", 0) or 0) for hit in hits)),
+    }
+
+
 def scan_regularities(
     bars_by_symbol: dict[str, pd.DataFrame],
     *,
@@ -284,6 +358,8 @@ def scan_regularities(
     cfg: dict[str, Any] | None = None,
     period: str = "",
     record: bool = False,
+    alpha: float = 0.05,
+    diagnostics: dict[str, Any] | None = None,
 ) -> list[Regularity]:
     """
     扫多个品种，把过关的规律收成列表。
@@ -324,6 +400,7 @@ def scan_regularities(
         extra = "" if len(symbols) >= 2 else "仅单品种，跨品种还没验证。"
         win_ok = int(sum(hit.windows_ok for hit in hits) / len(hits))
         win_total = int(sum(hit.windows_total for hit in hits) / len(hits))
+        stats = _aggregate_stats(hits)
         if win_total > 0:
             extra += f" 分段 {win_ok}/{win_total} 同向显著。"
             if win_ok / win_total < 0.75:
@@ -333,6 +410,7 @@ def scan_regularities(
             title = spec.title
             logic = spec.logic
             kind = "单因子"
+            group = spec.group
         else:
             pair = next((item for item in PAIRS if item.id == base), None)
             if pair is None:
@@ -340,6 +418,8 @@ def scan_regularities(
             title = pair.title
             logic = pair.logic
             kind = "双因子"
+            left = FACTOR_BY_ID.get(pair.left)
+            group = left.group if left is not None else ""
         item = Regularity(
             id=key,
             title=title,
@@ -359,9 +439,28 @@ def scan_regularities(
                 "cross_symbol": len(symbols) >= 2,
                 "windows_ok": win_ok,
                 "windows_total": win_total,
+                **stats,
             },
+            group=group,
         )
         out.append(item)
+
+    # 门 6/7：对「两半都显著」的这一族做 BH-FDR，不显著的不进候选池。
+    adjusted = bh_fdr([item.details.get("perm_p", 1.0) for item in out], alpha=alpha)
+    kept: list[Regularity] = []
+    for item, adj in zip(out, adjusted):
+        item.details["adj_p"] = float(adj) if pd.notna(adj) else 1.0
+        if fdr_pass(item.details["adj_p"], alpha):
+            kept.append(item)
+    if diagnostics is not None:
+        diagnostics.update(
+            {
+                "gate2": len(out),
+                "fdr_pass": len(kept),
+                "alpha": float(alpha),
+            }
+        )
+    out = kept
 
     out.sort(key=lambda row: abs(float(row.details.get("t_first", 0))) + abs(float(row.details.get("t_second", 0))), reverse=True)
     if record and cfg is not None:
@@ -369,7 +468,7 @@ def scan_regularities(
 
         try:
             manifest = build_run_manifest(
-                "regularity",
+                "factor_mining",
                 cfg,
                 symbols=scanned,
                 period=period,
@@ -381,7 +480,7 @@ def scan_regularities(
         except Exception as exc:  # noqa: BLE001
             from loguru import logger
 
-            logger.debug("规律扫描运行清单没写上: {}", exc)
+            logger.debug("因子挖掘运行清单没写上: {}", exc)
     return out
 
 
@@ -392,15 +491,22 @@ def format_scan_report(
     bars: dict[str, int],
     skipped: list[str],
     style_text: str = "",
+    notes: list[str] | None = None,
+    diagnostics: dict[str, Any] | None = None,
 ) -> str:
-    """界面右侧长文：先声明不是买卖点，再写类型倾向，再列过关规律。"""
+    """界面右侧长文：先声明不是买卖点，再写类型倾向，再列过关因子。"""
     lines = [
-        "规律扫描完成（这不是买卖点，扫描层不会下单）",
+        "因子挖掘完成（这不是买卖点，挖掘层不会下单）",
         f"品种  {'、'.join(symbols) or '无'}",
         "根数  " + "；".join(f"{name} {count} 根" for name, count in bars.items()),
         f"过关  {len(items)} 条（两段样本都显著；多品种时尽量要求至少两个合约）",
-        "",
     ]
+    if diagnostics:
+        gate2 = int(diagnostics.get("gate2", 0) or 0)
+        passed = int(diagnostics.get("fdr_pass", 0) or 0)
+        level = float(diagnostics.get("alpha", 0.05) or 0.05)
+        lines.append(f"多重检验  门2过关 {gate2} 条 → BH-FDR 后 {passed} 条（alpha={level:g}）")
+    lines.append("")
     if style_text:
         lines.append(style_text.rstrip())
         lines.append("")
@@ -411,17 +517,54 @@ def format_scan_report(
             "",
         ]
     )
+    if notes:
+        lines.append("提示：")
+        lines.extend(f"- {msg}" for msg in notes)
+        lines.append("")
     if skipped:
         lines.append("没扫成的品种：")
         lines.extend(f"- {msg}" for msg in skipped)
         lines.append("")
     if not items:
-        lines.append("这一段里没有同时过关的规律。可能是样本太短、波动太乱，或这些因子在这段历史上站不住。")
+        lines.append(
+            "这一段里没有同时过门2和 FDR 的因子。可能是样本太短、波动太乱，"
+            "或这些因子在多重检验后站不住。"
+        )
         return "\n".join(lines)
     for i, item in enumerate(items, start=1):
         mark = "已勾选" if item.selected else "未勾选"
         lines.append(f"{i}. [{item.kind}] {item.title}（往后 {item.horizon} 根）  {mark}")
         lines.append(f"   逻辑：{item.logic}")
         lines.append(f"   证据：{item.evidence}")
+        details = item.details
+        if "ic_mean" in details:
+            lines.append(
+                "   统计：IC均 {:+.3f}  ICIR {:+.2f}  IC>0 {:.0%}  互信息 {:.3f}（p={:.3f}）"
+                "  分层单调 {:+.2f}  置换p {:.3f}  FDR {:.3f}".format(
+                    float(details.get("ic_mean", 0.0)),
+                    float(details.get("icir", 0.0)),
+                    float(details.get("ic_pos", 0.0)),
+                    float(details.get("mi", 0.0)),
+                    float(details.get("mi_p", 1.0)),
+                    float(details.get("monotonic", 0.0)),
+                    float(details.get("perm_p", 1.0)),
+                    float(details.get("adj_p", 1.0)),
+                )
+            )
+            if float(details.get("wfa_consistency", 0.0)) > 0 or details.get("lock_n"):
+                lines.append(
+                    "   样本外：WFA 效率 {:+.2f}  同向 {:.0%}  最后20% Lock IC {:+.3f}（n={}）".format(
+                        float(details.get("wfa_eff", 0.0)),
+                        float(details.get("wfa_consistency", 0.0)),
+                        float(details.get("lock_ic", 0.0)),
+                        int(details.get("lock_n", 0) or 0),
+                    )
+                )
+            ic_mean = float(details.get("ic_mean", 0.0))
+            lock_value = float(details.get("lock_ic", 0.0))
+            if ic_mean * lock_value < 0 and abs(lock_value) > 0.01:
+                lines.append("   提醒：最后 20% 的 IC 方向和全样本相反，样本外可能已经失效。")
+            if float(details.get("monotonic", 0.0)) < 0.6:
+                lines.append("   提醒：分层不单调，可能只有两端有效，别当成通用因子。")
         lines.append("")
     return "\n".join(lines).rstrip() + "\n"

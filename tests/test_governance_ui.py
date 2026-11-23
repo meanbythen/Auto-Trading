@@ -21,7 +21,7 @@ from src.ui import theme as T
 from src.ui.governance_tab import GovernanceTabMixin
 from src.ui.research_hub import ResearchHubMixin
 
-ORIGINAL_TABS = ["历史回测", "交叉测试", "策略优化", "复盘", "规律候选"]
+ORIGINAL_TABS = ["历史回测", "交叉测试", "策略优化", "复盘", "因子挖掘"]
 
 
 def test_governance_tab_registered_in_research_tabs() -> None:

@@ -1,7 +1,8 @@
 """
-决策前的公共拦截：通用止损与交割月闸门。
+决策前的公共拦截：通用止损、交割月闸门与尾盘半根闸门。
 
-功能：策略自己说「继续持有」时，让公共止损补一刀；到了交割月，有仓必须平、开仓要拒。
+功能：策略自己说「继续持有」时，让公共止损补一刀；到了交割月，有仓必须平、开仓要拒；
+      30/60 分钟尾盘不足整周期的半根只参与指标，不许触发新开仓。
 原理：实盘扫描（scheduler/runner.py）和回测（backtest/engine.py）以前各写一份同样的判断，
       规则一改就得改两处，容易漂移。这里收成一处，两边只负责成交、记账和各自的日志/事件。
 """
@@ -14,6 +15,7 @@ from typing import Any
 
 import pandas as pd
 
+from src.data.periods import partial_tail_bar
 from src.risk.delivery import ContractGate, contract_gate
 from src.strategy.generic_stop import GenericStopHit, GenericStopOverlay
 from src.strategy.types import StrategyAction, StrategyDecision
@@ -115,3 +117,37 @@ def apply_delivery_gate(
             rejected=decision,
         )
     return DeliveryGateOutcome(decision, gate)
+
+
+def apply_partial_tail_gate(
+    decision: StrategyDecision,
+    bars: pd.DataFrame | None,
+    period: str,
+    *,
+    symbol: str = "",
+    allow: bool = False,
+) -> tuple[StrategyDecision, bool]:
+    """
+    30/60 分钟尾盘那根不足整周期的半根，只让指标看，不让开新仓。
+
+    返回 (决策, 是否拦截)。5～29 分钟、日线周线、平仓和止损一律原样放行。
+    回测的换月移仓、实盘的启动补开仓可用 allow=True 放行。
+    """
+    if allow or bars is None or len(bars) == 0:
+        return decision, False
+    if decision.action not in (StrategyAction.BUY_OPEN, StrategyAction.SELL_OPEN):
+        return decision, False
+    index = getattr(bars, "index", None)
+    if index is None or len(index) == 0:
+        return decision, False
+    if not partial_tail_bar(index[-1], period, symbol=symbol):
+        return decision, False
+    return (
+        StrategyDecision(
+            StrategyAction.HOLD,
+            symbol or getattr(decision, "symbol", ""),
+            "尾盘不足整周期（半根），只参与指标，不开新仓",
+            meta=dict(getattr(decision, "meta", None) or {}),
+        ),
+        True,
+    )

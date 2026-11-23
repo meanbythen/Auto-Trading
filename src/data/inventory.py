@@ -19,6 +19,15 @@ from src.data.quote_check import normalize_source, product_code, storage_symbol,
 
 LATEST_NAME = "K线库存.xlsx"
 
+# 1 分钟是最基础数据，日线周线也不在这次重拼口径里；只清 2 分钟及以上的分钟拼合 K。
+REBUILT_MINUTE_SQL = "period GLOB '[0-9]*' AND CAST(period AS INTEGER) > 1"
+
+
+def _is_rebuilt_period(period: Any) -> bool:
+    """2 分钟及以上的纯数字周期，都是拼合出来的。"""
+    text = str(period or "").strip()
+    return text.isdigit() and int(text) > 1
+
 
 def split_stored_symbol(stored: str) -> tuple[str, str]:
     """
@@ -635,6 +644,92 @@ def purge_klines(
         "csv_locked": csv_locked,
         "clean_n": preview["clean_n"],
         "raw_n": preview["raw_n"],
+    }
+
+
+def _tick_bar_path(base: Path, tick_store: str | Path | None) -> Path:
+    """tick 合成 K 线库的位置。配置了就用配置，默认 data/klines/tick_bars.sqlite。"""
+    if tick_store:
+        path = Path(tick_store)
+        return path if path.is_absolute() else base / path
+    return base / "data" / "klines" / "tick_bars.sqlite"
+
+
+def preview_rebuilt_klines(
+    root: Path | str,
+    *,
+    tick_store: str | Path | None = None,
+) -> dict[str, Any]:
+    """
+    数一数要清的拼合 K 线。
+
+    只数 2 分钟及以上的分钟周期：清洗库、tick 合成库、同目录 CSV。
+    1 分钟、日线周线、tick 原始数据都不在内。
+    """
+    base = Path(root)
+    cache_dir = base / "data" / "klines"
+    clean_store = BarStore(cache_dir / "market.sqlite")
+    tick_path = _tick_bar_path(base, tick_store)
+    tick_keys: list[tuple[str, str]] = []
+    tick_n = 0
+    if tick_path.exists():
+        tick_store_obj = BarStore(tick_path)
+        tick_keys = tick_store_obj.keys_where(REBUILT_MINUTE_SQL, ())
+        tick_n = tick_store_obj.count_where(REBUILT_MINUTE_SQL, ())
+    clean_keys = clean_store.keys_where(REBUILT_MINUTE_SQL, ())
+    csv_keys = [
+        pair
+        for pair in _csv_keys_on_disk(
+            cache_dir, source=None, symbol=None, period=None
+        )
+        if _is_rebuilt_period(pair[1])
+    ]
+    periods = sorted(
+        {period for _stored, period in (*clean_keys, *tick_keys, *csv_keys)},
+        key=int,
+    )
+    return {
+        "clean_n": clean_store.count_where(REBUILT_MINUTE_SQL, ()),
+        "tick_n": tick_n,
+        "clean_keys": clean_keys,
+        "tick_keys": tick_keys,
+        "csv_keys": csv_keys,
+        "periods": periods,
+        "tick_db": str(tick_path),
+    }
+
+
+def purge_rebuilt_klines(
+    root: Path | str,
+    *,
+    tick_store: str | Path | None = None,
+) -> dict[str, Any]:
+    """
+    一键清除拼合 K 线：只删 2 分钟及以上的分钟周期。
+
+    保留 1 分钟 K 线、日线周线、tick 原始数据和原样库，方便按新口径重新拼。
+    清洗库和 tick 合成库里的 CSV 同步清理；被 Excel 占用时写 .skip 标记。
+    """
+    preview = preview_rebuilt_klines(root, tick_store=tick_store)
+    base = Path(root)
+    cache_dir = base / "data" / "klines"
+    clean_store = BarStore(cache_dir / "market.sqlite")
+    clean_deleted = clean_store.delete_where(REBUILT_MINUTE_SQL, ())
+    tick_path = _tick_bar_path(base, tick_store)
+    tick_deleted = 0
+    if tick_path.exists():
+        tick_deleted = BarStore(tick_path).delete_where(REBUILT_MINUTE_SQL, ())
+    keys = [*preview["csv_keys"], *preview["clean_keys"]]
+    csv_n, csv_locked = _sync_csv(cache_dir, clean_store, keys)
+    return {
+        "clean_deleted": clean_deleted,
+        "tick_deleted": tick_deleted,
+        "clean_n": preview["clean_n"],
+        "tick_n": preview["tick_n"],
+        "periods": preview["periods"],
+        "csv_touched": csv_n,
+        "csv_locked": csv_locked,
+        "tick_db": str(tick_path),
     }
 
 

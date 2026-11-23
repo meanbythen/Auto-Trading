@@ -412,6 +412,28 @@ def test_ctp_opponent_limit_uses_ask_bid_not_stop() -> None:
     assert ctp_opponent_limit(is_buy=True, last=3893, ask=3883, upper=3900, tick=1, extra_ticks=2) == 3885.0
 
 
+def test_order_session_open_blocks_commodity_tea_break() -> None:
+    """
+    商品 10:15～10:30 休市：时段表写成 09:00～11:30 一整段也要挡住报单。
+
+    柜台在休市里会回「当前状态禁止此项操作」，不能让程序反复发单再被撤。
+    """
+    from datetime import datetime
+
+    bot = _bot()
+    bot.sessions = [["09:00", "11:30"], ["13:30", "15:00"], ["21:00", "23:00"]]
+
+    assert bot._order_session_open("fu2701", datetime(2026, 11, 23, 10, 14)) is True
+    assert bot._order_session_open("fu2701", datetime(2026, 11, 23, 10, 15, 58)) is False
+    assert bot._order_session_open("fu2701", datetime(2026, 11, 23, 10, 29)) is False
+    assert bot._order_session_open("fu2701", datetime(2026, 11, 23, 10, 30)) is True
+    assert bot._order_session_open("fu2701", datetime(2026, 11, 23, 12, 0)) is False
+
+    # 中金所没有上午休息，10:20 照常可下单。
+    bot.sessions = [["09:30", "11:30"], ["13:00", "15:00"]]
+    assert bot._order_session_open("IF2612", datetime(2026, 11, 23, 10, 20)) is True
+
+
 def test_ctp_close_price_adds_protective_ticks() -> None:
     """CTP 平仓按对手价方向让几跳，不拿止损价挂单。"""
     import pandas as pd

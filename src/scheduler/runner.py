@@ -34,7 +34,11 @@ from src.scheduler.order_executor import OrderExecutorMixin
 from src.scheduler.order_pricing import entry_slip_blocked as entry_slip_blocked
 from src.scheduler.session_audit import SessionAuditMixin
 from src.strategy import StrategyAction, StrategyDecision, create_strategy
-from src.strategy.decision_guard import apply_delivery_gate, apply_generic_stop
+from src.strategy.decision_guard import (
+    apply_delivery_gate,
+    apply_generic_stop,
+    apply_partial_tail_gate,
+)
 from src.strategy.generic_stop import GenericStopOverlay
 from src.trader import create_trader
 from src.trader.ctp_logic import position_avg_price
@@ -1864,6 +1868,7 @@ class TradingBot(
             "halt_kind": str(getattr(self.risk, "halt_kind", "") or ""),
             "positions": snapshot_positions(self.strategy),
             "symbols": self.symbols,
+            "scan_symbols": list(getattr(self, "scan_symbols", None) or []),
             "last_alert": _safe_last_alert(self.risk.max_daily_loss),
             "health": getattr(self, "_health_report", None),
             "market_health": {
@@ -2146,6 +2151,33 @@ class TradingBot(
         elif gate_outcome.rejected is not None:
             self._reject_gate(decision, "delivery_month", gate_outcome.gate.reason, "")
         decision = gate_outcome.decision
+
+        # 30/60 分钟尾盘不足整周期的半根：保留给指标，但不拿它开新仓；平仓、止损照常。
+        # 启动回溯补开仓（catch_up_used）是补历史信号，不加这道闸门。
+        decision, partial_blocked = apply_partial_tail_gate(
+            decision,
+            closed,
+            str(signal_tf),
+            symbol=symbol,
+            allow=catch_up_used,
+        )
+        if partial_blocked:
+            partial_bar_time = str(closed.index[-1]) if closed is not None and len(closed) else ""
+            logger.info("{} 尾盘半根不开新仓 | {}", symbol, decision.reason)
+            self._record_event(
+                "partial_bar_block_open",
+                symbol=symbol,
+                reason=decision.reason,
+                bar_id=partial_bar_time,
+            )
+            journal.record_audit(
+                "signal_blocked",
+                trace_id=str((decision.meta or {}).get("trace_id") or ""),
+                symbol=symbol,
+                message=str(decision.reason or ""),
+                payload={"gate": "partial_bar", "bar_time": partial_bar_time},
+                root=self.cfg.get("_project_root"),
+            )
 
         # 给人看：最新K线长什么样 + 本轮是否符合开仓（不影响下单逻辑）
         try:

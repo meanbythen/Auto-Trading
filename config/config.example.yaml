@@ -463,13 +463,28 @@ data:
       start: "2026-10-01"
       end: "2026-10-31"
       chunk_days: 1              # 每段下载天数，也是断点续传粒度
+      chunk_pause_sec: 3         # 块与块之间暂停几秒，单连接串行，不抢满通道
+      policy: "off_hours_only"   # 开盘暂停并保留断点；manual=允许盘中下载
+      auto_resume: true          # 盘中暂停后等收盘自动续传；false=收盘后再手动点
+      resume_poll_sec: 60        # 等待收盘时多久检查一次，不占天勤连接
+      lookback_days: 120         # 数据管理页「补齐历史tick」默认回看天数
       out_dir: "data/ticks/history"
       keep_raw_csv: true
   # 天勤 tick：免费账号盘中常驻采集，落本地库，收盘后合成 K 线供回测。
   tick:
-    enabled: false               # 默认不自动启动，避免没配账号时反复重连
+    enabled: false               # 程序启动时自动采集；数据管理页有同名开关，不必手改
     symbols: []                  # 空=用配置页关注品种；也可填真实合约如 fu2701
     resolve_main: true           # 只填品种时自动解析当前主力真实合约
+    session_only: true           # 只在交易时段连接天勤，收盘自动断开
+    open_lead_seconds: 30        # 开盘前多少秒开始连
+    close_grace_seconds: 60      # 收盘后多少秒再断，收完最后几笔
+    idle_poll_seconds: 30        # 非交易时段多久检查一次是否快开盘
+    auto_synth: true             # 收盘后自动把 tick 合成 K 线
+    synth_delay_seconds: 120     # 收盘后等多久再合成，给最后几笔落库时间
+    retention_days: 30           # 原始 tick 保留天数，0=不清理
+    pause_record_during_download: true  # 下载历史 tick 时先暂停实时采集
+    lock_file: "data/ticks/recorder.lock"
+    synth_state_file: "data/ticks/synth_state.json"
     flush_seconds: 5
     batch_size: 2000
     database: "data/ticks/vnpy_data.db"
@@ -479,6 +494,21 @@ data:
     max_backoff_seconds: 60
     bar_store: "data/klines/tick_bars.sqlite"
     synth_periods: ["1", "5", "15", "30", "60", "D"]
+  # 因子挖掘基础数据补齐。只补研究页当前选中的「合约 × 周期」，已达标的不重复下载。
+  # 免费天勤 K 线一次约 1 万根；到上限记 cap_reached，不会无限重试。
+  factor_backfill:
+    enabled: true
+    auto_on_start: false         # 本轮不做自动调度，只在研究页手动点「补齐」
+    after_close_topup: false
+    policy: "off_hours_only"     # off_hours_only | throttled | manual
+    max_concurrent: 1            # 免费账号只开一条下载连接
+    chunk_pause_sec: 3           # 每个合约周期之间的暂停
+    pause_when_trading: true     # 交易时段直接等待，不抢实盘连接
+    target_mode: "standard"      # quick | standard | strict | regime
+    periods: ["5", "15", "30", "60", "D"]
+    require_oi: true             # 研究持仓量；关掉只按价量判定
+    cap_bars: 10000              # 免费天勤单次约能给的上限
+    max_attempts: 3              # 同一格当天最多失败几次
   # 天勤失败时是否回退新浪。回退数据单独按新浪原名入库，并带 fallback_from=tq 标记。
   fallback_source: "akshare"
   fallback_allow_entry: true     # 回退行情是否允许开新仓；false 时只允许平仓/止损

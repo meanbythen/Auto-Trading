@@ -675,15 +675,22 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
         with (lock if lock is not None else nullcontext()):
             return self._execute_locked(decision)
 
-    def _order_session_open(self, symbol: str = "") -> bool:
+    def _order_session_open(self, symbol: str = "", now: datetime | None = None) -> bool:
         """当前是否在该品种可下单的交易时段内。没配时段时放行。"""
         picker = getattr(self, "_symbol_sessions_for", None)
         sessions = picker(symbol) if (symbol and callable(picker)) else getattr(self, "sessions", None)
         if not sessions:
             return True
-        from src.utils.session_clock import in_trading_sessions
+        from datetime import time as clock_time
 
-        return bool(in_trading_sessions(sessions))
+        from src.utils.session_clock import has_commodity_tea_break, in_trading_sessions
+
+        stamp = now or datetime.now()
+        # 品种表上午常写成 09:00～11:30 一整段，但商品 10:15～10:30 休市。
+        # 落在这一段时柜台会以「当前状态禁止此项操作」拒单，不能当成在盘。
+        if has_commodity_tea_break(symbol) and clock_time(10, 15) <= stamp.time() < clock_time(10, 30):
+            return False
+        return bool(in_trading_sessions(sessions, stamp))
 
     def _execute_locked(self, decision: StrategyDecision) -> bool:
         """_execute 的实体；调用方已经持有交易锁。"""

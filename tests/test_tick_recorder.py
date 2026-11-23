@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import threading
 from pathlib import Path
 
 import pandas as pd
@@ -29,6 +30,7 @@ def _cfg(tmp_path: Path, symbols: list[str], *, resolve_main: bool = True) -> di
             "tick": {
                 "symbols": symbols,
                 "resolve_main": resolve_main,
+                "session_only": False,
                 "flush_seconds": 0.1,
                 "batch_size": 2,
                 "database": "data/ticks/vnpy_data.db",
@@ -137,3 +139,60 @@ def test_thread_collects_flushes_and_stops(tmp_path) -> None:
 
 def test_read_status_missing_returns_empty(tmp_path) -> None:
     assert read_status(tmp_path / "nope.json") == {}
+
+
+def test_concurrent_flush_is_serial_and_keeps_new_buffer(tmp_path, monkeypatch) -> None:
+    recorder = TickRecorder(_cfg(tmp_path, ["fu2701"]))
+    recorder._buffer = ["old"]
+    batches: list[list[str]] = []
+    first_entered = threading.Event()
+    second_entered = threading.Event()
+    release_first = threading.Event()
+
+    def fake_save(batch, **kwargs) -> int:
+        current = list(batch)
+        batches.append(current)
+        if len(batches) == 1:
+            first_entered.set()
+            assert release_first.wait(timeout=5)
+        else:
+            second_entered.set()
+        return len(current)
+
+    monkeypatch.setattr(recorder_module, "save_ticks", fake_save)
+    first = threading.Thread(target=recorder.flush)
+    second = threading.Thread(target=recorder.flush)
+    first.start()
+    assert first_entered.wait(timeout=5)
+    with recorder._buffer_lock:
+        recorder._buffer.append("new")
+    second.start()
+    second_started_before_release = second_entered.wait(timeout=0.1)
+    release_first.set()
+    first.join(timeout=5)
+    second.join(timeout=5)
+
+    assert not first.is_alive() and not second.is_alive()
+    assert second_started_before_release is False
+    assert batches == [["old"], ["new"]]
+    assert recorder.status()["buffered"] == 0
+    assert recorder.status()["ticks_total"] == 2
+
+
+def test_failed_close_synthesis_preserves_ticks_and_success_state(tmp_path, monkeypatch) -> None:
+    recorder = TickRecorder(_cfg(tmp_path, ["fu2701"]))
+    recorder._symbols = ["SHFE.fu2701"]
+    recorder.synth_delay_seconds = 0
+    cleanup_calls: list[bool] = []
+
+    def fail_synthesis(*args, **kwargs):
+        raise RuntimeError("合成库暂时不可用")
+
+    monkeypatch.setattr("src.data.tick.synthesize.synthesize_symbol", fail_synthesis)
+    monkeypatch.setattr(recorder, "_cleanup_retention", lambda: cleanup_calls.append(True))
+
+    recorder._after_session_close()
+
+    assert cleanup_calls == []
+    assert recorder._last_synth_day == ""
+    assert not recorder.synth_state_file.exists()

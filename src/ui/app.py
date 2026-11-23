@@ -187,6 +187,8 @@ class AutoTradingApp(
         self._tick_after_id = self.after(800, self._tick)
         self._login_tick_after_id = self.after(5000, self._tick_login_schedule)
         self.after(2000, self._warn_unprotected_resume)
+        # 界面建好后再按配置自动开 tick 采集，避免启动时被天勤连接卡住。
+        self.after(1600, self._auto_start_tick_if_enabled)
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self._dm_scraping = False
         # 读同花顺图时焦点在期货通上，窗口快捷键可能收不到；工作线程还会另外查 ESC。

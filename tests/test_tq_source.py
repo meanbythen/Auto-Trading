@@ -141,6 +141,15 @@ def test_frame_turns_utc_start_time_into_beijing_right_label() -> None:
     assert float(frame.iloc[0]["open"]) == 4700.0
 
 
+def test_frame_keeps_open_interest() -> None:
+    """天勤 K 线的 close_oi 要收进 oi 列，因子挖掘才有持仓量可用。"""
+    raw = _raw("2026-10-30 01:00", "2026-10-30 01:05")
+    raw["open_oi"] = [1200, 1210]
+    raw["close_oi"] = [1210, 1234]
+    frame = frame_from_klines(raw, 300)
+    assert list(frame["oi"]) == [1210.0, 1234.0]
+
+
 def test_frame_keeps_the_unfinished_last_bar() -> None:
     """最后一根可能还在走。照样留着，交给上层：持仓看影线，空仓和回测只认收盘。"""
     frame = frame_from_klines(_raw("2026-10-30 01:00", "2026-10-30 01:05"), 300)

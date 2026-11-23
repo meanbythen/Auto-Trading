@@ -334,7 +334,11 @@ class CtpProbeWindow(tk.Toplevel):
                 ),
                 start=1,
             ):
-                self._quote_cell(quotes, index + 1, col, var, fill, index)
+                # 行情时间带毫秒（10:47:44.121），8 个字宽会把开头裁掉。
+                cell_width = 13 if col == 8 else 8
+                self._quote_cell(
+                    quotes, index + 1, col, var, fill, index, width=cell_width
+                )
         self.local_time = tk.StringVar(value="—")
         ttk.Label(quotes, textvariable=self.local_time).grid(
             row=self.QUOTE_ROWS + 1, column=8, sticky="w", padx=6
@@ -1125,6 +1129,7 @@ class CtpProbeWindow(tk.Toplevel):
         var: tk.StringVar,
         fill: str | None,
         index: int,
+        width: int = 8,
     ) -> None:
         """
         盘口一格。买一、卖一、最新整块都能点，把这一行的合约和价格填进上面。
@@ -1137,7 +1142,7 @@ class CtpProbeWindow(tk.Toplevel):
             textvariable=var,
             font=("Segoe UI", 10, "bold"),
             fg="#0b57d0" if fill else None,
-            width=8,
+            width=width,
             anchor="e",
         )
         item.pack()

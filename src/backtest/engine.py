@@ -47,7 +47,11 @@ from src.data.sessions import session_bar_times as session_bar_times
 from src.data.periods import canonical_period, drop_forming_bar, period_label, unique_ohlc_columns
 from src.risk.commission import fee_close, fee_open, is_close_today
 from src.strategy import StrategyAction, StrategyDecision, create_strategy
-from src.strategy.decision_guard import apply_delivery_gate, apply_generic_stop
+from src.strategy.decision_guard import (
+    apply_delivery_gate,
+    apply_generic_stop,
+    apply_partial_tail_gate,
+)
 from src.strategy.generic_stop import GenericStopOverlay, generic_stop_snapshot
 from src.strategy.session_scope import session_kind
 from src.strategy.types import PositionState
@@ -541,6 +545,7 @@ class _BacktestRun:
     symbol: str
     mult: float
     strategy: Any
+    tf: str
     fill: FillModel
     generic_stop: GenericStopOverlay
     contracts: dict[str, Any]
@@ -896,6 +901,26 @@ def _decide_bar(run: _BacktestRun, i: int, view: Any) -> _BarContext:
             key="交割月不开仓",
         )
     decision = outcome.decision
+    # 30/60 分钟尾盘那根不足整周期的半根：保留给指标，不拿它开新仓；
+    # 换月移仓是延续旧仓，放行。
+    open_side = decision.action
+    decision, partial_blocked = apply_partial_tail_gate(
+        decision,
+        signal_df,
+        run.tf,
+        symbol=symbol,
+        allow=bool((decision.meta or {}).get("rollover_carry")),
+    )
+    if partial_blocked:
+        run.note_reject(
+            "尾盘半根",
+            "尾盘不足整周期，不触发新开仓",
+            "多" if open_side == StrategyAction.BUY_OPEN else "空",
+            at=now,
+            price=px,
+            stop=decision.stop_price,
+            key="尾盘半根不开仓",
+        )
     run.limits.on_bar(now)
     meta = decision.meta or {}
     scale = str(meta.get("scale") or "")
@@ -1820,6 +1845,7 @@ def run_backtest(
         symbol=symbol,
         mult=mult,
         strategy=strategy,
+        tf=setup.tf,
         fill=fill,
         generic_stop=generic_stop,
         contracts=(cfg.get("risk") or {}).get("contracts") or {},

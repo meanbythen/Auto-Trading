@@ -15,7 +15,7 @@ import json
 import os
 import threading
 import time
-from datetime import date, datetime
+from datetime import date, datetime, time as dtime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +24,9 @@ from loguru import logger
 from src.data.tick.vnpy_store import VnpyUnavailable, save_ticks, split_instrument, to_tick_data
 from src.data.tq_source import main_contract, tq_symbol
 from src.utils import load_secrets
+from src.utils.holidays import calendar_from_config
+from src.utils.session_clock import in_trading_sessions, parse_hhmm, sessions_for_symbol
+from src.utils.trading_day import futures_trading_day, is_trading_day
 
 _BACKOFF = (5.0, 10.0, 30.0, 60.0)
 
@@ -52,6 +55,20 @@ def tick_settings(cfg: dict[str, Any]) -> dict[str, Any]:
         "root": root,
         "symbols": symbols,
         "resolve_main": bool(tick_cfg.get("resolve_main", True)),
+        "enabled": bool(tick_cfg.get("enabled", False)),
+        "session_only": bool(tick_cfg.get("session_only", True)),
+        "open_lead_seconds": float(tick_cfg.get("open_lead_seconds", 30)),
+        "close_grace_seconds": float(tick_cfg.get("close_grace_seconds", 60)),
+        "idle_poll_seconds": max(5.0, float(tick_cfg.get("idle_poll_seconds", 30))),
+        "auto_synth": bool(tick_cfg.get("auto_synth", True)),
+        "synth_delay_seconds": max(0.0, float(tick_cfg.get("synth_delay_seconds", 120))),
+        "retention_days": max(0, int(tick_cfg.get("retention_days", 30))),
+        "pause_record_during_download": bool(
+            tick_cfg.get("pause_record_during_download", True)
+        ),
+        "lock_file": root / str(tick_cfg.get("lock_file", "data/ticks/recorder.lock")),
+        "synth_state_file": root
+        / str(tick_cfg.get("synth_state_file", "data/ticks/synth_state.json")),
         "flush_seconds": float(tick_cfg.get("flush_seconds", 5)),
         "batch_size": int(tick_cfg.get("batch_size", 2000)),
         "database": root / str(tick_cfg.get("database", "data/ticks/vnpy_data.db")),
@@ -87,28 +104,71 @@ def _wait_update(client: Any) -> None:
         client.wait_update()
 
 
+def _pid_alive(pid: int) -> bool:
+    """锁文件里的进程还在不在。Windows 用 OpenProcess，其它系统用 kill 0。"""
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(0x00100000, False, int(pid))  # SYNCHRONIZE
+            if not handle:
+                return False
+            kernel32.CloseHandle(handle)
+            return True
+        except Exception:  # noqa: BLE001
+            return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
 class TickRecorder:
     """常驻采集器。start() 起线程，stop() 先落盘再关连接。"""
 
     def __init__(self, cfg: dict[str, Any], *, api_factory: Any | None = None) -> None:
         settings = tick_settings(cfg)
+        self.cfg = cfg
         self.symbols_in = settings["symbols"]
         self.resolve_main = bool(settings["resolve_main"])
+        self.session_only = bool(settings["session_only"])
+        self.open_lead_seconds = float(settings["open_lead_seconds"])
+        self.close_grace_seconds = float(settings["close_grace_seconds"])
+        self.idle_poll_seconds = float(settings["idle_poll_seconds"])
+        self.auto_synth = bool(settings["auto_synth"])
+        self.synth_delay_seconds = float(settings["synth_delay_seconds"])
+        self.retention_days = int(settings["retention_days"])
+        self.lock_file = Path(settings["lock_file"])
+        self.synth_state_file = Path(settings["synth_state_file"])
         self.flush_seconds = float(settings["flush_seconds"])
         self.batch_size = max(1, int(settings["batch_size"]))
         self.database = Path(settings["database"])
         self.status_file = Path(settings["status_file"])
+        self.bar_store = Path(settings["bar_store"])
+        self.synth_periods = list(settings["synth_periods"])
         self.reconnect_seconds = float(settings["reconnect_seconds"])
         self.max_backoff_seconds = float(settings["max_backoff_seconds"])
         self.user = str(settings["user"])
         self.password = str(settings["password"])
         self._api_factory = api_factory
+        self._calendar = calendar_from_config(cfg, settings["root"])
 
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._api: Any | None = None
         self._buffer: list[Any] = []
         self._buffer_lock = threading.Lock()
+        self._flush_lock = threading.Lock()
         self._seen: dict[str, str] = {}
         self._symbols: list[str] = []
         self._state = "idle"
@@ -118,6 +178,9 @@ class TickRecorder:
         self._ticks_today = 0
         self._today = date.today()
         self._saved = 0
+        self._next_open = ""
+        self._last_synth_day = self._read_synth_state()
+        self._locked = False
 
     # ---------- 对外 ----------
 
@@ -129,6 +192,7 @@ class TickRecorder:
         """起采集线程。已经在跑就直接返回。"""
         if self.running:
             return
+        self._acquire_lock()
         self._stop.clear()
         self._thread = threading.Thread(target=self._run, name="TickRecorder", daemon=True)
         self._thread.start()
@@ -140,27 +204,30 @@ class TickRecorder:
         if thread is not None and thread.is_alive() and thread is not threading.current_thread():
             thread.join(timeout=timeout)
         self.flush()
+        self._release_lock()
         self._write_status("stopped")
 
     def flush(self) -> int:
         """把缓冲写进 vnpy 库。失败保留缓冲，下一轮再试。"""
-        with self._buffer_lock:
-            batch = list(self._buffer)
-        if not batch:
-            return 0
-        try:
-            saved = save_ticks(batch, database=self.database, batch_size=self.batch_size)
-        except Exception as exc:  # noqa: BLE001
-            self._error = f"tick 入库失败：{exc}"
-            logger.warning("tick 入库失败，缓冲保留（{} 条）等下次重试：{}", len(batch), exc)
-            self._write_status(self._state or "running")
-            return 0
-        with self._buffer_lock:
-            del self._buffer[: len(batch)]
-            self._saved += saved
-        self._error = ""
-        logger.debug("tick 入库 {} 条 → {}", saved, self.database)
-        return saved
+        # 停止按钮和工作线程可能同时 flush。串行复制/删除，避免后一次删掉前一次保存期间新增的 tick。
+        with self._flush_lock:
+            with self._buffer_lock:
+                batch = list(self._buffer)
+            if not batch:
+                return 0
+            try:
+                saved = save_ticks(batch, database=self.database, batch_size=self.batch_size)
+            except Exception as exc:  # noqa: BLE001
+                self._error = f"tick 入库失败：{exc}"
+                logger.warning("tick 入库失败，缓冲保留（{} 条）等下次重试：{}", len(batch), exc)
+                self._write_status(self._state or "running")
+                return 0
+            with self._buffer_lock:
+                del self._buffer[: len(batch)]
+                self._saved += saved
+            self._error = ""
+            logger.debug("tick 入库 {} 条 → {}", saved, self.database)
+            return saved
 
     def status(self) -> dict[str, Any]:
         """当前状态，字段和心跳文件一致。"""
@@ -168,6 +235,9 @@ class TickRecorder:
             buffered = len(self._buffer)
         return {
             "state": self._state,
+            "session_only": self.session_only,
+            "next_open": self._next_open,
+            "last_synth_day": self._last_synth_day,
             "database": str(self.database),
             "symbols": list(self._symbols),
             "buffered": buffered,
@@ -184,9 +254,21 @@ class TickRecorder:
 
     def _run(self) -> None:
         attempt = 0
+        if not self.symbols_in:
+            self._error = (
+                "没有要采集的合约：请在配置页填关注品种，或在 data.tick.symbols 里写真实合约"
+            )
+            self._state = "stopped"
+            logger.error("tick 采集停住：{}", self._error)
+            self._write_status("stopped")
+            self._release_lock()
+            return
         while not self._stop.is_set():
+            if self.session_only and not self._wait_for_open():
+                break
             try:
                 self._session()
+                attempt = 0
             except (TickConfigError, VnpyUnavailable) as exc:
                 # 没装库、没填合约：再连也一样，停住让界面把原因显示出来。
                 self._error = str(exc)
@@ -204,12 +286,189 @@ class TickRecorder:
                 attempt += 1
                 if self._stop.wait(wait):
                     break
+                continue
+            # 正常收盘退出：落盘、补合成、清旧数据，然后回去等下一次开盘。
+            if self.session_only and not self._stop.is_set():
+                self.flush()
+                self._state = "closed"
+                self._write_status("closed")
+                self._after_session_close()
         self.flush()
+        self._release_lock()
         self._write_status("stopped")
 
-    def _backoff(self, attempt: int) -> float:
-        step = _BACKOFF[min(max(0, attempt), len(_BACKOFF) - 1)]
-        return min(max(self.reconnect_seconds, step), self.max_backoff_seconds)
+    def _after_session_close(self) -> None:
+        """收盘后的收尾：等最后几笔落库，再合成 K 线、清旧 tick。"""
+        synth_ok = True
+        if self.auto_synth and not self._stop.is_set():
+            if self._stop.wait(self.synth_delay_seconds):
+                return
+            synth_ok = self._synth_recent()
+        # 合成失败时保留原始 tick，下次收盘重试；不能没合成成就先删掉。
+        if synth_ok and not self._stop.is_set():
+            self._cleanup_retention()
+
+    def _synth_recent(self) -> bool:
+        """收盘后合成 tick K 线。全部合约成功才记状态；重复运行幂等。"""
+        day = futures_trading_day(datetime.now()).isoformat()
+        from src.data.tick.synthesize import synthesize_symbol
+        from src.data.tq_source import config_symbol_from_tq
+
+        succeeded = True
+        for instrument in list(self._symbols):
+            symbol = config_symbol_from_tq(instrument)
+            if not symbol:
+                continue
+            try:
+                report = synthesize_symbol(
+                    symbol,
+                    database=self.database,
+                    bar_store=self.bar_store,
+                    periods=self.synth_periods,
+                )
+                logger.info(
+                    "收盘 tick 合成 {}：tick {} 条（丢 {}），写库 {}",
+                    symbol,
+                    report["ticks"],
+                    report["dropped"],
+                    report["bars"],
+                )
+            except Exception as exc:  # noqa: BLE001
+                succeeded = False
+                logger.warning("收盘 tick 合成 {} 失败：{}", symbol, exc)
+        if succeeded:
+            self._last_synth_day = day
+            self._write_synth_state(day)
+        return succeeded
+
+    def _cleanup_retention(self) -> None:
+        """只保留最近 N 天原始 tick；汇总表一起重建，界面库存才不会撒谎。"""
+        if self.retention_days <= 0:
+            return
+        import sqlite3
+
+        cutoff = (datetime.now() - timedelta(days=self.retention_days)).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
+        try:
+            conn = sqlite3.connect(self.database)
+            try:
+                removed = conn.execute(
+                    "DELETE FROM dbtickdata WHERE datetime < ?", (cutoff,)
+                ).rowcount
+                conn.execute("DELETE FROM dbtickoverview")
+                conn.execute(
+                    "INSERT INTO dbtickoverview (symbol, exchange, count, start, end) "
+                    "SELECT symbol, exchange, COUNT(*), MIN(datetime), MAX(datetime) "
+                    "FROM dbtickdata GROUP BY symbol, exchange"
+                )
+                conn.commit()
+            finally:
+                conn.close()
+            logger.info("tick 保留 {} 天，清掉 {} 条旧数据", self.retention_days, removed)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("tick 旧数据清理失败：{}", exc)
+
+    def _read_synth_state(self) -> str:
+        try:
+            payload = json.loads(self.synth_state_file.read_text(encoding="utf-8"))
+            return str(payload.get("last_trading_day") or "")
+        except (OSError, ValueError):
+            return ""
+
+    def _write_synth_state(self, day: str) -> None:
+        try:
+            self.synth_state_file.parent.mkdir(parents=True, exist_ok=True)
+            tmp = self.synth_state_file.with_suffix(self.synth_state_file.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps({"last_trading_day": day}, ensure_ascii=False),
+                encoding="utf-8",
+            )
+            tmp.replace(self.synth_state_file)
+        except OSError as exc:
+            logger.debug("tick 合成状态写入失败：{}", exc)
+
+    def _acquire_lock(self) -> None:
+        """同一时间只允许一个进程采 tick，避免两条天勤连接互挤。"""
+        path = self.lock_file
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if path.exists():
+                raw = path.read_text(encoding="utf-8").strip()
+                pid = int(raw) if raw.isdigit() else 0
+                if pid and pid != os.getpid() and _pid_alive(pid):
+                    raise TickConfigError(f"另一个 tick 采集进程正在运行（PID {pid}）")
+            path.write_text(str(os.getpid()), encoding="utf-8")
+            self._locked = True
+        except TickConfigError:
+            raise
+        except OSError as exc:
+            logger.debug("tick 锁文件写入失败（继续运行）：{}", exc)
+
+    def _release_lock(self) -> None:
+        if not self._locked:
+            return
+        try:
+            if self.lock_file.exists():
+                raw = self.lock_file.read_text(encoding="utf-8").strip()
+                if raw == str(os.getpid()):
+                    self.lock_file.unlink()
+        except OSError as exc:
+            logger.debug("tick 锁文件删除失败：{}", exc)
+        self._locked = False
+
+    # ---------- 交易时段 ----------
+
+    def _sessions(self) -> list[list[str]]:
+        out: list[list[str]] = []
+        for symbol in self.symbols_in:
+            for item in sessions_for_symbol(self.cfg, symbol):
+                if item not in out:
+                    out.append(item)
+        return out
+
+    def _calendar_day_ok(self, moment: datetime) -> bool:
+        """凌晨 06:00 前算前一天的夜盘，周五夜盘跨到周六也仍有效。"""
+        day = moment.date()
+        if moment.time() < dtime(6, 0):
+            day -= timedelta(days=1)
+        return is_trading_day(day, calendar=self._calendar)
+
+    def _in_session(self, moment: datetime, *, grace_sec: float = 90.0) -> bool:
+        if not self._calendar_day_ok(moment):
+            return False
+        return in_trading_sessions(self._sessions(), moment, grace_sec=grace_sec)
+
+    def _wait_for_open(self) -> bool:
+        """平常只等，不连天勤；开盘前 open_lead_seconds 才开始连。"""
+        while not self._stop.is_set():
+            now = datetime.now()
+            if self._in_session(now) or self._in_session(
+                now + timedelta(seconds=self.open_lead_seconds)
+            ):
+                return True
+            self._next_open = self._format_next_open(now)
+            self._write_status("waiting_open")
+            wait = min(self.idle_poll_seconds, max(5.0, self.open_lead_seconds))
+            if self._stop.wait(wait):
+                return False
+        return False
+
+    def _format_next_open(self, now: datetime) -> str:
+        sessions = self._sessions()
+        if not sessions:
+            return ""
+        for offset in range(0, 9):
+            day = now.date() + timedelta(days=offset)
+            if not is_trading_day(day, calendar=self._calendar):
+                continue
+            for start, _end in sessions:
+                moment = datetime.combine(day, parse_hhmm(start))
+                if moment > now:
+                    return moment.isoformat(timespec="minutes")
+        return ""
+
+    # ---------- 连接 ----------
 
     def _session(self) -> None:
         if not self.symbols_in:
@@ -223,6 +482,7 @@ class TickRecorder:
             serials = {name: client.get_tick_serial(name, data_length=2) for name in instruments}
             self._symbols = list(serials)
             self._state = "running"
+            self._next_open = ""
             self._connected_at = datetime.now().isoformat(timespec="seconds")
             logger.info("tick 采集已连接：{}", ", ".join(self._symbols))
             for instrument, serial in serials.items():
@@ -233,7 +493,18 @@ class TickRecorder:
             last_flush = time.monotonic()
             last_status = last_flush
             refreshed = date.today()
+            seen_session = False
             while not self._stop.is_set():
+                if self.session_only:
+                    now = datetime.now()
+                    if self._in_session(now, grace_sec=0) or self._in_session(
+                        now - timedelta(seconds=self.close_grace_seconds), grace_sec=0
+                    ):
+                        seen_session = True
+                    elif seen_session:
+                        # 开盘前提前连上的那几十秒还没算进时段，只有真正开过盘才判收盘。
+                        self._state = "closed"
+                        break
                 _wait_update(client)
                 for instrument, serial in list(serials.items()):
                     self._append_serial(instrument, serial)

@@ -362,6 +362,11 @@ def frame_from_klines(raw: Any, seconds: int) -> pd.DataFrame:
             "volume": pd.to_numeric(raw[columns["volume"]], errors="coerce").astype(float),
         }
     )
+    # 天勤 K 线自带持仓量，字段叫 close_oi（这根结束时的持仓）。因子挖掘要用它，
+    # 这里一并收进 oi 列；没有这个字段的行情源仍按原来的价量处理。
+    oi_column = columns.get("close_oi") or columns.get("open_oi") or columns.get("open_interest")
+    if oi_column:
+        frame["oi"] = pd.to_numeric(raw[oi_column], errors="coerce").astype(float)
     # tqsdk 的时间戳是 UTC；程序里统一用不带时区的北京时间。
     # 显式指定 unit="s"，避免 numpy 把「整数 + Timedelta」当成 generic unit（未来会变错误）。
     beijing = pd.DatetimeIndex(times).floor("s") + pd.Timedelta(hours=8)

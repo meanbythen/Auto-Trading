@@ -191,8 +191,9 @@ def aligned_bars(
     （商品 09:00/13:30/21:00，中金所 09:30/13:00）：中金所 13:30 是正常收盘时刻，
     不能按商品那套丢掉。session_opens 不传就不做这一项。
 
-    休市当中的整点（商品 12:00、13:00，以及 10:16～10:29）不留给均线。
-    一根 K 线跨过大休市后，实盘那个时点根本下不了单。
+    5～29 分钟按整周期格子，休市当中的整点（商品 12:00、13:00，以及 10:16～10:29）不留给均线。
+    30/60 分钟按连续交易分钟累计，收线可能落在 10:45、11:15、14:15 这种非整点上，
+    只保留交易时段推算出的这套周期允许的收线时刻。
     """
     from src.utils.session_clock import has_commodity_tea_break
 
@@ -211,20 +212,23 @@ def aligned_bars(
             & (index.nanosecond == 0)
         )
         hm = index.hour * 60 + index.minute
-        on_step = (hm % step) == 0
-        if step >= 60:
-            # 时段收盘的短 K：10:15、11:30、02:30。不再保留跨午休的 11:15/14:15。
-            stub_60 = np.isin(
-                hm,
-                (
-                    10 * 60 + 15,
-                    11 * 60 + 30,
-                    2 * 60 + 30,
-                ),
+        if step >= 30:
+            # 30/60 按连续交易分钟累计，收线不一定落在整点上（10:45、11:15、14:15…）。
+            # 用交易时段算出这套周期允许的收线时刻，旧的整点/半点时钟 K 一并清掉。
+            from datetime import date as _date
+
+            from src.data.periods import session_close_times
+
+            labels = session_close_times(
+                _date(2026, 1, 5), step, symbol=symbol or "", include_night=True
             )
-            mask &= on_step | stub_60
+            allowed = np.array(
+                sorted({stamp.hour * 60 + stamp.minute for stamp in labels}),
+                dtype=np.int64,
+            )
+            mask &= np.isin(hm, allowed)
         else:
-            mask &= on_step
+            mask &= (hm % step) == 0
         if session_opens:
             opens = np.asarray(index.hour * 60 + index.minute)
             mask &= ~np.isin(opens, np.asarray(session_opens))
@@ -382,6 +386,41 @@ class BarStore:
                 (symbol, period),
             ).fetchone()
         return int(row[0] if row else 0)
+
+    def coverage(
+        self,
+        symbol: str,
+        period: str,
+        start: str | None = None,
+        end: str | None = None,
+    ) -> dict[str, Any]:
+        """一段区间里有多少根、首末时间、持仓量非空比例；只读，不加载K线。"""
+        where = ["symbol = ?", "period = ?"]
+        params: list[Any] = [symbol, period]
+        if start:
+            where.append("ts >= ?")
+            params.append(str(start))
+        if end:
+            where.append("ts < ?")
+            params.append(str(end))
+        sql = (
+            "SELECT COUNT(*), MIN(ts), MAX(ts), "
+            "SUM(CASE WHEN oi IS NOT NULL THEN 1 ELSE 0 END) "
+            f"FROM bars WHERE {' AND '.join(where)}"
+        )
+        with _STORE_LOCK, self._connect() as conn:
+            row = conn.execute(sql, params).fetchone()
+        n = int(row[0] or 0) if row else 0
+        oi_n = int(row[3] or 0) if row else 0
+        return {
+            "symbol": symbol,
+            "period": period,
+            "n": n,
+            "ts_from": str(row[1] or "") if row else "",
+            "ts_to": str(row[2] or "") if row else "",
+            "oi_n": oi_n,
+            "oi_ratio": (oi_n / n) if n else 0.0,
+        }
 
     def summarize(self) -> list[dict[str, Any]]:
         """每一组（合约+周期）有多少根、从哪根到哪根。不把全部K线读进内存。"""
