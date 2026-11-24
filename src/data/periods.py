@@ -25,9 +25,6 @@ import pandas as pd
 # 程序里统一的 K 线列。各家下载之后都收成这一张表，避免换源时列名、时区对不上。
 OHLC_COLUMNS = ("open", "high", "low", "close", "volume")
 
-_NS_PER_DAY = 24 * 60 * 60 * 1_000_000_000
-
-
 # 持仓量在不同行情源里的列名。统一收成 oi，缺了就是缺了，不填 0。
 OI_ALIASES = ("close_oi", "open_oi", "open_interest", "position", "hold")
 
@@ -373,6 +370,37 @@ def _clock_in_segments(stamp: datetime, segments: tuple[tuple[dtime, dtime], ...
     return False
 
 
+def trading_minutes_between(start: datetime, end: datetime, symbol: Any = "") -> float:
+    """
+    两个时刻之间真正落在盘内的分钟数：午休、收盘后和休市日都不算。
+
+    K 线年龄用它判断，避免把 11:30→13:30 的午休算成 120 分钟过期。
+    夜盘段按开段当天是否开市判断；节前夜盘是否临时取消不在本函数处理。
+    """
+    if end <= start:
+        return 0.0
+    segments = trading_segments_for_symbol(symbol)
+    from src.utils.trading_day import is_trading_day
+
+    total = 0.0
+    # 前一天的夜盘可能跨零点，所以从 start 前一天开始扫。
+    day = start.date() - timedelta(days=1)
+    last_day = end.date()
+    while day <= last_day:
+        if is_trading_day(day):
+            for seg_start, seg_end in segments:
+                begin = datetime.combine(day, seg_start)
+                finish = datetime.combine(day, seg_end)
+                if seg_end <= seg_start:
+                    finish += timedelta(days=1)
+                lo = max(start, begin)
+                hi = min(end, finish)
+                if hi > lo:
+                    total += (hi - lo).total_seconds() / 60.0
+        day += timedelta(days=1)
+    return total
+
+
 def _session_kind(stamp: datetime) -> str:
     """日盘 / 夜盘。夜盘可跨零点。"""
     hour = stamp.hour
@@ -686,7 +714,9 @@ def bars_from_trading_minutes(
     if not valid.any():
         return empty
 
-    day_ord = (index.normalize().asi8 // _NS_PER_DAY).astype(np.int64) + base_days
+    # 用日期差取日序号，不假设 pandas 的 datetime64 是纳秒精度：
+    # pandas 3.x 默认微秒精度，按 asi8 整除一天会把夜盘在零点处拆成两组。
+    day_ord = (index.normalize() - pd.Timestamp("1970-01-01")).days + base_days
     group = day_ord * 2 + kind.astype(np.int64)
     frame = data.loc[valid, columns].copy()
     frame.insert(0, "ts", index[valid])

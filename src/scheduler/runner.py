@@ -20,7 +20,7 @@ import schedule
 from loguru import logger
 
 from src.data import KlineProvider
-from src.data.kline import bars_age_minutes, is_bars_stale
+from src.data.kline import bars_age_minutes, is_bar_gap, is_bars_stale
 from src.data.periods import drop_forming_bar, period_label, stale_after_minutes
 from src.kernel.commands import Command, CommandBus, FLATTEN, SCAN, STOP
 from src.kernel.events import EventBus, SIGNAL
@@ -164,6 +164,15 @@ class TradingBot(
         from src.ops.alerts import set_run_id
 
         set_run_id(self.run_id)
+        from src.version import __version__
+
+        logger.info(
+            "程序启动 run_id={} 版本={} 根目录={} 启动时间={}",
+            self.run_id,
+            __version__,
+            root,
+            self.started_at,
+        )
         self.login_mgr = AppLoginManager(cfg)
         self.risk = RiskService.from_config(cfg, root=root)
         self.sizer = PositionSizer(cfg)
@@ -1740,7 +1749,7 @@ class TradingBot(
                         health = dict(stored)
                 except Exception:  # noqa: BLE001
                     pass
-        age = bars_age_minutes(bars)
+        age = bars_age_minutes(bars, symbol=symbol, period=str(period))
         stale_limit = stale_after_minutes(str(period), self.max_stale_minutes)
         health.setdefault("symbol", symbol)
         health.setdefault("period", str(period))
@@ -2196,8 +2205,15 @@ class TradingBot(
         # 过期缓存：禁止新开仓，仍允许平仓（防断网用旧K线乱开）
         # 日线、周线不能沿用「90 分钟就算过期」，否则昨天的日线永远开不了仓。
         stale_limit = stale_after_minutes(str(signal_tf), self.max_stale_minutes)
-        stale = is_bars_stale(closed, stale_limit)
-        signal_age = bars_age_minutes(closed)
+        stale = is_bars_stale(closed, stale_limit, symbol=symbol, period=str(signal_tf))
+        gap = is_bar_gap(
+            closed,
+            str(signal_tf),
+            symbol=symbol,
+            max_stale_minutes=self.max_stale_minutes,
+        )
+        stale = stale or gap
+        signal_age = bars_age_minutes(closed, symbol=symbol, period=str(signal_tf))
         signal_bar_time = str(closed.index[-1]) if closed is not None and len(closed) else ""
         download_ms = float(health.get("download_ms") or 0.0)
         evaluation_ms = (time.perf_counter() - evaluation_started) * 1000.0
@@ -2211,6 +2227,8 @@ class TradingBot(
         if stale:
             if forming is not None and len(forming) > 0:
                 issues.append("bar_forming")
+            if gap:
+                issues.append("bar_gap")
             issues.append("cache_stale" if health.get("from_cache") else "source_stale")
         slow_ms = max(5.0, float(getattr(self, "scan_interval", 30))) * 1000.0
         if download_ms > slow_ms:

@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import builtins
+import sys
+
 import numpy as np
 import pandas as pd
+import pytest
 
 from src.research.regimes import fit_regimes, format_regime_report, save_regimes
 
@@ -74,3 +78,21 @@ def test_regime_report_and_save(tmp_path) -> None:
     path = save_regimes(tmp_path, result)
     assert path.exists()
     assert "transition" in path.read_text(encoding="utf-8")
+
+
+def test_fit_regimes_reports_missing_sklearn(monkeypatch) -> None:
+    """sklearn 没装时，给出带安装命令的友好提示，而不是裸 ImportError。"""
+    real_import = builtins.__import__
+
+    def _block(name: str, *args: object, **kwargs: object) -> object:
+        if name == "sklearn" or name.startswith("sklearn."):
+            raise ImportError("No module named 'sklearn'")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _block)
+    for mod in list(sys.modules):
+        if mod == "sklearn" or mod.startswith("sklearn."):
+            monkeypatch.delitem(sys.modules, mod)
+
+    with pytest.raises(RuntimeError, match="requirements-optional"):
+        fit_regimes(_bars(), seed=1)

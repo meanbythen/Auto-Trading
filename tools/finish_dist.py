@@ -34,6 +34,7 @@ def _readme_txt(version: str) -> str:
 - 运行页「测试工具」含：试跑一轮信号、点击下单自检、完整自检（三项分选）
 - 历史回测「把本页参数写入配置页」会写回策略、品种、周期、开关和开仓限制（不改实盘余额）
 - 当前策略：日内实体、趋势跟随、SuperTrend、双均线、长线趋势加减仓、长线箱体突破、多因子、自定义规则（DSL）
+- 策略插件：把导出 SPEC（code/label/factory/version）的 .py 放进本文件夹的 plugins\\，重启后自动出现在策略下拉框；加载失败只跳过该插件
 - 自定义规则：config\\rules\\ 下的 YAML 用指标条件组合搭策略，不写代码；改完重启生效，写错会停止开仓并写告警
 - 日内实体怎么挂机：看 docs\\日内实体操作说明书.md
 - 日期用日历选择，查看/删除本地K线用时分下拉；同花顺图只给回测，不写进实盘来源
@@ -42,6 +43,7 @@ def _readme_txt(version: str) -> str:
 - 交叉测试 / 回测 / 优化导出含盈利覆盖、每笔收益、日均等列
 - 交易密码、仿真密码、认证码、天勤密码请到界面「账号」页填写（发布包故意不带密钥文件）
 - config\\品种与合约.xlsx 是保证金比例和每手数量的来源，请勿删除；比例填 23 表示 23%，占用随开仓价变
+- config\\多因子复合CTA回测评估与因子衰减监控模板.xlsx 是 CTA 因子衰减导出的表头模板，请勿删除
 - config\\主力合约表.xlsx 是回测换月的依据：回测页「更新主力合约表」手动重算，「打开表格」可在「手动修正」页覆盖任意换月段，更新时该页保留
 - config\\优化参数.xlsx 是策略优化的网格档位和中文名：优化页「打开优化参数表」直接改，保存后下次优化生效
 
@@ -52,6 +54,7 @@ def _readme_txt(version: str) -> str:
   data\\                状态、回测、复盘（reviews 子目录）
   logs\\                运行日志
   strategies\\          策略说明
+  plugins\\             外置策略插件（放 .py，重启生效）
   _internal\\           程序依赖（勿删）
 
 四、命令行（可选）
@@ -69,9 +72,27 @@ def main() -> int:
         print(f"未找到 {DIST}，请先成功执行 PyInstaller")
         return 1
 
+    # 发布必需文件缺失时直接失败：宁可打不出包，也不要发出一个点到该功能才报错的版本。
+    required = (
+        "VERSION",
+        "config/config.example.yaml",
+        "config/品种与合约.xlsx",
+        "config/holidays.yaml",
+        "config/多因子复合CTA回测评估与因子衰减监控模板.xlsx",
+        "config/rules",
+        "strategies",
+        "src/account/schema.sql",
+    )
+    missing = [rel for rel in required if not (ROOT / rel).exists()]
+    if missing:
+        print("[失败] 源码树缺少发布必需文件：")
+        for rel in missing:
+            print(f"  - {rel}")
+        return 1
+
     version = (ROOT / "VERSION").read_text(encoding="utf-8").strip() or "0.0.0"
 
-    for name in ("config", "data", "data/reviews", "logs", "strategies"):
+    for name in ("config", "data", "data/reviews", "logs", "strategies", "plugins"):
         (DIST / name).mkdir(parents=True, exist_ok=True)
 
     # 版本号放到 exe 旁，方便一眼看到；程序读的是 _internal 里那份。
@@ -106,6 +127,13 @@ def main() -> int:
         shutil.copy2(holidays_src, DIST / "config" / "holidays.yaml")
     else:
         print("[警告] 未找到 config/holidays.yaml，实盘可能因节假日表不够而禁开仓")
+
+    # CTA 因子衰减导出模板：导出函数按 exe 旁的 config 查找，漏带会直接导不出。
+    decay_src = ROOT / "config" / "多因子复合CTA回测评估与因子衰减监控模板.xlsx"
+    if decay_src.exists():
+        shutil.copy2(decay_src, DIST / "config" / decay_src.name)
+    else:
+        print(f"[警告] 未找到 {decay_src}，CTA 衰减导出会失败")
 
     # 自定义规则模板：不写代码加策略的入口，用户复制一份改成自己的。
     rules_src = ROOT / "config" / "rules"

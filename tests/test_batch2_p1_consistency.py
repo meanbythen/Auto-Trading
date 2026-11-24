@@ -26,6 +26,7 @@ from src.account.signal_book import (
 from src.account.sqlite_ledger import _book_id
 from src.account.sqlite_migrate import SCHEMA_VERSION, migrate
 from src.account.trading_db import (
+    check_account_projection,
     connect,
     connect_readonly,
     diff_accounts,
@@ -139,9 +140,9 @@ def test_diff_accounts_detects_missing_mismatched_and_absent_db(tmp_path: Path) 
     db = tmp_path / "data" / "trading.db"
     migrate(tmp_path, db)
 
-    # 库压根没有 → 提示需要迁移。
+    # 库压根没有 → 只说明"尚未创建"，不当成投影漂移。
     absent = tmp_path / "no_db"
-    assert any("不存在" in d for d in diff_accounts(absent))
+    assert any("尚未创建" in d for d in diff_accounts(absent))
 
     # 改掉库里的 book_id → 漂移。
     with sqlite3.connect(db) as conn:
@@ -154,6 +155,28 @@ def test_diff_accounts_detects_missing_mismatched_and_absent_db(tmp_path: Path) 
         conn.execute("DELETE FROM accounts WHERE account_id = ?", ("acc_huatai_sim_01",))
     diffs = diff_accounts(tmp_path)
     assert any("缺失" in d and "acc_huatai_sim_01" in d for d in diffs)
+
+
+def test_check_account_projection_alerts_only_on_real_drift(tmp_path: Path) -> None:
+    """库未建/打不开只跳过比对；真漂移才告警，且写在本工作区，不污染真实 data/alerts.jsonl。"""
+    AccountRegistry(accounts=[_account()], profiles=[_profile()]).save(tmp_path)
+    db = tmp_path / "data" / "trading.db"
+    migrate(tmp_path, db)
+    alerts = tmp_path / "data" / "alerts.jsonl"
+
+    # 未建库：不写告警。
+    fresh = tmp_path / "fresh"
+    AccountRegistry(accounts=[_account()], profiles=[_profile()]).save(fresh)
+    assert any("尚未创建" in d for d in check_account_projection(fresh))
+    assert not (fresh / "data" / "alerts.jsonl").exists()
+
+    # 真漂移：告警落在本工作区。
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE accounts SET book_id = ? WHERE account_id = ?", ("wrong", "acc_huatai_sim_01"))
+    diffs = check_account_projection(tmp_path)
+    assert any("book_id" in d for d in diffs)
+    assert alerts.exists()
+    assert "book_id" in alerts.read_text(encoding="utf-8")
 
 
 # =========================================================================== #
@@ -351,7 +374,8 @@ def test_apply_outbox_event_maps_legacy_book_via_audit(tmp_path: Path) -> None:
     assert [r["fill_key"] for r in target["trades"]] == ["legacy:1"]
 
 
-def test_failed_outbox_events_are_reported_on_startup(tmp_path: Path) -> None:
+def test_failed_outbox_events_are_reported_on_startup(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.setattr("src.ops.alerts._last_emit", {})
     outbox.enqueue(tmp_path, outbox.ORDER_SUBMITTED, {}, event_id="order:x:1", status="ready")
 
     def _boom(_event: dict) -> None:
@@ -361,6 +385,11 @@ def test_failed_outbox_events_are_reported_on_startup(tmp_path: Path) -> None:
         outbox.process_ready(tmp_path, _boom)
     assert outbox.ready_events(tmp_path) == []
     assert len(outbox._rows(tmp_path, "failed", 10)) == 1
+
+    # 失败告警落在本工作区，不写真实 data/alerts.jsonl。
+    alerts = tmp_path / "data" / "alerts.jsonl"
+    assert alerts.exists()
+    assert "outbox_failed" in alerts.read_text(encoding="utf-8")
 
     with patch("src.ops.alerts.emit_alert") as alert:
         count = outbox.report_failed(tmp_path)

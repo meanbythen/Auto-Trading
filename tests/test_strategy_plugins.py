@@ -72,6 +72,16 @@ def test_plugins_can_be_disabled(tmp_path: Path, monkeypatch) -> None:
     assert strategy.__class__ is factory.REGISTRY[factory.DEFAULT_ENGINE]
 
 
+def test_user_plugin_dir_is_scanned(tmp_path: Path, monkeypatch) -> None:
+    """打包版 src 下没有 .py，插件仍能从 exe 旁的 plugins 目录加载。"""
+    (tmp_path / "my_break.py").write_text(_PLUGIN, encoding="utf-8")
+    monkeypatch.setattr(plugins, "user_plugin_dir", lambda: tmp_path)
+
+    specs = plugins.discover_specs()
+    assert specs["my_break"].label == "我的突破"
+    assert "daily_body" in specs
+
+
 def test_strategy_identity_has_version() -> None:
     ident = factory.strategy_identity({"strategy": {"engine": "daily_body"}})
     assert ident["code"] == "daily_body"

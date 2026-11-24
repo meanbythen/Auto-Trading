@@ -195,6 +195,20 @@ def _engines_for(name: str) -> list[dict[str, str]]:
     return engines
 
 
+def _import_sklearn() -> tuple[Any, Any]:
+    """延迟导入 sklearn；缺包时给出明确安装指引，而不是抛裸 ImportError。"""
+    try:
+        from sklearn.cluster import KMeans
+        from sklearn.metrics import silhouette_score
+    except ImportError as exc:
+        raise RuntimeError(
+            "还没装状态识别组件。请先关掉本程序，在项目目录执行 "
+            ".venv\\Scripts\\python -m pip install -r requirements-optional.txt "
+            "（需要 scikit-learn），装完再打开。"
+        ) from exc
+    return KMeans, silhouette_score
+
+
 def fit_regimes(
     df: pd.DataFrame,
     *,
@@ -203,8 +217,7 @@ def fit_regimes(
     seed: int = 42,
 ) -> RegimeResult:
     """样本内拟合 KMeans，样本外按最近中心归类；输出画像、转移矩阵和引擎清单。"""
-    from sklearn.cluster import KMeans
-    from sklearn.metrics import silhouette_score
+    KMeans, silhouette_score = _import_sklearn()
 
     features = build_regime_features(df)
     ratio = min(max(float(train_ratio), 0.50), 0.85)

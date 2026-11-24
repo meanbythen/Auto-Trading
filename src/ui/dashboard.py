@@ -25,7 +25,7 @@ def symbol_card_text(current: str, scan_symbols: list[str]) -> str:
 
 def reconcile_needs_human(rec: dict[str, Any] | None) -> bool:
     """
-    程序持仓卡下的「认领仓单 / 拒绝仓单」要不要点亮。
+    程序持仓卡下的「同步柜台 / 不同步柜台」要不要点亮。
 
     本程序自己的成交回报会直接改账本，按钮保持灰色。
     只有柜台多出来或账本多出来（又不是刚成交）才变红。
@@ -265,7 +265,7 @@ class DashboardMixin:
         phantom = [str(item) for item in (rec.get("phantom") or []) if str(item).strip()]
         note = ""
         if unclaimed:
-            note = "对账：柜台有未认领持仓 " + "、".join(unclaimed)
+            note = "对账：柜台有、程序账没有的持仓 " + "、".join(unclaimed)
         elif phantom:
             note = "对账：账本有、柜台无 " + "、".join(phantom)
         elif rec.get("ok") is False and rec.get("queried") is not False:

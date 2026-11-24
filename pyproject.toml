@@ -22,7 +22,11 @@ ignore = ["E501"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-q"
+addopts = "-q -m 'not perf and not soak'"
+markers = [
+    "perf: 性能基准，默认不跑，用 -m perf 单独执行",
+    "soak: 长稳用例，默认不跑，用 -m soak 或 tools/perf_soak.py 执行",
+]
 
 [tool.coverage.run]
 source = ["src"]

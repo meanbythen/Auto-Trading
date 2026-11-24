@@ -1,12 +1,14 @@
 # 逐条固定到已验证的版本，供 CI 和重现问题使用。
-# 范围与 requirements.txt 的直接依赖一一对应，改依赖时两边一起改。
-# 没有钉住间接依赖（如 certifi、urllib3），它们仍按各自的约束解析。
+# 范围与 requirements.txt 的必需依赖一一对应，改依赖时两边一起改；
+# 可选功能依赖（scikit-learn、vnpy、vnpy_sqlite）不在锁内，见 requirements-optional.txt。
+# 不钉大部分间接依赖（如 urllib3），它们仍按各自的约束解析；
+# 例外是 pip-audit 有告警、且已被验证可用版本的间接依赖，直接钉住以便审计清零。
 numpy==2.5.4
-pandas==2.3.3
+pandas==3.0.6
 matplotlib==3.11.2
-openpyxl==3.1.2
+openpyxl==3.1.5
 akshare==1.20.6
-Pillow==11.3.0
+Pillow==13.0.0
 pyautogui==0.9.54
 pygetwindow==0.0.9
 PyYAML==6.0.3
@@ -19,3 +21,7 @@ keyboard==0.13.5
 pytest==9.1.1
 openctp-ctp==6.7.11.0
 tqsdk==3.10.4
+# 间接依赖（安全修复钉版）
+certifi==2026.10.18
+pypdf==6.21.4
+soupsieve==4.0.0

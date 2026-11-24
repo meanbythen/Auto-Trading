@@ -1,0 +1,7 @@
+# 可选功能依赖：因子聚类（scikit-learn）与 tick 入库（vnpy）。
+# CI 与日常运行不装，保持 lock 轻量；需要这些功能时执行：
+#   .venv\Scripts\python -m pip install -r requirements-optional.txt
+# 版本取本机已验证可用的值，与 requirements.txt 的范围一致。
+scikit-learn==1.9.1
+vnpy==4.5.0
+vnpy_sqlite==1.1.3

@@ -25,14 +25,12 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
 
-      - name: Ruff
-        run: python -m ruff check .
+      - name: Dependency audit
+        run: python -m pip_audit -r requirements.lock
 
-      - name: Mypy
-        run: python -m mypy
-
-      - name: Pytest
-        run: python -m pytest -q --cov=src --cov-report=term-missing
+      # 本地与 CI 共用同一入口：pytest(带覆盖率) + ruff + mypy + 导入契约 + 文档版本校验。
+      - name: Test gate
+        run: python tools/testkit.py gate --coverage
 
   build:
     # 在 Windows 上真打一次 onedir 包，再启动 exe 看它能不能活过启动阶段。
@@ -49,28 +47,15 @@ jobs:
           cache-dependency-path: |
             requirements.lock
             requirements-dev.txt
+            requirements-build.txt
 
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-dev.txt
-          python -m pip install "pyinstaller==6.15.0"
+          python -m pip install -r requirements-build.txt
 
-      - name: Build exe
-        run: python -m PyInstaller --noconfirm Auto-Trading.spec
-
-      - name: Verify dist
-        run: python tools/verify_dist.py
-
-      - name: Smoke start
-        shell: pwsh
-        run: |
-          $exe = "dist/Auto-Trading/Auto-Trading.exe"
-          $p = Start-Process -FilePath $exe -PassThru
-          Start-Sleep -Seconds 12
-          if ($p.HasExited) {
-            Write-Error "exe 启动后立即退出，退出码 $($p.ExitCode)"
-            exit 1
-          }
-          Write-Host "exe 启动 12 秒后仍在运行，冒烟通过"
-          Stop-Process -Id $p.Id -Force
+      # 预检 → 清理 → PyInstaller → 收尾 → 验收 → 元数据 → 12 秒启动冒烟，
+      # 与本地「打包成EXE.bat」完全同一条路径。
+      - name: Build and verify exe
+        run: python tools/build_exe.py

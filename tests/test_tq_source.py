@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 
 import pandas as pd
 import pytest
@@ -35,6 +35,17 @@ def _raw(*starts: str, close: float = 4700.0) -> pd.DataFrame:
             "volume": [100] * len(starts),
         }
     )
+
+
+def test_reset_api_at_exit_swallows_interrupt(monkeypatch: pytest.MonkeyPatch) -> None:
+    """退出阶段被 Ctrl-C 打断时，atexit 回调不要喷 traceback。"""
+    import src.data.tq_source as tq_source
+
+    def _boom() -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(tq_source, "reset_api", _boom)
+    tq_source._reset_api_at_exit()
 
 
 def test_tq_symbol_adds_exchange() -> None:
@@ -429,3 +440,92 @@ def test_short_history_warns_once_and_does_not_wait_again(monkeypatch) -> None:
     assert fake.waits == 3
     assert len(short_warnings) == 1
     assert "5/10" in short_warnings[0]
+
+
+def _bars_at(*stamps: str) -> pd.DataFrame:
+    """按右标签时间造一张最小 K 线表，只给活性判断用。"""
+    index = pd.DatetimeIndex(pd.to_datetime(list(stamps)))
+    return pd.DataFrame({"close": [100.0] * len(stamps)}, index=index)
+
+
+def test_serial_frozen_after_two_periods() -> None:
+    """盘内同一根 K 线过了两个周期还没前进，就判序列僵死。"""
+    from src.data import tq_source
+
+    tq_source._clear_liveness()
+    frame = _bars_at("2026-11-24 09:25")
+    first = tq_source._liveness_frozen(
+        "fu2701", "SHFE.fu2701", 300, frame, now=datetime(2026, 11, 24, 9, 30)
+    )
+    assert first is None  # 第一次只记基准
+    stopped = tq_source._liveness_frozen(
+        "fu2701", "SHFE.fu2701", 300, frame, now=datetime(2026, 11, 24, 9, 40)
+    )
+    assert stopped == datetime(2026, 11, 24, 9, 25)
+    tq_source._clear_liveness()
+
+
+def test_serial_not_frozen_during_lunch_break() -> None:
+    """午休不计交易分钟，11:25 到 13:20 不能判成僵死。"""
+    from src.data import tq_source
+
+    tq_source._clear_liveness()
+    frame = _bars_at("2026-11-24 11:20")
+    assert (
+        tq_source._liveness_frozen(
+            "fu2701", "SHFE.fu2701", 300, frame, now=datetime(2026, 11, 24, 11, 25)
+        )
+        is None
+    )
+    assert (
+        tq_source._liveness_frozen(
+            "fu2701", "SHFE.fu2701", 300, frame, now=datetime(2026, 11, 24, 13, 20)
+        )
+        is None
+    )
+    tq_source._clear_liveness()
+
+
+def test_serial_frozen_resets_api_once(monkeypatch) -> None:
+    """连续两轮同根 K 线且盘内已过两个周期：重建连接一次，告警只写一次。"""
+    from src.data import tq_source
+
+    tq_source._clear_liveness()
+    _clear_history_short()
+    raw = _raw("2026-11-24 01:25")
+    warnings: list[str] = []
+
+    def _capture_warning(message, *args, **kwargs):
+        warnings.append(str(message).format(*args) if args else str(message))
+
+    class _FrozenApi:
+        def get_kline_serial(self, symbol: str, seconds: int, data_length: int = 200):
+            return raw
+
+        def wait_update(self, deadline: float | None = None) -> None:
+            return None
+
+    class _Clock:
+        def __init__(self, stamp: datetime) -> None:
+            self.stamp = stamp
+
+        def now(self) -> datetime:
+            return self.stamp
+
+    clock = _Clock(datetime(2026, 11, 24, 9, 30))
+    resets: list[int] = []
+    monkeypatch.setattr(tq_source, "datetime", clock)
+    monkeypatch.setattr(tq_source, "_get_api", lambda _u, _p: _FrozenApi())
+    monkeypatch.setattr(tq_source, "reset_api", lambda: resets.append(1))
+    monkeypatch.setattr(tq_source.logger, "warning", _capture_warning)
+
+    fetch_frame("fu2701", "5", limit=10)
+    clock.stamp = datetime(2026, 11, 24, 9, 40)
+    fetch_frame("fu2701", "5", limit=10)
+    clock.stamp = datetime(2026, 11, 24, 9, 45)
+    fetch_frame("fu2701", "5", limit=10)
+
+    assert len(resets) == 1
+    assert len([text for text in warnings if "没有前进" in text]) == 1
+    tq_source._clear_liveness()
+    _clear_history_short()

@@ -36,6 +36,10 @@ Desktop.ini
 # 编辑器
 .idea/
 .vscode/
+docs/.obsidian/
+
+# 覆盖率临时产物
+.coverage
 
 # 工具临时产物
 .trae/

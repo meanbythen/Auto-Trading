@@ -1,0 +1,2 @@
+# EXE 打包工具链；版本与 tools/build_exe.py 的 PINNED_PYINSTALLER 保持一致。
+pyinstaller==6.22.3

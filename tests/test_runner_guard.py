@@ -753,7 +753,7 @@ def test_successful_order_keeps_signal_mark() -> None:
     assert bot.strategy.get_signaled_bar("fu2701") == "2026-11-05 21:05:00"
 
 
-def test_scan_symbol_releases_mark_when_execute_raises_before_dispatch() -> None:
+def test_scan_symbol_releases_mark_when_execute_raises_before_dispatch(tmp_path) -> None:
     """下单前报错（例如 11-05 的 dry_run AttributeError）不能吃掉信号，下一轮还要能重试。"""
     from datetime import datetime, timedelta
 
@@ -772,7 +772,7 @@ def test_scan_symbol_releases_mark_when_execute_raises_before_dispatch() -> None
         "schedule": {"scan_interval_sec": 30, "trading_sessions": [["09:00", "15:00"]]},
         "risk": {"sizing_mode": "fixed", "capital": 10000},
         "data": {},
-        "_project_root": ".",
+        "_project_root": str(tmp_path),
     }
     bot = TradingBot(cfg)
     end = datetime.now() - timedelta(minutes=2)
@@ -802,7 +802,7 @@ def test_scan_symbol_releases_mark_when_execute_raises_before_dispatch() -> None
     assert bot.strategy.get_signaled_bar("fu2701") == ""
 
 
-def test_scan_symbol_skips_open_when_price_already_ran_away() -> None:
+def test_scan_symbol_skips_open_when_price_already_ran_away(tmp_path) -> None:
     """信号价 100、现价 110、ATR 2（0.5×ATR=1）→ 不追，也不点单。"""
     from datetime import datetime, timedelta
 
@@ -821,7 +821,7 @@ def test_scan_symbol_skips_open_when_price_already_ran_away() -> None:
         "schedule": {"scan_interval_sec": 30, "trading_sessions": [["09:00", "15:00"]]},
         "risk": {"sizing_mode": "fixed", "capital": 10000},
         "data": {},
-        "_project_root": ".",
+        "_project_root": str(tmp_path),
     }
     bot = TradingBot(cfg)
     end = datetime.now() - timedelta(minutes=2)
@@ -917,7 +917,8 @@ def _stale_market_bars():
 
     import pandas as pd
 
-    end = datetime.now() - timedelta(hours=3)
+    # 用一周前的K线，保证按交易分钟计龄也远超 90 分钟，不受测试运行时刻影响。
+    end = datetime.now() - timedelta(days=7)
     index = pd.DatetimeIndex([end - timedelta(minutes=5 * (39 - i)) for i in range(40)])
     close = pd.Series(100.0, index=index)
     bars = pd.DataFrame(
@@ -930,7 +931,7 @@ def _stale_market_bars():
         "stale": True,
         "download_ms": 125.0,
         "latest_bar_time": str(index[-1]),
-        "latest_bar_age_minutes": 180.0,
+        "latest_bar_age_minutes": 10080.0,
         "error": "模拟断流",
     }
     return bars

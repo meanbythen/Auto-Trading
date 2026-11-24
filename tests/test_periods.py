@@ -3,7 +3,9 @@
 from datetime import date, datetime
 
 import pandas as pd
+import pytest
 
+from src.data.kline import bar_gap_minutes, bars_age_minutes, is_bar_gap, is_bars_stale
 from src.data.periods import (
     _session_open_edge_mask,
     bars_from_minutes,
@@ -13,6 +15,7 @@ from src.data.periods import (
     overlay_minute_bars,
     resample_ohlc,
     session_close_times,
+    trading_minutes_between,
     ui_parts,
     unique_ohlc_columns,
 )
@@ -431,3 +434,104 @@ def test_duplicate_close_column_keeps_last() -> None:
     assert cleaned is not None
     assert not cleaned.columns.duplicated().any()
     assert float(cleaned["high"].iloc[1]) == 4486
+
+
+def test_trading_minutes_skip_lunch_break() -> None:
+    """11:30→13:30 全在午休，交易分钟为 0；到 13:45 只算下午 15 分钟。"""
+    assert trading_minutes_between(
+        datetime(2026, 11, 24, 11, 30),
+        datetime(2026, 11, 24, 13, 30),
+        "fu2701",
+    ) == pytest.approx(0.0)
+    assert trading_minutes_between(
+        datetime(2026, 11, 24, 11, 30),
+        datetime(2026, 11, 24, 13, 45),
+        "fu2701",
+    ) == pytest.approx(15.0)
+
+
+def test_trading_minutes_skip_overnight_for_no_night_product() -> None:
+    """生猪没有夜盘：15:00→次日 09:00 不算过期，09:30 才算 30 分钟。"""
+    assert trading_minutes_between(
+        datetime(2026, 11, 24, 15, 0),
+        datetime(2026, 11, 25, 9, 0),
+        "lh2701",
+    ) == pytest.approx(0.0)
+    assert trading_minutes_between(
+        datetime(2026, 11, 24, 15, 0),
+        datetime(2026, 11, 25, 9, 30),
+        "lh2701",
+    ) == pytest.approx(30.0)
+
+
+def test_trading_minutes_count_night_session() -> None:
+    """有夜盘的品种 21:00→23:00 记 120 分钟，15:00→21:00 仍为 0。"""
+    assert trading_minutes_between(
+        datetime(2026, 11, 24, 21, 0),
+        datetime(2026, 11, 24, 23, 0),
+        "fu2701",
+    ) == pytest.approx(120.0)
+    assert trading_minutes_between(
+        datetime(2026, 11, 24, 15, 0),
+        datetime(2026, 11, 24, 21, 0),
+        "fu2701",
+    ) == pytest.approx(0.0)
+
+
+def test_bars_age_uses_session_minutes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """13:30 时 11:30 的 15 分钟K线：自然年龄 120 分钟，交易年龄 0，不算过期。"""
+
+    class _FixedNow:
+        @staticmethod
+        def now() -> datetime:
+            return datetime(2026, 11, 24, 13, 30)
+
+    monkeypatch.setattr("src.data.kline.datetime", _FixedNow)
+    index = pd.to_datetime(["2026-11-24 11:15", "2026-11-24 11:30"])
+    bars = pd.DataFrame(
+        {
+            "open": [1.0, 2.0],
+            "high": [1.0, 2.0],
+            "low": [1.0, 2.0],
+            "close": [1.0, 2.0],
+            "volume": [1.0, 1.0],
+        },
+        index=index,
+    )
+    assert bars_age_minutes(bars) == pytest.approx(120.0)
+    assert bars_age_minutes(bars, symbol="fu2701", period="15") == pytest.approx(0.0)
+    assert not is_bars_stale(bars, 90, symbol="fu2701", period="15")
+
+
+def test_bar_gap_minutes_per_period() -> None:
+    """缺根阈值默认两根：15 分钟 30 分钟、5 分钟 10 分钟、60 分钟 120 分钟。"""
+    assert bar_gap_minutes("15") == pytest.approx(30.0)
+    assert bar_gap_minutes("5") == pytest.approx(10.0)
+    assert bar_gap_minutes("60") == pytest.approx(120.0)
+
+
+def test_bar_gap_detects_missing_bars(monkeypatch: pytest.MonkeyPatch) -> None:
+    """13:44 只缺一根不算断流；14:00 连缺两根（30 个交易分钟）判为缺根。"""
+
+    class _Clock:
+        current = datetime(2026, 11, 24, 13, 44)
+
+        @classmethod
+        def now(cls) -> datetime:
+            return cls.current
+
+    monkeypatch.setattr("src.data.kline.datetime", _Clock)
+    index = pd.to_datetime(["2026-11-24 11:15", "2026-11-24 11:30"])
+    bars = pd.DataFrame(
+        {
+            "open": [1.0, 2.0],
+            "high": [1.0, 2.0],
+            "low": [1.0, 2.0],
+            "close": [1.0, 2.0],
+            "volume": [1.0, 1.0],
+        },
+        index=index,
+    )
+    assert not is_bar_gap(bars, "15", symbol="fu2701")
+    _Clock.current = datetime(2026, 11, 24, 14, 0)
+    assert is_bar_gap(bars, "15", symbol="fu2701")

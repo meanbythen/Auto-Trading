@@ -42,6 +42,7 @@ from src.data.periods import (
     period_label,
     resample_ohlc,
     stale_after_minutes,
+    trading_minutes_between,
 )
 from src.data.tq_source import session_open_minutes
 from src.utils import load_secrets
@@ -172,22 +173,61 @@ def rebuilt_stamp_list(raw: Any) -> list:
         return []
 
 
-def bars_age_minutes(df: pd.DataFrame | None) -> float | None:
-    """最后一根K线距离现在多少分钟；无法判断则返回 None。"""
+def bars_age_minutes(
+    df: pd.DataFrame | None,
+    *,
+    symbol: Any = "",
+    period: str = "",
+) -> float | None:
+    """
+    最后一根K线距离现在多少分钟；无法判断则返回 None。
+
+    分钟周期传了 symbol 时按交易时段计龄，午休和收盘后不计入，
+    避免 11:30 的K线在 13:30 被当成「过期 120 分钟」。日/周线仍按自然时间。
+    """
     if df is None or len(df) == 0:
         return None
     try:
         last = pd.Timestamp(df.index[-1]).to_pydatetime()
         if last.tzinfo is not None:
             last = last.replace(tzinfo=None)
-        return max(0.0, (datetime.now() - last).total_seconds() / 60.0)
+        now = datetime.now()
+        if symbol and period and canonical_period(period) not in {"D", "W"}:
+            return max(0.0, trading_minutes_between(last, now, symbol))
+        return max(0.0, (now - last).total_seconds() / 60.0)
     except Exception:  # noqa: BLE001
         return None
 
 
-def is_bars_stale(df: pd.DataFrame | None, max_age_minutes: float) -> bool:
-    """K线是否过期（用于禁止用陈旧缓存开仓）。"""
-    age = bars_age_minutes(df)
+def bar_gap_minutes(period: str, max_stale_minutes: float = 90.0) -> float:
+    """连续缺几根K线算断流：默认两根，最少 10 分钟，且不超过过期阈值。"""
+    canonical = canonical_period(period)
+    if canonical in {"D", "W"}:
+        return stale_after_minutes(canonical, max_stale_minutes)
+    return max(10.0, min(stale_after_minutes(canonical, max_stale_minutes), 2.0 * int(canonical)))
+
+
+def is_bar_gap(
+    df: pd.DataFrame | None,
+    period: str,
+    *,
+    symbol: Any = "",
+    max_stale_minutes: float = 90.0,
+) -> bool:
+    """是否连续缺根：用交易年龄判断，正常休市不会误报。"""
+    age = bars_age_minutes(df, symbol=symbol, period=period)
+    return age is not None and age >= bar_gap_minutes(period, max_stale_minutes)
+
+
+def is_bars_stale(
+    df: pd.DataFrame | None,
+    max_age_minutes: float,
+    *,
+    symbol: Any = "",
+    period: str = "",
+) -> bool:
+    """K线是否过期（用于禁止用陈旧缓存开仓）；分钟周期按交易时段计龄。"""
+    age = bars_age_minutes(df, symbol=symbol, period=period)
     if age is None:
         return True
     return age > float(max_age_minutes)
@@ -333,7 +373,7 @@ class KlineProvider:
             self._market_health[key] = health
             raise
 
-        age = bars_age_minutes(bars)
+        age = bars_age_minutes(bars, symbol=symbol, period=str(canonical))
         stale_limit = stale_after_minutes(canonical, self.max_stale_minutes)
         from_cache = bool(bars.attrs.get("from_cache", False))
         error = str(bars.attrs.get("download_error", "") or "")
@@ -539,7 +579,7 @@ class KlineProvider:
                     # 回测要长历史：往大要，天勤服务端按它的上限（免费账号实测约 10000 根）
                     # 截断，给多少存多少。这些K线会存进本地库，下次区间落在已有数据里就不再重下。
                     # 实盘仍只要最近一段。
-                    fresh = self._fetch_tq(symbol, period, limit=1_000_000 if keep_history else 200)
+                    fresh = self._fetch_tq(symbol, period, limit=1_000_000 if keep_history else limit)
                     self._save_vendor_raw(symbol, period, fresh)
                 else:
                     fresh = self._fetch_akshare(sina_code, period, symbol_hint=symbol)

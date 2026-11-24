@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import os
 import sys
 import tkinter as tk
 
@@ -19,6 +20,18 @@ class _MemoryCipher:
         if not token.startswith("mem:"):
             raise SecretStoreUnavailable("测试密钥库解不开这条密文")
         return token[4:]
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _no_live_tq_login():
+    """测试进程不登录真实天勤账号：同一账号并发登录会顶掉实盘行情连接。"""
+    old = os.environ.get("AUTO_TRADING_NO_TQ_LOGIN")
+    os.environ["AUTO_TRADING_NO_TQ_LOGIN"] = "1"
+    yield
+    if old is None:
+        os.environ.pop("AUTO_TRADING_NO_TQ_LOGIN", None)
+    else:
+        os.environ["AUTO_TRADING_NO_TQ_LOGIN"] = old
 
 
 @pytest.fixture(autouse=True)

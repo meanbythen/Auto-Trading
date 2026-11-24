@@ -197,7 +197,7 @@ def _fail(root: str | Path, event: dict[str, Any], exc: Exception, *, keep: str)
         try:
             from src.ops.alerts import emit_alert
 
-            emit_alert("outbox_failed", msg, level="error")
+            emit_alert("outbox_failed", msg, level="error", root=root)
         except Exception:  # noqa: BLE001 - 告警失败不影响事件流转
             pass
 
@@ -213,7 +213,8 @@ def report_failed(root: str | Path, limit: int = 200) -> int:
     try:
         from src.ops.alerts import emit_alert
 
-        emit_alert("outbox_failed_backlog", msg, level="error")
+        # 告警写到本次处理的工作区：测试/临时目录不会污染真实 data/alerts.jsonl。
+        emit_alert("outbox_failed_backlog", msg, level="error", root=root)
     except Exception:  # noqa: BLE001
         pass
     return len(failed)

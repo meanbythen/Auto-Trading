@@ -97,7 +97,7 @@ class RunTabMixin:
             state="disabled",
         )
         self.btn_stop.pack(side="left", expand=True, fill="x", padx=(6, 0))
-        # 核对委托：点单和记账之间崩溃后的熔断。和持仓卡「认领/拒绝仓单」不是一回事。
+        # 核对委托：点单和记账之间崩溃后的熔断。和持仓卡「同步柜台 / 不同步柜台」不是一回事。
         self.btn_confirm = ctk.CTkButton(
             btn_row,
             text="核对委托",
@@ -923,9 +923,9 @@ class RunTabMixin:
             return
         if not messagebox.askyesno(
             "核对委托",
-            "这和右上「认领仓单 / 拒绝仓单」不是同一件事。\n\n"
+            "这和程序持仓卡下的「同步柜台 / 不同步柜台」不是同一件事。\n\n"
             "这里只清掉「点单后程序崩溃、还没记上账」留下的告警，不改持仓。\n"
-            "柜台手数和程序账对不上，请用程序持仓卡下的认领或拒绝。\n\n"
+            "柜台手数和程序账对不上，请用程序持仓卡下的「同步柜台」或「不同步柜台」。\n\n"
             "请先在交易软件里核对实际持仓与委托。如果这笔其实已成交，先用「手工单录入」补进程序账。\n\n"
             "确认无误后解除熔断并继续扫描？",
         ):
@@ -946,25 +946,26 @@ class RunTabMixin:
         return list(dict.fromkeys([*(rec.get("unclaimed") or []), *(rec.get("phantom") or [])]))
 
     def _on_claim_lots(self) -> None:
-        """认领仓单：以华泰柜台为准，改程序账。"""
+        """同步柜台：以华泰柜台为准，改程序账（原「认领仓单」）。"""
         bot = getattr(self.worker, "bot", None)
         if bot is None:
-            messagebox.showinfo("认领仓单", "常驻没有在跑。启动常驻后再认领。")
+            messagebox.showinfo("同步柜台", "常驻没有在跑。启动常驻后再同步柜台。")
             return
         pending = self._reconcile_pending_symbols()
         rec = (bot.status_snapshot() or {}).get("reconcile") or {}
         unclaimed = {str(item).strip().lower() for item in (rec.get("unclaimed") or [])}
         if not pending:
-            messagebox.showinfo("认领仓单", "现在柜台和程序账是对齐的，不用认领。")
+            messagebox.showinfo("同步柜台", "现在柜台和程序账是对齐的，不用同步。")
             return
         names = "、".join(pending)
         if not messagebox.askyesno(
-            "认领仓单",
+            "同步柜台",
             "将以华泰柜台为准，改程序持仓和本地账本。\n"
             f"涉及：{names}\n\n"
-            "柜台有仓、账本没有：把柜台的仓收进程序。\n"
-            "柜台已空、账本还有：按现价把账本也改成空（手机刚平完应点「是」）。\n\n"
-            "不想改账本、仍让程序记着仓，请点「否」，改用「拒绝仓单」。",
+            "柜台有仓、程序账没有：把柜台的仓收进程序。\n"
+            "柜台已空、程序账还有：按现价把程序账也改成空（手机刚平完选这个）。\n\n"
+            "这会把程序账改成和柜台一致；如果只想保留程序账、不改账本，"
+            "请点「否」，改用「不同步柜台」。",
         ):
             return
         for symbol in pending:
@@ -974,27 +975,27 @@ class RunTabMixin:
                 ok, msg = bot.close_broker_position(symbol)
             self._append_log(msg)
             if not ok:
-                messagebox.showwarning("认领仓单", msg)
+                messagebox.showwarning("同步柜台", msg)
         self._refresh_status_cards()
 
     def _on_reject_lots(self) -> None:
-        """拒绝仓单：以程序账为准，不跟柜台改。柜台已空时也不会把账本平掉。"""
+        """不同步柜台：以程序账为准，不跟柜台改（原「拒绝仓单」）。柜台已空时也不会把账本平掉。"""
         bot = getattr(self.worker, "bot", None)
         if bot is None:
-            messagebox.showinfo("拒绝仓单", "常驻没有在跑。启动常驻后再拒绝。")
+            messagebox.showinfo("不同步柜台", "常驻没有在跑。启动常驻后再处理。")
             return
         pending = self._reconcile_pending_symbols()
         if not pending:
-            messagebox.showinfo("拒绝仓单", "现在柜台和程序账是对齐的，不用拒绝。")
+            messagebox.showinfo("不同步柜台", "现在柜台和程序账是对齐的，不用处理。")
             return
         names = "、".join(pending)
         if not messagebox.askyesno(
-            "拒绝仓单",
-            "将以程序账为准，不按柜台改持仓。\n"
+            "不同步柜台",
+            "将保留程序账，不按柜台改持仓。\n"
             f"涉及：{names}\n\n"
-            "柜台有仓、账本没有：不把柜台的仓收进来。\n"
-            "柜台已空、账本还有：账本仍记着仓，不会替你平掉；该品种暂停自动开仓。\n\n"
-            "手机已经平完、要把账本也改成空，请点「否」，改用「认领仓单」。",
+            "柜台有仓、程序账没有：不把柜台的仓收进来。\n"
+            "柜台已空、程序账还有：程序账仍记着仓，不会替你平掉；该品种暂停自动开仓。\n\n"
+            "如果手机已经平完、要把程序账也改成空，请点「否」，改用「同步柜台」。",
         ):
             return
         reject = getattr(bot, "reject_broker_lots", None)
@@ -1005,11 +1006,11 @@ class RunTabMixin:
                 ok, msg = bot.ignore_reconcile_symbol(symbol)
             self._append_log(msg)
             if not ok:
-                messagebox.showwarning("拒绝仓单", msg)
+                messagebox.showwarning("不同步柜台", msg)
         self._refresh_status_cards()
 
     def _on_reconcile_actions(self) -> None:
-        """旧入口转到认领仓单。"""
+        """旧入口转到「同步柜台」。"""
         self._on_claim_lots()
 
 

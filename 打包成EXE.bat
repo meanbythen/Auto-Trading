@@ -15,8 +15,8 @@ if not exist ".venv\Scripts\python.exe" (
   exit /b 1
 )
 
-echo [1/4] 安装/更新 PyInstaller ...
-".venv\Scripts\python.exe" -m pip install -U "pyinstaller>=6.0" wheel
+echo [1/2] 安装固定版本的打包工具 ...
+".venv\Scripts\python.exe" -m pip install -r requirements-build.txt
 if errorlevel 1 (
   echo pip 安装失败
   pause
@@ -24,37 +24,22 @@ if errorlevel 1 (
 )
 
 echo.
-echo [2/4] 开始打包（首次可能要几分钟，请耐心等待）...
-".venv\Scripts\python.exe" -m PyInstaller Auto-Trading.spec --noconfirm --clean
+echo [2/2] 预检 -^> 清理 -^> 打包 -^> 收尾 -^> 验收 -^> 冒烟 ...
+".venv\Scripts\python.exe" tools\build_exe.py %*
 if errorlevel 1 (
   echo.
-  echo 打包失败。可把 console=True 写进 Auto-Trading.spec 再试，便于看报错。
-  pause
-  exit /b 1
-)
-
-echo.
-echo [3/4] 整理发布目录 ...
-".venv\Scripts\python.exe" tools\finish_dist.py
-if errorlevel 1 (
-  echo 整理脚本失败，但 dist\Auto-Trading 可能已生成。
-)
-
-echo.
-echo [4/4] 验收发布包（版本、复盘模块、备查文件）...
-".venv\Scripts\python.exe" tools\verify_dist.py
-if errorlevel 1 (
-  echo.
-  echo 验收未通过，请根据上面的提示修补后再分发。
+  echo 打包未通过。按上面的第一条错误修复后重试；
+  echo 排查缓存问题时可用：打包成EXE.bat --no-clean
   pause
   exit /b 1
 )
 
 echo.
 echo ========================================
-echo 完成！请把整个文件夹拷到目标电脑：
+echo 完成！分发时请拷贝整个文件夹：
 echo   dist\Auto-Trading\
 echo 双击 Auto-Trading.exe 即可（无需安装 Python）
+echo 构建元数据：build\packaging\build-info.json
 echo ========================================
 explorer "dist\Auto-Trading"
 pause

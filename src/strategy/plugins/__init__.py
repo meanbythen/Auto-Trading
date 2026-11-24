@@ -2,7 +2,8 @@
 
 约定：
 1. 内置策略的清单从 factory.REGISTRY 现算，不另抄一份；
-2. 新策略只需在本目录放一个 .py，模块里导出 SPEC（dict 或 StrategySpec）；
+2. 新策略只需在插件目录放一个 .py，模块里导出 SPEC（dict 或 StrategySpec）；
+   源码环境是 src/strategy/plugins/，打包版是 exe 同级的 plugins/；
 3. 任何插件加载失败都只记 warning 并跳过，调用方继续用内置 REGISTRY；
 4. 参数 schema 默认取 params.ENGINE_SECTION_DEFAULTS，插件可在 SPEC.params 里补充。
 
@@ -30,8 +31,10 @@ from ..factory import (
 )
 from ..params import DEFAULT_ENGINE, ENGINE_SECTION_DEFAULTS
 from ..rule_dsl import rule_engine_stem
+from ...utils.paths import project_root
 
 PLUGIN_DIR = Path(__file__).resolve().parent
+USER_PLUGIN_DIR_NAME = "plugins"
 BUILTIN_VERSION = "builtin-1"
 
 PluginFactory = Callable[[dict[str, Any]], Any]
@@ -116,11 +119,34 @@ def _builtin_specs() -> dict[str, StrategySpec]:
     return specs
 
 
+def user_plugin_dir() -> Path:
+    """用户插件目录：打包版是 exe 同级的 plugins/，源码运行是项目根 plugins/。
+
+    打包后 src/strategy/plugins 只剩字节码，没有 .py 文件；外置目录让用户
+    仍能放源码插件，加载方式与开发环境一致。
+    """
+    return project_root() / USER_PLUGIN_DIR_NAME
+
+
 def _plugin_files(directory: str | Path | None) -> list[Path]:
-    root = Path(directory) if directory is not None else PLUGIN_DIR
-    if not root.is_dir():
-        return []
-    return sorted(path for path in root.glob("*.py") if not path.name.startswith("_"))
+    if directory is not None:
+        roots = [Path(directory)]
+    else:
+        roots = [PLUGIN_DIR, user_plugin_dir()]
+    files: list[Path] = []
+    seen: set[Path] = set()
+    for root in roots:
+        if not root.is_dir():
+            continue
+        for path in sorted(root.glob("*.py")):
+            if path.name.startswith("_"):
+                continue
+            resolved = path.resolve()
+            if resolved in seen:
+                continue
+            seen.add(resolved)
+            files.append(path)
+    return files
 
 
 def _coerce_spec(raw: Any, path: Path) -> StrategySpec:
@@ -278,6 +304,7 @@ def strategy_identity(cfg: dict[str, Any] | None) -> dict[str, str]:
 __all__ = [
     "BUILTIN_VERSION",
     "PLUGIN_DIR",
+    "USER_PLUGIN_DIR_NAME",
     "StrategySpec",
     "discover_specs",
     "param_schema",
@@ -285,5 +312,6 @@ __all__ = [
     "plugins_enabled",
     "spec_for",
     "strategy_identity",
+    "user_plugin_dir",
     "validate_params",
 ]

@@ -4,6 +4,322 @@
 
 规则写在 README 的「版本」一节。已经写在这里的旧版本不再改写，新的改动加在最上面。
 
+## 53.7.33 — 2026-11-24
+
+修复：因子聚类（状态识别）缺 sklearn 时只抛裸 `ImportError`，用户看不到安装指引。
+
+- `src/research/regimes.py` 把 sklearn 延迟导入收进 `_import_sklearn()`，缺包时抛带 `requirements-optional.txt` 安装命令的 `RuntimeError`，与 tick 入库（vnpy）的缺包提示风格一致。
+- 新增 `tests/test_research_regimes.py` 1 项，验证缺包时给出友好提示。
+- 无策略/交易逻辑改动。
+
+## 53.7.32 — 2026-11-24
+
+runner.py 启动检查、健康闸门与看门狗回调补测（只加测试与文档）。
+
+- 新增 `tests/test_runner_checks.py` 13 项：节假日历覆盖检查的干跑/缺失/已止/首次熔断/告警失败、遗留动作文件的新旧与坏行、健康分闸门开/关/异常、看门狗快照、心跳过期暂停报单与告警失败。
+- `tests/test_runner_lifecycle.py` 再补 4 项：清仓待办第二轮重试、写事件失败仍记 `last_error`、交易通道无 `shutdown` 方法时收尾、收盘关机因其他原因等待。
+- 覆盖率：runner.py 语句 77.4% → 82.2%（未覆盖 378 → 298）；scheduler 包 86.10% → 88.33%（合并 86%）。
+- 回归：全量 2486 项通过；ruff / mypy / lint-imports / 文档校验通过。
+- 文档：测试报告升 3.1；测试方案与用例库同步 2486 项；架构报告测试文件数 216 → 217；同时修正 53.7.29 条目里「2635 行以后无缺口」的不准确表述。
+
+## 53.7.31 — 2026-11-24
+
+调整依赖分层（只改环境声明与文档）。
+
+- 新增 `requirements-optional.txt`，钉 `scikit-learn==1.9.1`、`vnpy==4.5.0`、`vnpy_sqlite==1.1.3`（因子聚类与 tick 入库）。
+- `requirements.lock` 移除这三项，恢复为「必需依赖」锁；CI 安装和 `pip-audit` 仍只扫 lock，不再被 PySide6 拖慢。
+- README 安装说明补充可选依赖安装命令，文件树补上四个 requirements 文件的分工。
+- 无代码改动。
+
+## 53.7.30 — 2026-11-24
+
+修复依赖锁缺项（只改环境声明与文档，不改代码）。
+
+- `requirements.lock` 补钉 `scikit-learn==1.9.1`、`vnpy==4.5.0`、`vnpy_sqlite==1.1.3`，与 `requirements.txt` 的直接依赖对齐。此前按 lock 建环境会缺因子聚类与 tick 入库依赖，新机器只能靠缺包报错逐个补。
+- 无代码改动；回归用例与打包内容不变，仅版本号随发版更新。
+
+## 53.7.29 — 2026-11-24
+
+runner.py 启动流程与收盘关机补测（只加测试与文档）。
+
+- 新增 `tests/test_runner_lifecycle.py` 22 项：柜台通道/需要登录/刚登录过三种启动分支、发件箱监听与补账失败降级、SCAN/FLATTEN 命令、清仓到点重试与完成后重置、单轮异常 5 秒后续跑、Ctrl+C 收尾、退出时看门狗/防休眠/发件箱/交易通道/落盘全部失败仍能停稳、收盘关机开关/当日去重/持仓等待/预约成功/预约失败/多品种合并、watchdog 启停与重复启动。
+- 覆盖率：runner.py 语句 71.9% → 77.4%（未覆盖 470 → 378）；`run_forever` 与 `_maybe_shutdown_after_close` 主路径已覆盖（该区间仅剩少量分支）；scheduler 包 83.53% → 86.10%（合并 81% → 84%）。
+- 回归：全量 2469 项通过；ruff / mypy / lint-imports / 文档校验通过。
+- 文档：测试报告升 3.0；测试方案与用例库同步 2469 项；架构报告测试文件数 215 → 216。
+
+## 53.7.28 — 2026-11-24
+
+catch_up.py 补测（只加测试与文档）。
+
+- `tests/test_catch_up.py` 新增 12 项：`_truncate_by_end` 正常/空/索引不可比、`_prefix_bars` 根数不足、`_atr_at_end` 短序列/缺列/全平/空序列、`stop_was_touched` 缺列与未知方向、`_probe_open` 开仓过滤/趋势参数/旧签名回退/策略配置优先、禁用与空序列、无时间戳跳过、未来信号压成 0 分钟、缺开仓价继续看旧一根、ATR 缺失继续看旧一根、forming 根参与止损（含与已收盘后续合并）。
+- 覆盖率：catch_up.py 语句 76.4% → 99.4%（161 语句，未覆盖 38 → 1），合并 73% → 99%；scheduler 包 83.53% 语句 / 81% 合并。
+- 回归：全量 2447 项通过；ruff / mypy / lint-imports / 文档校验通过。
+- 文档：测试报告升 2.9；测试方案与用例库同步 2447 项；架构报告测试文件数不变（12 项追加在既有文件）。
+
+## 53.7.27 — 2026-11-24
+
+修复：对账按钮已改成「同步柜台 / 不同步柜台」，但弹出的确认框还写着「认领仓单 / 拒绝仓单」，用词对不上。
+
+- 两个确认框的标题和正文统一为「同步柜台」「不同步柜台」，并分别写明功能：同步柜台以华泰柜台为准改程序账（柜台有仓收进来、柜台已空则按现价把程序账改成空）；不同步柜台保留程序账（柜台多出的仓不收、程序账多出的仓不平，只暂停该品种自动开仓）。
+- 「核对委托」提示里的旧按钮名一并改掉，并说明它和这两个按钮不是同一件事。
+- 对账提示「柜台有未认领持仓」改成「柜台有、程序账没有的持仓」，不再另造术语。
+- 只改界面文案，不动对账逻辑；2435 项回归全部通过。
+- 已重新打包，发布包版本 53.7.27。
+
+## 53.7.26 — 2026-11-24
+
+修复：天勤行情连接里的K线序列僵死后不会自愈，早盘会一直拿着昨天的K线报 `source_stale`。
+
+- 新增序列活性保护：盘内最后一根K线连续两个周期没有前进，自动 `reset_api()` 重建行情序列，同一条序列只告警一次；午休、收盘后、周末按交易分钟计，不误判。
+- 测试进程不再登录真实天勤账号：`tests/conftest.py` 设置 `AUTO_TRADING_NO_TQ_LOGIN=1`，`_get_api` 直接拒绝；pytest 反复登录会顶掉实盘行情连接。
+- 测试隔离：`test_catch_up.py`、`test_runner_guard.py` 的 `_project_root` 改到 `tmp_path`，假K线不再写进生产 `data/market_health.jsonl` / `data/events.jsonl`。
+- 实盘天勤取数改按 `data.live_max_bars`（600）请求，日志里的 `max_bars` 与真实请求一致。
+- 启动日志新增一行 `程序启动 run_id=... 版本=... 根目录=... 启动时间=...`，启动与关闭能直接对齐。
+- 新增 3 项回归（两周期判死、午休不判死、只重置一次）；全量 2435 项。
+- 已重新打包，发布包版本 53.7.26。
+
+## 53.7.25 — 2026-11-24
+
+补强：开盘后一直没有当日K线时，不再等到 90 分钟才报警。
+
+- 新增 `bar_gap_minutes()` / `is_bar_gap()`：分钟周期连续缺 2 根（15 分钟即 30 个交易分钟）就判为断流，最少 10 分钟。
+- 实盘扫描把缺根并入过期闸门：`lh2701` 09:30 仍无当日K线就会报 `bar_gap` 并拒绝开仓；13:30 午休仍按交易年龄为 0，不误报。
+- 新增 2 项回归（阈值、13:44/14:00 缺根判定）；全量 2432 项。
+- 已重新打包，发布包版本 53.7.25。
+
+## 53.7.24 — 2026-11-24
+
+修复：行情过期告警把午休算成断流，并误拦下午开盘的新仓。
+
+- 新增 `trading_minutes_between()`：K 线年龄只累计交易时段，午休、收盘后、周末与节假日不计入。
+- `bars_age_minutes()` / `is_bars_stale()` 支持 `symbol`、`period`；分钟周期按交易分钟计龄，日/周线仍按自然时间。
+- 实盘扫描与行情健康记录改用交易年龄：11:30 的 15 分钟 K 线在 13:30 不再报 `source_stale`，也不再误拦 13:30–13:45 的新开仓。
+- 新增 4 项回归：午休、无夜盘隔夜、夜盘计时、13:30 年龄与开仓闸门；全量 2430 项。
+- 已重新打包，发布包版本 53.7.24。
+
+## 53.7.23 — 2026-11-24
+
+文档更新：项目定位从「同花顺期货通辅助点击」改为「CTP 为主通道」。
+
+- 简介改为：主力通道为华泰期货 CTP 穿透式接入，仿真与实盘共用一套代码；同花顺 GUI 点击仅作无程序化权限时的辅助通道。
+- 执行通道、能力对照表同步：CTP 标为主通道，已通过穿透接入测试，不再写「代码已通、只差前置与账号」。
+- 清仓与手工仓说明改为 CTP 口径：CTP 仓在期货公司交易台平仓，GUI 仓用同花顺手平，再用「手工单录入」记账。
+- 只改文档与版本号，不改代码与交易规则；已重新打包，发布包内的 `README.md` 与 `VERSION` 同步为 53.7.23。
+
+## 53.7.22 — 2026-11-24
+
+依赖升级：pandas 2.3.3 → 3.0.6，openpyxl 3.1.2 → 3.1.5，最低 Python 升到 3.11。
+
+- `requirements.lock`：`pandas==3.0.6`、`openpyxl==3.1.5`；`requirements.txt` 改为 `pandas>=3.0.0`、`openpyxl>=3.1.5`，头部注明 Python 3.11+（pandas 3 的最低要求）。
+- openpyxl 必须同步升级：pandas 3 的 `read_excel` 要求 `openpyxl>=3.1.5`，只升 pandas 会让全部 Excel 读取报 `ImportError`。
+- 验证：`pip check` 无冲突；全量门禁 2426 项 + ruff + mypy + 导入契约 + 文档版本全部通过；性能连续采样 7 次，PERF-01/07/09 与旧基线基本持平，依赖哈希 `78a495e78f5e` → `de4bd406a0ca`，新基线见 `docs/软件测试/perf-baseline.md`。
+- EXE 重新打包并做 12 秒启动冒烟，pandas 3 与 openpyxl 3.1.5 已进包。
+- 兼容性说明：代码层此前已修过 pandas 3 的两处行为差异（`datetime64` 微秒精度、`iterrows` 深拷贝 `attrs`），本次全量回归无新增改动。
+
+## 53.7.21 — 2026-11-24
+
+打包版支持外置策略插件：PyInstaller 不保留 `.py` 源码，改为从 exe 同级的 `plugins/` 发现插件。
+
+- `src/strategy/plugins/__init__.py`：插件扫描改为两处——源码环境的 `src/strategy/plugins/` 与运行目录的 `plugins/`，按绝对路径去重；新增 `user_plugin_dir()`。
+- `ensure_runtime_layout()` 首次运行创建 `plugins/`；`finish_dist.py` 在发布包建目录并在「使用说明.txt」写明用法；`verify_dist.py` 增加目录校验。
+- 打包版插件加载与源码环境一致：放一个导出 `SPEC`（`code`/`label`/`factory`/`version`）的 `.py`，重启后自动出现在策略下拉框；加载失败只 warning 跳过。
+- 约束：插件只能使用已打进包的依赖；插件属外部代码，需自行确认来源可信。
+- 新增 `tests/test_strategy_plugins.py::test_user_plugin_dir_is_scanned`；全量回归 2426 项。
+
+## 53.7.20 — 2026-11-24
+
+重构 EXE 打包流程，把「每次打包临时补依赖」收敛为固化的依赖清单与单一构建入口。
+
+- 新增 `tools/build_exe.py`：预检（Python/PyInstaller 版本、必需文件、`compileall`）→ 限定范围清理 → PyInstaller → `finish_dist.py` → `verify_dist.py` → 写 `build/packaging/build-info.json` → 12 秒启动冒烟；任一步失败即非零退出。
+- `Auto-Trading.spec`：`src` 模块改为按文件系统静态枚举，不再依赖 `collect_submodules("src")` 的导入结果，新增 `.py` 无需改规格；必需资源缺失或 `collect_all` 失败直接终止打包，不再静默跳过。
+- 修复两处真实漏打资源：`src/account/schema.sql`（账号/成交库建表脚本）与 `config/多因子复合CTA回测评估与因子衰减监控模板.xlsx`（CTA 因子衰减导出模板）。
+- 新增 `requirements-build.txt`（`pyinstaller==6.22.3`）；`打包成EXE.bat` 与 CI 改为调用同一入口，避免 PyInstaller 版本漂移、旧产物残留和两套流程。
+- `finish_dist.py` / `verify_dist.py` 同步增加上述资源的复制与验收项。
+- 重写 `PACKAGING.md` 为本项目实际流程（onedir、漏依赖根因、依赖清单、路径规范、自动化/人工验收、故障对照）。
+- 新增 `tests/test_build_exe.py` 5 项；全量回归 2425 项；ruff / mypy / `check_doc_versions.py` 通过。
+
+## 53.7.19 — 2026-11-24
+
+新增 `docs/testkit使用说明.md`，补齐测试编排入口的使用文档（只加文档，不改代码）。
+
+- 三个子命令的参数、输出示例、退出码约定与产物 JSON 结构。
+- 典型场景：提交前门禁、按包补测闭环、只改文档、CI 调用。
+- 与原始 pytest/coverage/ruff/mypy 命令的对应关系，方便脱离 testkit 排查。
+- 常见问题（为何禁用 `pytest --cov`、覆盖率文件隔离、docs 步骤失败排查、控制台编码）与扩展方式、已知限制。
+- README 文档索引与测试方案已链接该说明；用例与代码未变动，全量仍 2420 项。
+
+## 53.7.18 — 2026-11-24
+
+新增项目内测试编排入口 `tools/testkit.py`，把散落的测试脚本收敛成一条命令。
+
+- `baseline`：统计用例规模（选中 / 收集 / 取消选中），口径与 pyproject 默认排除一致。
+- `cov <包> --target 80`：用 `coverage run` 采集单包覆盖率，输出逐文件语句/分支覆盖率与缺口行，未达标时返回非零。
+- `gate [--coverage] [--only ...]`：pytest + ruff + mypy + 导入契约 + 文档版本校验；`--coverage` 时同时校验全局 `fail_under`。
+- 产物统一写入 `build/testkit/*.json`，便于本地排查和 CI 取用。
+- CI 收敛为 `python tools/testkit.py gate --coverage` 一步（依赖审计仍单独执行）。
+- 新增 `tests/test_testkit.py` 10 项；全量 2420 项通过；ruff / mypy / lint-imports / `check_doc_versions.py` 通过。
+
+## 53.7.17 — 2026-11-24
+
+把「按包补测 + 版本同步」固化为项目 skill（只加文档，不改代码）。
+
+- 新增 `.trae/skills/package-coverage-release/SKILL.md`：覆盖基线采集、缺口选点（纯函数优先）、写测试标准、覆盖率复核、全量回归、静态检查、版本与七处文档同步、常见坑与反模式。
+- 明确本机必须用 `coverage run -m pytest`（`pytest --cov` 会因 numpy 重复加载失败），以及运行中不要改 `VERSION` 等已知问题。
+- 用例与代码均未变动：全量仍为 2410 项；ruff / mypy / lint-imports / `check_doc_versions.py` 通过。
+
+## 53.7.16 — 2026-11-24
+
+scheduler 轻量宿主补测（10.3 阶段 2 完成：scheduler 语句覆盖率 ≥80%；只加测试与文档）。
+
+- 新建 `tests/fixtures/scheduler_host.py`：组合四个 Mixin 的 `LightHost`，配套 `FakeTrader`/`FakeKline`/`FakeStrategy`/`FakeRisk`/`FakeSizer`/`FakeCfg` 与 `make_position`、`bars_frame`；宿主只用注入属性，事件记到 `events`/`audits`，不读真实 config/data。
+- 新建 `tests/test_scheduler_host_mixins.py` 73 项：手工开平仓与账本拒记、手数缩放/动态仓位、风控闸门事件、反向先平、CTP 报价与滑点闸门、CTP 点单与未确认发单、成交入账（策略/风控/手续费/平仓钩子）、CTP 回报部分成交/未成交/逐笔补记、柜台资金同步与 CTP 常驻闸门、启动对账、收盘清仓强制/异常/放弃/未确认、委托意图读写与人工解除熔断。
+- 新建 `tests/test_runner_helpers.py` 9 项：`_safe_last_alert`、`_parse_hhmm`、`in_trading_session`、`_bar_now_from_prefix`、`_last_close`、`_latest_atr`、`_eval_now` 及其异常回退。
+- 覆盖率：scheduler 语句 75.35% → 82.60%，分支合并 73% → 80%；order_executor 175 → 57 未覆盖（89%）、fill_reconcile 93 → 39（87%）、login_flow 51 → 22（87%）、order_state 25 → 0（99%）、flatten_manager 16 → 1（98%）、runner 483 → 465（69%）。
+- 回归：全量 2410 项通过；ruff / mypy / lint-imports 通过。
+- 文档：测试报告升 1.8；测试方案与用例库同步 2410 项；架构报告测试文件数 213。
+
+## 53.7.15 — 2026-11-24
+
+scheduler 纯函数补测（10.3 阶段 2 scheduler ≥80% 目标的第一批；只加测试与文档）。
+
+- 新建 `tests/test_scheduler_pure_functions.py` 6 项：`_same_contract`（空值/郑商所 3-4 位合约）、`ctp_fill_key`（去重键构造与空 ref）。
+- `tests/test_order_pricing_unit.py` 追加 4 项：卖出价 floor 夹到 0 返回 None、滑点闸门配置异常值回退、wanted_symbols 非空跳过 legacy latest、kline.fetch 异常吞掉。
+- `tests/test_catch_up.py` 追加 6 项：`from_cfg` 非 dict 回退、atr_period 下限、max_chase 下限、`_bar_time` 空 DataFrame、index NaT 走 datetime 列、双重 NaT 返回 None。
+- 覆盖率：scheduler 从 75.1% → 75.4%；order_pricing 7 → 0 未覆盖（99%）；catch_up 42 → 38；order_state 26 → 25。剩余缺口集中在 runner/order_executor/fill_reconcile 的 TradingBot mixin 方法（宿主依赖极多）。
+- 回归：全量 2326 项通过；ruff / mypy / lint-imports 通过。
+- 文档：测试报告升 1.7；测试方案与用例库同步 2326 项。
+
+## 53.7.14 — 2026-11-24
+
+发件箱调度生命周期与边界行为补测（只加测试与文档）。
+
+- `tests/test_outbox.py` 新增 6 项：非法 event_type 不入队、空 event_id 自动生成、dispatcher 幂等启动与 stop 清理、wake 后立即消费 ready、pending/ready 事件列表 limit 生效、消费函数 limit 生效、dispatcher 内部 process_ready 抛异常不退出。
+- 回归：全量 2310 项通过；ruff / mypy / lint-imports 通过。
+- 文档：测试报告升 1.6；测试方案与用例库同步 2310 项。
+
+## 53.7.13 — 2026-11-24
+
+发件箱故障行为补测（行/分支已 100%，本轮补行为断言；只加测试与文档）。
+
+- `tests/test_outbox.py` 新增 5 项：崩溃在 `mark_ready` 前重放不重复入账、单个坏事件不阻塞其余 pending/ready、并发重复入队只落一条、SQLite 排他锁时入队降级返回 `False` 且锁释放后可继续写。
+- 回归：全量 2304 项通过；ruff / mypy / lint-imports 通过。
+- 文档：测试报告升 1.5；测试方案与用例库同步 2304 项。
+
+## 53.7.12 — 2026-11-24
+
+将发件箱补测到 100%（延续 10.3 的覆盖率补齐，只加测试与文档）。
+
+- 新增 1 项用例：`_rows` 遇到损坏的 `payload_json` 时降级为空字典，不再中断启动恢复或后台消费。
+- 覆盖率：`outbox.py` 208 条语句、46 个分支全部覆盖，语句与分支均为 **100%**；`account` 包 88.8%，全局语句 70.67% → **70.68%**。
+- 回归：全量 2299 项通过；ruff / mypy / lint-imports 通过。
+- 文档：测试报告升 1.4；测试方案与用例库同步 2299 项。
+
+## 53.7.11 — 2026-11-24
+
+实施测试报告 10.3 阶段 2 的账号包补测（只加测试与文档，不碰交易逻辑）。
+
+- 新增 `tests/test_account_failure_paths.py`（59 项）：覆盖注册表审计轮转与损坏回退、账号增删改/状态流转、`sync_from_cfg` 回写与迁移归档、`ensure_registry`/`sync_registry_from_cfg`/`check_cfg_with_registry`；发件箱写入与状态失败、订单阶段映射、重试终态与告警、调度线程异常与幂等启停；柜台资金空值/坏值对账、非 CTP 对齐、常驻缺资金账号与 `can_pull_from_trader`。
+- 覆盖率（`coverage run --branch --source=src` 全量采集）：`account` 语句 **88.8%**（3070 语句、345 未覆盖，原 79.4% / 632）；`registry.py` 69% → **99.5%**，`outbox.py` 71% → **99.0%**，`ctp_sync.py` 71% → **97.0%**；全局语句 70.20% → **70.67%**，分支合并 67.42% → **67.92%**。DEF-05 关闭。
+- 回归：全量 2298 项通过；ruff / mypy / lint-imports 通过。
+- 文档：测试报告升 1.3（10.3 账号补测完成、覆盖率表与 DEF-05 状态更新）；测试方案与用例库同步 210 个测试文件、2298 项。
+- 环境说明：本机 pytest-cov 7.1.0 + coverage 7.17.5 + numpy 2.5.4 组合下 `pytest --cov` 会在收集阶段报 `numpy: cannot load module more than once per process`；覆盖率改用 `coverage run -m pytest` + `coverage report` 采集，不影响用例执行与门禁结论。
+
+## 53.7.10 — 2026-11-24
+
+实施测试报告 10.2 阶段 1（只动依赖、CI、性能门禁与文档，不碰交易逻辑）。
+
+- 依赖安全：Pillow 11.3.0 → 13.0.0（先在隔离 venv 验证 matplotlib 出图与 customtkinter 导入/缩略图）；`certifi==2026.10.18`、`pypdf==6.21.4`、`soupsieve==4.0.0` 钉进 lock；pip 25.0.1 → 26.3、setuptools 84.0.0 → 84.2.1。`pip-audit` 对 lock 与实际环境均为 0 条（原 76 / 72 条）。
+- 环境对齐：按 lock 重建后 pandas 3.0.6 → 2.3.3、akshare 1.19.1 → 1.20.6、Pillow、openpyxl、psutil 共 5 处漂移清零；性能依赖哈希 `22baefa41f00` → `78a495e78f5e`。
+- 性能门禁：吞吐类头条值由 p95 改为三次采样的中位数（3 个样本时 p95 恰是最好那次，会偏乐观）；PERF-01 冷启动改为 5 次取中位数（单次杀毒/索引抖动曾把 p95 拉到 926 ms / 比值 1.48），噪声下限 50 → 100 ms；吞吐相对下限 0.8 → 0.85，绝对阈值 500 → 1500 bars/s；`tools/perf_report.py` 同步。
+- 性能复测：按 lock 对齐后连跑 3 次，PERF-01 614–643 ms、PERF-07 3418–3581 bars/s；按三次中位数重设基线，`PERF_STRICT=1` 复核 PERF-01 619.65 ms、PERF-07 3606.1 bars/s，`perf_report.py --strict` 5/5 通过。
+- CI：`tests.yml` 增加 `lint-imports` 与 `pip-audit -r requirements.lock`；PyInstaller 统一 6.22.3；`requirements-dev.txt` 增加 `pip-audit==2.10.1`。
+- 测试：新增 2 条单测（吞吐取中位数不被最好一次带绿、冷启动单次抖动不判红），`tests/test_perf_report.py` 共 12 项；全量 2239 项通过（177.23 s）；ruff / mypy / lint-imports 通过。
+- 文档：测试报告升到 1.2（关闭 DEF-02/03/04/06，更新环境卡、执行统计、性能与 10.2 状态）；`docs/perf-baseline.md` 更新环境卡与新基线。
+
+## 53.7.9 — 2026-11-24
+
+修复测试报告里登记的 DEF-01 与 DEF-08（只动性能报告工具与测试，不碰交易逻辑）。
+
+- DEF-01：`tools/perf_report.py` 结论段不再把"相对基线超限"写成"超过绝对阈值"。`evaluate_case` 新增 `threshold_ok`、`ratio_ok`，结论只列真正失败的原因，并标注是 1.2 还是 0.8 相对门禁。
+- DEF-08：吞吐类指标的相对门禁方向写反了。原来比值算 `基线 ÷ 本次` 却要求 ≥0.8，等于只拦"变快太多"，吞吐下降会静默通过。现在两处（`tools/perf_report.py`、`tests/perf/conftest.py`）统一成 `本次 ÷ 基线`：耗时类 ≤1.2，吞吐类 ≥0.8，与 `docs/perf-baseline.md` 一致。
+- 修正后 PERF-07 的比值由 1.24 变为 0.81（判定仍是压线通过），PERF-01 的失败原因显示为"基线 564.62 ms，比值 1.30（超过 1.2 相对门禁）"。
+- `tests/test_perf_report.py` 补 4 条单测：仅相对超限（并校验严格模式退出码 1）、仅绝对阈值超限、吞吐回归、吞吐提升。
+- 测试报告登记 DEF-08 并标记 DEF-01/DEF-08 已修复。
+- 测试报告升到 1.1：按复测结果更新回归总数 2237、PERF 5/5 通过与跨轮波动数据；DEF-06 由"相对门禁未通过"改为"性能基准波动大"，并补充 3 次采样取中位数的改进动作。
+
+## 53.7.8 — 2026-11-24
+
+执行首轮完整软件测试并归档报告（本版仅新增文档，未改程序逻辑）。
+
+- 新增 `docs/测试报告/软件测试报告-2026-11-24.md`：环境、执行统计、覆盖率、静态检查、依赖审计、性能、缺陷清单（DEF-01~07）、退出准则对照与分阶段改进方案。
+- 实测：2233 项回归全通过（0 失败、0 跳过、250.81 s）；语句覆盖率 70.22%（分支合并 67.45%）；ruff / mypy / import-linter 全绿。
+- 暴露问题：`pip-audit` 不通过（Pillow、certifi、pypdf 等 6 个包 72 条）；PERF-01 冷启动为基线 1.30 倍、PERF-07 吞吐为基线 0.807 倍；本地依赖与 `requirements.lock` 漂移 5 处；CI 未执行 `lint-imports` 与 `pip-audit`；`tools/perf_report.py` 结论段会把"相对基线超限"误写成"超过绝对阈值"（已在报告中定位到行号并给出修法）。
+- 测试方案同步资产盘点（209 文件 / 2233 项）、`-m` 标记说明与报告归档位置；用例库版本与用例总数同步。
+
+## 53.7.7 — 2026-11-24
+
+实施 P3.2/P3.3：把性能结果变成可读报告，把长稳变成可执行的采样工具。
+
+- 新增 `tools/perf_report.py`：汇总 `build/perf/result-*.json`，按当前基线重算比值，输出环境卡、指标总表、趋势与结论；支持 `--latest`、`--output`、`--strict`（有失败用例退出码 1）。
+- 新增 `tools/perf_soak.py`：拉起目标进程，每 30 秒采 RSS/私有字节/线程/句柄/CPU，每小时采 DB/WAL/日志/告警/发件箱/磁盘，每 6 小时写检查点，产出 `soak-*.jsonl` 与 `soak-*.md`；支持 dry-run、Ctrl+C 收尾和自动终止条件。
+- 新增 `docs/perf-baseline.md`（首轮基线环境卡与 5 个用例数值）与 `docs/perf-soak-checklist.md`（24h/72h 执行检查表与结论模板）。
+- 新增 `tests/test_perf_report.py`、`tests/test_perf_soak.py` 共 15 项单测；全量 2233 项通过，`ruff check` 通过。
+- 测试方案与 P3 方案同步 P3.2/P3.3 状态；README 文档索引登记两份新文档。
+
+## 53.7.6 — 2026-11-24
+
+实施 P3.1 性能基准：把启动、扫描、回测、入账四类耗时变成可记录、可比对、可门禁的用例。
+
+- 新增 `tests/perf/` 夹具与 5 个基准：导入主程序、单品种 evaluate、10 品种一轮、固定数据回测吞吐、单笔入账到 SQLite 投影。
+- `pyproject.toml` 注册 `perf`/`soak` 标记，默认 `pytest` 排除性能用例，日常回归仍为 2218 项。
+- 结果写 `build/perf/result-*.json`；支持 `PERF_WRITE_BASELINE=1` 固化基线、`PERF_STRICT=1` 严格门禁，并为亚毫秒指标设置噪声下限。
+- 本机首轮 p95：导入 565ms、单品种 0.015ms、10 品种 0.291ms、回测 3610 bars/s、入账 20.6ms，全部通过初始阈值。
+- 严格门禁复跑通过；`ruff check tests/perf` 通过。
+
+## 53.7.5 — 2026-11-24
+
+实施 P2 集成/E2E 自动化测试：把「发件箱→账本→SQLite 投影→重启」和「回测-实盘同源」两条链路锁进回归。
+
+- 新增 `tests/test_p2_ledger_projection_restart.py`：pending 成交补记后同时写入 JSON 账本与 SQLite 投影；重复投递不二次入账；再次重启不重放；投影库删除后可从 JSON 账本重建。
+- 新增 `tests/test_p2_backtest_live_parity.py`：回测与实盘共用同一策略工厂和 `evaluate`；回测只喂到当前 K 线；同一份数据两次回测逐笔一致。
+- 新增文件 7 项全部通过，`ruff check` 通过；全量 `pytest` 2218 项通过，覆盖率 70.22%。
+- 测试方案与用例库同步 P2 状态、用例落点与统计。
+
+## 53.7.4 — 2026-11-24
+
+补齐测试方案执行层：新增 7 个直接单元测试文件，并修掉夜盘 60 分钟跨零点被拆组的问题。
+
+- 测试方案 `docs/软件测试方案.md` 补入白盒覆盖准则、模块测试缺口清单、实施路线图与完备性核对表；新增配套 `docs/软件测试用例.md`，收录黑盒 60 条、白盒 75 个函数、集成/E2E/专项/人工用例与追溯矩阵。
+- 新增 `tests/test_ctp_symbols.py`、`test_ctp_limits.py`、`test_order_pricing_unit.py`、`test_fill_reconcile_unit.py`、`test_flatten_manager_unit.py`、`test_login_flow_unit.py`、`test_session_audit_trigger.py`，共 75 个测试函数、172 项执行全部通过。
+- 修复 `src/data/periods.py`：pandas 3.x 的 `datetime64` 默认微秒精度，原按纳秒整除一天计算日序号，导致夜盘 60 分钟在 00:00 处被拆成两组；改用日期差计算。
+- 全量 `pytest` 2211 项通过，覆盖率 70.21%；新增文件 `ruff check` 通过。
+
+## 53.7.3 — 2026-11-23
+
+查清「发件箱事件失败」告警：真实发件箱没有积压，这些告警是测试夹具写进真实告警文件的；已修掉泄漏并清理历史噪音。
+
+- `outbox._fail` 与 `report_failed` 的告警改为写到本次处理的工作区，pytest 临时目录里的模拟失败不再落到真实 `data/alerts.jsonl`（此前那些 `order:x:1`、`order:acc:1:submitted` 加「投影失败」的事件 id 都来自测试）。
+- 核对真实库：`event_outbox` 64 条全部 `done`，没有 `failed`/`pending` 积压，交易记账正常。
+- 清理真实告警文件里 211 条同类测试噪音（备份 `data/alerts.jsonl.bak2`，上一次清理的备份 `alerts.jsonl.bak` 保留）。
+- 加强 1 项回归（断言失败告警写在临时工作区）；相关 `pytest` 用例通过，`ruff check` 与 `mypy` 通过。
+
+## 53.7.2 — 2026-11-23
+
+修掉「账号表过期」误报：账号投影库还没建、或只读打不开时不再告警，只有字段真的不一致才报；测试/临时工作区不再往真实 `data/alerts.jsonl` 写告警。
+
+- 启动比对先看库文件：不存在时只说明「尚未创建」并按 debug 记日志（写连接首次落库后自动比对），不再当成投影漂移。
+- 文件在但只读连接打不开（多为上次退出残留 WAL 需要写权限恢复、或被临时占用）时同样不告警，只记 debug，避免每秒刷「库不存在」。
+- 只有真实漂移（字段不一致、账号缺失/多余、schema 缺列、注册表坏）才写 `accounts_projection_stale` 告警；告警写到本次比对的工作区，pytest 临时目录里的检查不再污染真实告警文件。
+- 新增 1 项回归；`pytest` 相关用例通过，`ruff check` 与 `mypy` 通过。
+
+## 53.7.1 — 2026-11-23
+
+天勤退出阶段不再因 Ctrl+C 打印 atexit traceback。
+
+- `atexit` 改为调用 `_reset_api_at_exit()`，捕获 `BaseException` 后只记 debug；运行中的 `reset_api()` 行为不变，Ctrl+C 仍能正常中断。
+- 日志里的 `KeyboardInterrupt` 出现在程序退出清理天勤连接时，不是启动崩溃；行情超时后已按设计回退本地 K 线库。
+- 新增 1 项测试。
+
 ## 53.7.0 — 2026-11-23
 
 均线波段参数界面新增自适应阈值的四个控件。默认值与配置一致，现有实盘行为不变，属于功能更新。

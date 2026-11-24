@@ -203,8 +203,9 @@ def ensure_runtime_layout() -> Path:
     """
     root = project_root()
     res = resource_root()
-    # 需要落在 exe 旁的目录（reviews 给收盘复盘存 txt/json，rules 给自定义规则策略）
-    for name in ("config", "config/rules", "data", "data/reviews", "logs", "strategies"):
+    # 需要落在 exe 旁的目录（reviews 给收盘复盘存 txt/json，rules 给自定义规则策略，
+    # plugins 给打包版外置策略插件：PyInstaller 不保留 .py 源码）
+    for name in ("config", "config/rules", "data", "data/reviews", "logs", "strategies", "plugins"):
         (root / name).mkdir(parents=True, exist_ok=True)
 
     # 从打包资源复制缺省文件（不覆盖用户已有配置）

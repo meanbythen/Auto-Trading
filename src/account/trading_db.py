@@ -122,6 +122,10 @@ _ACCOUNT_DIFF_FIELDS = (
 )
 
 
+# 这两种只是"暂不可比对"，不是投影漂移：首次启动还没建库、或只读连接被占用/等 WAL 恢复。
+_UNAVAILABLE_PREFIXES = ("SQLite 账号投影库尚未创建", "SQLite 账号投影库打不开")
+
+
 def _norm(value: Any) -> str:
     return str(value or "")
 
@@ -138,9 +142,13 @@ def diff_accounts(
     settings = storage_settings(root, cfg)
     if not settings.sqlite_enabled:
         return []
+    if not settings.db_path.exists():
+        # 首次启动/库被清掉时写连接会自动建库，这里只说明"暂未建"，不当成漂移。
+        return [f"SQLite 账号投影库尚未创建（{settings.db_path.name}），写连接首次落库后自动比对"]
     conn = connect_readonly(settings.db_path)
     if conn is None:
-        return ["SQLite 账号投影库不存在（data/trading.db）"]
+        # 文件在但只读打不开：多为上次退出残留 WAL 需要写权限恢复，或被临时占用。
+        return [f"SQLite 账号投影库打不开（{settings.db_path.name}，可能被占用或 WAL 未合并），本次跳过比对"]
     try:
         registry, _source = resolve_registry(root)
     except Exception as exc:  # noqa: BLE001
@@ -183,12 +191,19 @@ def diff_accounts(
     return diffs
 
 
+# 这两种只是"暂不可比对"，不是投影漂移：首次启动还没建库、或只读连接被占用/等 WAL 恢复。
+_UNAVAILABLE_PREFIXES = ("SQLite 账号投影库尚未创建", "SQLite 账号投影库打不开")
+
+
 def check_account_projection(
     root: str | Path, cfg: dict[str, Any] | None = None
 ) -> list[str]:
     """启动时检查账号投影漂移；有差异则告警，不阻断启动。返回差异列表。"""
     diffs = diff_accounts(root, cfg)
     if not diffs:
+        return diffs
+    if all(d.startswith(_UNAVAILABLE_PREFIXES) for d in diffs):
+        logger.debug("账号投影暂不可比对：{}", "；".join(diffs))
         return diffs
     preview = "；".join(diffs[:5])
     if len(diffs) > 5:
@@ -198,7 +213,8 @@ def check_account_projection(
     try:
         from src.ops.alerts import emit_alert
 
-        emit_alert("accounts_projection_stale", message, level="warning")
+        # 告警写到本次比对用的工作区：测试/临时目录不会污染真实 data/alerts.jsonl。
+        emit_alert("accounts_projection_stale", message, level="warning", root=root)
     except Exception:  # noqa: BLE001 - 告警失败不影响启动
         pass
     return diffs

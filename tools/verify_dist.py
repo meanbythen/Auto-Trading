@@ -63,6 +63,9 @@ def main() -> int:
         "config/品种与合约.xlsx",
         "config/优化参数.xlsx",
         "config/holidays.yaml",
+        "config/多因子复合CTA回测评估与因子衰减监控模板.xlsx",
+        "_internal/src/account/schema.sql",
+        "_internal/config/多因子复合CTA回测评估与因子衰减监控模板.xlsx",
         "config/rules/dual_ma_equiv.yaml",
         "config/rules/dualthrust.yaml",
         "config/rules/r_breaker.yaml",
@@ -112,7 +115,7 @@ def main() -> int:
         if (DIST / gone).exists():
             errors.append(f"发布包里仍有已删策略说明 {gone}，请从 strategies 去掉后再打包")
 
-    for rel in ("data", "data/reviews", "logs", "config"):
+    for rel in ("data", "data/reviews", "logs", "config", "plugins"):
         path = DIST / rel
         if not path.exists():
             errors.append(f"缺少目录 {rel}")

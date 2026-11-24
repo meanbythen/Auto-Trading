@@ -11,15 +11,16 @@
 from __future__ import annotations
 
 import atexit
+import os
 import threading
 import time
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 import pandas as pd
 from loguru import logger
 
-from src.data.periods import canonical_period
+from src.data.periods import canonical_period, trading_minutes_between
 
 # 品种代码在天勤属于哪家交易所。主连用 KQ.m@交易所.品种。
 _EXCHANGES = {
@@ -66,6 +67,11 @@ _HISTORY_STALL_WAITS = 3
 # (天勤合约, 周期秒数) → 已经确认填不满时的根数。下一轮不要再空等、也不要再刷同一条告警。
 _HISTORY_SHORT: dict[tuple[str, int], int] = {}
 _HISTORY_SHORT_WARNED: set[tuple[str, int, int, int]] = set()
+
+# 序列活性：(天勤合约, 周期秒) → (最后一根K线时间, 第一次看到这个时间点的时刻)。
+# 盘内超过两个周期没前进就重建连接，否则旧序列会一直僵在同一个时间上。
+_LIVENESS: dict[tuple[str, int], tuple[datetime, datetime]] = {}
+_LIVENESS_WARNED: set[tuple[str, int]] = set()
 
 
 def period_seconds(period: str) -> int:
@@ -283,6 +289,56 @@ def _clear_history_short() -> None:
     _HISTORY_SHORT_WARNED.clear()
 
 
+def _clear_liveness() -> None:
+    """清掉序列活性的观测基准。测试开始时用，运行中不要清。"""
+    _LIVENESS.clear()
+    _LIVENESS_WARNED.clear()
+
+
+def _liveness_frozen(
+    symbol: str,
+    code: str,
+    seconds: int,
+    frame: pd.DataFrame,
+    *,
+    now: datetime | None = None,
+) -> datetime | None:
+    """
+    盘内最后一根K线超过两个周期没前进，返回这根的时间；否则返回 None。
+
+    只在交易时段累计：午休、收盘后、周末的等待不算，避免把正常休市误判成僵死。
+    第一次看到某根K线只记基准；之后它一直不动、且盘内已经走过两个周期，才判死。
+    """
+    if frame is None or len(frame) == 0:
+        return None
+    try:
+        last = pd.Timestamp(frame.index[-1]).to_pydatetime()
+    except Exception:  # noqa: BLE001
+        return None
+    if getattr(last, "tzinfo", None) is not None:
+        last = last.replace(tzinfo=None)
+    current = now or datetime.now()
+    key = (code, int(seconds))
+    seen = _LIVENESS.get(key)
+    if seen is None or last > seen[0]:
+        _LIVENESS[key] = (last, current)
+        _LIVENESS_WARNED.discard(key)
+        return None
+    if trading_minutes_between(seen[1], current, symbol) < 2.0 * (int(seconds) / 60.0):
+        return None
+    return last
+
+
+def _login_disabled() -> bool:
+    """测试/自检进程禁止登录真实天勤账号：同账号并发登录会顶掉实盘行情连接。"""
+    return os.environ.get("AUTO_TRADING_NO_TQ_LOGIN", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
 def reset_api() -> None:
     """断线或换账号后丢掉旧连接，下次重新登录。"""
     global _api, _api_key
@@ -317,6 +373,10 @@ def _get_api(user: str, password: str) -> Any:
     if not user or not password:
         raise RuntimeError(
             "天勤需要账号和密码：请填 data.tq.user，密码放 config/secrets.local.yaml 的 tq_password"
+        )
+    if _login_disabled():
+        raise RuntimeError(
+            "AUTO_TRADING_NO_TQ_LOGIN 已开启：测试/自检不登录天勤，避免顶掉实盘行情连接"
         )
     if _api is not None and _api_key == (user, password):
         return _api
@@ -574,7 +634,29 @@ def fetch_frames(
                 logger.warning("天勤K线 {} 没有可用数据，跳过", codes[symbol])
         for symbol, frame in frames.items():
             logger.info("天勤K线 {} {} {} 根", codes[symbol], period, len(frame))
-        return frames
+        # 盘内最后一根连续两个周期没前进，说明这条连接里的序列已经僵死，重建后下轮重新取。
+        frozen: list[tuple[tuple[str, int], datetime]] = []
+        for symbol, frame in frames.items():
+            stopped = _liveness_frozen(symbol, codes[symbol], seconds, frame)
+            if stopped is None:
+                continue
+            key = (codes[symbol], seconds)
+            if key not in _LIVENESS_WARNED:
+                _LIVENESS_WARNED.add(key)
+                logger.warning(
+                    "天勤K线 {} {} 最后一根停在 {}，盘内已超过两个周期没有前进，重建行情序列",
+                    codes[symbol],
+                    period,
+                    stopped,
+                )
+            frozen.append((key, stopped))
+    if frozen and api is None:
+        reset_api()
+        # 重建后重新计时，避免下一轮立刻又判死；告警标记保留到序列真的前进。
+        resumed = datetime.now()
+        for key, stopped in frozen:
+            _LIVENESS[key] = (stopped, resumed)
+    return frames
 
 
 def fetch_frame(
@@ -602,4 +684,12 @@ def fetch_frame(
 
 # 进程退出时主动关闭天勤连接，消除退出时一片 "Event loop is closed" 的 asyncio 噪音。
 # reset_api 里判断过 _api 是不是 None，没登录过时这步什么都不做。
-atexit.register(reset_api)
+def _reset_api_at_exit() -> None:
+    """退出阶段可能被 Ctrl-C 打断；atexit 里吞掉异常，不再往控制台喷 traceback。"""
+    try:
+        reset_api()
+    except BaseException:  # noqa: BLE001
+        logger.debug("退出时关闭天勤连接被打断，已忽略")
+
+
+atexit.register(_reset_api_at_exit)
