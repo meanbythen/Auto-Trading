@@ -69,6 +69,8 @@ class RegimeResult:
     transition: list[list[float]] = field(default_factory=list)
     persistence: list[float] = field(default_factory=list)
     engines: list[dict[str, Any]] = field(default_factory=list)
+    rule_cross: list[dict[str, Any]] = field(default_factory=list)
+    rule_latest: dict[str, str] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
@@ -83,6 +85,8 @@ class RegimeResult:
             "transition": self.transition,
             "persistence": self.persistence,
             "engines": self.engines,
+            "rule_cross": self.rule_cross,
+            "rule_latest": self.rule_latest,
             "warnings": self.warnings,
         }
 
@@ -179,6 +183,33 @@ def _name_state(profile: dict[str, float], adx_cut: float, vol_cut: float) -> st
     if vol >= vol_cut:
         return "高波-无序"
     return "震荡-低波"
+
+
+def _state_mood(name: str) -> str:
+    """把聚类状态名归成 trend/range/mixed 三类，用于和规则状态对照。
+
+    重名状态会带「#N」后缀（如 趋势-高波#2），先去掉再归类。
+    """
+    base = str(name).split("#", 1)[0]
+    if base.startswith("趋势") or base == "延续态":
+        return "trend"
+    if base.startswith("震荡") or base == "回归态":
+        return "range"
+    return "mixed"
+
+
+def _rule_mood_series(usable: pd.DataFrame) -> pd.Series:
+    """给每根 K 线一个规则情绪标签（趋势/偏弱/震荡）。
+
+    口径与 strategy.market_state.MarketState.describe() 一致：ADX≥25 判趋势、
+    ≥20 判偏弱、否则震荡。直接复用聚类已算好的 adx_14，避免逐根重跑
+    evaluate_market_state 的 O(n²) 开销。
+    """
+    adx = usable["adx_14"].astype(float)
+    mood = pd.Series("震荡", index=usable.index, dtype=object)
+    mood[adx >= 20.0] = "偏弱"
+    mood[adx >= 25.0] = "趋势"
+    return mood
 
 
 def _engines_for(name: str) -> list[dict[str, str]]:
@@ -340,6 +371,47 @@ def fit_regimes(
         if drift > 1.0:
             warnings.append("样本外特征均值漂移超过 1 个标准差，标记「状态漂移」。")
 
+    # 规则状态 × 聚类状态对照：同一批 K 线上，规则过滤（ADX 口径）与聚类画像是否一致。
+    # 只并列展示并提示分歧，绝不用聚类结果覆盖规则过滤。
+    rule_mood = _rule_mood_series(usable)
+    rule_cross: list[dict[str, Any]] = []
+    for profile in profiles:
+        cluster = int(profile["cluster"])
+        mask = label_series == cluster
+        moods = rule_mood[mask]
+        total = int(mask.sum()) or 1
+        breakdown = {m: float((moods == m).sum()) / total for m in ("趋势", "偏弱", "震荡")}
+        rule_cross.append(
+            {
+                "state": profile["name"],
+                "share": profile["share"],
+                "mood": _state_mood(profile["name"]),
+                "rule_dominant": max(breakdown, key=lambda key: breakdown[key]),
+                "rule_breakdown": breakdown,
+            }
+        )
+
+    latest_cluster = int(label_series.iloc[-1]) if len(label_series) else 0
+    latest_name = names.get(latest_cluster, "")
+    latest_cluster_mood = _state_mood(latest_name)
+    latest_rule_mood = str(rule_mood.iloc[-1]) if len(rule_mood) else "震荡"
+    rule_latest = {
+        "rule_mood": latest_rule_mood,
+        "cluster_name": latest_name,
+        "cluster_mood": latest_cluster_mood,
+    }
+    # 只在「一边明确趋势、另一边明确震荡」时提醒，偏弱算中间态不报警。
+    if latest_cluster_mood == "trend" and latest_rule_mood == "震荡":
+        warnings.append(
+            f"最新一根：规则状态判「震荡」（ADX 偏低，趋势策略可能被拦住），"
+            f"但聚类画像偏趋势（{latest_name}）。规则拦住但数据画像偏趋势，可复查参数。"
+        )
+    elif latest_cluster_mood == "range" and latest_rule_mood == "趋势":
+        warnings.append(
+            f"最新一根：规则状态判「趋势」（趋势策略放行），"
+            f"但聚类画像偏震荡（{latest_name}）。规则放行但数据画像偏震荡，谨慎。"
+        )
+
     engines: list[dict[str, Any]] = []
     for profile in profiles:
         names_for_state = _engines_for(profile["name"])
@@ -367,6 +439,8 @@ def fit_regimes(
         transition=[[float(v) for v in row] for row in transition],
         persistence=[float(v) for v in persistence],
         engines=engines,
+        rule_cross=rule_cross,
+        rule_latest=rule_latest,
         warnings=warnings,
     )
 
@@ -407,6 +481,26 @@ def format_regime_report(result: RegimeResult) -> str:
     for item in result.engines:
         names = "、".join(engine["name"] for engine in item["engines"]) or "无"
         lines.append(f"- {item['state']}（{item['share']:.0%}）：{names}。{item['note']}")
+    if result.rule_cross:
+        mood_label = {"trend": "偏趋势", "range": "偏震荡", "mixed": "方向不明"}
+        lines.append("")
+        lines.append("规则状态 × 聚类状态（并列对照，不互相覆盖）：")
+        for item in result.rule_cross:
+            breakdown = item.get("rule_breakdown", {})
+            cells = "  ".join(
+                f"{mood} {breakdown.get(mood, 0.0):.0%}" for mood in ("趋势", "偏弱", "震荡")
+            )
+            lines.append(
+                f"- {item['state']}（{item['share']:.0%}，画像{mood_label.get(item.get('mood'), '方向不明')}）："
+                f"规则判为 {cells}"
+            )
+        latest = result.rule_latest or {}
+        if latest:
+            lines.append(
+                f"最新一根：规则={latest.get('rule_mood', '—')}，"
+                f"聚类={latest.get('cluster_name', '—')}"
+                f"（{mood_label.get(latest.get('cluster_mood'), '方向不明')}）"
+            )
     if result.warnings:
         lines.append("")
         lines.extend(f"提醒：{msg}" for msg in result.warnings)

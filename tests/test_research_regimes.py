@@ -9,7 +9,13 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.research.regimes import fit_regimes, format_regime_report, save_regimes
+from src.research.regimes import (
+    _rule_mood_series,
+    _state_mood,
+    fit_regimes,
+    format_regime_report,
+    save_regimes,
+)
 
 
 def _bars(n: int = 700, seed: int = 11) -> pd.DataFrame:
@@ -96,3 +102,40 @@ def test_fit_regimes_reports_missing_sklearn(monkeypatch) -> None:
 
     with pytest.raises(RuntimeError, match="requirements-optional"):
         fit_regimes(_bars(), seed=1)
+
+
+def test_rule_cross_structure_and_report(tmp_path) -> None:
+    """规则状态 × 聚类状态：每个状态都有对照行，占比和为 1，报告与 JSON 都带上。"""
+    df = _bars()
+    result = fit_regimes(df, seed=42)
+    assert len(result.rule_cross) == result.k
+    for item in result.rule_cross:
+        assert item["mood"] in {"trend", "range", "mixed"}
+        breakdown = item["rule_breakdown"]
+        assert set(breakdown) == {"趋势", "偏弱", "震荡"}
+        assert abs(sum(breakdown.values()) - 1.0) < 1e-6
+        assert item["rule_dominant"] in breakdown
+    assert result.rule_latest["rule_mood"] in {"趋势", "偏弱", "震荡"}
+    assert result.rule_latest["cluster_mood"] in {"trend", "range", "mixed"}
+
+    text = format_regime_report(result)
+    assert "规则状态 × 聚类状态" in text
+    assert "最新一根" in text
+    path = save_regimes(tmp_path, result)
+    assert "rule_cross" in path.read_text(encoding="utf-8")
+
+
+def test_rule_mood_series_thresholds() -> None:
+    """规则情绪标签口径：ADX≥25 趋势、≥20 偏弱、否则震荡。"""
+    frame = pd.DataFrame({"adx_14": [10.0, 20.0, 22.0, 25.0, 40.0]})
+    mood = _rule_mood_series(frame)
+    assert mood.tolist() == ["震荡", "偏弱", "偏弱", "趋势", "趋势"]
+
+
+def test_state_mood_classification() -> None:
+    assert _state_mood("延续态") == "trend"
+    assert _state_mood("趋势-高波") == "trend"
+    assert _state_mood("趋势-高波#2") == "trend"
+    assert _state_mood("回归态") == "range"
+    assert _state_mood("震荡-低波") == "range"
+    assert _state_mood("高波-无序") == "mixed"
