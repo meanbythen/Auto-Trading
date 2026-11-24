@@ -225,7 +225,7 @@ class TradingBot(
         # 交易时段跟当前盯的合约走（品种表优先；白银黄金默认收到 02:30）。
         live_symbol = (self.scan_symbols[0] if getattr(self, "scan_symbols", None) else "") or self.default_symbol
         self.sessions = sessions_for_symbol(cfg, live_symbol)
-        self._session_skip_log_at: datetime | None = None
+        self._session_skip_active: bool = False
         self._live_session_key = ""
         self.logged_in = False
         # CTP 登录失败后的下次重试时刻；None 表示可以立即尝试。
@@ -2508,9 +2508,8 @@ class TradingBot(
         # 触发已超过 1 小时就跑一次，避免同一时段重复跑。
         self._maybe_run_session_audit()
         if not force and not self._scan_session_active():
-            now = datetime.now()
-            last = self._session_skip_log_at
-            if last is None or (now - last).total_seconds() >= 60:
+            # 同一段连续暂停只记一次，避免每分钟刷屏；重新进入交易时段后才再记。
+            if not self._session_skip_active:
                 if self._multi_symbol_enabled():
                     logger.info(
                         "扫描清单 {} 都不在各自交易时段，本轮不拉K线、不扫描",
@@ -2523,8 +2522,10 @@ class TradingBot(
                         "现在不在交易时段，本轮不拉K线、不扫描（夜盘按 {}）",
                         night_txt,
                     )
-                self._session_skip_log_at = now
+                self._session_skip_active = True
             return
+        # 到达这里说明本轮真正进入扫描：重置标志，下一段暂停时再记一次。
+        self._session_skip_active = False
 
         if not self.logged_in:
             if self.trader_capabilities.orders_via_broker:

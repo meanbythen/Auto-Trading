@@ -74,6 +74,52 @@ def _events(tmp_path: Path) -> str:
     return path.read_text(encoding="utf-8") if path.exists() else ""
 
 
+def test_session_skip_logged_once_per_pause(tmp_path, monkeypatch) -> None:
+    """同一段连续暂停只记一次「本轮不拉K线」，不再每分钟刷屏。"""
+    from loguru import logger
+
+    bot = TradingBot(_cfg(tmp_path))
+    monkeypatch.setattr(bot, "_maybe_run_session_audit", lambda: None)
+    monkeypatch.setattr(bot, "_scan_session_active", lambda: False)
+    messages: list[str] = []
+    sink = logger.add(lambda m: messages.append(m.record["message"]), level="INFO")
+    try:
+        for _ in range(3):
+            bot.scan_once()
+    finally:
+        logger.remove(sink)
+    hits = [m for m in messages if "本轮不拉K线" in m]
+    assert len(hits) == 1
+    assert bot._session_skip_active is True
+
+
+def test_session_skip_resets_after_reentering_session(tmp_path, monkeypatch) -> None:
+    """重新进入交易时段后重置标志，下一段暂停时再记一次。"""
+    from loguru import logger
+
+    bot = TradingBot(_cfg(tmp_path))
+    monkeypatch.setattr(bot, "_maybe_run_session_audit", lambda: None)
+    messages: list[str] = []
+    sink = logger.add(lambda m: messages.append(m.record["message"]), level="INFO")
+    try:
+        # 第一段暂停：记一次。
+        monkeypatch.setattr(bot, "_scan_session_active", lambda: False)
+        bot.scan_once()
+        assert bot._session_skip_active is True
+        # 进入交易时段：走扫描分支并重置标志；mock 登录避免连通道。
+        monkeypatch.setattr(bot, "_scan_session_active", lambda: True)
+        monkeypatch.setattr(bot, "do_login", lambda: None)
+        bot.scan_once()
+        assert bot._session_skip_active is False
+        # 第二段暂停：应再记一次。
+        monkeypatch.setattr(bot, "_scan_session_active", lambda: False)
+        bot.scan_once()
+    finally:
+        logger.remove(sink)
+    hits = [m for m in messages if "本轮不拉K线" in m]
+    assert len(hits) == 2
+
+
 def test_holiday_min_cover_days_falls_back_on_bad_config(tmp_path) -> None:
     bot = TradingBot(_cfg(tmp_path))
     assert bot._holiday_min_cover_days() == 60
