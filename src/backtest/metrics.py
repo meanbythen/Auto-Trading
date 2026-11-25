@@ -10,13 +10,13 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
 
+from src.domain.contracts import MARGIN_RATE
 from src.domain.pnl_stats import summarize_pnl
 from src.domain.trade import TradeRecord
 
 
+# 兜底保证金比例统一从 src.domain.contracts.MARGIN_RATE 取（0.10 = 10%）。
 # 收益率只用这个比例估算每笔要交的保证金。不改变开仓手数，也不参与优选排名。
-# 10% 和账户分析里「填 10 表示 10%」是同一个意思。
-MARGIN_RATE = 0.10
 
 
 def peak_margin(

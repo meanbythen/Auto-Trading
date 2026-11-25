@@ -38,8 +38,9 @@ from src.backtest.limits import (
     cap_open_volume as _cap_open_volume,
     skip_reason_key,
 )
-from src.backtest.metrics import MARGIN_RATE, TradeRecord, calc_performance, peak_margin
+from src.backtest.metrics import TradeRecord, calc_performance, peak_margin
 from src.backtest.models import BacktestResult, RejectedSignal
+from src.domain.contracts import MARGIN_RATE
 from src.strategy.cta_factors import factor_fields_for_trade
 from src.strategy.market_state import adx_series
 from src.data.kline import KlineProvider, clear_fetch_cache

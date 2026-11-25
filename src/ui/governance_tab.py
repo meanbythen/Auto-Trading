@@ -11,13 +11,13 @@ import copy
 import threading
 from typing import Any
 
+from src.domain.contracts import MARGIN_RATE
 from src.research import governance as gov
 from src.ui import theme as T
 import customtkinter as ctk
 
 _PLACEHOLDER_SYMBOL = "（还没有）"
-# 和 tools/check_capacity.py 保持一致：没填保证金比例时按 10% 估算。
-_FALLBACK_MARGIN_RATE = 0.1
+# 没填保证金比例时的展示兜底，统一取 src.domain.contracts.MARGIN_RATE（10%）。
 _DEFAULT_PARTICIPATION_PCT = "1.0"
 _DEFAULT_LOOKBACK = "20"
 
@@ -619,7 +619,7 @@ class GovernanceTabMixin:
                 participation=participation,
                 lookback=lookback,
                 multiplier=float(box.get("multiplier") or 10.0),
-                margin_rate=rate if rate > 0 else _FALLBACK_MARGIN_RATE,
+                margin_rate=rate if rate > 0 else MARGIN_RATE,
             )
             lines.extend(format_capacity_lines(symbol, estimate))
             ok += 1

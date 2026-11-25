@@ -16,7 +16,7 @@ from datetime import date, datetime, timedelta
 from typing import Any
 
 from src.account.signal_book import matched_closes
-from src.domain.contracts import DEFAULT_MULTIPLIER
+from src.domain.contracts import DEFAULT_MULTIPLIER, MARGIN_RATE
 from src.domain.pnl_stats import summarize_pnl
 from src.utils.trading_day import futures_trading_day
 
@@ -79,7 +79,7 @@ def lot_margin(
     volume: int,
     multiplier: float,
     *,
-    rate: float = 0.1,
+    rate: float = MARGIN_RATE,
     margin_rates: dict[str, float] | None = None,
 ) -> float:
     """
@@ -101,7 +101,7 @@ def analyze_book(
     *,
     start: date | None,
     end: date | None,
-    margin_rate: float = 0.1,
+    margin_rate: float = MARGIN_RATE,
     margin_rates: dict[str, float] | None = None,
 ) -> SignalReport:
     """

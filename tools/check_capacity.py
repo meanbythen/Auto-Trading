@@ -25,10 +25,9 @@ from src.backtest.capacity import (
     format_capacity_lines,
 )
 from src.data.kline import KlineProvider
+from src.domain.contracts import MARGIN_RATE
 from src.risk.universe_table import apply_universe_table_to_cfg, product_key
 from src.utils import load_config
-
-FALLBACK_MARGIN_RATE = 0.1
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -63,7 +62,7 @@ def main(argv: list[str] | None = None) -> int:
             participation=args.participation,
             lookback=args.lookback,
             multiplier=float(box.get("multiplier") or 10.0),
-            margin_rate=rate if rate > 0 else FALLBACK_MARGIN_RATE,
+            margin_rate=rate if rate > 0 else MARGIN_RATE,
         )
         print("\n".join(format_capacity_lines(symbol, estimate)))
     return 1 if failed == len(symbols) else 0

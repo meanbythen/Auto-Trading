@@ -10,6 +10,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from src.domain.contracts import MARGIN_RATE
+
 DEFAULT_PARTICIPATION = 0.01
 DEFAULT_LOOKBACK = 20
 MIN_BARS = 20
@@ -43,7 +45,7 @@ def estimate_capacity(
     lookback: int = DEFAULT_LOOKBACK,
     price: float | None = None,
     multiplier: float = 10.0,
-    margin_rate: float = 0.1,
+    margin_rate: float = MARGIN_RATE,
 ) -> dict[str, Any]:
     """按成交量估算单品种容量。
 

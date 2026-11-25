@@ -4,6 +4,15 @@
 
 规则写在 README 的「版本」一节。已经写在这里的旧版本不再改写，新的改动加在最上面。
 
+## 57.0.2 — 2026-11-26
+
+重构（小更新）：把回测/统计展示里「没填保证金比例」的兜底比例 10% 统一收敛到 `src/domain/contracts.py` 的 `MARGIN_RATE` 常量。**不改变任何交易行为，也不改变回测数值。**
+
+- 此前这个 10% 散落在多处各自写死：`metrics.py` 的 `MARGIN_RATE`、`signal_stats.py` 两处默认值、`governance_tab.py` 的 `_FALLBACK_MARGIN_RATE`、`tools/check_capacity.py` 的 `FALLBACK_MARGIN_RATE`、`capacity.py` 的默认值，以及优选页写死的「×10%」说明文字。只改其中一处会让口径脱节。
+- 现在统一定义在 [contracts.py](src/domain/contracts.py) 的 `MARGIN_RATE = 0.10`（最底层 domain，零依赖、无循环导入）；`metrics / engine / portfolio / capacity / signal_stats / governance_tab / tools/check_capacity` 全部改为引用它，优选页「×10%」文案改为按常量动态拼接。
+- 说明：这个兜底只用于收益率、资金使用率、容量等**展示估算**；实盘开仓的保证金仍只按品种表比例现算，缺比例一律拒开（见 55.0.0/56.0.0）。
+- 测试：定向回归与 mypy 通过；全量门禁见本次验证。
+
 ## 57.0.1 — 2026-11-26
 
 修错误（小更新）：`entry_mode=trigger`（触发即开仓）下，日内实体策略在同一根未收线 K 线内会被 5 秒轮询反复触发开仓。补上 `_signaled_bar` 去重，同一根 forming 只发一次开仓信号。**不改变哪根 K 线会开仓，只修重复触发。**

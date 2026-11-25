@@ -22,6 +22,7 @@ from typing import Any, Callable
 from loguru import logger
 
 from src.backtest.evaluation import verdict_text
+from src.domain.contracts import MARGIN_RATE
 from src.strategy.factory import ENGINE_ALIASES, cross_engine_choices
 
 # 主力连续：代码末尾的 0 表示「当前主力」，例如 rb0 会到新浪去拉 RB0。
@@ -1896,7 +1897,7 @@ def board_summary(result: dict[str, Any]) -> str:
         tail = "点「开始优选」后，下表按得分列出全部品种。" if not tested else f"已测 {len(tested)} 个，有名次 {ranked} 个。"
         return (
             f"不带基准 · {spec.get('engine') or '当前策略'} · 区间 {span}\n"
-            f"按本页设置打分，分数高的排前面。得分看盈利因子和净赚能不能盖住回撤，不看胜率。成交少于 3 笔不排名。收益率、交易频率、实际时段和 K 线根数只供参考。收益率＝净盈亏÷这次占用最多的一笔保证金，保证金按开仓价×乘数×手数×10%估算。{thin_note}{tail}{stopped}"
+            f"按本页设置打分，分数高的排前面。得分看盈利因子和净赚能不能盖住回撤，不看胜率。成交少于 3 笔不排名。收益率、交易频率、实际时段和 K 线根数只供参考。收益率＝净盈亏÷这次占用最多的一笔保证金，保证金按开仓价×乘数×手数×{MARGIN_RATE * 100:g}%估算。{thin_note}{tail}{stopped}"
         )
     base = result.get("baseline") or {}
     volume = int(result.get("volume") or base.get("fixed_volume") or 1)
@@ -1905,7 +1906,7 @@ def board_summary(result: dict[str, Any]) -> str:
     tail = "点「开始优选」后，下表列出每个测过的品种。" if not tested else f"已测 {len(tested)} 个，入选 {picked} 个。"
     return (
         f"基准 {base.get('symbol') or '-'} · 每笔 {volume} 手，不看保证金 · 区间 {span}\n"
-        f"入选看净盈亏、盈利因子、最大回撤至少两项更好，不看胜率，并且成交不少于 3 笔。收益率、交易频率、实际时段、K线根数和得分只供参考。收益率＝净盈亏÷这次占用最多的一笔保证金，保证金按开仓价×乘数×手数×10%估算。{thin_note}{tail}{stopped}"
+        f"入选看净盈亏、盈利因子、最大回撤至少两项更好，不看胜率，并且成交不少于 3 笔。收益率、交易频率、实际时段、K线根数和得分只供参考。收益率＝净盈亏÷这次占用最多的一笔保证金，保证金按开仓价×乘数×手数×{MARGIN_RATE * 100:g}%估算。{thin_note}{tail}{stopped}"
     )
 
 

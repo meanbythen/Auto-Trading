@@ -17,8 +17,9 @@ from typing import Any, Callable, Iterable
 
 from loguru import logger
 
-from src.backtest.metrics import MARGIN_RATE, calc_performance
+from src.backtest.metrics import calc_performance
 from src.backtest.risk_metrics import format_risk_lines, risk_summary
+from src.domain.contracts import MARGIN_RATE
 
 WEIGHT_MODES = ("equal", "inverse_vol", "risk_budget", "fixed")
 MODE_LABELS = {

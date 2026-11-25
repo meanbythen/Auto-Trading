@@ -11,6 +11,11 @@ from typing import Any
 # 配置没写乘数时的兜底值。全程序只认这一处，不在各页面再写 10。
 DEFAULT_MULTIPLIER: float = 10.0
 
+# 回测/统计展示里「没填保证金比例」时的兜底比例（小数，0.10 = 10%）。
+# 仅用于收益率、资金使用率、容量等展示估算，不影响实盘开仓手数（实盘缺比例一律拒开）。
+# 全程序只认这一处：metrics / engine / portfolio / signal_stats / 界面 / tools 都从这里取。
+MARGIN_RATE: float = 0.10
+
 # 国内常见主力：报价「元/吨」，合约乘数「吨/手」→ 价格动1点，每手盈亏≈乘数 元
 DEFAULT_CONTRACTS: dict[str, dict[str, Any]] = {
     "bu": {"multiplier": 10, "name": "沥青"},
