@@ -13,6 +13,10 @@ from src.data.periods import period_label
 from src.ui import theme as T
 from src.ui.datetime_pickers import DateTimeField
 
+# 自动采集启动失败（多为锁文件撞车）后按间隔重试，别一次失败就整场不采。
+_TICK_AUTOSTART_RETRY_DELAY_MS = 30_000
+_TICK_AUTOSTART_RETRY_LIMIT = 6
+
 
 class DataTabMixin:
     """Methods mixed into AutoTradingApp; UI state remains on the app instance."""
@@ -1484,10 +1488,14 @@ class DataTabMixin:
         self._refresh_tick_card()
 
     def _auto_start_tick_if_enabled(self) -> None:
-        """程序启动后按 data.tick.enabled 自动开采集；非交易时段只等开盘，不连天勤。"""
+        """程序启动后按 data.tick.enabled 自动开采集；非交易时段只等开盘，不连天勤。
+
+        启动失败（尤其锁文件撞车）不放弃，按 30 秒间隔重试，最多 6 次。
+        """
         from src.data.tick.recorder import TickRecorder, tick_settings
 
         if getattr(self, "_tick_recorder", None) is not None:
+            self._tick_autostart_tries = 0
             return
         try:
             settings = tick_settings(self.cfg)
@@ -1500,9 +1508,14 @@ class DataTabMixin:
             recorder = TickRecorder(self.cfg)
             recorder.start()
         except Exception as exc:  # noqa: BLE001
-            logger.warning("自动 tick 采集未启动：{}", exc)
-            self._dm_write(f"自动 tick 采集未启动：{exc}")
+            tries = int(getattr(self, "_tick_autostart_tries", 0)) + 1
+            self._tick_autostart_tries = tries
+            logger.warning("自动 tick 采集未启动（第 {} 次）：{}", tries, exc)
+            self._dm_write(f"自动 tick 采集未启动（第 {tries} 次）：{exc}")
+            if tries <= _TICK_AUTOSTART_RETRY_LIMIT and hasattr(self, "after"):
+                self.after(_TICK_AUTOSTART_RETRY_DELAY_MS, self._auto_start_tick_if_enabled)
             return
+        self._tick_autostart_tries = 0
         self._tick_recorder = recorder
         self._dm_write("自动 tick 采集已启动：仅交易时段连接，收盘后自动合成K线")
         self._refresh_tick_card()

@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import threading
+import time
 from contextlib import closing
 from pathlib import Path
 from typing import Any, Protocol
@@ -15,6 +16,23 @@ from loguru import logger
 from src.account.trading_db import DB_LOCK, connect, connect_readonly, json_text, storage_settings
 
 _LOCK = threading.RLock()
+
+# os.replace 在 Windows 上撞到杀软/索引器的瞬时锁会报 WinError 5（拒绝访问）。
+# 这类锁通常在几十毫秒内释放，重试几次基本能吃掉；仍失败才向上抛。
+_REPLACE_ATTEMPTS = 5
+_REPLACE_BACKOFF_SEC = 0.02
+
+
+def _replace_with_retry(src: Path, dst: Path) -> None:
+    """重试受瞬时文件锁影响的 os.replace，其余错误立即抛出。"""
+    for attempt in range(_REPLACE_ATTEMPTS):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if attempt == _REPLACE_ATTEMPTS - 1:
+                raise
+            time.sleep(_REPLACE_BACKOFF_SEC * (attempt + 1))
 
 
 class RiskStateStore(Protocol):
@@ -60,9 +78,12 @@ class JsonRiskStateStore:
                     json.dump(snapshot, fh, ensure_ascii=False, indent=2, default=str)
                     fh.flush()
                     os.fsync(fh.fileno())
-                os.replace(temp, path)
+                _replace_with_retry(temp, path)
             finally:
-                temp.unlink(missing_ok=True)
+                try:
+                    temp.unlink(missing_ok=True)
+                except OSError as exc:  # 临时文件被外部占用时别把原始异常盖掉
+                    logger.debug("风控状态临时文件清理失败: {}", exc)
 
     def append_decision(self, record: dict[str, Any]) -> None:
         path = self.decisions_path

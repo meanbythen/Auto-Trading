@@ -4,6 +4,8 @@
 原理：不启动软件，直接调用 RiskGuardian，适合初学者理解风控逻辑。
 """
 
+import pytest
+
 from src.risk.guardian import RiskGuardian
 
 
@@ -297,6 +299,51 @@ def test_risk_sqlite_failure_preserves_json_and_trade_result(tmp_path, monkeypat
     assert saved["positions"] == {"bu2612": 2}
     lines = (tmp_path / "data" / "risk_decisions.jsonl").read_text(encoding="utf-8").splitlines()
     assert len(lines) == 1
+
+
+def test_risk_json_save_retries_transient_replace_lock(tmp_path, monkeypatch) -> None:
+    """os.replace 撞瞬时 WinError 5 时重试后成功，最终落盘。"""
+    from src.risk import state_store
+
+    store = state_store.JsonRiskStateStore(tmp_path)
+    real_replace = state_store.os.replace
+    calls = {"n": 0}
+
+    def _flaky(src, dst):
+        calls["n"] += 1
+        if calls["n"] <= 2:
+            raise PermissionError(5, "拒绝访问。", str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(state_store.os, "replace", _flaky)
+    monkeypatch.setattr(state_store.time, "sleep", lambda _s: None)
+    store.save("acc_retry", {"open_orders_today": 1})
+
+    assert calls["n"] == 3
+    assert store.load("acc_retry") == {"open_orders_today": 1}
+    assert not (tmp_path / "data" / "risk_state_acc_retry.json.tmp").exists()
+
+
+def test_risk_json_save_raises_after_persistent_lock_keeps_old_file(tmp_path, monkeypatch) -> None:
+    """锁一直不放时重试耗尽后抛出，旧快照与临时文件都不被破坏。"""
+    from src.risk import state_store
+
+    store = state_store.JsonRiskStateStore(tmp_path)
+    store.save("acc_locked", {"open_orders_today": 1})
+
+    attempts = {"n": 0}
+
+    def _locked(_src, dst):
+        attempts["n"] += 1
+        raise PermissionError(5, "拒绝访问。", str(dst))
+
+    monkeypatch.setattr(state_store.os, "replace", _locked)
+    monkeypatch.setattr(state_store.time, "sleep", lambda _s: None)
+    with pytest.raises(PermissionError):
+        store.save("acc_locked", {"open_orders_today": 2})
+
+    assert attempts["n"] == state_store._REPLACE_ATTEMPTS
+    assert store.load("acc_locked") == {"open_orders_today": 1}
 
 
 def test_risk_sqlite_disabled_keeps_json_authoritative(tmp_path) -> None:

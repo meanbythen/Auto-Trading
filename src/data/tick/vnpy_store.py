@@ -168,6 +168,14 @@ def _beijing_naive(moment: Any) -> datetime:
     return value.replace(tzinfo=None)
 
 
+def format_tick_time(moment: Any) -> str:
+    """天勤 tick 时间（纳秒整数/字符串/Timestamp）转北京时间文本，看不懂就原样返回。"""
+    try:
+        return _beijing_naive(moment).strftime("%Y-%m-%d %H:%M:%S")
+    except (TypeError, ValueError, OverflowError):
+        return str(moment or "")
+
+
 def _number(value: Any) -> float:
     """空值、NaN、坏字符串一律当 0。"""
     try:

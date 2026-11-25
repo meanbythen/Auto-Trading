@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from datetime import datetime
@@ -48,8 +49,8 @@ def test_lock_blocks_second_process(tmp_path, monkeypatch) -> None:
     cfg = _cfg(tmp_path, ["fu2701"])
     lock = tmp_path / "data/ticks/recorder.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
-    lock.write_text("999999", encoding="utf-8")
-    monkeypatch.setattr(recorder_module, "_pid_alive", lambda _pid: True)
+    lock.write_text(json.dumps({"pid": 999999, "created": "abc"}), encoding="utf-8")
+    monkeypatch.setattr(recorder_module, "_process_created", lambda _pid: "abc")
 
     recorder = TickRecorder(cfg)
     with pytest.raises(TickConfigError, match="PID 999999"):
@@ -61,7 +62,7 @@ def test_lock_released_only_by_owner(tmp_path) -> None:
     recorder = TickRecorder(cfg)
     recorder._acquire_lock()
     lock = tmp_path / "data/ticks/recorder.lock"
-    assert lock.read_text(encoding="utf-8") == str(os.getpid())
+    assert json.loads(lock.read_text(encoding="utf-8"))["pid"] == os.getpid()
     recorder._release_lock()
     assert not lock.exists()
 

@@ -4,6 +4,29 @@
 
 规则写在 README 的「版本」一节。已经写在这里的旧版本不再改写，新的改动加在最上面。
 
+## 53.8.3 — 2026-11-25
+
+修复：重启程序后 tick 采集整场不启动（2026-11-25 下午 13:30–15:00 数据缺失的根因）。
+
+- 根因：`data/ticks/recorder.lock` 只记 PID。重启时旧进程被关掉但锁文件残留，新实例比对 PID 误判「已有采集进程在运行」（Windows 会复用 PID，或旧进程句柄尚未释放），自动启动直接放弃且**不再重试**，导致整个下午无采集。
+- `src/data/tick/recorder.py` 锁改为 JSON：`{"pid", "created", "started_at"}`。`_process_created()` 取进程创建时间（Windows 用 GetProcessTimes 的 FILETIME 计数，Linux 读 /proc/<pid>/stat），判活要求 **PID 与创建时间同时匹配**；PID 被复用或进程已退出都按陈旧锁接管并记日志。
+- 旧格式（纯 PID）锁无法确认身份，按陈旧锁接管，避免升级后仍被一次误判卡死。
+- `_release_lock()` 只删除属于自己的锁，不误删别人的。
+- `src/ui/data_tab.py` 自动启动失败后按 30 秒间隔重试，最多 6 次，不再一次失败放弃整场。
+- 顺带修 `recorder_status.json` 的 `last_tick_at`：原来直接存天勤纳秒浮点（`1.795584608372e+18`），现由新增的 `vnpy_store.format_tick_time()` 转成北京时间文本。
+- 新增 5 项回归：同进程锁拦截、PID 复用接管、旧格式锁接管、释放不误删他人锁、纳秒时间格式化；另更新 2 项旧锁测试。
+- 无策略/交易逻辑改动。
+
+## 53.8.2 — 2026-11-25
+
+修复：风控状态 JSON 偶发「保存失败: [WinError 5] 拒绝访问」。
+
+- 原因：`os.replace` 在 Windows 上撞到杀软实时扫描、索引器或同步工具对 `risk_state_*.json` / `.tmp` 的瞬时占用，返回 WinError 5。原实现一次失败就放弃并记 ERROR。
+- `src/risk/state_store.py` 新增 `_replace_with_retry()`：`os.replace` 遇 `PermissionError` 按 20/40/60/80ms 递增退避重试，共 5 次，仍失败才向上抛；非 `PermissionError` 立即抛出，不掩盖真实错误。
+- 顺带修掉 `finally` 里 `temp.unlink()` 被外部占用时会盖掉原始异常的问题，改为捕获 `OSError` 记 debug。
+- 新增 `tests/test_risk.py` 2 项：瞬时锁重试后成功落盘、锁持续不放时重试耗尽抛出且旧快照完好。
+- 无策略/交易逻辑改动。
+
 ## 53.8.1 — 2026-11-24
 
 修复：不在交易时段时，「本轮不拉K线、不扫描」每分钟刷一条，夜盘结束后等长时间暂停会刷屏。

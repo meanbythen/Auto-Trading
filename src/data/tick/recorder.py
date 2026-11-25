@@ -21,7 +21,13 @@ from typing import Any
 
 from loguru import logger
 
-from src.data.tick.vnpy_store import VnpyUnavailable, save_ticks, split_instrument, to_tick_data
+from src.data.tick.vnpy_store import (
+    VnpyUnavailable,
+    format_tick_time,
+    save_ticks,
+    split_instrument,
+    to_tick_data,
+)
 from src.data.tq_source import main_contract, tq_symbol
 from src.utils import load_secrets
 from src.utils.holidays import calendar_from_config
@@ -104,33 +110,58 @@ def _wait_update(client: Any) -> None:
         client.wait_update()
 
 
-def _pid_alive(pid: int) -> bool:
-    """锁文件里的进程还在不在。Windows 用 OpenProcess，其它系统用 kill 0。"""
+_SELF_CREATED: str | None = None
+
+
+def _process_created(pid: int) -> str | None:
+    """进程创建时间（Windows 用 FILETIME 计数，Linux 用 /proc 第 22 列）。
+
+    Windows 会回收复用 PID，只比对 PID 会把「已经退出的旧进程」误判成还在跑。
+    把创建时间和 PID 一起记进锁里，才能确认锁的主人到底还是不是原来那个进程。
+    """
+    global _SELF_CREATED
     if pid <= 0:
-        return False
-    if pid == os.getpid():
-        return True
+        return None
+    if pid == os.getpid() and _SELF_CREATED is not None:
+        return _SELF_CREATED
+    value: str | None
     if os.name == "nt":
         try:
             import ctypes
+            from ctypes import wintypes
 
-            kernel32 = ctypes.windll.kernel32
-            handle = kernel32.OpenProcess(0x00100000, False, int(pid))  # SYNCHRONIZE
+            kernel32 = getattr(ctypes, "windll").kernel32
+            handle = kernel32.OpenProcess(0x1000, False, int(pid))  # QUERY_LIMITED_INFORMATION
             if not handle:
-                return False
-            kernel32.CloseHandle(handle)
-            return True
+                return None
+            try:
+                created = wintypes.FILETIME()
+                exited = wintypes.FILETIME()
+                kernel_time = wintypes.FILETIME()
+                user_time = wintypes.FILETIME()
+                ok = kernel32.GetProcessTimes(
+                    handle,
+                    ctypes.byref(created),
+                    ctypes.byref(exited),
+                    ctypes.byref(kernel_time),
+                    ctypes.byref(user_time),
+                )
+                if not ok:
+                    return None
+                ticks = (int(created.dwHighDateTime) << 32) | int(created.dwLowDateTime)
+                value = str(ticks)
+            finally:
+                kernel32.CloseHandle(handle)
         except Exception:  # noqa: BLE001
-            return False
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    except OSError:
-        return False
-    return True
+            return None
+    else:
+        try:
+            value = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8").split()[21]
+        except (OSError, IndexError):
+            return None
+    if pid == os.getpid():
+        _SELF_CREATED = value
+    return value
 
 
 class TickRecorder:
@@ -388,17 +419,60 @@ class TickRecorder:
         except OSError as exc:
             logger.debug("tick 合成状态写入失败：{}", exc)
 
+    def _lock_payload(self) -> str:
+        """锁内容：PID + 进程创建时间，两者一起才能确认身份。"""
+        pid = os.getpid()
+        return json.dumps(
+            {
+                "pid": pid,
+                "created": _process_created(pid) or "",
+                "started_at": datetime.now().isoformat(timespec="seconds"),
+            },
+            ensure_ascii=False,
+        )
+
+    @staticmethod
+    def _lock_owner(path: Path) -> tuple[int, str] | None:
+        """读锁：新格式返回 (pid, 创建时间)，旧格式（纯 PID）创建时间给空串。"""
+        try:
+            raw = path.read_text(encoding="utf-8").strip()
+        except OSError:
+            return None
+        if not raw:
+            return None
+        if raw.isdigit():
+            return int(raw), ""
+        try:
+            payload = json.loads(raw)
+        except ValueError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        try:
+            pid = int(payload.get("pid") or 0)
+        except (TypeError, ValueError):
+            return None
+        return (pid, str(payload.get("created") or "")) if pid > 0 else None
+
     def _acquire_lock(self) -> None:
-        """同一时间只允许一个进程采 tick，避免两条天勤连接互挤。"""
+        """同一时间只允许一个进程采 tick，避免两条天勤连接互挤。
+
+        锁里同时记 PID 和进程创建时间：Windows 会回收复用 PID，只比 PID 会把
+        「已经退出的旧进程」误判成还在跑，新实例就永远起不来，会整整停掉一天。
+        """
         path = self.lock_file
         try:
             path.parent.mkdir(parents=True, exist_ok=True)
-            if path.exists():
-                raw = path.read_text(encoding="utf-8").strip()
-                pid = int(raw) if raw.isdigit() else 0
-                if pid and pid != os.getpid() and _pid_alive(pid):
+            owner = self._lock_owner(path)
+            if owner is not None:
+                pid, created = owner
+                if created and _process_created(pid) == created:
                     raise TickConfigError(f"另一个 tick 采集进程正在运行（PID {pid}）")
-            path.write_text(str(os.getpid()), encoding="utf-8")
+                if created:
+                    logger.info("接管陈旧 tick 锁（PID {}），原进程已退出", pid)
+                else:
+                    logger.info("接管旧格式 tick 锁（PID {}），没法确认身份按陈旧处理", pid)
+            path.write_text(self._lock_payload(), encoding="utf-8")
             self._locked = True
         except TickConfigError:
             raise
@@ -409,10 +483,9 @@ class TickRecorder:
         if not self._locked:
             return
         try:
-            if self.lock_file.exists():
-                raw = self.lock_file.read_text(encoding="utf-8").strip()
-                if raw == str(os.getpid()):
-                    self.lock_file.unlink()
+            owner = self._lock_owner(self.lock_file)
+            if owner is None or owner[0] == os.getpid():
+                self.lock_file.unlink(missing_ok=True)
         except OSError as exc:
             logger.debug("tick 锁文件删除失败：{}", exc)
         self._locked = False
@@ -591,7 +664,8 @@ class TickRecorder:
         if serial is None or len(serial) == 0:
             return
         row = serial.iloc[-1]
-        moment = str(row.get("datetime") or "")
+        raw_moment = row.get("datetime")
+        moment = str(raw_moment or "")
         if not moment or moment == "NaT":
             return
         if self._seen.get(instrument) == moment:
@@ -610,7 +684,7 @@ class TickRecorder:
         with self._buffer_lock:
             self._buffer.append(tick)
         self._ticks_today += 1
-        self._last_tick_at = moment
+        self._last_tick_at = format_tick_time(raw_moment)
 
     # ---------- 心跳 ----------
 
