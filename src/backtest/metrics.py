@@ -44,6 +44,33 @@ def peak_margin(
     return peak
 
 
+def resolve_margin_rate(
+    cfg: dict[str, Any] | None, symbol: str, backtest_cfg: dict[str, Any] | None
+) -> float:
+    """收益率分母的保证金比例（小数，0.10 = 10%）。
+
+    优先用品种与合约表里该品种的真实保证金比例（margin_rate_pct 是百分数，除以 100）；
+    表里没填再退回 backtest.margin_rate 全局估算；都没有或非法时用 MARGIN_RATE 兜底。
+    仅用于收益率展示估算，不影响开仓手数。
+    """
+    from src.account.slippage_log import product_of
+
+    contracts = ((cfg or {}).get("risk") or {}).get("contracts") or {}
+    row = contracts.get(product_of(symbol)) or {}
+    try:
+        table_pct = float(row.get("margin_rate_pct") or 0)
+    except (TypeError, ValueError):
+        table_pct = 0.0
+    if table_pct > 0:
+        return table_pct / 100.0
+    raw = (backtest_cfg or {}).get("margin_rate", MARGIN_RATE)
+    try:
+        rate = float(raw)
+    except (TypeError, ValueError):
+        return MARGIN_RATE
+    return rate if 0 < rate <= 1 else MARGIN_RATE
+
+
 @dataclass
 class Performance:
     trades: int = 0

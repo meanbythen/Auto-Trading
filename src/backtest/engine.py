@@ -38,7 +38,7 @@ from src.backtest.limits import (
     cap_open_volume as _cap_open_volume,
     skip_reason_key,
 )
-from src.backtest.metrics import TradeRecord, calc_performance, peak_margin
+from src.backtest.metrics import TradeRecord, calc_performance, peak_margin, resolve_margin_rate
 from src.backtest.models import BacktestResult, RejectedSignal
 from src.domain.contracts import MARGIN_RATE
 from src.strategy.cta_factors import factor_fields_for_trade
@@ -685,14 +685,9 @@ def _prepare_backtest(
     # 回测需要足够长的历史；旧逻辑只留约100根 → 经常只有1笔成交、胜率失真
     bt_cfg = cfg.get("backtest") or {}
     max_bars = int(bt_cfg.get("max_bars", 1200))
-    # 收益率分母的保证金比例。默认仍 10%；配置非法时回退默认，避免把收益率算成天文数字。
-    raw_margin = bt_cfg.get("margin_rate", MARGIN_RATE)
-    try:
-        margin_rate = float(raw_margin)
-    except (TypeError, ValueError):
-        margin_rate = MARGIN_RATE
-    if not (0 < margin_rate <= 1):
-        margin_rate = MARGIN_RATE
+    # 收益率分母的保证金比例：优先品种与合约表该品种的真实比例；
+    # 表里没填再退回 backtest.margin_rate 全局估算；都没有才用 MARGIN_RATE 兜底。
+    margin_rate = resolve_margin_rate(cfg, symbol, bt_cfg)
     warmup = int(bt_cfg.get("warmup", warmup))
     # 策略自带的最少 K 线（含行情过滤回看窗口）比默认预热更长时，把前面那些根直接跳过，
     # 不参加回测循环。不这么做也能跑，只是会重复回放一堆「K线不足」的空决策。

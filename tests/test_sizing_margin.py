@@ -1,5 +1,7 @@
 """保证金只按 价格×每手数量×比例 计算；缺比例直接拒绝开仓。"""
 
+import pytest
+
 from src.risk.sizing import PositionSizer, disable_margin_cap
 
 
@@ -279,3 +281,34 @@ def test_margin_blocks_when_equity_cannot_buy_one_lot() -> None:
     sized = PositionSizer(_cfg(32.7154, mode="fixed")).calc_open("bu2612", 4585, 4575)
     assert sized.volume == 0
     assert "仓位上限不够" in sized.reason or "保证金不够" in sized.reason
+
+
+def test_resolve_margin_rate_prefers_product_table() -> None:
+    from src.backtest.metrics import resolve_margin_rate
+
+    cfg = {"risk": {"contracts": {"rb": {"margin_rate_pct": 12}}}}
+    assert resolve_margin_rate(cfg, "rb2510", {}) == pytest.approx(0.12)
+
+
+def test_resolve_margin_rate_falls_back_to_backtest_config() -> None:
+    from src.backtest.metrics import resolve_margin_rate
+
+    cfg = {"risk": {"contracts": {}}}
+    assert resolve_margin_rate(cfg, "rb2510", {"margin_rate": 0.15}) == pytest.approx(0.15)
+
+
+def test_resolve_margin_rate_defaults_when_missing() -> None:
+    from src.backtest.metrics import resolve_margin_rate
+    from src.domain.contracts import MARGIN_RATE
+
+    assert resolve_margin_rate({"risk": {"contracts": {}}}, "rb2510", {}) == MARGIN_RATE
+    assert resolve_margin_rate(None, "rb2510", None) == MARGIN_RATE
+
+
+def test_resolve_margin_rate_rejects_illegal_backtest_config() -> None:
+    from src.backtest.metrics import resolve_margin_rate
+    from src.domain.contracts import MARGIN_RATE
+
+    cfg = {"risk": {"contracts": {}}}
+    assert resolve_margin_rate(cfg, "rb2510", {"margin_rate": 5}) == MARGIN_RATE
+    assert resolve_margin_rate(cfg, "rb2510", {"margin_rate": "bad"}) == MARGIN_RATE
