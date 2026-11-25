@@ -15,6 +15,7 @@ from __future__ import annotations
 import queue
 import sys
 from pathlib import Path
+from typing import Callable
 
 # 允许直接 python src/ui/app.py 启动：先把项目根加入路径
 _FALLBACK_ROOT = Path(__file__).resolve().parents[2]
@@ -172,6 +173,8 @@ class AutoTradingApp(
         self._held_logs: list[str] = []
         # 后台线程写日志只进队列，主线程定时取出，避免跨线程调用 Tk。
         self._log_queue: queue.Queue[str] = queue.Queue()
+        # 后台线程要执行的主线程回调也只入队，由同一个 100ms 泵取出执行。
+        self._ui_queue: queue.Queue[Callable[[], None]] = queue.Queue()
         # 定时刷新的 after id。关窗口时先 after_cancel，避免窗口销毁后回调还在跑。
         self._closing = False
         self._tick_after_id: str | None = None

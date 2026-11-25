@@ -37,6 +37,39 @@ def test_real_app_builds_all_tabs_and_backtest_initial_state(real_app) -> None:
     assert real_app.bt_start_var.get()
 
 
+def test_post_to_main_only_enqueues(tmp_path) -> None:
+    """后台线程回调只入队，不能直接调 Tk：关窗 join 时互相等会拖到 15 秒超时。"""
+    import queue as queue_module
+    from types import SimpleNamespace
+
+    from src.ui.run_tab import RunTabMixin
+
+    stub = SimpleNamespace(_ui_queue=queue_module.Queue())
+    seen: list[str] = []
+    RunTabMixin._post_to_main(stub, lambda: seen.append("done"))
+    assert seen == []
+
+    RunTabMixin._drain_ui_callbacks(stub)
+    assert seen == ["done"]
+
+
+def test_post_to_main_swallows_destroyed_widget_errors() -> None:
+    """控件已销毁（弹窗先关、后台慢半拍）时 TclError 要被吞掉，不能打断泵。"""
+    import queue as queue_module
+    import tkinter as tk
+    from types import SimpleNamespace
+
+    from src.ui.run_tab import RunTabMixin
+
+    stub = SimpleNamespace(_ui_queue=queue_module.Queue())
+
+    def boom() -> None:
+        raise tk.TclError("invalid command name")
+
+    RunTabMixin._post_to_main(stub, boom)
+    RunTabMixin._drain_ui_callbacks(stub)  # 不抛异常即通过
+
+
 def test_open_tab_routes_research_pages_through_the_hub(real_app) -> None:
     real_app._open_tab("复盘")
     assert real_app.tabs.get() == "策略研究"

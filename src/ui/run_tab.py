@@ -283,6 +283,21 @@ class RunTabMixin:
         self._log_after_id = self.after(100, self._drain_logs)
 
 
+    def _drain_ui_callbacks(self) -> None:
+        """主线程执行后台线程排进来的回调；控件已销毁（TclError）就静默丢弃。"""
+        while True:
+            try:
+                callback = self._ui_queue.get_nowait()
+            except queue.Empty:
+                return
+            try:
+                callback()
+            except tk.TclError:
+                # 弹窗/控件已关，后台线程慢半拍，属正常边界情况，不写 ERROR。
+                pass
+            except Exception:  # noqa: BLE001
+                logger.exception("_post_to_main 回调异常")
+
     def _drain_logs(self) -> None:
         """主线程定时把队列里的日志写进运行页。内部任何一步异常都不能让日志泵断掉。"""
         if self._closing:
@@ -294,6 +309,7 @@ class RunTabMixin:
                     self._append_log(text)
             except queue.Empty:
                 pass
+            self._drain_ui_callbacks()
             from src.trader.gui_trader import order_click_in_progress
 
             if not order_click_in_progress():
@@ -1502,37 +1518,15 @@ class RunTabMixin:
 
     def _post_to_main(self, callback: Callable[[], None]) -> None:
         """
-        后台线程安全地把回调排到 Tk 主线程队列。
+        后台线程安全地把回调排到 Tk 主线程队列，只入队、不直接碰 Tk。
 
-        self.after(0, ...) 官方就是线程安全的；唯一风险是窗口或其中某个子控件已
-        destroy 后，排队的 lambda 才被主线程取出来执行，此时对已销毁控件调
-        configure/insert 等会抛 TclError: invalid command name "...".
+        不能直接调 self.after()：关窗时主线程正阻塞在 thread.join() 等后台线程退出，
+        此时后台线程调 after 会一直等主线程处理 Tk 事件，两边互等，join 必然超时，
+        最后弹出「后台线程未退出，是否强制关闭」。改成入队后，后台线程总能立刻返回。
 
-        这里除了吞 self.after 自己可能抛的异常，还在执行期再包一层，把「已销毁
-        控件」的 TclError 也吞掉——后台线程慢半拍、弹窗先关了都算正常边界情况，
-        不值得写 ERROR 到日志。
+        回调由 _drain_logs 那个 100ms 的泵在主线程取出执行；关窗过程中直接丢弃。
         """
-
-        def _safe() -> None:
-            try:
-                callback()
-            except tk.TclError:
-                # 99% 的情况是 "invalid command name '.!ctktoplevel...!label'"，
-                # 也就是 callback 闭包里抓着某个已经被 destroy 的子控件不放
-                # （比如手工平仓弹窗已关、后台线程才跑完推荐止损计算）。
-                # 静默丢弃即可，不要把正常边界情况写成 ERROR。
-                pass
-            except Exception:  # noqa: BLE001
-                # 其他真正的 bug 还是写日志，别让它静默。
-                logger.exception("_post_to_main 回调异常")
-
-        try:
-            self.after(0, _safe)
-        except tk.TclError:
-            # self 自己已经 destroy，after 队列也没意义了。
-            pass
-        except Exception:  # noqa: BLE001
-            pass
+        self._ui_queue.put_nowait(callback)
 
 
     def _on_close(self) -> None:

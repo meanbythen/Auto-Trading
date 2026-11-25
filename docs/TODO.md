@@ -1,6 +1,6 @@
 # Auto-Trading 待办清单（TODO）
 
-对应版本 **53.8.3**（2026-11-25）。最新审查结论见 [项目全面审查报告-2026-11-21.md](项目全面审查报告-2026-11-21.md)，系统全貌见 [auto-trading-architecture.html](auto-trading-architecture/自动交易系统完整架构.html)，历史审查与演进决策见 [整体设计方案.html](project-review-2026/整体设计方案.html)。
+对应版本 **53.8.4**（2026-11-25）。最新审查结论见 [项目全面审查报告-2026-11-21.md](项目全面审查报告-2026-11-21.md)，系统全貌见 [auto-trading-architecture.html](auto-trading-architecture/自动交易系统完整架构.html)，历史审查与演进决策见 [整体设计方案.html](project-review-2026/整体设计方案.html)。
 
 这份文档只收「**还没做**」的事。已经做完的功能去 [CHANGELOG.md](../CHANGELOG.md) 查，操作步骤去 [实盘交易简易说明书.md](实盘交易简易说明书.md) 查。
 
