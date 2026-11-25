@@ -33,7 +33,13 @@ def build_entry_stop_sections(app: AutoTradingApp, scroll: ctk.CTkFrame) -> None
     )
     ctk.CTkLabel(
         box_entry,
-        text="回测里逐根 K 线独立跑，天然只有已收盘口径，选哪档都等价「收盘价确认」。",
+        text=(
+            "触发即开仓：盘中用未收线K线的最高/最低碰到触发价就市价开仓，不等收线。\n"
+            "支持：日内实体、趋势跟随、SuperTrend、布林突破、以损定开、凯利突破、"
+            "SAR波段、长线箱体、双周期通道。\n"
+            "其余策略（双均线、均线波段、多因子、长线趋势、双周期分型、自定义规则）"
+            "没有固定触发价，仍按收盘价确认。"
+        ),
         font=T.FONT_SMALL,
         text_color=T.TEXT_DIM,
         wraplength=460,

@@ -64,6 +64,9 @@ _api_key: tuple[str, str] | None = None
 _TQ_MAX_SIZE = 10_000
 # 分批下发时 close 连续几次没增加，就当作更早的历史没有了，不必空等到 15 秒。
 _HISTORY_STALL_WAITS = 3
+# 每轮取 K 线都必须推进一次 tqsdk 事件循环：K 线序列只有被推进才会刷新。
+# 行情活跃时 wait_update 立即返回；完全没消息时才等满这个时间（秒）。
+_PUMP_SECONDS = 0.5
 # (天勤合约, 周期秒数) → 已经确认填不满时的根数。下一轮不要再空等、也不要再刷同一条告警。
 _HISTORY_SHORT: dict[tuple[str, int], int] = {}
 _HISTORY_SHORT_WARNED: set[tuple[str, int, int, int]] = set()
@@ -470,6 +473,17 @@ def _wait_update(client: Any, deadline: float) -> None:
         client.wait_update()
 
 
+def _pump_once(client: Any) -> None:
+    """
+    每轮至少推进一次事件循环。
+
+    tqsdk 的 K 线序列是被动的：只有 wait_update 处理过消息，序列才会刷新。
+    这件事必须由取数入口每轮无条件做，不能挂在「历史还没填满」这种条件上：
+    历史一填满就不会再刷新，最后一根 K 线会一直停住，只能靠僵死检测重建来治标。
+    """
+    _wait_update(client, time.time() + _PUMP_SECONDS)
+
+
 def _client_serials(client: Any) -> dict[tuple[str, int], tuple[int, Any]]:
     """每个天勤连接自己的 K 线序列缓存。重连换了对象，旧序列自然丢掉。"""
     try:
@@ -490,7 +504,10 @@ def _fill_history(
     seconds: int,
     size: int,
 ) -> None:
-    """等这些序列的历史填满。多个合约共用同一次 wait_update。"""
+    """等这些序列的历史填满。多个合约共用同一次 wait_update。
+
+    调用方（`fetch_frames`）每轮已经先推进过一次事件循环；这里只管历史没满时多等。
+    """
     filled: dict[str, int] = {}
     unknown = False
     for symbol in codes:
@@ -617,7 +634,10 @@ def fetch_frames(
                 else:
                     klines = cached[1]
                 serials[symbol] = klines
-            # 等服务端把历史填满再转换：服务端分批下发，只等一次可能拿到半截数据。
+            # 每轮先推进一次事件循环：K 线序列只有被推进才会刷新，
+            # 这件事和「历史是否已经填满」无关，必须无条件做。
+            _pump_once(client)
+            # 历史没满（服务端分批下发）时再多等几轮。
             _fill_history(client, codes, serials, seconds, size)
         except Exception:
             # 连接断了就丢掉，下一轮重新登录，不要拿着死连接一直重试。

@@ -39,6 +39,8 @@ from .types import (
     StrategyAction,
     StrategyDecision,
     config_flag,
+    forming_price_range,
+    pick_breakout_side,
     stop_mode_from_cfg,
     stop_triggered,
 )
@@ -170,6 +172,7 @@ class TrendFollowStrategy(StrategyBase):
         bars: pd.DataFrame,
         now: datetime | None = None,
         trail_bars: pd.DataFrame | None = None,
+        forming: pd.DataFrame | None = None,
     ) -> StrategyDecision:
         """只看信号周期上已经收盘的 K 线。通道用前面的 K 线，不用当前这根自己。"""
         _ = trail_bars
@@ -184,7 +187,8 @@ class TrendFollowStrategy(StrategyBase):
             return StrategyDecision(StrategyAction.HOLD, symbol, "K线不足，趋势通道还算不出来")
 
         bar = bars.iloc[-1]
-        bar_id = str(bar.name)
+        trigger_mode = forming is not None and len(forming) > 0
+        bar_id = str(forming.index[-1]) if trigger_mode else str(bar.name)
         if pos.side != "flat":
             return self._manage(symbol, bars, bar, now, bar_id)
 
@@ -210,6 +214,41 @@ class TrendFollowStrategy(StrategyBase):
         entry_high = float(past["high"].iloc[-self.entry_bars :].max())
         entry_low = float(past["low"].iloc[-self.entry_bars :].min())
         close = float(bar["close"])
+        if trigger_mode:
+            price_range = forming_price_range(forming)
+            if price_range is None:
+                return StrategyDecision(
+                    StrategyAction.HOLD, symbol, "未收线K线读不到最高最低，先等"
+                )
+            fh, fl = price_range
+            try:
+                live = float(forming.iloc[-1]["close"])
+            except (KeyError, TypeError, ValueError):
+                live = close
+            side = pick_breakout_side(
+                close=live, high_level=entry_high, low_level=entry_low, high=fh, low=fl
+            )
+            if side == "long":
+                allowed, why = self.slope_gate.check(bars, "long", symbol=symbol)
+                if not allowed:
+                    return StrategyDecision(StrategyAction.HOLD, symbol, why)
+                self._signaled_bar[symbol] = bar_id
+                stop = entry_high - self.atr_mult * atr
+                return self._open(
+                    symbol, now, bar_id, entry_high, "long", stop, entry_high, entry_high,
+                    trigger_price=entry_high,
+                )
+            if side == "short":
+                allowed, why = self.slope_gate.check(bars, "short", symbol=symbol)
+                if not allowed:
+                    return StrategyDecision(StrategyAction.HOLD, symbol, why)
+                self._signaled_bar[symbol] = bar_id
+                stop = entry_low + self.atr_mult * atr
+                return self._open(
+                    symbol, now, bar_id, entry_low, "short", stop, entry_low, entry_low,
+                    trigger_price=entry_low,
+                )
+            return StrategyDecision(StrategyAction.HOLD, symbol, "盘中还在最近这段高低点里面")
         if close > entry_high:
             allowed, why = self.slope_gate.check(bars, "long", symbol=symbol)
             if not allowed:
@@ -259,6 +298,8 @@ class TrendFollowStrategy(StrategyBase):
         stop: float,
         extreme: float,
         broken: float,
+        *,
+        trigger_price: float | None = None,
     ) -> StrategyDecision:
         """顺着突破方向开仓。止损放在进场价外面若干倍波动的位置。"""
         risk = entry - stop if side == "long" else stop - entry
@@ -279,13 +320,17 @@ class TrendFollowStrategy(StrategyBase):
             "extreme": extreme,
         }
         logger.info("{} {}", symbol, text)
+        meta: dict[str, Any] = {"signal": signal, "bar_id": bar_id}
+        if trigger_price is not None:
+            meta["intraday_entry"] = True
         return StrategyDecision(
             action,
             symbol,
             text,
             stop_price=stop,
             entry_price=entry,
-            meta={"signal": signal, "bar_id": bar_id},
+            trigger_price=trigger_price,
+            meta=meta,
         )
 
     def _is_entry_bar(self, symbol: str, bar_id: str) -> bool:

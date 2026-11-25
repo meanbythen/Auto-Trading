@@ -65,6 +65,8 @@ from .types import (
     StrategyAction,
     StrategyDecision,
     config_flag,
+    forming_price_range,
+    pick_breakout_side,
     stop_mode_from_cfg,
     stop_triggered,
 )
@@ -292,6 +294,47 @@ def judge_opening_break(
             f"{tag}收盘跌破开盘区间。区间 {box_low:.2f} 到 {box_high:.2f}，收盘 {last_close:.2f}"
         )
     return "none", f"{tag}收盘还在开盘区间 {box_low:.2f} 到 {box_high:.2f} 里面，先等"
+
+
+def _direction_signal_trigger(
+    bars: pd.DataFrame,
+    forming: pd.DataFrame,
+    now: datetime,
+    session_open: dtime,
+    eth_minutes: int,
+    timeframe: str,
+) -> tuple[str, str]:
+    """
+    trigger 模式：未收线那根的 high/low 碰到开盘箱沿就定方向。
+
+    箱体仍用已收盘 K 线画；只把「收盘站上/跌破」换成「盘中碰到」。
+    ETH 没走完、箱子画不出来时与收盘路径给同样的等待提示。
+    """
+    tag = period_label(str(timeframe))
+    if _signal_minutes(timeframe) <= 0:
+        return "none", f"日内实体只看分钟线。当前周期 {tag} 没有开盘ETH区间，先不开"
+    box_high, box_low, wait = opening_box_levels(bars, now, session_open, eth_minutes, timeframe)
+    if box_high is None or box_low is None:
+        return "none", wait
+    eth_done = last_open_at(_naive(now), session_open) + timedelta(minutes=max(0, int(eth_minutes)))
+    if _naive(now) <= eth_done:
+        return "none", f"ETH 到 {eth_done.strftime('%H:%M')} 才走完（从开盘起算），先把箱子看完"
+    price_range = forming_price_range(forming)
+    if price_range is None:
+        return "none", "未收线K线读不到最高最低，先等"
+    fh, fl = price_range
+    try:
+        live = float(forming.iloc[-1]["close"])
+    except (KeyError, TypeError, ValueError):
+        live = (float(box_high) + float(box_low)) / 2.0
+    side = pick_breakout_side(
+        close=live, high_level=float(box_high), low_level=float(box_low), high=fh, low=fl
+    )
+    if side == "long":
+        return "long", f"{tag}盘中最高{fh:.2f}站上开盘区间上沿 {float(box_high):.2f}"
+    if side == "short":
+        return "short", f"{tag}盘中最低{fl:.2f}跌破开盘区间下沿 {float(box_low):.2f}"
+    return "none", f"{tag}盘中还在开盘区间 {float(box_low):.2f} 到 {float(box_high):.2f} 里面，先等"
 
 
 # 同一轮判断里，定方向、画箱子、算 ATR/EMA 都要同一份信号周期 K 线。
@@ -948,11 +991,13 @@ class DailyBodyStrategy(StrategyBase):
         now: datetime | None = None,
         trail_bars: pd.DataFrame | None = None,
         trend_bars: pd.DataFrame | None = None,
+        forming: pd.DataFrame | None = None,
     ) -> StrategyDecision:
         """
         先管已经拿着的仓，再看信号周期收盘有没有离开开盘区间。
 
         持仓：打穿箱沿就平；否则拿到收盘。不再做回撤收紧。
+        trigger 模式传入 forming 时，空仓改为盯未收线这根的 high/low 碰箱沿。
         """
         del trail_bars
         bars = unique_ohlc_columns(bars)
@@ -1036,7 +1081,12 @@ class DailyBodyStrategy(StrategyBase):
                 StrategyAction.HOLD, symbol, f"行情不匹配：{state.reason}"
             )
 
-        bar_id = str(bars.index[-1])
+        trigger_mode = forming is not None and len(forming) > 0
+        bar_id = (
+            str(forming.index[-1])
+            if trigger_mode and forming is not None
+            else str(bars.index[-1])
+        )
         count = self._count_for(symbol, session)
         limit = self._session_limit(anchor, symbol)
         if count >= limit:
@@ -1067,6 +1117,12 @@ class DailyBodyStrategy(StrategyBase):
                 )
             if self._used_bar.get(symbol) == bar_id:
                 return StrategyDecision(StrategyAction.HOLD, symbol, "这一根已经判断过，先看")
+        # trigger 模式同一根 forming 只开一次：第一次扫描发出开仓信号后，
+        # 后续扫描看到同一个 bar_id 直接跳过，避免 5 秒轮询反复触发。
+        # 收盘模式（无 forming）不在此去重：订单未成交时二次扫描还能再发信号，
+        # 以免把信号弄丢；daily_body 靠 session/count 防止同一段重复开仓。
+        if trigger_mode and self._signaled_bar.get(symbol) == bar_id:
+            return StrategyDecision(StrategyAction.HOLD, symbol, "这一根已经判断过日内实体")
         # 未过第二窗口：只判第一口箱子。刚过第二窗口：丢掉第一窗口留下的急破等待。
         # 已经在第二窗口里记下的急破等待还保留，否则回抽确认会被误清掉。
         eth, eth_kind = self._eth_plan(symbol, count, now, anchor)
@@ -1098,9 +1154,14 @@ class DailyBodyStrategy(StrategyBase):
 
         del trend_bars
         # 定方向交给可替换的钩子：日内实体看箱子突破，浮盈飘单换成自己的方向选择器。
-        side, text = self._direction_signal(
-            bars, now, anchor, eth, symbol=symbol, second=second
-        )
+        if trigger_mode:
+            side, text = _direction_signal_trigger(
+                bars, forming, now, anchor, eth, self.timeframe
+            )
+        else:
+            side, text = self._direction_signal(
+                bars, now, anchor, eth, symbol=symbol, second=second
+            )
         if side == "long":
             action = StrategyAction.BUY_OPEN
         elif side == "short":
@@ -1157,7 +1218,12 @@ class DailyBodyStrategy(StrategyBase):
                         meta={"blocked": True, "side": side, "block_key": "box_too_wide"},
                     )
 
-        entry = last_ohlc_price(bars, "close")
+        entry: float | None
+        if trigger_mode and use_box:
+            # 盘中碰到箱沿就按箱沿价进，不再等收盘。
+            entry = float(box_high if side == "long" else box_low)
+        else:
+            entry = last_ohlc_price(bars, "close")
         if entry is None:
             return StrategyDecision(StrategyAction.HOLD, symbol, "没有可用的收盘价，先不开")
         if not use_box:
@@ -1167,6 +1233,7 @@ class DailyBodyStrategy(StrategyBase):
             distance = abs(entry - stop)
             self._pending_session[symbol] = session
             self._pending_bar[symbol] = bar_id
+            self._signaled_bar[symbol] = bar_id
             self._pending_eth[symbol] = eth
             self._pending_kind[symbol] = eth_kind
             stop_text = self._open_stop_text(side, box_low, box_high, tick_pad)
@@ -1248,6 +1315,7 @@ class DailyBodyStrategy(StrategyBase):
         # 先记下「如果成交，占哪一段」；未成交不写入 _used_session。
         self._pending_session[symbol] = session
         self._pending_bar[symbol] = bar_id
+        self._signaled_bar[symbol] = bar_id
         self._pending_eth[symbol] = eth
         self._pending_kind[symbol] = eth_kind
         stop_text = self._open_stop_text(side, box_low, box_high, tick_pad)
@@ -1270,19 +1338,23 @@ class DailyBodyStrategy(StrategyBase):
         elif eth_kind == "eth2":
             reason = f"日盘第二ETH窗口开仓：{reason}"
         logger.info("{} {}", symbol, reason)
+        meta = {
+            "signal": self.SIGNAL_NAME,
+            "bar_id": bar_id,
+            "session": session,
+            "side": side,
+            "stop_kind": "box",
+            "box_high": box_high,
+            "box_low": box_low,
+        }
+        if trigger_mode:
+            meta["intraday_entry"] = True
         return StrategyDecision(
             action,
             symbol,
             reason,
             stop_price=stop,
             entry_price=entry,
-            meta={
-                "signal": self.SIGNAL_NAME,
-                "bar_id": bar_id,
-                "session": session,
-                "side": side,
-                "stop_kind": "box",
-                "box_high": box_high,
-                "box_low": box_low,
-            },
+            trigger_price=entry if trigger_mode else None,
+            meta=meta,
         )

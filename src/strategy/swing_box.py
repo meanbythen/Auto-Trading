@@ -36,6 +36,8 @@ from .types import (
     StrategyAction,
     StrategyDecision,
     config_flag,
+    forming_price_range,
+    pick_breakout_side,
     stop_mode_from_cfg,
     stop_triggered,
 )
@@ -283,6 +285,7 @@ class SwingBoxStrategy(StrategyBase):
         bars: pd.DataFrame,
         now: datetime | None = None,
         trail_bars: pd.DataFrame | None = None,
+        forming: pd.DataFrame | None = None,
     ) -> StrategyDecision:
         now = now or datetime.now()
         pos = self.positions.setdefault(symbol, PositionState(symbol=symbol))
@@ -296,7 +299,8 @@ class SwingBoxStrategy(StrategyBase):
             return StrategyDecision(StrategyAction.HOLD, symbol, "K线不够，箱子还画不出来")
 
         bar = bars.iloc[-1]
-        bar_id = str(bar.name)
+        trigger_mode = forming is not None and len(forming) > 0
+        bar_id = str(forming.index[-1]) if trigger_mode else str(bar.name)
 
         if self.is_flatten_time(now):
             return StrategyDecision(StrategyAction.HOLD, symbol, "收盘清仓时段，不再开新仓")
@@ -336,7 +340,13 @@ class SwingBoxStrategy(StrategyBase):
             )
 
         if self.vol_mult > 0 and "volume" in bars.columns:
-            vol = float(bar.get("volume") or 0)
+            if trigger_mode:
+                try:
+                    vol = float(forming.iloc[-1].get("volume") or 0)
+                except (KeyError, TypeError, ValueError):
+                    vol = float(bar.get("volume") or 0)
+            else:
+                vol = float(bar.get("volume") or 0)
             hist_vol = bars["volume"].iloc[-(self.lookback + 1) : -1]
             avg_vol = float(hist_vol.mean()) if len(hist_vol) else 0.0
             if avg_vol > 0 and vol < avg_vol * self.vol_mult:
@@ -346,6 +356,37 @@ class SwingBoxStrategy(StrategyBase):
                     f"{formed.reason}；突破这根量不够（{vol:.0f}<均量{avg_vol:.0f}×{self.vol_mult:g}）",
                 )
 
+        if trigger_mode:
+            price_range = forming_price_range(forming)
+            if price_range is None:
+                return StrategyDecision(
+                    StrategyAction.HOLD, symbol, "未收线K线读不到最高最低，先等"
+                )
+            fh, fl = price_range
+            try:
+                live = float(forming.iloc[-1]["close"])
+            except (KeyError, TypeError, ValueError):
+                live = close
+            side = pick_breakout_side(
+                close=live, high_level=formed.high, low_level=formed.low, high=fh, low=fl
+            )
+            if side == "long":
+                stop = formed.high - self.stop_atr * formed.atr
+                return self._open(
+                    symbol, now, bar_id, formed.high, "long", stop, formed,
+                    trigger_price=formed.high,
+                )
+            if side == "short":
+                stop = formed.low + self.stop_atr * formed.atr
+                return self._open(
+                    symbol, now, bar_id, formed.low, "short", stop, formed,
+                    trigger_price=formed.low,
+                )
+            return StrategyDecision(
+                StrategyAction.HOLD,
+                symbol,
+                f"{formed.reason}；盘中还在箱子里，等真正走出去",
+            )
         if close > formed.high:
             stop = formed.high - self.stop_atr * formed.atr
             return self._open(symbol, now, bar_id, close, "long", stop, formed)
@@ -367,6 +408,8 @@ class SwingBoxStrategy(StrategyBase):
         side: str,
         stop: float,
         formed: FormedBox,
+        *,
+        trigger_price: float | None = None,
     ) -> StrategyDecision:
         risk = entry - stop if side == "long" else stop - entry
         if risk <= 0:
@@ -395,19 +438,23 @@ class SwingBoxStrategy(StrategyBase):
             "box_height": formed.height,
         }
         logger.info("{} {}", symbol, text)
+        meta = {
+            "signal": signal,
+            "bar_id": bar_id,
+            "box_high": formed.high,
+            "box_low": formed.low,
+            "box_height": formed.height,
+        }
+        if trigger_price is not None:
+            meta["intraday_entry"] = True
         return StrategyDecision(
             action,
             symbol,
             text,
             stop_price=stop,
             entry_price=entry,
-            meta={
-                "signal": signal,
-                "bar_id": bar_id,
-                "box_high": formed.high,
-                "box_low": formed.low,
-                "box_height": formed.height,
-            },
+            trigger_price=trigger_price,
+            meta=meta,
         )
 
     def _is_entry_bar(self, symbol: str, bar_id: str) -> bool:

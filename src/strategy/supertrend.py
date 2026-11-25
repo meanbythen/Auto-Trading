@@ -26,6 +26,7 @@ from .types import (
     StrategyAction,
     StrategyDecision,
     config_flag,
+    forming_price_range,
     stop_mode_from_cfg,
     stop_triggered,
 )
@@ -144,6 +145,7 @@ class SuperTrendStrategy(StrategyBase):
         bars: pd.DataFrame,
         now: datetime | None = None,
         trail_bars: pd.DataFrame | None = None,
+        forming: pd.DataFrame | None = None,
     ) -> StrategyDecision:
         _ = trail_bars
         now = now or datetime.now()
@@ -167,7 +169,8 @@ class SuperTrendStrategy(StrategyBase):
             return StrategyDecision(StrategyAction.HOLD, symbol, "SuperTrend 尚未稳定")
 
         bar = bars.iloc[-1]
-        bar_id = str(bar.name)
+        trigger_mode = forming is not None and len(forming) > 0
+        bar_id = str(forming.index[-1]) if trigger_mode else str(bar.name)
         close = float(bar["close"])
         st_now = float(st_line.iloc[-1])
         dir_now = int(direction.iloc[-1])
@@ -203,6 +206,39 @@ class SuperTrendStrategy(StrategyBase):
         if not state.ok:
             return StrategyDecision(
                 StrategyAction.HOLD, symbol, f"行情不匹配：{state.reason}", stop_price=st_now
+            )
+
+        # 空仓：trigger 模式盯未收线那根有没有碰到当前 SuperTrend 线。
+        if trigger_mode:
+            price_range = forming_price_range(forming)
+            if price_range is None:
+                return StrategyDecision(
+                    StrategyAction.HOLD, symbol, "未收线K线读不到最高最低，先等"
+                )
+            fh, fl = price_range
+            if dir_now < 0 and fh >= st_now:
+                allowed, why = self.slope_gate.check(bars, "long", symbol=symbol)
+                if not allowed:
+                    return StrategyDecision(
+                        StrategyAction.HOLD, symbol, why, stop_price=st_now
+                    )
+                return self._open(
+                    symbol, now, bar_id, st_now, "long", st_now, trigger_price=st_now
+                )
+            if dir_now > 0 and fl <= st_now:
+                allowed, why = self.slope_gate.check(bars, "short", symbol=symbol)
+                if not allowed:
+                    return StrategyDecision(
+                        StrategyAction.HOLD, symbol, why, stop_price=st_now
+                    )
+                return self._open(
+                    symbol, now, bar_id, st_now, "short", st_now, trigger_price=st_now
+                )
+            return StrategyDecision(
+                StrategyAction.HOLD,
+                symbol,
+                f"SuperTrend 盘中还没碰到线 {st_now:.2f}",
+                stop_price=st_now,
             )
 
         # 空仓：只在「本根刚翻转」时开仓，避免中途切入旧趋势
@@ -308,6 +344,7 @@ class SuperTrendStrategy(StrategyBase):
         stop: float,
         *,
         reverse_from: str | None = None,
+        trigger_price: float | None = None,
     ) -> StrategyDecision:
         risk = entry - stop if side == "long" else stop - entry
         if risk <= 0:
@@ -334,17 +371,21 @@ class SuperTrendStrategy(StrategyBase):
             pos = self.positions.get(symbol)
             self._close_entry[symbol] = float(pos.entry_price or 0.0) if pos else 0.0
         logger.info("{} {}", symbol, text)
+        meta: dict[str, Any] = {
+            "signal": "supertrend",
+            "bar_id": bar_id,
+            "reverse": bool(reverse_from),
+        }
+        if trigger_price is not None:
+            meta["intraday_entry"] = True
         return StrategyDecision(
             action,
             symbol,
             text,
             stop_price=stop,
             entry_price=entry,
-            meta={
-                "signal": "supertrend",
-                "bar_id": bar_id,
-                "reverse": bool(reverse_from),
-            },
+            trigger_price=trigger_price,
+            meta=meta,
         )
 
     def _close_decision(

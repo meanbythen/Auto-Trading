@@ -23,29 +23,29 @@ def test_roundtrip_and_enabled(tmp_path: Path) -> None:
             {
                 "symbol": "fu2701",
                 "name": "燃油",
-                "margin": 11232,
+                "margin_rate_pct": 23,
                 "multiplier": 10,
                 "commission": 2.63,
                 "commission_close_today": 0.0,
                 "enabled": True,
             },
-            {"symbol": "c2701", "name": "玉米", "margin": 2220, "multiplier": 10, "enabled": True},
-            {"symbol": "bu", "name": "沥青", "margin": 8276, "multiplier": 10, "enabled": False},
+            {"symbol": "c2701", "name": "玉米", "margin_rate_pct": 7, "multiplier": 10, "enabled": True},
+            {"symbol": "bu", "name": "沥青", "margin_rate_pct": 17, "multiplier": 10, "enabled": False},
         ],
     )
     rows = read_universe_table(path)
     symbols, contracts = parse_universe_rows(rows)
     assert symbols == ["fu2701", "c2701"]
     assert "bu" not in [s.lower() for s in symbols]
-    assert contracts["fu"]["margin"] == 11232
-    assert float(contracts["fu"].get("margin_rate_pct") or 0) == 0
+    assert contracts["fu"]["margin_rate_pct"] == 23
+    assert "margin" not in contracts["fu"]
     assert contracts["fu"]["multiplier"] == 10
     assert contracts["fu"]["commission"] == 2.63
     assert contracts["fu"]["commission_close_today"] == 0.0
-    assert contracts["c"]["margin"] == 2220
+    assert contracts["c"]["margin_rate_pct"] == 7
     assert contracts["c"].get("commission", 0) == 0
     assert "commission_close_today" not in contracts["c"]
-    assert contracts["bu"]["margin"] == 8276
+    assert contracts["bu"]["margin_rate_pct"] == 17
 
 
 def test_same_product_fees_must_match(tmp_path: Path) -> None:
@@ -56,7 +56,7 @@ def test_same_product_fees_must_match(tmp_path: Path) -> None:
             {
                 "symbol": "fu2701",
                 "name": "燃油",
-                "margin": 1000,
+                "margin_rate_pct": 23,
                 "multiplier": 10,
                 "commission": 2.63,
                 "enabled": True,
@@ -64,7 +64,7 @@ def test_same_product_fees_must_match(tmp_path: Path) -> None:
             {
                 "symbol": "fu2705",
                 "name": "燃油",
-                "margin": 1000,
+                "margin_rate_pct": 23,
                 "multiplier": 10,
                 "commission": 1.0,
                 "enabled": True,
@@ -80,8 +80,8 @@ def test_same_product_margin_must_match(tmp_path: Path) -> None:
     write_universe_table(
         path,
         [
-            {"symbol": "fu2701", "name": "燃油", "margin": 1000, "multiplier": 10, "enabled": True},
-            {"symbol": "fu2705", "name": "燃油", "margin": 2000, "multiplier": 10, "enabled": True},
+            {"symbol": "fu2701", "name": "燃油", "margin_rate_pct": 23, "multiplier": 10, "enabled": True},
+            {"symbol": "fu2705", "name": "燃油", "margin_rate_pct": 25, "multiplier": 10, "enabled": True},
         ],
     )
     with pytest.raises(ValueError, match="fu"):
@@ -93,7 +93,7 @@ def test_apply_to_cfg(tmp_path: Path) -> None:
     write_universe_table(
         path,
         [
-            {"symbol": "jm2701", "name": "焦煤", "margin": 12690, "multiplier": 60, "enabled": True},
+            {"symbol": "jm2701", "name": "焦煤", "margin_rate_pct": 12, "multiplier": 60, "enabled": True},
         ],
     )
     cfg: dict = {"_project_root": str(tmp_path), "risk": {}, "strategy": {"symbols": ["bu2612"]}}
@@ -117,7 +117,7 @@ def test_symbol_sessions_roundtrip(tmp_path: Path) -> None:
             {
                 "symbol": "ag2702",
                 "name": "白银",
-                "margin": 1,
+                "margin_rate_pct": 15,
                 "multiplier": 15,
                 "enabled": True,
                 "trading_sessions": "09:00-11:30,13:30-15:00,21:00-02:30",
@@ -126,7 +126,7 @@ def test_symbol_sessions_roundtrip(tmp_path: Path) -> None:
             {
                 "symbol": "fu2701",
                 "name": "燃油",
-                "margin": 1,
+                "margin_rate_pct": 23,
                 "multiplier": 10,
                 "enabled": True,
                 "trading_sessions": "09:00-11:30,13:30-15:00,21:00-23:00",
@@ -171,7 +171,7 @@ def test_margin_rate_roundtrip(tmp_path: Path) -> None:
     _symbols, contracts = parse_universe_rows(rows)
     assert contracts["fu"]["margin_rate_pct"] == 23
     assert contracts["fu"]["multiplier"] == 10
-    assert float(contracts["fu"].get("margin") or 0) == 0
+    assert "margin" not in contracts["fu"]
 
 
 def test_sync_ctp_contract_updates_same_product(tmp_path: Path) -> None:
@@ -217,8 +217,8 @@ def test_sync_ctp_contract_updates_same_product(tmp_path: Path) -> None:
     assert "21:00" in (rows[0].get("trading_sessions") or "")
 
 
-def test_read_old_header_file(tmp_path: Path) -> None:
-    """旧表还是「每手保证金 / 乘数」时也能读，金额当兜底。"""
+def test_old_table_without_rate_is_rejected(tmp_path: Path) -> None:
+    """只有「每手保证金」旧列、没有比例的表直接拒读，提示补保证金比例。"""
     import openpyxl
 
     path = tmp_path / "old.xlsx"
@@ -227,8 +227,5 @@ def test_read_old_header_file(tmp_path: Path) -> None:
     sheet.append(["合约代码", "中文名", "每手保证金", "乘数", "启用"])
     sheet.append(["fu2701", "燃油", 9240, 10, "是"])
     book.save(path)
-    rows = read_universe_table(path)
-    _symbols, contracts = parse_universe_rows(rows)
-    assert contracts["fu"]["margin"] == 9240
-    assert contracts["fu"]["multiplier"] == 10
-    assert float(contracts["fu"].get("margin_rate_pct") or 0) == 0
+    with pytest.raises(ValueError, match="保证金比例"):
+        read_universe_table(path)

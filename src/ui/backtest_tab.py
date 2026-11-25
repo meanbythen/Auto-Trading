@@ -48,11 +48,6 @@ class BacktestTabMixin(BacktestConfigMixin, BacktestActionsMixin):
         if self.bt_symbol_var.get() not in symbol_values:
             self.bt_symbol_var.set(symbol_values[0])
         self.bt_symbol_menu = self._option_row(box, "历史回测品种", self.bt_symbol_var, symbol_values, width=160)
-        try:
-            self.bt_symbol_var.trace_add("write", lambda *_: self._sync_bt_margin_from_table())
-        except Exception:  # noqa: BLE001
-            pass
-        self._sync_bt_margin_from_table()
         ctk.CTkLabel(
             box,
             text="和配置页的关注品种是同一份。在那边添加或移出，这里的列表一起变。要改成配置页当前选中的合约，点下面「按配置页重新填入」。",
@@ -512,14 +507,6 @@ class BacktestTabMixin(BacktestConfigMixin, BacktestActionsMixin):
             self.bt_capital_var,
             hint="可改成准备投入的资金；点「按配置页重新填入」抄回当前余额",
             width=160,
-        )
-        self._entry_row(
-            box_risk,
-            "兜底每手保证金(元)",
-            self.bt_margin_var,
-            hint="表里填了保证金比例时按开仓价现算，不用这个数。没填比例才用。0=不限制",
-            width=160,
-            readonly=True,
         )
         self._entry_row(
             box_risk,

@@ -714,28 +714,18 @@ class AccountTabMixin:
         self._draw_account_chart()
 
 
-    def _account_margin_settings(self) -> tuple[dict[str, float], dict[str, float], float]:
-        """读配置里的保证金比例和兜底金额。"""
+    def _account_margin_rates(self) -> dict[str, float]:
+        """读配置里的保证金比例（%）。占用只按 价格×每手数量×比例 估算。"""
         risk = self.cfg.get("risk") or {}
-        try:
-            default_margin = float(risk.get("margin_per_lot") or 0)
-        except (TypeError, ValueError):
-            default_margin = 0.0
-        margins: dict[str, float] = {}
         rates: dict[str, float] = {}
         for key, info in (risk.get("contracts") or {}).items():
             if not isinstance(info, dict):
                 continue
-            code = str(key).lower()
             try:
-                margins[code] = float(info.get("margin") or 0)
+                rates[str(key).lower()] = float(info.get("margin_rate_pct") or 0)
             except (TypeError, ValueError):
                 pass
-            try:
-                rates[code] = float(info.get("margin_rate_pct") or 0)
-            except (TypeError, ValueError):
-                pass
-        return margins, rates, default_margin
+        return rates
 
 
     def _paint_account_stats(self, book) -> None:
@@ -751,13 +741,11 @@ class AccountTabMixin:
         if not hasattr(self, "ac_win_label"):
             return
         start, end = span_bounds(self.ac_span_var.get() or "全部", futures_trading_day())
-        margins, rates, default_margin = self._account_margin_settings()
+        rates = self._account_margin_rates()
         report = analyze_book(
             book or {"trades": [], "changes": []},
             start=start,
             end=end,
-            margins=margins,
-            default_margin=default_margin,
             margin_rates=rates,
         )
         self._ac_report = report

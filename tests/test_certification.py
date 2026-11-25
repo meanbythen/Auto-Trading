@@ -46,10 +46,10 @@ def test_clean_config_has_no_issues():
 
 def test_missing_margin_and_multiplier_are_errors():
     issues = check_contracts(
-        _cfg(contracts={"fu": {"margin_rate_pct": 0, "margin": 0, "multiplier": 0, "commission": 2.0, "price_tick": 1.0}})
+        _cfg(contracts={"fu": {"margin_rate_pct": 0, "multiplier": 0, "commission": 2.0, "price_tick": 1.0}})
     )
     fields = {(item["symbol"], item["field"], item["severity"]) for item in issues}
-    assert ("fu2701", "margin", "error") in fields
+    assert ("fu2701", "margin_rate_pct", "error") in fields
     assert ("fu2701", "multiplier", "error") in fields
     # lh 在总表里没有：单独报一条错误。
     assert ("lh2701", "contracts", "error") in fields

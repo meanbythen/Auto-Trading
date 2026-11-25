@@ -47,7 +47,7 @@ def test_account_and_symbol_stats_follow_the_selected_span() -> None:
         book,
         start=date(2026, 10, 16),
         end=date(2026, 10, 22),
-        default_margin=1000,
+        margin_rates={"bu": 100.0},
     )
     assert report.account.closed == 1
     assert report.account.net_pnl == -100
@@ -70,7 +70,7 @@ def test_profit_factor_is_gains_over_losses() -> None:
     # 平仓盈亏的变动时间必须跟成交同一天，按结束日筛权益线时才不会漏掉。
     pnl_times = [row["time"][:10] for row in book["changes"] if row.get("kind") == "pnl"]
     assert pnl_times == ["2026-10-02", "2026-10-08"]
-    report = analyze_book(book, start=None, end=date(2026, 10, 22), default_margin=0)
+    report = analyze_book(book, start=None, end=date(2026, 10, 22))
     # 全部时段从 0 加起：本金 10000，只加一次，再加减平仓盈亏，不能变成 20000 出头。
     assert report.equity[-1][1] == 10200
     assert report.account.closed == 2

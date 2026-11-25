@@ -79,28 +79,20 @@ def lot_margin(
     volume: int,
     multiplier: float,
     *,
-    margins: dict[str, float] | None = None,
-    default_margin: float = 0.0,
     rate: float = 0.1,
     margin_rates: dict[str, float] | None = None,
 ) -> float:
     """
     这一手占用多少保证金。
 
-    填了保证金比例：开仓价 × 每手数量 × 比例% × 手数。
-    没填比例、写了每手金额：用那个固定金额 × 手数。
-    再没有就用配置页兜底金额。都没有时按价格乘乘数乘手数再乘默认 10%。
+    只用保证金比例：开仓价 × 每手数量 × 比例% × 手数。
+    没填比例时按默认 10% 估算（仅统计展示，不参与实盘开仓）。
     """
     product = "".join(ch for ch in str(symbol) if ch.isalpha()).lower()
     lots = max(0, int(volume))
     rate_pct = float((margin_rates or {}).get(product) or 0)
     if rate_pct > 0 and float(price) > 0 and float(multiplier) > 0:
         return float(price) * float(multiplier) * lots * (rate_pct / 100.0)
-    per = float((margins or {}).get(product) or 0)
-    if per > 0:
-        return per * lots
-    if default_margin > 0:
-        return float(default_margin) * lots
     return float(price) * float(multiplier) * lots * float(rate)
 
 
@@ -109,8 +101,6 @@ def analyze_book(
     *,
     start: date | None,
     end: date | None,
-    margins: dict[str, float] | None = None,
-    default_margin: float = 0.0,
     margin_rate: float = 0.1,
     margin_rates: dict[str, float] | None = None,
 ) -> SignalReport:
@@ -138,8 +128,6 @@ def analyze_book(
         book,
         start,
         end,
-        margins=margins,
-        default_margin=default_margin,
         margin_rate=margin_rate,
         margin_rates=margin_rates,
     )
@@ -320,8 +308,6 @@ def _margin_peaks(
     start: date | None,
     end: date | None,
     *,
-    margins: dict[str, float] | None,
-    default_margin: float,
     margin_rate: float,
     margin_rates: dict[str, float] | None = None,
 ) -> tuple[float, dict[str, float]]:
@@ -345,8 +331,6 @@ def _margin_peaks(
                 float(row.get("price") or 0),
                 int(row.get("volume") or 0),
                 float(row.get("multiplier") or DEFAULT_MULTIPLIER),
-                margins=margins,
-                default_margin=default_margin,
                 rate=margin_rate,
                 margin_rates=margin_rates,
             )

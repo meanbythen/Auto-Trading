@@ -28,7 +28,6 @@ def build_contracts(cfg: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
             contracts[str(key).lower()] = {
                 "multiplier": float(value.get("multiplier", DEFAULT_MULTIPLIER)),
                 "name": str(value.get("name", key)),
-                "margin": float(value.get("margin", 0) or 0),
                 "margin_rate_pct": float(value.get("margin_rate_pct", 0) or 0),
             }
         else:

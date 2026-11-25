@@ -747,13 +747,8 @@ class ConfigSupportMixin:
 
 
     def _refresh_margin_table_summary(self) -> None:
-        """同步保证金摘要到回测页用的变量，并刷新上方关注下拉（界面不再显示说明文字）。"""
-        from src.risk.margin_table import summarize_contracts
-
+        """刷新上方关注下拉（界面不再显示保证金说明文字）。"""
         symbols = list((self.cfg.get("strategy") or {}).get("symbols") or [])
-        contracts = (self.cfg.get("risk") or {}).get("contracts") or {}
-        # 回测页抄「当前品种保证金」仍用摘要字符串，界面不再展示这段说明。
-        self.margin_map_var.set(summarize_contracts(contracts))
         if symbols and symbols != list(self._watch_symbols):
             try:
                 self._set_watch_codes(symbols, select=symbols[0], save=False)
@@ -779,7 +774,6 @@ class ConfigSupportMixin:
             if symbols:
                 self._set_watch_codes(symbols, select=symbols[0], save=False)
             self._refresh_margin_table_summary()
-            self._sync_bt_margin_from_table()
             if not silent:
                 try:
                     save_config(self.cfg)

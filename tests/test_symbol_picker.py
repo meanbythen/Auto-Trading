@@ -72,8 +72,7 @@ def test_prepare_screen_cfg_fixes_lots_and_clears_margin_without_touching_origin
         },
         "trade": {"volume": 2},
         "risk": {
-            "margin_per_lot": 5000,
-            "contracts": {"bu": {"multiplier": 10, "margin": 7794}},
+            "contracts": {"bu": {"multiplier": 10, "margin_rate_pct": 17}},
         },
     }
     baseline = {
@@ -86,14 +85,13 @@ def test_prepare_screen_cfg_fixes_lots_and_clears_margin_without_touching_origin
     out, volume = prepare_screen_cfg(cfg, baseline)
     assert volume == 1
     assert out["trade"]["volume"] == 1
-    assert out["risk"]["margin_per_lot"] == 0
-    assert out["risk"]["contracts"]["bu"]["margin"] == 0
+    assert out["risk"]["ignore_margin_cap"] is True
+    assert out["risk"]["contracts"]["bu"]["margin_rate_pct"] == 17
     assert out["risk"]["contracts"]["bu"]["multiplier"] == 10
     assert out["risk"]["contracts"]["i"]["multiplier"] == 100
     assert out["strategy"]["engine"] == "daily_body"
     assert out["strategy"]["flatten_at_close"] is True
-    assert cfg["risk"]["margin_per_lot"] == 5000
-    assert cfg["risk"]["contracts"]["bu"]["margin"] == 7794
+    assert cfg["risk"]["contracts"]["bu"]["margin_rate_pct"] == 17
 
 
 def test_aligned_backtest_runner_follows_rollover_switch(monkeypatch) -> None:
@@ -124,7 +122,7 @@ def test_prepare_screen_cfg_keeps_account_capital_for_evaluation() -> None:
     cfg = {
         "strategy": {"engine": "daily_body", "symbols": ["bu2612"]},
         "trade": {"volume": 2},
-        "risk": {"capital": 93100, "margin_per_lot": 5000},
+        "risk": {"capital": 93100},
     }
     out, volume = prepare_screen_cfg(
         cfg,
@@ -137,7 +135,7 @@ def test_prepare_screen_cfg_keeps_account_capital_for_evaluation() -> None:
     )
     assert volume == 1
     assert out["risk"]["capital"] == 93100
-    assert out["risk"]["margin_per_lot"] == 0
+    assert out["risk"]["ignore_margin_cap"] is True
 
 
 def test_prepare_screen_cfg_uses_page_capital_when_given() -> None:
@@ -145,7 +143,7 @@ def test_prepare_screen_cfg_uses_page_capital_when_given() -> None:
     cfg = {
         "strategy": {"engine": "daily_body", "symbols": ["bu2612"]},
         "trade": {"volume": 2},
-        "risk": {"capital": 32790, "margin_per_lot": 5000},
+        "risk": {"capital": 32790},
     }
     out, volume = prepare_screen_cfg(
         cfg,
@@ -184,7 +182,7 @@ def test_screen_keeps_only_symbols_that_beat_baseline_on_two_metrics() -> None:
 
     def runner(cfg, *, symbol, volume, start_date, end_date, engine):
         assert volume == 1
-        assert cfg["risk"]["margin_per_lot"] == 0
+        assert cfg["risk"]["ignore_margin_cap"] is True
         if symbol == "c0":
             raise RuntimeError("没有K线")
         return Result(symbol, table[symbol])
@@ -275,7 +273,7 @@ def test_prepare_screen_cfg_keeps_the_quote_source() -> None:
         "data": {"source": "tq"},
         "strategy": {"engine": "daily_body", "daily_body": {"eth_minutes": 20}},
         "trade": {"volume": 1},
-        "risk": {"margin_per_lot": 0, "contracts": {}},
+        "risk": {"contracts": {}},
     }
     out, _volume = prepare_screen_cfg(cfg, {"fixed_volume": 1, "engine": "daily_body"})
     assert out["data"]["source"] == "tq"
@@ -372,7 +370,6 @@ def test_actual_span_and_bar_count_show_what_was_tested() -> None:
             "max_daily_loss": 5000,
             "min_order_interval_sec": 0,
             "max_orders_per_day": 20,
-            "margin_per_lot": 0,
             "has_flatten": True,
             "flatten_at_close": True,
         },
@@ -454,7 +451,7 @@ def test_rank_mode_orders_by_score_and_ignores_frequency() -> None:
 
     def runner(cfg, *, symbol, volume, start_date, end_date, engine):
         assert volume == 2
-        assert cfg["risk"]["margin_per_lot"] == 0
+        assert cfg["risk"]["ignore_margin_cap"] is True
         assert engine == "trend_follow"
         if symbol == "m0":
             # 笔数很多，但样本仍少于 3 笔的门槛时不能靠频率往前排。这里用 2 笔。
@@ -483,7 +480,6 @@ def test_rank_mode_orders_by_score_and_ignores_frequency() -> None:
             "max_daily_loss": 5000,
             "min_order_interval_sec": 0,
             "max_orders_per_day": 20,
-            "margin_per_lot": 0,
             "flatten_at_close": False,
             "has_flatten": True,
         },
@@ -544,7 +540,6 @@ def test_thin_liquidity_is_labeled_and_does_not_block_selection() -> None:
             "max_daily_loss": 5000,
             "min_order_interval_sec": 0,
             "max_orders_per_day": 20,
-            "margin_per_lot": 0,
             "has_flatten": True,
             "flatten_at_close": True,
         },
@@ -677,7 +672,7 @@ def test_cross_row_keeps_full_evaluation_dimensions(monkeypatch) -> None:
         {
             "strategy": {"daily_body": {"eth_minutes": 20}},
             "trade": {},
-            "risk": {"capital": 50000, "contracts": {"rb": {"margin": 5000, "multiplier": 10}}},
+            "risk": {"capital": 50000, "contracts": {"rb": {"margin_rate_pct": 10, "multiplier": 10}}},
         },
         {
             "timeframe": "5",
@@ -738,8 +733,8 @@ def test_cross_keeps_only_the_top_quarter_of_profitable_combos() -> None:
         assert engine == "daily_body"
         assert volume == 2
         assert cfg["risk"]["sizing_mode"] == "fixed"
-        assert cfg["risk"]["margin_per_lot"] == 0
-        assert cfg["risk"]["contracts"]["rb"]["margin"] == 0
+        assert cfg["risk"]["ignore_margin_cap"] is True
+        assert cfg["risk"]["contracts"]["rb"]["margin_rate_pct"] == 20
         assert cfg["risk"]["capital"] == 20148
         assert cfg["risk"]["max_daily_loss"] > 10_000_000
         assert cfg["risk"]["risk_per_trade_pct"] == 20
@@ -757,9 +752,8 @@ def test_cross_keeps_only_the_top_quarter_of_profitable_combos() -> None:
         "trade": {},
         "risk": {
             "capital": 20148,
-            "margin_per_lot": 8000,
             "max_daily_loss": 2000,
-            "contracts": {"rb": {"margin": 50000, "multiplier": 10}},
+            "contracts": {"rb": {"margin_rate_pct": 20, "multiplier": 10}},
         },
     }
     result = screen_cross(
@@ -774,7 +768,6 @@ def test_cross_keeps_only_the_top_quarter_of_profitable_combos() -> None:
             "risk_per_trade_pct": 20,
             "min_order_interval_sec": 60,
             "max_orders_per_day": 5,
-            "margin_per_lot": 8000,
             "has_flatten": True,
             "flatten_at_close": True,
             "engine": "should_be_ignored",
@@ -797,7 +790,7 @@ def test_cross_keeps_only_the_top_quarter_of_profitable_combos() -> None:
     assert result["volume"] == 2
     assert "engine" not in result["settings"]
     assert source["risk"]["capital"] == 20148
-    assert source["risk"]["contracts"]["rb"]["margin"] == 50000
+    assert source["risk"]["contracts"]["rb"]["margin_rate_pct"] == 20
     by_symbol = {row["symbol"]: row for row in result["rows"]}
     assert by_symbol["rb0"]["picked"] == "较好"
     assert by_symbol["bu0"]["picked"] == "一般"

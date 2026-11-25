@@ -751,10 +751,8 @@ class ConfigCollectMixin:
             from src.risk.sizing import DEFAULT_MARGIN_USAGE_PCT
 
             risk_pre["margin_usage_pct"] = DEFAULT_MARGIN_USAGE_PCT
-        try:
-            risk_pre["margin_per_lot"] = max(0.0, float(self.margin_var.get() or 0))
-        except ValueError:
-            risk_pre["margin_per_lot"] = 0.0
+        # 兜底每手保证金已删除：保证金只认品种与合约表，顺手清掉旧配置残留。
+        risk_pre.pop("margin_per_lot", None)
         # 保证金和手续费从总表补；关注名单以界面上这份为准，这里不去读表覆盖。
         # 在收集时重读总表会把用户刚改的名单和回测页选中的合约一起冲掉。
         table_rel = (

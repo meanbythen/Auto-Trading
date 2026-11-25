@@ -134,7 +134,6 @@ class ConfigVarsMixin:
         self.margin_usage_pct_var = ctk.StringVar(
             value=str(risk.get("margin_usage_pct", DEFAULT_MARGIN_USAGE_PCT))
         )
-        self.margin_var = ctk.StringVar(value=str(risk.get("margin_per_lot", 0) or 0))
         from src.risk.dynamic import DynamicExposure
 
         _dyn = DynamicExposure.from_config(self.cfg)
@@ -164,17 +163,11 @@ class ConfigVarsMixin:
         self.kelly_win_var = ctk.StringVar(value=win_rate_pct_display(_kr))
         self.kelly_payoff_var = ctk.StringVar(value="" if _kp is None else f"{_kp:g}")
         self.kelly_status_var = ctk.StringVar(value=status_text(self.cfg))
-        # 关注合约+保证金只认总表；margin_map_var 给回测页抄「当前品种保证金」用。
-        from src.risk.universe_table import DEFAULT_REL_PATH, summarize_universe
+        # 关注合约+保证金比例只认总表。
+        from src.risk.universe_table import DEFAULT_REL_PATH
 
         self.margin_table_path_var = ctk.StringVar(
             value=str(risk.get("universe_table") or risk.get("margin_table") or DEFAULT_REL_PATH)
-        )
-        self.margin_map_var = ctk.StringVar(
-            value=summarize_universe(
-                list(st.get("symbols") or []),
-                risk.get("contracts") or {},
-            )
         )
         self.scan_var = ctk.StringVar(value=str(sch.get("scan_interval_sec", 30)))
         # 公共交易时段：界面显示中文，保存时换回 all/day/night。只拦开新仓。
@@ -469,7 +462,6 @@ class ConfigVarsMixin:
         self.bt_max_loss_var = ctk.StringVar(value=str(risk.get("max_daily_loss", 500)))
         self.bt_interval_var = ctk.StringVar(value=str(risk.get("min_order_interval_sec", 60)))
         self.bt_max_orders_var = ctk.StringVar(value=str(risk.get("max_orders_per_day", 20)))
-        self.bt_margin_var = ctk.StringVar(value=str(risk.get("margin_per_lot", 0) or 0))
         from src.risk.sizing import DEFAULT_MARGIN_USAGE_PCT as _DEF_MGN_PCT
 
         self.bt_margin_usage_pct_var = ctk.StringVar(
@@ -514,7 +506,6 @@ class ConfigVarsMixin:
         self.pk_max_loss_var = ctk.StringVar(value=self.bt_max_loss_var.get())
         self.pk_interval_var = ctk.StringVar(value=self.bt_interval_var.get())
         self.pk_max_orders_var = ctk.StringVar(value=self.bt_max_orders_var.get())
-        self.pk_margin_var = ctk.StringVar(value="0")
 
         self.opt_engine_var = ctk.StringVar(value=_ui_engine(st.get("engine", "daily_body")))
         self.opt_source_var = ctk.StringVar(value=quote_label)
@@ -938,14 +929,10 @@ class ConfigVarsMixin:
         from src.risk.sizing import DEFAULT_MARGIN_USAGE_PCT
 
         self.margin_usage_pct_var.set(str(risk.get("margin_usage_pct", DEFAULT_MARGIN_USAGE_PCT)))
-        self.margin_var.set(str(risk.get("margin_per_lot", 0) or 0))
-        from src.risk.universe_table import DEFAULT_REL_PATH, summarize_universe
+        from src.risk.universe_table import DEFAULT_REL_PATH
 
         self.margin_table_path_var.set(
             str(risk.get("universe_table") or risk.get("margin_table") or DEFAULT_REL_PATH)
-        )
-        self.margin_map_var.set(
-            summarize_universe(list(st.get("symbols") or []), risk.get("contracts") or {})
         )
         try:
             self._refresh_margin_table_summary()

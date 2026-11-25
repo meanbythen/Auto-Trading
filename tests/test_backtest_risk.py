@@ -53,6 +53,7 @@ def _cfg(**risk) -> dict:
             "max_daily_loss": 500,
             "min_order_interval_sec": 60,
             "max_orders_per_day": 20,
+            "ignore_margin_cap": True,
             "contracts": {"bu": {"multiplier": 10}},
         },
     }
@@ -129,6 +130,7 @@ def test_fixed_volume_caps_risk_sized_lots() -> None:
                 "sizing_mode": "fixed",
                 "capital": 100_000,
                 "risk_per_trade_pct": 2,
+                "ignore_margin_cap": True,
                 "contracts": {"bu": {"multiplier": 10}},
             },
             "trade": {"volume": 2},

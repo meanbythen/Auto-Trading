@@ -794,8 +794,6 @@ risk:
     atr_period: 14
     atr_lookback: 20
     reduce_held: false      # 默认只限制新增风险，不在回撤底部强制减已有持仓
-  # 每手保证金。0 表示不看。表里没写的品种用这个数。
-  margin_per_lot: 0
   # 关注合约+保证金/乘数只认这张总表（配置页可打开/重新读取）。同品种保证金必须相同。
   universe_table: config/品种与合约.xlsx
   margin_table: config/品种与合约.xlsx

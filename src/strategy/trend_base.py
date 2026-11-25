@@ -25,6 +25,8 @@ from .types import (
     StrategyAction,
     StrategyDecision,
     config_flag,
+    entry_touched,
+    forming_price_range,
     stop_mode_from_cfg,
     stop_triggered,
 )
@@ -199,10 +201,13 @@ class TrendStrategyBase(StrategyBase):
         now: datetime | None = None,
         trail_bars: pd.DataFrame | None = None,
         trend_bars: pd.DataFrame | None = None,
+        forming: pd.DataFrame | None = None,
     ) -> StrategyDecision:
         _ = trail_bars
         # 多因子等策略会用另一套更大周期（通常是日线）做方向过滤。
         self._trend_bars = trend_bars
+        # trigger 模式才传 forming；为空时全部走原来的收盘口径。
+        self._forming = forming if forming is not None and len(forming) else None
         now = now or datetime.now()
         pos = self.positions.setdefault(symbol, PositionState(symbol=symbol))
         if bars is None or len(bars) < self.required_bars:
@@ -215,7 +220,7 @@ class TrendStrategyBase(StrategyBase):
             return StrategyDecision(StrategyAction.HOLD, symbol, f"{self.label}指标还没算稳")
 
         bar = bars.iloc[-1]
-        bar_id = str(bar.name)
+        bar_id = str(self._forming.index[-1]) if self._forming is not None else str(bar.name)
         close = float(bar["close"])
 
         if pos.side != "flat" and self.is_flatten_time(now):
@@ -247,10 +252,34 @@ class TrendStrategyBase(StrategyBase):
                 stop_price=close,
             )
         side, stop, reason, meta = signal
-        risk = close - stop if side == "long" else stop - close
+        meta = dict(meta or {})
+        trigger: float | None = None
+        raw_trigger = meta.get("trigger_price")
+        if self._forming is not None and raw_trigger not in (None, ""):
+            try:
+                trigger = float(raw_trigger)
+            except (TypeError, ValueError):
+                trigger = None
+            price_range = forming_price_range(self._forming)
+            if trigger is not None and price_range is not None:
+                if not entry_touched(
+                    side=side, trigger=trigger, high=price_range[0], low=price_range[1]
+                ):
+                    return StrategyDecision(
+                        StrategyAction.HOLD,
+                        symbol,
+                        f"{self.label}触发价 {trigger:.2f} 还没碰到",
+                        stop_price=trigger,
+                    )
+            else:
+                trigger = None
+        entry_ref = trigger if trigger is not None else close
+        if trigger is not None:
+            meta["intraday_entry"] = True
+        risk = entry_ref - stop if side == "long" else stop - entry_ref
         if not (risk > 0):
-            pad = max(abs(close) * 0.001, 1.0)
-            stop = close - pad if side == "long" else close + pad
+            pad = max(abs(entry_ref) * 0.001, 1.0)
+            stop = entry_ref - pad if side == "long" else entry_ref + pad
         self._pending[symbol] = {"time": now, "stop": stop, "bar_id": bar_id}
         self._signaled_bar[symbol] = bar_id
         action = StrategyAction.BUY_OPEN if side == "long" else StrategyAction.SELL_OPEN
@@ -260,7 +289,8 @@ class TrendStrategyBase(StrategyBase):
             symbol,
             reason,
             stop_price=stop,
-            entry_price=close,
+            entry_price=entry_ref,
+            trigger_price=trigger,
             meta={"signal": self.section, "bar_id": bar_id, **meta},
         )
 

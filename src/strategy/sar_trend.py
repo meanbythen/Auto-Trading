@@ -15,7 +15,7 @@ import pandas as pd
 
 from .indicators import ema_series, parabolic_sar
 from .trend_base import TrendStrategyBase
-from .types import PositionState
+from .types import PositionState, forming_price_range
 
 
 class SarTrendStrategy(TrendStrategyBase):
@@ -70,6 +70,30 @@ class SarTrendStrategy(TrendStrategyBase):
         close = float(bar["close"])
         ma = float(ind["ma"])
         sar = float(ind["sar"])
+        if self._forming is not None:
+            price_range = forming_price_range(self._forming)
+            if price_range is None:
+                return None
+            fh, fl = price_range
+            if not ind["bull"] and fh >= max(sar, ma):
+                entry = max(sar, ma)
+                stop = min(sar, entry)
+                return (
+                    "long",
+                    stop,
+                    f"SAR翻多做多 盘中最高{fh:.2f}越过SAR{self.ma_filter}分界{entry:.2f} 止损{stop:.2f}",
+                    {"sar": sar, "ma": ma, "trigger_price": entry},
+                )
+            if ind["bull"] and fl <= min(sar, ma):
+                entry = min(sar, ma)
+                stop = max(sar, entry)
+                return (
+                    "short",
+                    stop,
+                    f"SAR翻空做空 盘中最低{fl:.2f}跌破SAR分界{entry:.2f} 止损{stop:.2f}",
+                    {"sar": sar, "ma": ma, "trigger_price": entry},
+                )
+            return None
         if ind["flipped_up"] and close > ma:
             stop = min(sar, close - 1e-9)
             return (

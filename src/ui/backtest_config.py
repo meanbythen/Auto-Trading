@@ -164,7 +164,6 @@ class BacktestConfigMixin:
         self.bt_max_orders_var.set(self.max_orders_var.get())
         risk = self.cfg.get("risk", {}) if isinstance(self.cfg, dict) else {}
         self.bt_min_vol_var.set(str(risk.get("min_volume", self.bt_min_vol_var.get() or 1)))
-        self._sync_bt_margin_from_table(symbol)
         if hasattr(self, "opt_hist_menu"):
             self._refresh_opt_history()
 
@@ -214,7 +213,6 @@ class BacktestConfigMixin:
             max_loss = float(self.bt_max_loss_var.get())
             interval = max(0, int(float(self.bt_interval_var.get())))
             max_orders = max(1, int(float(self.bt_max_orders_var.get())))
-            margin = max(0.0, float(self.bt_margin_var.get() or 0))
         except ValueError:
             messagebox.showerror("数字不对", "开仓限制里的权益、风险和手数要填数字")
             return
@@ -237,8 +235,7 @@ class BacktestConfigMixin:
             f"最少手数  {min_vol}\n"
             f"日最大亏损  {max_loss:.0f} 元\n"
             f"开仓间隔  {interval} 秒\n"
-            f"每天最多开仓  {max_orders} 次\n"
-            f"兜底每手保证金  {margin:.0f} 元（表里有比例时按价格现算）\n\n"
+            f"每天最多开仓  {max_orders} 次\n\n"
             "确定写入？",
         ):
             return
@@ -265,15 +262,14 @@ class BacktestConfigMixin:
         self.max_loss_var.set(str(max_loss))
         self.min_interval_var.set(str(interval))
         self.max_orders_var.set(str(max_orders))
-        self.margin_var.set(str(margin))
         self.cfg.setdefault("risk", {})["min_volume"] = min_vol
-        self.cfg.setdefault("risk", {})["margin_per_lot"] = margin
+        self.cfg.setdefault("risk", {}).pop("margin_per_lot", None)
         self.cfg.setdefault("risk", {})["margin_usage_pct"] = margin_usage
         self.cfg.setdefault("risk", {}).pop("max_position", None)
 
         cfg = self._merge_disk_gui_coords(self._apply_ui_to_cfg())
         cfg.setdefault("risk", {})["min_volume"] = min_vol
-        cfg.setdefault("risk", {})["margin_per_lot"] = margin
+        cfg.setdefault("risk", {}).pop("margin_per_lot", None)
         cfg.setdefault("risk", {})["margin_usage_pct"] = margin_usage
         cfg.setdefault("risk", {}).pop("max_position", None)
         # 回测页的新浪/东财/天勤可以写入实盘。同花顺图不能写进 data.source，
@@ -350,47 +346,6 @@ class BacktestConfigMixin:
                 logger.warning("滑点跳数不是数字，沿用配置里的 {}", bt.get("slippage_ticks", 1))
 
 
-    def _table_margin_for_symbol(self, symbol: str | None = None) -> float:
-        """从品种与合约表（已载入的 risk.contracts）读该品种每手保证金。没有或为 0 则返回 0。"""
-        from src.risk.universe_table import product_key
-
-        code = (symbol or self.bt_symbol_var.get() or "").strip()
-        key = product_key(code)
-        if not key:
-            return 0.0
-        risk = self.cfg.get("risk") or {}
-        box = (risk.get("contracts") or {}).get(key)
-        if not isinstance(box, dict):
-            return 0.0
-        try:
-            return max(0.0, float(box.get("margin") or 0))
-        except (TypeError, ValueError):
-            return 0.0
-
-
-    def _sync_bt_margin_from_table(self, symbol: str | None = None) -> None:
-        """
-        把回测页「每手保证金」改成品种表里的数。
-
-        表里没有或为 0 时，改用配置页统一的每手保证金。
-        """
-        if not hasattr(self, "bt_margin_var"):
-            return
-        margin = self._table_margin_for_symbol(symbol)
-        if margin <= 0:
-            try:
-                margin = max(0.0, float(self.margin_var.get() or 0))
-            except (TypeError, ValueError):
-                margin = 0.0
-        text = str(int(margin)) if margin == int(margin) else str(margin)
-        try:
-            if str(self.bt_margin_var.get() or "").strip() == text:
-                return
-        except Exception:  # noqa: BLE001
-            pass
-        self.bt_margin_var.set(text)
-
-
     def _align_backtest_trading_params_with_live(self) -> None:
         """
         旧入口：点开始回测时曾经把配置页数字盖到回测页上。
@@ -430,19 +385,17 @@ class BacktestConfigMixin:
             risk["max_daily_loss"] = float(self.bt_max_loss_var.get())
             risk["min_order_interval_sec"] = max(0, int(float(self.bt_interval_var.get())))
             risk["max_orders_per_day"] = max(1, int(float(self.bt_max_orders_var.get())))
-            generic_margin = max(0.0, float(self.bt_margin_var.get() or 0))
         except ValueError as e:
             raise ValueError("回测页的账户权益、风险和手数要填数字") from e
         code = (symbol or self.bt_symbol_var.get() or "").strip()
-        # 有保证金比例时按每笔开仓价现算，不要绑死一个金额把比例清掉。
-        risk["margin_per_lot"] = generic_margin
+        # 保证金只认品种与合约表（比例或每手金额）；缺数据算仓时会直接拒绝。
+        risk.pop("margin_per_lot", None)
         logger.info(
-            "开仓限制已写入本次回测 | 测试权益={:g} 风险%={} 模式={} 品种={} 兜底保证金{:g}",
+            "开仓限制已写入本次回测 | 测试权益={:g} 风险%={} 模式={} 品种={}",
             risk["capital"],
             risk["risk_per_trade_pct"],
             risk["sizing_mode"],
             code or "?",
-            generic_margin,
         )
 
 

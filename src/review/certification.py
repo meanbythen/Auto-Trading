@@ -1,9 +1,9 @@
 """合约参数体检与再认证标记。
 
-功能：检查关注合约的保证金比例、每手保证金、乘数、手续费是否缺失或异常；
+功能：检查关注合约的保证金比例、乘数、手续费是否缺失或异常；
       把策略、风控、合约参数收成指纹，和上次认证结果比对，判断是否需要重新认证。
 原理：只读配置与品种总表，写一个 JSON 快照；不改配置、不碰交易链路。
-      保证金比例和每手保证金都为空时，组合回测会按 10% 估算；乘数缺失按默认值，
+      保证金比例为空时，实盘/回测都会拒绝开仓；乘数缺失按默认值，
       这两类填错会直接让手数和保证金占用算偏，所以体检放在组合与实盘之前。
 """
 
@@ -35,7 +35,6 @@ TRACKED_RISK_KEYS = (
 )
 TRACKED_CONTRACT_KEYS = (
     "margin_rate_pct",
-    "margin",
     "multiplier",
     "commission",
     "commission_close",
@@ -82,9 +81,8 @@ def check_contracts(cfg: dict[str, Any] | None) -> list[dict[str, str]]:
             _add(symbol, "contracts", ERROR, "总表里没有这个品种，回测会按 10% 保证金估算")
             continue
         rate = _number(box.get("margin_rate_pct"))
-        lot = _number(box.get("margin"))
-        if rate <= 0 and lot <= 0:
-            _add(symbol, "margin", ERROR, "保证金比例和每手保证金都没填，按 10% 估算")
+        if rate <= 0:
+            _add(symbol, "margin_rate_pct", ERROR, "保证金比例没填，实盘/回测会拒绝开仓")
         if _number(box.get("multiplier")) <= 0:
             _add(symbol, "multiplier", ERROR, "每手数量没填，乘数会按默认值算")
         if _number(box.get("commission")) <= 0:

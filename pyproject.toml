@@ -3,7 +3,7 @@
 [tool.ruff]
 target-version = "py312"
 line-length = 120
-extend-exclude = ["build", "dist", "data", "logs", "ctp"]
+extend-exclude = ["build", "dist", "data", "logs", "ctp", "docs/期权交易"]
 
 [tool.ruff.lint]
 # 只开 pycodestyle 的明显错误和 pyflakes：能抓到未定义名字、未使用导入这类真问题，

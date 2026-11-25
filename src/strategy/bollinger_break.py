@@ -15,7 +15,7 @@ import pandas as pd
 
 from .indicators import ema_series
 from .trend_base import TrendStrategyBase
-from .types import PositionState
+from .types import PositionState, forming_price_range, pick_breakout_side
 
 
 class BollingerBreakStrategy(TrendStrategyBase):
@@ -68,6 +68,35 @@ class BollingerBreakStrategy(TrendStrategyBase):
         down = float(ind["down"])
         atr = float(ind["atr"])
         pad = self.atr_stop_mult * atr
+        if self._forming is not None:
+            price_range = forming_price_range(self._forming)
+            if price_range is None:
+                return None
+            fh, fl = price_range
+            try:
+                live = float(self._forming.iloc[-1]["close"])
+            except (KeyError, TypeError, ValueError):
+                live = close
+            side = pick_breakout_side(
+                close=live, high_level=up, low_level=down, high=fh, low=fl
+            )
+            if side == "long":
+                stop = up - pad
+                return (
+                    "long",
+                    stop,
+                    f"布林突破做多 盘中最高{fh:.2f}触及上轨{up:.2f} 止损{stop:.2f}",
+                    {"mid": mid, "up": up, "atr": atr, "trigger_price": up},
+                )
+            if side == "short":
+                stop = down + pad
+                return (
+                    "short",
+                    stop,
+                    f"布林突破做空 盘中最低{fl:.2f}触及下轨{down:.2f} 止损{stop:.2f}",
+                    {"mid": mid, "down": down, "atr": atr, "trigger_price": down},
+                )
+            return None
         if close > mid and close > up:
             stop = close - pad
             return (

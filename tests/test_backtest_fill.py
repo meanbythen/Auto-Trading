@@ -340,24 +340,24 @@ def test_first_symbol_uses_the_watched_contract() -> None:
     assert result.symbol == "c"
 
 
-def test_symbol_margin_wins_over_the_generic_number() -> None:
-    """品种表里写了保证金就用它；没写才用统一的「每手保证金」。"""
+def test_symbol_margin_comes_only_from_the_table() -> None:
+    """保证金只认品种表比例：有比例按价格现算，没比例返回 0，算仓时直接拒绝。"""
     from src.risk.sizing import PositionSizer
 
     cfg = {
         "risk": {
             "capital": 100000,
-            "margin_per_lot": 9000,
             "contracts": {
-                "bu": {"multiplier": 10, "margin": 4000},
+                "bu": {"multiplier": 10, "margin_rate_pct": 10},
                 "c": {"multiplier": 10},
             },
         },
         "strategy": {"symbols": ["bu"]},
     }
     sizer = PositionSizer(cfg)
-    assert sizer.margin_for("bu2612") == 4000
-    assert sizer.margin_for("c2701") == 9000
+    assert sizer.margin_for("bu2612", 4000) == 4000
+    assert sizer.margin_for("c2701", 2300) == 0
+    assert sizer.margin_for("bu2612") == 0
 
 
 def test_symbol_tick_wins_over_the_global_tick() -> None:
@@ -386,7 +386,7 @@ def test_universe_table_round_trips_tick_column(tmp_path) -> None:
             {
                 "symbol": "bu2612",
                 "name": "沥青",
-                "margin": 4000,
+                "margin_rate_pct": 10,
                 "multiplier": 10,
                 "commission": 3,
                 "commission_close_today": None,
@@ -396,7 +396,7 @@ def test_universe_table_round_trips_tick_column(tmp_path) -> None:
             {
                 "symbol": "c2701",
                 "name": "玉米",
-                "margin": 2000,
+                "margin_rate_pct": 7,
                 "multiplier": 10,
                 "commission": 1,
                 "enabled": True,
@@ -687,6 +687,42 @@ def test_next_open_entry_can_stop_inside_its_execution_bar(monkeypatch) -> None:
     assert trade.entry_time == "2026-10-16T09:05:00"
     assert trade.exit_time == "2026-10-16T09:05:00"
     assert "止损" in trade.reason_exit
+
+
+def test_touch_stop_exits_in_trigger_bar_not_next_bar(monkeypatch) -> None:
+    """持仓K线最低价打穿止损，就在这根按止损价成交；下一根离得再远也不用它的开盘。"""
+    bars = _ohlc_frame(
+        [
+            ("2026-10-16 09:00", 99, 101, 98, 100),
+            ("2026-10-16 09:05", 100, 103, 99, 101),
+            ("2026-10-16 09:10", 101, 102, 94, 96),
+            ("2026-10-16 09:15", 110, 111, 109, 110),
+        ]
+    )
+    result = _run_scripted(monkeypatch, bars, None, _cfg(slippage_ticks=0))
+
+    assert len(result.trades) == 1
+    trade = result.trades[0]
+    assert trade.exit_price == 95.0
+    assert trade.exit_time == "2026-10-16T09:10:00"
+    assert trade.reason_exit and "止损" in trade.reason_exit
+
+
+def test_touch_stop_in_trigger_bar_still_pays_slippage(monkeypatch) -> None:
+    """触发根按止损价成交，但滑点照让：多单卖出比止损价更低。"""
+    bars = _ohlc_frame(
+        [
+            ("2026-10-16 09:00", 99, 101, 98, 100),
+            ("2026-10-16 09:05", 100, 103, 99, 101),
+            ("2026-10-16 09:10", 101, 102, 94, 96),
+            ("2026-10-16 09:15", 110, 111, 109, 110),
+        ]
+    )
+    result = _run_scripted(monkeypatch, bars, None, _cfg(slippage_ticks=1))
+
+    trade = result.trades[0]
+    assert trade.exit_price == 94.0
+    assert trade.exit_time == "2026-10-16T09:10:00"
 
 
 def test_stop_and_active_exit_same_bar_use_conservative_price_and_report_impact(monkeypatch) -> None:

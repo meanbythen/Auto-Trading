@@ -71,8 +71,7 @@ class BacktestActionsMixin:
             f"限制      最少{snap.get('min_volume')}手"
             f"  日亏停{float(snap.get('max_daily_loss') or 0):.0f}元"
             f"  间隔{snap.get('min_order_interval_sec')}秒"
-            f"  每天最多开{snap.get('max_orders_per_day')}次"
-            f"  兜底每手保证金{float(snap.get('margin_per_lot') or 0):.0f}元（有比例时按价格现算）\n"
+            f"  每天最多开{snap.get('max_orders_per_day')}次\n"
             f"凯利      {'按手填胜率/盈亏比算手数' if snap.get('kelly_in_backtest') else '关（按仓位模式和每笔风险%）'}\n"
             f"{skipped}"
         )

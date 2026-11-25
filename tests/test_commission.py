@@ -7,7 +7,7 @@ def test_open_and_close_today_fees() -> None:
     contracts = {
         "fu": {
             "name": "燃油",
-            "margin": 10000,
+            "margin_rate_pct": 20,
             "multiplier": 10,
             "commission": 2.63,
             "commission_close_today": 0.0,

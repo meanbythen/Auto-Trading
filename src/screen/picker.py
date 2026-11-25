@@ -275,12 +275,12 @@ def prepare_screen_cfg(
     """
     做出只给交叉测试用的配置副本。
 
-    没另给 settings 时，跟基准那次回测走：同样手数，保证金清成 0，
+    没另给 settings 时，跟基准那次回测走：同样手数，不做保证金上限判断，
     当天亏损和开仓次数也不再拦住，免得不同品种被风控提前停掉。
     传入 settings 且 fair_compare 为假时，改用交叉测试页自己填的仓位和限制。
     原配置不会被改。
     """
-    from src.risk.sizing import bind_run_margin
+    from src.risk.sizing import disable_margin_cap
 
     spec = settings if settings is not None else settings_from_baseline(baseline or {})
     out = copy.deepcopy(cfg)
@@ -307,19 +307,15 @@ def prepare_screen_cfg(
         risk["max_orders_per_day"] = 100_000
         risk["min_order_interval_sec"] = 0
         _attach_universe_contracts(risk)
-        bind_run_margin(out, 0)
+        disable_margin_cap(out)
         if spec.get("ignore_equity"):
-            # 交叉测试不按权益算手数。保证金清掉，避免高保证金品种开不出固定手数。
+            # 交叉测试不按权益算手数，保证金层已在上面关掉。
             # 本金优先用交叉测试页填的数，没有才用配置里的账户权益。
             eval_capital = 0.0
             try:
                 eval_capital = float(spec.get("capital") or risk.get("capital") or 0)
             except (TypeError, ValueError):
                 eval_capital = 0.0
-            for box in (risk.get("contracts") or {}).values():
-                if isinstance(box, dict):
-                    box["margin"] = 0
-                    box["margin_rate_pct"] = 0
             if eval_capital > 0:
                 risk["capital"] = eval_capital
             else:
@@ -350,7 +346,7 @@ def prepare_screen_cfg(
     risk["max_daily_loss"] = float(spec.get("max_daily_loss") or 0)
     risk["min_order_interval_sec"] = max(0, int(spec.get("min_order_interval_sec") or 0))
     risk["max_orders_per_day"] = max(1, int(spec.get("max_orders_per_day") or 1))
-    bind_run_margin(out, float(spec.get("margin_per_lot") or 0))
+    disable_margin_cap(out)
     return out, volume
 
 
@@ -362,7 +358,7 @@ def _attach_universe_contracts(risk: dict[str, Any]) -> None:
         key = product_key(code)
         box = contracts.get(key)
         if not isinstance(box, dict):
-            contracts[key] = {"multiplier": float(mult), "name": name, "margin": 0}
+            contracts[key] = {"multiplier": float(mult), "name": name}
         else:
             box.setdefault("multiplier", float(mult))
             box.setdefault("name", name)

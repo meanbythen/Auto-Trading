@@ -77,6 +77,80 @@ def entry_mode_from_cfg(cfg: dict[str, Any]) -> str:
     return normalize_entry_mode(st.get("entry_mode"))
 
 
+def forming_price_range(forming: Any) -> tuple[float, float] | None:
+    """
+    取 forming 最后一根的最高/最低价。
+
+    trigger 模式只用它判「碰没碰到触发价」，不参与指标计算。
+    空数据或列缺失返回 None。
+    """
+    if forming is None:
+        return None
+    try:
+        if len(forming) == 0:
+            return None
+        row = forming.iloc[-1]
+        high = float(row["high"])
+        low = float(row["low"])
+    except (AttributeError, KeyError, IndexError, TypeError, ValueError):
+        return None
+    if high != high or low != low:
+        return None
+    return high, low
+
+
+def entry_touched(*, side: str, trigger: float | None, high: float, low: float) -> bool:
+    """
+    forming 的最高/最低有没有碰到触发价。
+
+    多单看最高价上穿，空单看最低价下穿。触发价缺失或非正数视为未触发。
+    """
+    if trigger is None:
+        return False
+    try:
+        level = float(trigger)
+        bar_high = float(high)
+        bar_low = float(low)
+    except (TypeError, ValueError):
+        return False
+    if level <= 0 or level != level:
+        return False
+    if side == "long":
+        return bar_high >= level
+    if side == "short":
+        return bar_low <= level
+    return False
+
+
+def pick_breakout_side(
+    *,
+    close: float,
+    high_level: float,
+    low_level: float,
+    high: float,
+    low: float,
+) -> str | None:
+    """
+    同一根 forming 同时碰到上下两个触发价时按最新价定向。
+
+    最新价还在上沿之外做多、还在下沿之外做空；夹在两沿之间放弃这一轮，
+    等下一次扫描，避免宽幅震荡同时破两边时乱开。
+    """
+    long_hit = float(high) >= float(high_level)
+    short_hit = float(low) <= float(low_level)
+    if long_hit and short_hit:
+        if float(close) >= float(high_level):
+            return "long"
+        if float(close) <= float(low_level):
+            return "short"
+        return None
+    if long_hit:
+        return "long"
+    if short_hit:
+        return "short"
+    return None
+
+
 # 止损触发方式（strategy.stop_mode），所有策略共用：
 #   touch = 价格最高/最低碰到止损位就平（实时看影线，默认）
 #   close = 等这根 K 线收盘，收盘价跌破/站上止损位才平
@@ -163,6 +237,8 @@ class StrategyDecision:
     reason: str
     stop_price: float | None = None
     entry_price: float | None = None
+    # trigger 模式下实际触发价；close 模式为 None。开仓时 entry_price 与它相同。
+    trigger_price: float | None = None
     meta: dict[str, Any] = field(default_factory=dict)
 
 

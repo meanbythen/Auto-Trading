@@ -1526,7 +1526,7 @@ def test_live_size_open_uses_current_books_net_kelly_samples(tmp_path: Path, mon
             "capital": 100_000,
             "risk_per_trade_pct": 1,
             "min_volume": 1,
-            "margin_per_lot": 0,
+            "ignore_margin_cap": True,
             "contracts": {"bu": {"multiplier": 10}},
             "dynamic": {"enabled": False},
             "kelly": {"enabled": True, "auto_from_ledger": True, "min_samples": 2},

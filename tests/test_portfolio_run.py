@@ -60,7 +60,7 @@ def test_all_legs_failed_returns_empty_with_message():
     assert "没有可用腿" in format_portfolio_lines(out)[0]
 
 
-def test_margin_by_lot_read_from_config():
+def test_margin_rate_read_from_config():
     days = ["2024-01-02"]
     trade = SimpleNamespace(
         symbol="fu2701",
@@ -80,10 +80,10 @@ def test_margin_by_lot_read_from_config():
             params_snapshot={},
         )
 
-    cfg = {"risk": {"capital": 100_000.0, "contracts": {"fu": {"margin": 8830.0}}}}
+    cfg = {"risk": {"capital": 100_000.0, "contracts": {"fu": {"margin_rate_pct": 29.4333}}}}
     out = run_portfolio_backtest(cfg, ["fu2701"], runner=runner)
-    assert out["margin_source"] == "配置每手保证金"
-    assert out["margin_peak"] == pytest.approx(8_830.0)
+    assert out["margin_source"] == "配置保证金比例×开仓价×乘数"
+    assert out["margin_peak"] == pytest.approx(8_830.0, abs=0.02)
 
 
 def test_margin_rate_from_config_used_when_lot_margin_zero():
@@ -101,7 +101,7 @@ def test_margin_rate_from_config_used_when_lot_margin_zero():
     def runner(cfg, *, symbol, initial_capital, **kwargs):
         return SimpleNamespace(equity=[initial_capital], equity_times=days, trades=[trade], params_snapshot={})
 
-    cfg = {"risk": {"capital": 100_000.0, "contracts": {"jd": {"margin": 0.0, "margin_rate_pct": 7.0}}}}
+    cfg = {"risk": {"capital": 100_000.0, "contracts": {"jd": {"margin_rate_pct": 7.0}}}}
     out = run_portfolio_backtest(cfg, ["jd2612"], runner=runner)
     assert out["margin_source"] == "配置保证金比例×开仓价×乘数"
     # 3600 × 10 × 7%

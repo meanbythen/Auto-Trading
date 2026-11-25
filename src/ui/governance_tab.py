@@ -157,7 +157,7 @@ class GovernanceTabMixin:
         card = self._card(parent)
         ctk.CTkLabel(
             card,
-            text="把策略、风控和关注合约参数收成指纹，和上次体检比对。保证金比例/每手保证金、"
+            text="把策略、风控和关注合约参数收成指纹，和上次体检比对。保证金比例、乘数、"
             "乘数缺失会直接标错；手续费、每跳缺失只提示。只写 data/review/certification.json，不改配置。",
             font=T.FONT_SMALL,
             text_color=T.TEXT_DIM,

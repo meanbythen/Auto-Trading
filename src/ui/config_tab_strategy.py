@@ -846,13 +846,6 @@ def build_strategy_section(
         readonly=True,
         width=160,
     )
-    app._entry_row(
-        left,
-        "兜底每手保证金(元)",
-        app.margin_var,
-        hint="品种表没填保证金比例时用这个固定金额；填了比例就按价格×每手数量×比例，0=不限制",
-        width=160,
-    )
     # 品种保证金+乘数只认 Excel，不再手打长串，避免和配置文件各改各的对不齐。
     app._pack_margin_table_row(left)
     # 每笔风险%、仓位上限% 放在下面「风控与资金管理」，和日亏损等放一起。

@@ -54,7 +54,7 @@ from src.strategy.decision_guard import (
 )
 from src.strategy.generic_stop import GenericStopOverlay, generic_stop_snapshot
 from src.strategy.session_scope import session_kind
-from src.strategy.types import PositionState
+from src.strategy.types import ENTRY_MODE_TRIGGER, PositionState, entry_mode_from_cfg
 from src.utils.trading_day import futures_trading_day
 
 if TYPE_CHECKING:
@@ -814,14 +814,55 @@ def _prepare_backtest(
     )
 
 
+def _accepts_kwarg(target: Any, name: str) -> bool:
+    """
+    策略的 evaluate 是否接受这个关键字参数。
+
+    结果记在策略实例上，回测逐根调用时不重复反射；
+    不支持就直接不传，策略自然走原来的收盘口径。
+    """
+    cache_key = f"_bt_accepts_{name}"
+    cached = getattr(target, cache_key, None)
+    if cached is not None:
+        return bool(cached)
+    import inspect
+
+    try:
+        params = inspect.signature(target.evaluate).parameters
+        ok = name in params or any(
+            param.kind is inspect.Parameter.VAR_KEYWORD for param in params.values()
+        )
+    except (TypeError, ValueError):
+        ok = False
+    setattr(target, cache_key, ok)
+    return bool(ok)
+
+
+def _trigger_entry_price(trigger: float, bar: Any) -> float:
+    """trigger 成交价：在当根 high/low 内就按触发价；跳空穿过时按开盘价。"""
+    low = float(bar["low"])
+    high = float(bar["high"])
+    if low <= trigger <= high:
+        return float(trigger)
+    return float(bar["open"])
+
+
 def _decide_bar(run: _BacktestRun, i: int, view: Any) -> _BarContext:
     """这一根做什么：换月接仓 / 策略评估 / 通用止损 / 交割闸门 / 开仓过滤。"""
     strategy = run.strategy
     symbol = run.symbol
     # 只用第 i 根（含）已收盘的数据做决策；开仓按下一根开盘成交（可配置关闭）。
+    # trigger 模式例外：把这根自己当 forming 传给策略，碰到触发价就在这根成交。
     signal_df, now, px = view.signal, view.now, view.px
     trail_df, trend_df, next_open = view.trail, view.trend, view.next_open
     next_index = getattr(view, "next_index", None)
+    forming = (
+        signal_df.iloc[-1:]
+        if entry_mode_from_cfg(run.cfg) == ENTRY_MODE_TRIGGER
+        and signal_df is not None
+        and len(signal_df)
+        else None
+    )
     # evaluate 会更新尾随止损。止损判定和成交都用这根之前已知的止损，
     # 这根新算出来的止损只对下一根生效，避免用当根K线自己算出的线平自己。
     pos_before = strategy.positions.get(symbol)
@@ -849,12 +890,17 @@ def _decide_bar(run: _BacktestRun, i: int, view: Any) -> _BarContext:
             meta={"rollover_carry": True, "volume": lots},
         )
     if decision is None:
+        extra: dict[str, Any] = {}
+        if forming is not None and _accepts_kwarg(strategy, "forming"):
+            extra["forming"] = forming
         if getattr(strategy, "uses_trend_bars", False):
             decision = strategy.evaluate(
-                symbol, signal_df, now=now, trail_bars=trail_df, trend_bars=trend_df
+                symbol, signal_df, now=now, trail_bars=trail_df, trend_bars=trend_df, **extra
             )
         else:
-            decision = strategy.evaluate(symbol, signal_df, now=now, trail_bars=trail_df)
+            decision = strategy.evaluate(
+                symbol, signal_df, now=now, trail_bars=trail_df, **extra
+            )
     # 先按现金+浮动权益更新峰值，再决定这一根能不能开，回撤才跟得上浮亏。
     _pos_eq = strategy.positions.get(symbol)
     _upnl = 0.0
@@ -1002,11 +1048,17 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
     )
     pos = strategy.positions.get(symbol)
     want = "long" if decision.action == StrategyAction.BUY_OPEN else "short"
+    trigger_price = float(decision.trigger_price or 0)
+    # trigger 模式：策略在当根 high/low 碰到触发价时开仓，按触发根成交，不等下一根开盘。
+    triggered = bool(meta.get("intraday_entry")) and trigger_price > 0
     # 涨跌停一字板：成交那根没有价格，开仓和反手都不做。
     # 下一根开盘成交时，挂单最多等 entry_timeout_bars 根；等到超时就当撤单。
     exec_idx = _fill_bar_index(ctx) if run.fill.on_next_open else ctx.i
     exec_bar = _execution_bar(run, ctx)
-    if run.fill.on_next_open and next_open is not None:
+    if triggered:
+        exec_idx = ctx.i
+        exec_bar = signal_df.iloc[-1]
+    elif run.fill.on_next_open and next_open is not None:
         wait_idx = run.liquidity.wait_fill_index(run.bars_signal, exec_idx)
         if wait_idx is None:
             run.note_reject(
@@ -1119,7 +1171,10 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
     # 成交口径统一：开了「下一根开盘」就按下一根开盘（跨休市也一样），
     # 只有最后一根没有下一根时才按当根收盘成交。
     # 不能再用策略内部价顶替，否则跳空时会报出当天根本没成交过的开仓价。
-    if run.fill.on_next_open and next_open is not None:
+    if triggered:
+        entry_ref = _trigger_entry_price(trigger_price, signal_df.iloc[-1])
+        entry_ts = run.bars_signal.index[ctx.i]
+    elif run.fill.on_next_open and next_open is not None:
         # 涨跌停锁住导致挂单顺延到后面几根时，按真正成交那根的开盘价成交。
         if exec_idx is not None and exec_idx != _fill_bar_index(ctx):
             entry_ref = float(run.bars_signal["open"].iloc[int(exec_idx)])
@@ -1368,7 +1423,13 @@ def _open_position(run: _BacktestRun, ctx: _BarContext) -> bool | None:
 
 
 def _close_position(run: _BacktestRun, ctx: _BarContext) -> bool:
-    """执行策略/通用止损平仓。False=没有仓可平，这根直接跳过。"""
+    """
+    执行策略/通用止损平仓。False=没有仓可平，这根直接跳过。
+
+    口径：touch 模式下止损在触发根就成交（当根 high/low 打穿 → 按止损价或更差的开盘价 + 滑点），
+    不推到下一根；只有 close 确认模式、主动离场和收盘清仓才用下一根开盘/当根收盘。
+    实盘盘中用还在走的那根判触及，触发根与这里一致。
+    """
     strategy = run.strategy
     symbol = run.symbol
     mult = run.mult
@@ -1746,7 +1807,6 @@ def _params_snapshot(setup: _BacktestSetup, run: _BacktestRun) -> dict[str, Any]
         "max_daily_loss": float(risk.get("max_daily_loss", 1000)),
         "min_order_interval_sec": int(risk.get("min_order_interval_sec", 60)),
         "max_orders_per_day": int(risk.get("max_orders_per_day", 20)),
-        "margin_per_lot": float(risk.get("margin_per_lot", 0) or 0),
         # 这一笔仓最多要交多少保证金。收益率用它做分母，不拿来改手数。
         "margin_used": peak_margin(run.trades, run.mult, setup.margin_rate),
         "margin_rate": setup.margin_rate,

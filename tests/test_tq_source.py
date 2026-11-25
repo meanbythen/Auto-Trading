@@ -407,7 +407,10 @@ def test_fetch_frame_waits_until_history_is_filled() -> None:
 
 
 def test_short_history_warns_once_and_does_not_wait_again(monkeypatch) -> None:
-    """合约历史不够时：close 不再增加就停；同一条告警只写一次，下一轮不再空等。"""
+    """合约历史不够时：close 不再增加就停；同一条告警只写一次。
+
+    第一轮：1 次推进 + 3 次确认填不满；下一轮不再空等 15 秒，但仍推进 1 次。
+    """
     from src.data import tq_source
 
     _clear_history_short()
@@ -437,9 +440,65 @@ def test_short_history_warns_once_and_does_not_wait_again(monkeypatch) -> None:
     short_warnings = [text for text in warnings if "只填满" in text]
     assert len(first) == 5
     assert len(second) == 5
-    assert fake.waits == 3
+    # 第一轮：1 次推进 + 3 次确认填不满；第二轮：跳过等待循环，只保留 1 次推进。
+    assert fake.waits == 5
     assert len(short_warnings) == 1
     assert "5/10" in short_warnings[0]
+
+
+def test_full_history_still_pumps_event_loop_once() -> None:
+    """历史已经填满时，每轮也要推进一次事件循环。
+
+    天勤的 K 线序列只有事件循环被推进才会刷新；一次都不推进就会出现
+    「连接没断、对账正常，但最后一根 K 线停住」，只能靠僵死检测重建来治标。
+    """
+    _clear_history_short()
+    raw = _raw(*[f"2026-10-30 01:{m:02d}" for m in range(10)])
+
+    class _FullApi:
+        def __init__(self) -> None:
+            self.waits = 0
+
+        def get_kline_serial(self, symbol: str, seconds: int, data_length: int = 200) -> pd.DataFrame:
+            return raw
+
+        def wait_update(self, deadline: float | None = None) -> None:
+            self.waits += 1
+
+    fake = _FullApi()
+    assert len(fetch_frame("fu2701", "5", limit=10, api=fake)) == 10
+    assert len(fetch_frame("fu2701", "5", limit=10, api=fake)) == 10
+    # 两轮各推进一次；填满之后不会再多等。
+    assert fake.waits == 2
+
+
+def test_pump_is_what_refreshes_the_serial() -> None:
+    """副作用契约：只有 wait_update 才会让序列前进，每轮取数都必须推进。
+
+    假客户端模拟天勤的真实行为——不推进就保持原样。如果哪天有人把每轮推进
+    删掉，第二轮的最后一根K线就不会前进，这条用例会失败。
+    """
+    _clear_history_short()
+    starts = [f"2026-10-30 01:{m:02d}" for m in range(10)]
+
+    class _LiveApi:
+        def __init__(self) -> None:
+            self.waits = 0
+            self.raw = _raw(*starts)
+
+        def get_kline_serial(self, symbol: str, seconds: int, data_length: int = 200) -> pd.DataFrame:
+            return self.raw
+
+        def wait_update(self, deadline: float | None = None) -> None:
+            self.waits += 1
+            # 服务端把新的一根追加到同一个序列对象里。
+            self.raw.loc[len(self.raw)] = _raw(f"2026-10-30 01:{self.waits + 10:02d}").iloc[0]
+
+    fake = _LiveApi()
+    first = fetch_frame("fu2701", "5", limit=10, api=fake)
+    second = fetch_frame("fu2701", "5", limit=10, api=fake)
+    assert fake.waits == 2
+    assert second.index[-1] > first.index[-1]
 
 
 def _bars_at(*stamps: str) -> pd.DataFrame:

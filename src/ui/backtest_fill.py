@@ -58,38 +58,3 @@ def first_symbol(symbols_text: str) -> str:
         if piece:
             return piece
     return "bu2612"
-
-
-def parse_margin_map(raw: str) -> dict[str, float]:
-    """读配置页「品种保证金」，例如 bu:7794,c:1500。写错的一段跳过。"""
-    out: dict[str, float] = {}
-    text = str(raw or "").replace("，", ",").replace("；", ",").replace("=", ":")
-    for part in text.split(","):
-        piece = part.strip()
-        if ":" not in piece:
-            continue
-        name, value = piece.split(":", 1)
-        key = product_key(name)
-        if not key:
-            continue
-        try:
-            out[key] = max(0.0, float(value.strip()))
-        except ValueError:
-            continue
-    return out
-
-
-def margin_text_for_symbol(symbol: str, generic_margin: str, margin_map_text: str) -> str:
-    """
-    回测页只有一个兜底「每手保证金」金额。
-
-    品种表写了保证金比例时，手数按开仓价现算，不用这个框。
-    没写比例、只写了金额时，才用这个品种的固定金额。
-    """
-    specific = parse_margin_map(margin_map_text).get(product_key(symbol), 0.0)
-    if specific > 0:
-        if specific == int(specific):
-            return str(int(specific))
-        return str(specific)
-    text = str(generic_margin or "").strip()
-    return text or "0"

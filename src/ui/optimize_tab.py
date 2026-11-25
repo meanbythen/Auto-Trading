@@ -753,7 +753,6 @@ class OptimizeTabMixin:
             "max_daily_loss": risk_now.get("max_daily_loss"),
             "min_order_interval_sec": risk_now.get("min_order_interval_sec"),
             "max_orders_per_day": risk_now.get("max_orders_per_day"),
-            "margin_per_lot": risk_now.get("margin_per_lot", 0),
             "skipped_opens": {},
         }
         cross_symbols = list(self._watch_symbols)

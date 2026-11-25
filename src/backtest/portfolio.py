@@ -298,13 +298,12 @@ def _open_margin(
     symbol: str,
     day: datetime,
     *,
-    lot_margin: float | None,
     margin_rate: float | None,
 ) -> tuple[float, bool]:
     """这一腿在某一天占用的保证金合计，以及当天是否有仓。
 
-    优先级：保证金比例 × 开仓价 × 乘数 → 旧列每手保证金 → 10% 兜底估算。
-    比例是总表的主口径，价格变了每手保证金也会跟着变；旧列只在没填比例时用。
+    只按「保证金比例 × 开仓价 × 乘数」算；没填比例的品种按 10% 估算并会在结果里点名。
+    不再使用任何每手保证金固定金额。
     """
     total = 0.0
     holding = False
@@ -323,8 +322,6 @@ def _open_margin(
         mult = _number(getattr(trade, "multiplier", 0))
         if margin_rate and margin_rate > 0 and price > 0 and mult > 0:
             total += price * mult * volume * margin_rate
-        elif lot_margin and lot_margin > 0:
-            total += volume * lot_margin
         elif price > 0 and mult > 0:
             total += price * mult * volume * MARGIN_RATE
     return total, holding
@@ -333,7 +330,6 @@ def _open_margin(
 def _trade_margin(
     trade: Any,
     *,
-    lot_margin: float | None,
     margin_rate: float | None,
 ) -> float:
     """一笔成交开仓时占用的保证金。口径与 _open_margin 保持一致。"""
@@ -344,8 +340,6 @@ def _trade_margin(
     mult = _number(getattr(trade, "multiplier", 0))
     if margin_rate and margin_rate > 0 and price > 0 and mult > 0:
         return price * mult * volume * margin_rate
-    if lot_margin and lot_margin > 0:
-        return volume * lot_margin
     if price > 0 and mult > 0:
         return price * mult * volume * MARGIN_RATE
     return 0.0
@@ -355,7 +349,6 @@ def simulate_shared_capital(
     legs: Iterable[Any],
     *,
     initial_capital: float,
-    margin_by_lot: dict[str, float] | None = None,
     margin_rates: dict[str, float] | None = None,
     max_margin_usage: float | None = None,
     daily_loss_limit: float | None = None,
@@ -367,8 +360,7 @@ def simulate_shared_capital(
     """共享资金账：所有腿抢同一个保证金池，开不起就记「拒开」。
 
     这是对既有「各腿独立跑满资金、再按权重缩放」的补充，不改原组合权益。
-    保证金占用按开仓价 × 乘数 × 比例（或每手保证金）逐笔累加；平仓日当天仍占用，
-    次一交易日释放。
+    保证金占用按开仓价 × 乘数 × 比例逐笔累加；平仓日当天仍占用，次一交易日释放。
 
     同一天多腿同时触发时按第 4.3 节的顺序重放：
     风险预算占用率（高→低）→ 资金效率（高→低）→ 相关性惩罚（高相关排后）
@@ -377,7 +369,6 @@ def simulate_shared_capital(
     配置 max_heat_pct 后，已持仓 + 本笔的预计风险不得超过该比例权益，超了拒开。
     """
     capital = _number(initial_capital)
-    lot_margins = dict(margin_by_lot or {})
     rates = dict(margin_rates or {})
     usage = 100.0 if max_margin_usage is None else _number(max_margin_usage)
     if usage <= 0:
@@ -403,7 +394,6 @@ def simulate_shared_capital(
             exit_day = _parse_day(getattr(trade, "exit_time", "")) or entry
             margin = _trade_margin(
                 trade,
-                lot_margin=lot_margins.get(symbol),
                 margin_rate=rates.get(symbol),
             )
             pnl = _number(getattr(trade, "pnl", 0))
@@ -617,7 +607,6 @@ def combine_results(
     initial_capital: float,
     weights: dict[str, float] | None = None,
     mode: str = "equal",
-    margin_by_lot: dict[str, float] | None = None,
     margin_rates: dict[str, float] | None = None,
     max_margin_usage: float | None = None,
     daily_loss_limit: float | None = None,
@@ -710,16 +699,12 @@ def combine_results(
         portfolio_equity.append(total)
 
     # 保证金与同时持仓。
-    lot_margins = dict(margin_by_lot or {})
     rates = dict(margin_rates or {})
     by_rate_symbols = [symbol for symbol in curves if symbol in rates]
-    by_lot_symbols = [symbol for symbol in curves if symbol not in rates and symbol in lot_margins]
-    estimated = [symbol for symbol in curves if symbol not in rates and symbol not in lot_margins]
+    estimated = [symbol for symbol in curves if symbol not in rates]
     parts: list[str] = []
     if by_rate_symbols:
         parts.append("配置保证金比例×开仓价×乘数")
-    if by_lot_symbols:
-        parts.append("配置每手保证金")
     if estimated:
         parts.append("10% 估算（" + "、".join(estimated) + "）")
     margin_source = "；".join(parts) if parts else "没有保证金数据"
@@ -738,7 +723,6 @@ def combine_results(
                 result_of[symbol],
                 symbol,
                 stamp,
-                lot_margin=lot_margins.get(symbol),
                 margin_rate=rates.get(symbol),
             )
             day_margin += amount * weight_of.get(symbol, 0.0)
@@ -847,7 +831,6 @@ def combine_results(
     result["shared_capital"] = simulate_shared_capital(
         kept,
         initial_capital=capital,
-        margin_by_lot=lot_margins,
         margin_rates=rates,
         max_margin_usage=max_margin_usage if max_margin_usage is not None else 100.0,
         daily_loss_limit=daily_loss_limit,
@@ -873,26 +856,22 @@ class PortfolioLeg:
 
 def _margin_inputs(
     cfg: dict[str, Any] | None, symbols: list[str]
-) -> tuple[dict[str, float], dict[str, float]]:
-    """从配置读保证金：返回（每手保证金金额，保证金比例）。
+) -> dict[str, float]:
+    """从配置读保证金比例（小数，如 0.2274）。
 
-    比例才是总表里的主口径（如 22.74%）；「每手保证金」是旧列，优先用。
-    两者都没有的品种，合并时按 10% 估算并在结果里点名。
+    这是唯一口径：占用 = 开仓价 × 每手数量 × 比例。
+    没填比例的品种合并时按 10% 估算并在结果里点名。
     """
     from src.account.slippage_log import product_of
 
     contracts = _box((cfg or {}).get("risk")).get("contracts") or {}
-    by_lot: dict[str, float] = {}
     by_rate: dict[str, float] = {}
     for symbol in symbols:
         row = _box(contracts.get(product_of(symbol)))
-        amount = _number(row.get("margin"))
-        if amount > 0:
-            by_lot[symbol] = amount
         rate = _number(row.get("margin_rate_pct"))
         if rate > 0:
             by_rate[symbol] = rate / 100.0
-    return by_lot, by_rate
+    return by_rate
 
 
 def run_portfolio_backtest(
@@ -1020,13 +999,12 @@ def run_portfolio_backtest(
     allowed_slip = _number(backtest_box.get("allowed_slip_ticks")) or 2.0
     portfolio_box = _box(_box((cfg or {}).get("risk")).get("portfolio"))
     heat_value = _number(portfolio_box.get("max_heat_pct"))
-    by_lot, by_rate = _margin_inputs(cfg, [leg.symbol for leg in legs])
+    by_rate = _margin_inputs(cfg, [leg.symbol for leg in legs])
     combined = combine_results(
         legs,
         initial_capital=capital,
         weights=weight_of,
         mode=str(allocated.get("mode") or mode),
-        margin_by_lot=by_lot,
         margin_rates=by_rate,
         max_margin_usage=usage,
         daily_loss_limit=loss_value if loss_value > 0 else None,

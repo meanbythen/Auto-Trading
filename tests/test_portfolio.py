@@ -157,9 +157,9 @@ def test_margin_peak_sums_concurrent_legs_and_counts_positions():
         [a, b],
         initial_capital=100_000.0,
         weights={"a": 0.5, "b": 0.5},
-        margin_by_lot={"a": 1_000.0, "b": 2_000.0},
+        margin_rates={"a": 0.10, "b": 0.20},
     )
-    assert out["margin_source"] == "配置每手保证金"
+    assert out["margin_source"] == "配置保证金比例×开仓价×乘数"
     # 01-03 两腿同时持仓：500 + 1000。
     assert out["margin_peak"] == pytest.approx(1_500.0)
     assert out["max_concurrent"] == 2
@@ -232,11 +232,11 @@ def test_margin_ok_compares_percent_with_percent():
     a = _leg("a", [100.0], days, [_trade("a", "2024-01-02 09:00", "2024-01-02 15:00")])
     tight = combine_results(
         [a], initial_capital=100_000.0, weights={"a": 1.0},
-        margin_by_lot={"a": 30_000.0}, max_margin_usage=80.0,
+        margin_rates={"a": 3.0}, max_margin_usage=80.0,
     )
     loose_usage = combine_results(
         [a], initial_capital=100_000.0, weights={"a": 1.0},
-        margin_by_lot={"a": 30_000.0}, max_margin_usage=10.0,
+        margin_rates={"a": 3.0}, max_margin_usage=10.0,
     )
     assert tight["margin_ok"] is True
     assert loose_usage["margin_ok"] is False
@@ -247,14 +247,14 @@ def test_margin_source_names_estimated_symbols():
     a = _leg("a", [100.0], days, [_trade("a", "2024-01-02 09:00", "2024-01-02 15:00")])
     b = _leg("b", [100.0], days, [_trade("b", "2024-01-02 09:00", "2024-01-02 15:00")])
     out = combine_results(
-        [a, b], initial_capital=100_000.0, weights={"a": 0.5, "b": 0.5}, margin_by_lot={"a": 1_000.0}
+        [a, b], initial_capital=100_000.0, weights={"a": 0.5, "b": 0.5}, margin_rates={"a": 0.10}
     )
-    assert "配置每手保证金" in out["margin_source"]
+    assert "配置保证金比例" in out["margin_source"]
     assert "b" in out["margin_source"]
     assert any("前向填充" in note for note in out["notes"])
 
 
-def test_margin_rate_used_when_lot_margin_missing():
+def test_margin_rate_used_for_peak():
     days = ["2024-01-02"]
     # 1000 元 × 10 倍 × 20% = 2000；若错用 10% 兜底会算成 1000。
     a = _leg("a", [100.0], days, [_trade("a", "2024-01-02 09:00", "2024-01-02 15:00", price=1000.0, mult=10.0)])

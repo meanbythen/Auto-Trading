@@ -21,7 +21,13 @@ from loguru import logger
 from src.data.periods import period_label
 
 from .dual_cycle import DualCycleMixin, donchian_prior, htf_bias, last_atr
-from .types import PositionState, StrategyAction, StrategyDecision, stop_triggered
+from .types import (
+    PositionState,
+    StrategyAction,
+    StrategyDecision,
+    forming_price_range,
+    stop_triggered,
+)
 
 
 class DualDonchianStrategy(DualCycleMixin):
@@ -49,6 +55,7 @@ class DualDonchianStrategy(DualCycleMixin):
         now: datetime | None = None,
         trail_bars: pd.DataFrame | None = None,
         trend_bars: pd.DataFrame | None = None,
+        forming: pd.DataFrame | None = None,
     ) -> StrategyDecision:
         del trail_bars
         now = now or datetime.now()
@@ -70,7 +77,8 @@ class DualDonchianStrategy(DualCycleMixin):
             adx_min=self.adx_min,
         )
         bar = bars.iloc[-1]
-        bar_id = str(bar.name)
+        trigger_mode = forming is not None and len(forming) > 0
+        bar_id = str(forming.index[-1]) if trigger_mode else str(bar.name)
         if pos.side != "flat":
             return self._manage(symbol, bars, pos, bias, now, bar_id)
 
@@ -89,6 +97,28 @@ class DualDonchianStrategy(DualCycleMixin):
             return StrategyDecision(StrategyAction.HOLD, symbol, "小周期通道或波动还没算稳")
         up, down = band
         close = float(bar["close"])
+        if trigger_mode:
+            price_range = forming_price_range(forming)
+            if price_range is None:
+                return StrategyDecision(
+                    StrategyAction.HOLD, symbol, "未收线K线读不到最高最低，先等"
+                )
+            fh, fl = price_range
+            if bias == "long" and fh >= up:
+                stop = up - self.atr_mult * atr
+                return self._open(
+                    symbol, now, bar_id, up, "long", stop, up, trigger_price=up
+                )
+            if bias == "short" and fl <= down:
+                stop = down + self.atr_mult * atr
+                return self._open(
+                    symbol, now, bar_id, down, "short", stop, down, trigger_price=down
+                )
+            return StrategyDecision(
+                StrategyAction.HOLD,
+                symbol,
+                f"盘中还在通道里（{down:.2f}~{up:.2f}），等真正走出去",
+            )
         if bias == "long" and close > up:
             stop = close - self.atr_mult * atr
             return self._open(symbol, now, bar_id, close, "long", stop, up)
@@ -111,6 +141,8 @@ class DualDonchianStrategy(DualCycleMixin):
         side: str,
         stop: float,
         broken: float,
+        *,
+        trigger_price: float | None = None,
     ) -> StrategyDecision:
         risk = entry - stop if side == "long" else stop - entry
         if risk <= 0:
@@ -132,13 +164,17 @@ class DualDonchianStrategy(DualCycleMixin):
         self._pending[symbol] = {"time": now, "stop": stop, "bar_id": bar_id}
         self._signaled_bar[symbol] = bar_id
         logger.info("{} {}", symbol, text)
+        meta = {"signal": signal, "bar_id": bar_id}
+        if trigger_price is not None:
+            meta["intraday_entry"] = True
         return StrategyDecision(
             action,
             symbol,
             text,
             stop_price=stop,
             entry_price=entry,
-            meta={"signal": signal, "bar_id": bar_id},
+            trigger_price=trigger_price,
+            meta=meta,
         )
 
     def _manage(

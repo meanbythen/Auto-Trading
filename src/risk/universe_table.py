@@ -4,8 +4,9 @@
 功能：一张表同时管「关注哪些合约」和「保证金比例 / 每手数量 / 手续费」。
 原理：只改这一处，启动和保存时读入 → 写入 strategy.symbols 与 risk.contracts。
       开仓占用 = 开仓价 × 每手数量 × 保证金比例%。价格涨了，同一手要交的钱也变多。
+      只有比例是唯一口径，不再保留「每手保证金」固定金额，避免长期不更新导致占用失真。
       同品种（如 fu2701 / fu2705）比例、每手数量、手续费必须相同，否则拒绝载入并提示。
-      没填比例时，仍可用旧列「每手保证金」或配置页兜底金额。
+      没填比例的行读入后比例为 0；实盘/回测算仓时会拒绝开仓并提示补比例。
       每手数量就是合约乘数（CTP「每手数量」），1 点价格变动时每手盈亏≈这个数（元）。
       开仓手续费 / 平仓手续费 / 平今手续费：每手多少元。
       平仓手续费空着时跟开仓相同；平今空着时跟平仓（或开仓）相同；填 0 表示免费。
@@ -28,7 +29,6 @@ _UNIVERSE_CACHE_SEC = 3.0
 _LAST_UNIVERSE_LOG = ""
 
 DEFAULT_REL_PATH = "config/品种与合约.xlsx"
-LEGACY_MARGIN_REL = "config/品种保证金.xlsx"
 SHEET_NAME = "品种与合约"
 # 每跳价格（最小变动价位）留空时，用交易配置里的全局 price_tick。
 HEADERS = (
@@ -36,7 +36,6 @@ HEADERS = (
     "中文名",
     "保证金比例%",
     "每手数量",
-    "每手保证金",
     "开仓手续费",
     "平仓手续费",
     "平今手续费",
@@ -70,7 +69,7 @@ def parse_margin_rate_pct(value: object) -> float:
     把表格里的保证金比例收成「百分之几」。
 
     23 或 23% → 23；0.23 → 也当成 23%（CTP 回报是小数）。
-    大于 100 的数是旧的每手保证金金额，不当比例。
+    大于 100 的数明显不是保证金比例，按无效处理（返回 0）。
     """
     text = str(value or "").strip().replace("%", "")
     if not text:
@@ -141,7 +140,6 @@ def rows_from_cfg(cfg: dict[str, Any]) -> list[dict[str, Any]]:
                 "symbol": sym,
                 "name": str(box.get("name") or key),
                 "margin_rate_pct": parse_margin_rate_pct(box.get("margin_rate_pct")),
-                "margin": max(0.0, _as_float(box.get("margin"), 0.0)),
                 "multiplier": max(0.1, _as_float(box.get("multiplier"), 10.0)),
                 "commission": max(0.0, _as_float(box.get("commission"), 0.0)),
                 "commission_close": _optional_named(box, "commission_close"),
@@ -166,7 +164,6 @@ def rows_from_cfg(cfg: dict[str, Any]) -> list[dict[str, Any]]:
                 "symbol": code,
                 "name": str(item.get("name") or code),
                 "margin_rate_pct": parse_margin_rate_pct(item.get("margin_rate_pct")),
-                "margin": max(0.0, _as_float(item.get("margin"), 0.0)),
                 "multiplier": max(0.1, _as_float(item.get("multiplier"), 10.0)),
                 "commission": max(0.0, _as_float(item.get("commission"), 0.0)),
                 "commission_close": _optional_named(item, "commission_close"),
@@ -207,7 +204,6 @@ def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     """补齐手续费/每跳字段，方便写表和校验。"""
     out = dict(row)
     out["margin_rate_pct"] = parse_margin_rate_pct(out.get("margin_rate_pct"))
-    out["margin"] = max(0.0, _as_float(out.get("margin"), 0.0))
     out["multiplier"] = max(0.1, _as_float(out.get("multiplier"), 10.0))
     out["commission"] = max(0.0, _as_float(out.get("commission"), 0.0))
     for fee_key in ("commission_close", "commission_close_today"):
@@ -249,7 +245,6 @@ def write_universe_table(path: Path | str, rows: list[dict[str, Any]]) -> Path:
     for row in rows:
         item = _normalize_row(row)
         rate = float(item.get("margin_rate_pct") or 0)
-        margin = float(item.get("margin") or 0)
         mult = float(item.get("multiplier") or DEFAULT_MULTIPLIER)
         fee = float(item.get("commission") or 0)
         close_fee = item.get("commission_close")
@@ -261,7 +256,6 @@ def write_universe_table(path: Path | str, rows: list[dict[str, Any]]) -> Path:
                 str(item.get("name") or ""),
                 _excel_number(rate) if rate > 0 else None,
                 _excel_number(mult),
-                _excel_number(margin) if margin > 0 else None,
                 _excel_number(fee),
                 _excel_number(close_fee) if close_fee is not None else None,
                 _excel_number(today) if today is not None else None,
@@ -275,14 +269,13 @@ def write_universe_table(path: Path | str, rows: list[dict[str, Any]]) -> Path:
     sheet.column_dimensions["B"].width = 14
     sheet.column_dimensions["C"].width = 14
     sheet.column_dimensions["D"].width = 12
-    sheet.column_dimensions["E"].width = 14
+    sheet.column_dimensions["E"].width = 12
     sheet.column_dimensions["F"].width = 12
     sheet.column_dimensions["G"].width = 12
-    sheet.column_dimensions["H"].width = 12
-    sheet.column_dimensions["I"].width = 8
-    sheet.column_dimensions["J"].width = 12
-    sheet.column_dimensions["K"].width = 42
-    sheet.column_dimensions["L"].width = 16
+    sheet.column_dimensions["H"].width = 8
+    sheet.column_dimensions["I"].width = 12
+    sheet.column_dimensions["J"].width = 42
+    sheet.column_dimensions["K"].width = 16
     book.save(file)
     return file
 
@@ -316,7 +309,6 @@ def read_universe_table(path: Path | str) -> list[dict[str, Any]]:
             names,
             ("保证金比例%", "保证金比例", "保证金率", "margin_rate", "margin_rate_pct"),
         )
-        idx_margin = _find_col(names, ("每手保证金", "每手保证金(兜底)", "margin"))
         idx_qty = _find_col(names, ("每手数量", "volume_multiple", "VolumeMultiple"))
         idx_mult = _find_col(names, ("乘数", "合约乘数", "multiplier"))
         idx_fee = _find_col(names, ("开仓手续费", "每手手续费", "手续费", "commission"))
@@ -328,8 +320,8 @@ def read_universe_table(path: Path | str) -> list[dict[str, Any]]:
         idx_flat = _find_col(names, ("清仓时刻", "清仓", "flatten_times", "flatten"))
         if idx_sym is None:
             raise ValueError("表格至少要有「合约代码」")
-        if idx_rate is None and idx_margin is None:
-            raise ValueError("表格要有「保证金比例%」，或旧列「每手保证金」")
+        if idx_rate is None:
+            raise ValueError("表格要有「保证金比例%」；保证金只按 价格×每手数量×比例 计算")
 
         rows: list[dict[str, Any]] = []
         for raw in rows_iter:
@@ -340,9 +332,6 @@ def read_universe_table(path: Path | str) -> list[dict[str, Any]]:
                 continue
             name_raw = raw[idx_name] if idx_name is not None and idx_name < len(raw) else ""
             name = str(name_raw or "").strip() or product_key(sym) or sym
-            margin = 0.0
-            if idx_margin is not None and idx_margin < len(raw):
-                margin = max(0.0, _as_float(raw[idx_margin], 0.0))
             rate = 0.0
             if idx_rate is not None and idx_rate < len(raw):
                 rate = parse_margin_rate_pct(raw[idx_rate])
@@ -384,7 +373,6 @@ def read_universe_table(path: Path | str) -> list[dict[str, Any]]:
                         "symbol": sym,
                         "name": name,
                         "margin_rate_pct": rate,
-                        "margin": margin,
                         "multiplier": mult,
                         "commission": fee,
                         "commission_close": close_fee,
@@ -412,35 +400,33 @@ def _fee_signature(row: dict[str, Any]) -> tuple[float, float | None, float | No
 
 
 def _assert_product_margins_consistent(rows: list[dict[str, Any]]) -> None:
-    """同品种多行时，比例、每手数量、兜底金额、手续费、每跳价格必须完全一致。"""
-    seen: dict[str, tuple[float, float, float, tuple[float, float | None, float | None], float | None, str]] = {}
+    """同品种多行时，保证金比例、每手数量、手续费、每跳价格必须完全一致。"""
+    seen: dict[str, tuple[float, float, tuple[float, float | None, float | None], float | None, str]] = {}
     for row in rows:
         key = product_key(str(row.get("symbol") or ""))
         if not key:
             continue
         rate = float(row.get("margin_rate_pct") or 0)
-        margin = float(row.get("margin") or 0)
         mult = float(row.get("multiplier") or DEFAULT_MULTIPLIER)
         fees = _fee_signature(row)
         tick = _optional_tick(row)
         prev = seen.get(key)
         if prev is None:
-            seen[key] = (rate, margin, mult, fees, tick, str(row.get("symbol")))
+            seen[key] = (rate, mult, fees, tick, str(row.get("symbol")))
             continue
         if (
             abs(prev[0] - rate) > 1e-9
-            or abs(prev[1] - margin) > 1e-9
-            or abs(prev[2] - mult) > 1e-9
-            or prev[3] != fees
-            or prev[4] != tick
+            or abs(prev[1] - mult) > 1e-9
+            or prev[2] != fees
+            or prev[3] != tick
         ):
             raise ValueError(
-                f"品种 {key} 出现不同的保证金/每手数量/手续费/每跳价格："
-                f"{prev[5]} 是比例{prev[0]:g}%、金额{prev[1]:g}、每手数量{prev[2]:g}、"
-                f"开仓手续费{prev[3][0]:g}、平仓{prev[3][1] if prev[3][1] is not None else '空'}、"
-                f"平今{prev[3][2] if prev[3][2] is not None else '空'}、"
-                f"每跳{prev[4] if prev[4] is not None else '空'}；"
-                f"{row.get('symbol')} 是比例{rate:g}%、金额{margin:g}、每手数量{mult:g}、"
+                f"品种 {key} 出现不同的保证金比例/每手数量/手续费/每跳价格："
+                f"{prev[4]} 是比例{prev[0]:g}%、每手数量{prev[1]:g}、"
+                f"开仓手续费{prev[2][0]:g}、平仓{prev[2][1] if prev[2][1] is not None else '空'}、"
+                f"平今{prev[2][2] if prev[2][2] is not None else '空'}、"
+                f"每跳{prev[3] if prev[3] is not None else '空'}；"
+                f"{row.get('symbol')} 是比例{rate:g}%、每手数量{mult:g}、"
                 f"开仓手续费{fees[0]:g}、平仓{fees[1] if fees[1] is not None else '空'}、"
                 f"平今{fees[2] if fees[2] is not None else '空'}、"
                 f"每跳{tick if tick is not None else '空'}。"
@@ -450,9 +436,9 @@ def _assert_product_margins_consistent(rows: list[dict[str, Any]]) -> None:
 
 def parse_universe_rows(rows: list[dict[str, Any]]) -> tuple[list[str], dict[str, dict[str, Any]]]:
     """
-    拆成：启用中的合约列表 + 品种→{name,margin,multiplier,commission,...}。
+    拆成：启用中的合约列表 + 品种→{name,margin_rate_pct,multiplier,commission,...}。
 
-    未启用的行仍贡献品种保证金（方便以后打开启用），但不进关注名单。
+    未启用的行仍贡献品种保证金比例（方便以后打开启用），但不进关注名单。
     """
     symbols: list[str] = []
     seen_sym: set[str] = set()
@@ -471,7 +457,6 @@ def parse_universe_rows(rows: list[dict[str, Any]]) -> tuple[list[str], dict[str
         box: dict[str, Any] = {
             "name": str(item.get("name") or key),
             "margin_rate_pct": float(item.get("margin_rate_pct") or 0),
-            "margin": float(item.get("margin") or 0),
             "multiplier": float(item.get("multiplier") or DEFAULT_MULTIPLIER),
             "commission": float(item.get("commission") or 0),
         }
@@ -492,39 +477,11 @@ def parse_universe_rows(rows: list[dict[str, Any]]) -> tuple[list[str], dict[str
     return symbols, contracts
 
 
-def _merge_legacy_margins_into_cfg(cfg: dict[str, Any], legacy_path: Path) -> None:
-    """生成总表前，用旧「品种保证金.xlsx」把缺的保证金/乘数补进 cfg。"""
-    if not legacy_path.exists():
-        return
-    try:
-        from src.risk.margin_table import read_margin_table
-
-        legacy_map = read_margin_table(legacy_path)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("读旧保证金表失败，生成总表时跳过: {}", exc)
-        return
-    contracts = cfg.setdefault("risk", {}).setdefault("contracts", {})
-    for code, item in legacy_map.items():
-        box = contracts.get(code)
-        if not isinstance(box, dict):
-            box = {"name": item.get("name") or code, "margin": 0.0, "multiplier": 10.0}
-            contracts[code] = box
-        if float(box.get("margin") or 0) <= 0 and float(item.get("margin") or 0) > 0:
-            box["margin"] = float(item["margin"])
-        if float(box.get("multiplier") or 0) <= 0:
-            box["multiplier"] = float(item.get("multiplier") or DEFAULT_MULTIPLIER)
-        if not str(box.get("name") or "").strip() or str(box.get("name")) == code:
-            if item.get("name"):
-                box["name"] = str(item["name"])
-
-
 def ensure_universe_table(path: Path | str, cfg: dict[str, Any]) -> Path:
-    """没有总表时，按当前配置（关注合约+保证金，必要时合并旧表）生成第一张。"""
+    """没有总表时，按当前配置（关注合约+保证金比例）生成第一张。"""
     file = Path(path)
     if file.exists():
         return file
-    legacy = file.parent / Path(LEGACY_MARGIN_REL).name
-    _merge_legacy_margins_into_cfg(cfg, legacy)
     rows = rows_from_cfg(cfg)
     write_universe_table(file, rows)
     logger.info("已生成品种与合约总表: {}（{} 行）", file, len(rows))
@@ -539,7 +496,7 @@ def _universe_fingerprint(
     for code in sorted(contracts):
         item = contracts[code]
         bits.append(
-            f"{code}:{item.get('margin_rate_pct')}:{item.get('margin')}:"
+            f"{code}:{item.get('margin_rate_pct')}:"
             f"{item.get('multiplier')}:{item.get('commission')}:"
             f"{item.get('commission_close')}:{item.get('commission_close_today')}"
         )
@@ -564,7 +521,6 @@ def _put_universe_into_cfg(
         box = {
             "name": item["name"],
             "margin_rate_pct": float(item.get("margin_rate_pct") or 0),
-            "margin": float(item["margin"]),
             "multiplier": float(item["multiplier"]),
             "commission": float(item.get("commission") or 0),
         }
@@ -613,6 +569,8 @@ def apply_universe_table_to_cfg(
         return symbols, contracts
 
     rows = read_universe_table(table_path)
+    # 旧表还留着「每手保证金」列时整表重写，删掉这一列。
+    upgrade_universe_drop_margin_amount_column(table_path, rows)
     # 旧表没有手续费列时，写回一遍，让 Excel 里出现新列（数字先是 0）。
     upgrade_universe_fee_columns(table_path, rows)
     upgrade_universe_close_fee_column(table_path, rows)
@@ -631,7 +589,7 @@ def apply_universe_table_to_cfg(
     fp = _universe_fingerprint(table_path, symbols, contracts)
     if fp != _LAST_UNIVERSE_LOG:
         logger.info(
-            "已从品种与合约表载入：关注 {} 个合约、{} 个品种保证金/手续费 → {}",
+            "已从品种与合约表载入：关注 {} 个合约、{} 个品种比例/手续费 → {}",
             len(symbols),
             len(contracts),
             table_path,
@@ -664,6 +622,19 @@ def _universe_headers_have(path: Path | str, aliases: tuple[str, ...]) -> bool:
 def universe_headers_have_fees(path: Path | str) -> bool:
     """表头里是否已经有手续费列。"""
     return _universe_headers_have(path, ("每手手续费", "手续费", "开仓手续费", "commission"))
+
+
+def upgrade_universe_drop_margin_amount_column(
+    path: Path | str, rows: list[dict[str, Any]] | None = None
+) -> bool:
+    """旧表还有「每手保证金」列时，按新表头整表重写，把这列删掉。"""
+    file = Path(path)
+    if not _universe_headers_have(file, ("每手保证金", "margin")):
+        return False
+    data = rows if rows is not None else read_universe_table(file)
+    write_universe_table(file, data)
+    logger.info("品种与合约表已删除「每手保证金」列: {}", file)
+    return True
 
 
 def upgrade_universe_close_fee_column(path: Path | str, rows: list[dict[str, Any]] | None = None) -> bool:
@@ -750,16 +721,12 @@ def summarize_universe(symbols: list[str], contracts: dict[str, dict[str, Any]])
     fees = []
     for key in sorted(contracts.keys()):
         rate = float(contracts[key].get("margin_rate_pct") or 0)
-        m = float(contracts[key].get("margin") or 0)
         qty = float(contracts[key].get("multiplier") or 0)
         bits = []
         if rate > 0:
             bits.append(f"{rate:g}%")
         if qty > 0:
             bits.append(f"每手{int(qty) if qty == int(qty) else qty}")
-        if m > 0 and rate <= 0:
-            text = str(int(m)) if m == int(m) else str(m)
-            bits.append(f"{text}元")
         if bits:
             margins.append(f"{key}:{','.join(bits)}")
         fee = float(contracts[key].get("commission") or 0)
@@ -791,7 +758,7 @@ def sync_watch_symbols_to_table(
     contracts: dict[str, dict[str, Any]] | None = None,
 ) -> None:
     """
-    界面添加/移出关注后，把启用名单写回总表（保留未启用行和原保证金）。
+    界面添加/移出关注后，把启用名单写回总表（保留未启用行和原保证金比例）。
 
     原理：读出现有表 → 启用集合改成 symbols → 缺的合约补行 → 写回。
     """
@@ -827,7 +794,6 @@ def sync_watch_symbols_to_table(
                         "symbol": sym,
                         "name": str(box.get("name") or key or sym),
                         "margin_rate_pct": parse_margin_rate_pct(box.get("margin_rate_pct")),
-                        "margin": float(box.get("margin") or 0),
                         "multiplier": float(box.get("multiplier") or DEFAULT_MULTIPLIER),
                         "commission": float(box.get("commission") or 0),
                         "commission_close": _optional_named(box, "commission_close"),
@@ -912,7 +878,6 @@ def sync_ctp_contract_to_universe(
                     "symbol": symbol,
                     "name": str(fields.get("name") or key or symbol),
                     "margin_rate_pct": parse_margin_rate_pct(fields.get("margin_rate_pct")),
-                    "margin": 0.0,
                     "multiplier": float(fields.get("multiplier") or DEFAULT_MULTIPLIER),
                     "commission": float(fields.get("commission") or 0),
                     "commission_close": fields.get("commission_close"),

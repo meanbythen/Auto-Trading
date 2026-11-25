@@ -435,14 +435,7 @@ def test_backtest_source_hint_margin_trace_and_opt_sync(real_app, monkeypatch) -
     real_app.bt_source_var.set("新浪")
     assert real_app.bt_source_hint.cget("text") == ""
 
-    real_app.cfg.setdefault("risk", {}).setdefault("contracts", {})["bu"] = {"margin": 12345}
-    real_app.margin_var.set("777")
-    real_app.bt_symbol_var.set("bu2612")
-    assert real_app.bt_margin_var.get() == "12345"
-    real_app.cfg["risk"]["contracts"]["bu"]["margin"] = 0
     real_app.bt_symbol_var.set("bu2613")
-    assert real_app.bt_margin_var.get() == "777"
-
     real_app.bt_engine_var.set("daily_body")
     real_app._set_period_vars("60", real_app.bt_tf_var, real_app.bt_tf_custom_var)
     real_app._set_period_vars("D", real_app.bt_trail_var, real_app.bt_trail_custom_var)
@@ -476,7 +469,6 @@ def test_config_mapping_save_and_reload_round_trip(real_app) -> None:
     real_app.min_interval_var.set("65")
     real_app.max_orders_var.set("7")
     real_app.ctp_max_volume_var.set("4")
-    real_app.margin_var.set("8888")
 
     strategy = real_app.cfg.setdefault("strategy", {})
     body = strategy.setdefault("daily_body", {})
@@ -492,6 +484,7 @@ def test_config_mapping_save_and_reload_round_trip(real_app) -> None:
     real_app.cfg.setdefault("data", {})["quote_check"] = {"enabled": True}
     real_app.cfg.setdefault("risk", {})["max_position"] = 9
     real_app.cfg["risk"]["apply_limits"] = True
+    real_app.cfg["risk"]["margin_per_lot"] = 9999
 
     cfg = real_app._apply_ui_to_cfg()
     assert cfg["strategy"]["engine"] == "daily_body"
@@ -505,6 +498,7 @@ def test_config_mapping_save_and_reload_round_trip(real_app) -> None:
     assert cfg["risk"]["capital"] == 234567
     assert cfg["risk"]["risk_per_trade_pct"] == 1.25
     assert cfg["risk"]["margin_usage_pct"] == 42.5
+    assert "margin_per_lot" not in cfg["risk"]
     assert cfg["risk"]["max_daily_loss"] == 4321
     assert cfg["risk"]["min_order_interval_sec"] == 65
     assert cfg["risk"]["max_orders_per_day"] == 7
@@ -866,7 +860,6 @@ def test_write_backtest_to_config_page_preserves_live_only_values(real_app, monk
     real_app.bt_max_loss_var.set("1234")
     real_app.bt_interval_var.set("66")
     real_app.bt_max_orders_var.set("8")
-    real_app.bt_margin_var.set("7777")
     real_app.bt_start_var.set("2030-01-02")
     real_app.bt_end_var.set("2030-02-03")
     real_app.bt_limits_on_var.set(False)
@@ -889,7 +882,7 @@ def test_write_backtest_to_config_page_preserves_live_only_values(real_app, monk
     assert saved["risk"]["max_daily_loss"] == 1234
     assert saved["risk"]["min_order_interval_sec"] == 66
     assert saved["risk"]["max_orders_per_day"] == 8
-    assert saved["risk"]["margin_per_lot"] == 7777
+    assert "margin_per_lot" not in saved["risk"]
     assert "apply_limits" not in saved["risk"]
     assert saved.get("backtest", {}).get("start_date") != "2030-01-02"
     assert saved.get("backtest", {}).get("end_date") != "2030-02-03"

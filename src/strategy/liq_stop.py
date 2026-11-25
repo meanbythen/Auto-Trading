@@ -22,7 +22,7 @@ from .indicators import average_true_range, price_1d
 from .market_state import adx_series
 from .swing_box import find_pivots
 from .trend_base import TrendStrategyBase
-from .types import PositionState, config_flag
+from .types import PositionState, config_flag, forming_price_range
 
 
 def _zone(levels: list[float], fallback: float, tol: float) -> tuple[float, float]:
@@ -149,6 +149,15 @@ class LiquidityStopStrategy(TrendStrategyBase):
         close = float(bar["close"])
         recent_low = float(price_1d(bars["low"]).iloc[-self.break_window :].min())
         recent_high = float(price_1d(bars["high"]).iloc[-self.break_window :].max())
+        # trigger 模式：forming 的最高/最低也参与「击穿」和「收回」判断。
+        forming_high: float | None = None
+        forming_low: float | None = None
+        if self._forming is not None:
+            price_range = forming_price_range(self._forming)
+            if price_range is not None:
+                forming_high, forming_low = price_range
+                recent_low = min(recent_low, forming_low)
+                recent_high = max(recent_high, forming_high)
         zone_l = float(ind["zone_l"])
         zone_h = float(ind["zone_h"])
         short_l = float(ind["short_l"])
@@ -165,25 +174,27 @@ class LiquidityStopStrategy(TrendStrategyBase):
         # 多头：先向下跌穿多头止损区（吃掉止损），再收回区间上沿之外。
         if plus_di > minus_di and recent_low < zone_l:
             trigger = zone_h + self.entry_offset * atr if self.entry_offset > 0 else zone_h
-            if close > trigger:
+            hit = forming_high > trigger if forming_high is not None else close > trigger
+            if hit:
                 stop = zone_l - self.stop_atr * atr
                 return (
                     "long",
                     stop,
-                    f"以损定开做多 击穿止损区{zone_l:.2f}~{zone_h:.2f}后收回{close:.2f} 止损{stop:.2f}",
-                    meta,
+                    f"以损定开做多 击穿止损区{zone_l:.2f}~{zone_h:.2f}后收回{trigger:.2f} 止损{stop:.2f}",
+                    {**meta, "trigger_price": trigger},
                 )
 
         # 空头：先向上击穿空头止损区，再跌回区间下沿之外。
         if minus_di > plus_di and recent_high > short_h:
             trigger = short_l - self.entry_offset * atr if self.entry_offset > 0 else short_l
-            if close < trigger:
+            hit = forming_low < trigger if forming_low is not None else close < trigger
+            if hit:
                 stop = short_h + self.stop_atr * atr
                 return (
                     "short",
                     stop,
-                    f"以损定开做空 击穿止损区{short_l:.2f}~{short_h:.2f}后跌回{close:.2f} 止损{stop:.2f}",
-                    meta,
+                    f"以损定开做空 击穿止损区{short_l:.2f}~{short_h:.2f}后跌回{trigger:.2f} 止损{stop:.2f}",
+                    {**meta, "trigger_price": trigger},
                 )
         return None
 

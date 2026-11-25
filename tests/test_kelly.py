@@ -49,7 +49,7 @@ def _live_cfg(kelly: dict) -> dict:
             "capital": 100_000,
             "risk_per_trade_pct": 0.5,
             "min_volume": 1,
-            "margin_per_lot": 0,
+            "ignore_margin_cap": True,
             "kelly": kelly,
         },
     }

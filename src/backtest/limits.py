@@ -23,6 +23,8 @@ def skip_reason_key(reason: str) -> str:
         return "当天开仓次数达到上限"
     if "间隔" in text:
         return "两笔开仓间隔太近"
+    if "保证金比例" in text or "拒绝开仓" in text:
+        return "保证金比例缺失，拒绝开仓"
     if "仓位上限" in text or "保证金" in text:
         return "仓位上限/保证金不够"
     return text[:24] or "未开仓"

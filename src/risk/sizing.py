@@ -15,9 +15,10 @@
 2) 仓位上限（保证金占用，公共设置）
    - 填了保证金比例：每手占用 = 开仓价 × 每手数量 × 比例%
      价格高了同一手要交的钱也变多
-   - 没填比例、只写了每手保证金金额：仍按那个固定金额
    - 有占用数时：floor( (权益 × 仓位上限% − 已占用) ÷ 这一手占用 )
-   - 仓位上限% ≤ 0，或本品种没填比例也没填金额：本层不限制
+   - 没填保证金比例：直接拒绝开仓，提示去品种与合约表补比例。
+     表里不再保留「每手保证金」固定金额，避免长期不更新导致占用失真。
+   - 研究/交叉测试显式设 ignore_margin_cap 时本层不限制（不需要保证金数据）
    - 例：燃油 4000 点、每手 10 吨、比例 23% → 每手 9200 元
 
 3) 单笔上限（柜台渠道）
@@ -46,20 +47,15 @@ from src.domain.contracts import DEFAULT_MULTIPLIER, build_contracts
 DEFAULT_MARGIN_USAGE_PCT = 80.0
 
 
-def bind_run_margin(cfg: dict[str, Any], margin_per_lot: float) -> None:
+def disable_margin_cap(cfg: dict[str, Any]) -> None:
     """
-    这一次运行改成同一个每手保证金金额，并关掉品种比例。
+    这一次运行不做保证金上限判断（交叉测试 / 研究用）。
 
-    交叉测试要比策略、不要被高保证金品种卡住时，传入 0。
-    历史回测跟品种表走时不要调用这里，否则价格一变手数还是按死金额算。
-    不写磁盘。
+    只改内存里的 cfg，不写磁盘、不伪造金额：缺保证金数据的品种也能按固定手数跑。
+    实盘和普通回测不要调用这里。
     """
     risk = cfg.setdefault("risk", {})
-    risk["margin_per_lot"] = max(0.0, float(margin_per_lot or 0))
-    for item in (risk.get("contracts") or {}).values():
-        if isinstance(item, dict):
-            item["margin"] = 0
-            item["margin_rate_pct"] = 0
+    risk["ignore_margin_cap"] = True
 
 
 @dataclass
@@ -91,8 +87,8 @@ class PositionSizer:
         self.cash_available: float | None = None
         self.risk_pct = float(risk.get("risk_per_trade_pct", 0.5))
         self.min_volume = int(risk.get("min_volume", 1))
-        # 每手保证金。0 表示品种表也没写时不看保证金。
-        self.margin_per_lot = float(risk.get("margin_per_lot", 0) or 0)
+        # 保证金上限是否跳过。只有交叉测试/研究显式打开；实盘默认必须按表算。
+        self.ignore_margin_cap = bool(risk.get("ignore_margin_cap", False))
         # 仓位上限%：权益里最多拿出这么多交保证金。≤0 表示本层关闭（按全部权益估）。
         try:
             self.margin_usage_pct = float(
@@ -124,8 +120,8 @@ class PositionSizer:
         """
         这个品种 1 手现在要占用多少保证金。
 
-        填了比例：开仓价 × 每手数量 × 比例%。没填比例：用表里的固定金额。
-        再没有就用配置页兜底金额。都是 0 就不限制。
+        只用「保证金比例%」：开仓价 × 每手数量 × 比例%。
+        没填比例、或价格不可用时返回 0，由 calc_open 直接拒绝开仓。
         """
         key = self._product_key(symbol)
         box = self.contracts.get(key, {})
@@ -138,10 +134,7 @@ class PositionSizer:
                 px = 0.0
             if px > 0 and qty > 0:
                 return px * qty * (rate / 100.0)
-        specific = float(box.get("margin", 0) or 0)
-        if specific > 0:
-            return specific
-        return self.margin_per_lot
+        return 0.0
 
     def calc_open(
         self,
@@ -168,9 +161,32 @@ class PositionSizer:
         intent, intent_note, risk_cash, risk_per_lot, stop_dist = self._intent_for_symbol(
             symbol, entry_price, stop_price, kelly_rows=kelly_rows
         )
-        margin_lots, lot_margin, margin_note = self._lots_by_margin_cap(
-            symbol, current_abs_position, positions, entry_price
-        )
+        if intent <= 0:
+            # 意图本来就是 0（缺止损、凯利负期望等），直接按意图原因返回，不再看保证金。
+            margin_lots, lot_margin, margin_note = None, 0.0, ""
+        elif self.ignore_margin_cap:
+            # 研究/交叉测试显式关闭：只看风险手数与单笔上限，不需要保证金数据。
+            margin_lots, lot_margin, margin_note = None, 0.0, ""
+        else:
+            lot_margin = self.margin_for(symbol, entry_price)
+            if lot_margin <= 0:
+                # 没有保证金比例：宁可不开，也不用任何固定金额估算。
+                return SizeResult(
+                    0,
+                    (
+                        f"品种与合约表没有 {symbol} 的保证金比例，"
+                        "无法估算仓位上限，拒绝开仓。"
+                        "请先在「品种与合约」表里补上保证金比例%。"
+                    ),
+                    risk_cash=risk_cash,
+                    risk_per_lot=risk_per_lot,
+                    stop_distance=stop_dist,
+                    intent_lots=intent,
+                    margin_lots=0,
+                )
+            margin_lots, lot_margin, margin_note = self._lots_by_margin_cap(
+                symbol, current_abs_position, positions, entry_price
+            )
 
         caps = [intent]
         if margin_lots is not None:
@@ -308,18 +324,16 @@ class PositionSizer:
         current_abs_position: int,
         positions: dict[str, int] | None,
         entry_price: float | None = None,
-    ) -> tuple[int | None, float, str]:
+    ) -> tuple[int, float, str]:
         """
         仓位上限层：还能再开几手。
 
         预算 = 权益 × 仓位上限%。已占用按各品种自己的保证金扣。
         有比例时按这笔开仓价现算每手占用。
-        没填保证金 → 返回 None（本层不限制）。
+        缺保证金数据由 calc_open 先拒绝，本函数只处理 need>0 的情况。
         仓位上限% ≤ 0 → 仍按全部权益估买得起几手（兼容旧「钱够就开」）。
         """
         need = self.margin_for(symbol, entry_price)
-        if need <= 0:
-            return None, 0.0, ""
 
         pct = float(self.margin_usage_pct or 0)
         if pct <= 0:

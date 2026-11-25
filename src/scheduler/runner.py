@@ -21,7 +21,12 @@ from loguru import logger
 
 from src.data import KlineProvider
 from src.data.kline import bars_age_minutes, is_bar_gap, is_bars_stale
-from src.data.periods import drop_forming_bar, period_label, stale_after_minutes
+from src.data.periods import (
+    canonical_period,
+    drop_forming_bar,
+    period_label,
+    stale_after_minutes,
+)
 from src.kernel.commands import Command, CommandBus, FLATTEN, SCAN, STOP
 from src.kernel.events import EventBus, SIGNAL
 from src.kernel.trace import new_trace_id, set_trace_id
@@ -40,6 +45,13 @@ from src.strategy.decision_guard import (
     apply_partial_tail_gate,
 )
 from src.strategy.generic_stop import GenericStopOverlay
+from src.strategy.types import (
+    ENTRY_MODE_TRIGGER,
+    STOP_MODE_TOUCH,
+    entry_mode_from_cfg,
+    normalize_stop_mode,
+    stop_triggered,
+)
 from src.trader import create_trader
 from src.trader.ctp_logic import position_avg_price
 from src.trader.order_timeline import OrderTimeline, now_iso
@@ -143,6 +155,103 @@ def _eval_now(eval_bars: Any, closed: Any, *, catch_up: bool) -> datetime | None
         return _bar_now_from_prefix(eval_bars)
     del eval_bars, closed
     return datetime.now()
+
+
+# 盘中止损同一根 K 线内的重发间隔；平仓单没成交时才会用到。
+_INTRADAY_STOP_RETRY_SEC = 120.0
+# 开仓就在这根开盘后几十秒内（正常是收线后下一轮扫描成交）时，仍允许判这根；
+# 超出这个宽限说明这根里有较长一段是开仓前的行情，整根跳过，避免被进场前的针扫掉。
+_ENTRY_BAR_GRACE_SEC = 60.0
+
+
+def _entry_dt(pos: Any) -> datetime | None:
+    """程序账的开仓时刻；没有或解析不了返回 None（盘中判定按保守跳过处理）。"""
+    raw = getattr(pos, "opened_at", None)
+    if not raw:
+        return None
+    try:
+        stamp = pd.Timestamp(raw)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(stamp):
+        return None
+    if getattr(stamp, "tzinfo", None) is not None:
+        stamp = stamp.tz_localize(None)
+    return stamp.to_pydatetime()
+
+
+def _bar_start(bar_label: Any, period: str) -> datetime | None:
+    """右标签 K 线的开始时刻。日线/周线或解析失败返回 None。"""
+    code = canonical_period(period)
+    if not code.isdigit():
+        return None
+    try:
+        stamp = pd.Timestamp(bar_label)
+    except (TypeError, ValueError):
+        return None
+    if pd.isna(stamp):
+        return None
+    if getattr(stamp, "tzinfo", None) is not None:
+        stamp = stamp.tz_localize(None)
+    return stamp.to_pydatetime() - timedelta(minutes=int(code))
+
+
+def _intraday_stop_decision(
+    leg: Any,
+    symbol: str,
+    pos: Any,
+    forming: Any,
+    *,
+    period: str,
+) -> StrategyDecision | None:
+    """
+    持仓期间用还在走的那根 K 线判一次「触及止损」。
+
+    止损线仍只由已收盘 K 线算出（存在持仓的 trail_stop / initial_stop 上），
+    forming 只负责碰线：最高/最低越过止损位就平，不再等这根收线。
+    开仓那根若含较长一段开仓前行情（超过宽限 60 秒），整根跳过，避免刚进场就被进场前的针扫掉；
+    正常「收线后下一轮扫描成交」只差几秒，这根照判，和回测的成交根一致。
+    """
+    if pos is None:
+        return None
+    side = str(getattr(pos, "side", "flat") or "flat")
+    if side not in {"long", "short"}:
+        return None
+    if normalize_stop_mode(getattr(leg, "stop_mode", "touch")) != STOP_MODE_TOUCH:
+        return None
+    if forming is None or len(forming) == 0:
+        return None
+    stop = float(getattr(pos, "trail_stop", 0) or getattr(pos, "initial_stop", 0) or 0)
+    if stop <= 0:
+        return None
+    bar_start = _bar_start(forming.index[-1], period)
+    if bar_start is None:
+        return None
+    entry = _entry_dt(pos)
+    if entry is None or entry > bar_start + timedelta(seconds=_ENTRY_BAR_GRACE_SEC):
+        return None
+    row = forming.iloc[-1]
+    try:
+        high = float(row["high"])
+        low = float(row["low"])
+        close = float(row["close"])
+    except (TypeError, ValueError, KeyError):
+        return None
+    if pd.isna(high) or pd.isna(low) or pd.isna(close):
+        return None
+    if not stop_triggered(
+        side=side, stop=stop, close=close, high=high, low=low, mode=STOP_MODE_TOUCH
+    ):
+        return None
+    label = str(getattr(leg, "label", "") or getattr(leg, "engine", "") or "策略")
+    return StrategyDecision(
+        StrategyAction.CLOSE,
+        symbol,
+        f"{label}止损 {stop:.2f} 盘中触及离场",
+        stop_price=stop,
+        entry_price=float(getattr(pos, "entry_price", 0) or 0),
+        meta={"intraday_stop": True, "bar_id": str(forming.index[-1])},
+    )
 
 
 class TradingBot(
@@ -259,6 +368,8 @@ class TradingBot(
         self._last_signal_bars: dict[str, Any] = {}
         self._dyn_cut_key: str = ""
         self._dyn_cut_pending: str = ""
+        # 盘中止损：同一根正在走的 K 线只发一次平仓单（symbol -> (bar_id, monotonic)）。
+        self._intraday_stop_sent: dict[str, tuple[str, float]] = {}
         # GUI：点击成功后是否立刻当作成交记账（默认 True 可挂机；False=只记「已发单」不改持仓，更安全）
         gui_cfg = (trade.get("gui") or {}) if isinstance(trade, dict) else {}
         self.gui_assume_fill = bool(gui_cfg.get("assume_fill", True))
@@ -1980,6 +2091,7 @@ class TradingBot(
         scan_gap_sec = None if previous_scan is None else scan_started - previous_scan
         self._market_scan_at[key] = scan_started
         leg = self._strategy_for(symbol)
+        entry_mode = entry_mode_from_cfg(self.cfg)
         signal_tf = getattr(leg, "timeframe", "15")
         trail_tf = getattr(leg, "trail_timeframe", signal_tf)
 
@@ -2049,9 +2161,9 @@ class TradingBot(
         eval_trail = trail_closed
         eval_trend = trend_closed
         catch_up_used = False
-        # 策略评估和通用止损都只看已收线 K 线：未收线的盘中影线不触发
-        # trigger/touch，和回测「只用已收盘 K 线、下一根成交」保持同一口径。
-        # forming 仍保留给健康状态和启动回溯判断，不参与本轮决策。
+        # 策略评估默认只用已收线 K 线：信号、开仓都以收盘为准。
+        # entry_mode=trigger 时把正在走的 forming 也交给策略，由策略按自己的触发价判「碰到就开」；
+        # close 模式不传 forming。止损仍只用已收盘 K 线算，forming 只负责碰线。
         if try_catch_up:
             hit = find_catch_up_open(
                 cfg=self.cfg,
@@ -2086,6 +2198,9 @@ class TradingBot(
                 trail_bars=eval_trail,
                 trend_bars=eval_trend,
                 now=_eval_now(eval_bars, closed, catch_up=catch_up_used),
+                forming=None
+                if catch_up_used or entry_mode != ENTRY_MODE_TRIGGER
+                else forming,
             )
         except Exception as exc:
             health.update(
@@ -2133,7 +2248,8 @@ class TradingBot(
                 self._position_for(symbol),
                 gs_bars,
                 flat=False,
-                forming=None,
+                # 盘中那根也拿去判触及；回溯补开仓是历史场景，不掺今天的盘中数据。
+                forming=None if catch_up_used else forming,
                 mode=getattr(leg, "stop_mode", "touch"),
                 # 平仓未成交时别每轮都重复发单，和策略自身止损的等待口径一致。
                 cooldown_sec=120.0,
@@ -2145,6 +2261,38 @@ class TradingBot(
                     kind=gs_hit.kind,
                     stop=gs_hit.stop,
                 )
+
+        # 盘中触及止损：touch 模式下不等这根收线，用 forming 的最高/最低对照已记录的止损价。
+        # 通用止损先判；已经让平仓就不再重复。暂停报单时不生成，恢复后下一轮再判。
+        if (
+            decision.action == StrategyAction.HOLD
+            and not catch_up_used
+            and not self._orders_paused
+            and not self._symbol_is_flat(symbol)
+        ):
+            intraday = _intraday_stop_decision(
+                leg,
+                symbol,
+                self._position_for(symbol),
+                forming,
+                period=str(signal_tf),
+            )
+            if intraday is not None:
+                bar_id = str((intraday.meta or {}).get("bar_id") or "")
+                last = self._intraday_stop_sent.get(symbol)
+                too_soon = (
+                    last is not None
+                    and last[0] == bar_id
+                    and time.monotonic() - last[1] < _INTRADAY_STOP_RETRY_SEC
+                )
+                if not too_soon:
+                    decision = intraday
+                    self._record_event(
+                        "intraday_stop",
+                        symbol=symbol,
+                        stop=intraday.stop_price,
+                        bar_id=bar_id,
+                    )
 
         # 交割月不再交易这一手：日盘收完、下一交易日已进交割月时平仓，也不开新仓。
         gate_outcome = apply_delivery_gate(
@@ -2409,6 +2557,20 @@ class TradingBot(
             if dispatch_started:
                 self._halt_on_unknown_dispatch(exc)
             raise
+        if sent and (decision.meta or {}).get("intraday_stop"):
+            bar_id = str((decision.meta or {}).get("bar_id") or "")
+            self._intraday_stop_sent[symbol] = (bar_id, time.monotonic())
+            note = getattr(leg, "note_flat_wait_next_bar", None)
+            if callable(note) and bar_id:
+                # 这根收线后不再让策略按同一根再发一次止损，也不在同一根立刻补仓。
+                note(symbol, bar_id)
+        if sent and (decision.meta or {}).get("intraday_entry"):
+            self._record_event(
+                "intraday_entry",
+                symbol=symbol,
+                price=decision.trigger_price,
+                bar_id=str((decision.meta or {}).get("bar_id") or ""),
+            )
         pending_cut = str(getattr(self, "_dyn_cut_pending", "") or "")
         if pending_cut:
             if sent:
@@ -2457,6 +2619,7 @@ class TradingBot(
         trail_bars: Any = None,
         trend_bars: Any = None,
         now: datetime | None = None,
+        forming: Any = None,
     ) -> StrategyDecision:
         """调用正式策略。回溯时可能带上信号时刻；策略不支持就不传。"""
         target = self._strategy_for(symbol)
@@ -2466,6 +2629,9 @@ class TradingBot(
             kwargs["trend_bars"] = trend_bars
         if now is not None and self._evaluate_accepts("now", target):
             kwargs["now"] = now
+        # trigger 模式才传 forming；策略不支持这个参数时自然回退收盘确认。
+        if forming is not None and self._evaluate_accepts("forming", target):
+            kwargs["forming"] = forming
         return target.evaluate(symbol, bars, **kwargs)
 
     def _halt_on_unknown_dispatch(self, exc: Exception) -> None:

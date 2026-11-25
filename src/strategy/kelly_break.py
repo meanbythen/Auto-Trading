@@ -15,7 +15,7 @@ from typing import Any
 import pandas as pd
 
 from .trend_base import TrendStrategyBase
-from .types import PositionState, config_flag
+from .types import PositionState, config_flag, forming_price_range, pick_breakout_side
 
 
 class KellyBreakStrategy(TrendStrategyBase):
@@ -79,6 +79,35 @@ class KellyBreakStrategy(TrendStrategyBase):
         low_n = float(ind["low_n"])
         pad = self.stop_atr * atr
         meta = {"high_n": high_n, "low_n": low_n, "atr": atr, "atr_ratio": ratio}
+        if self._forming is not None:
+            price_range = forming_price_range(self._forming)
+            if price_range is None:
+                return None
+            fh, fl = price_range
+            try:
+                live = float(self._forming.iloc[-1]["close"])
+            except (KeyError, TypeError, ValueError):
+                live = close
+            side = pick_breakout_side(
+                close=live, high_level=high_n, low_level=low_n, high=fh, low=fl
+            )
+            if side == "long":
+                stop = high_n - pad
+                return (
+                    "long",
+                    stop,
+                    f"凯利突破做多 盘中最高{fh:.2f}触及前{self.lookback}根高点{high_n:.2f} 止损{stop:.2f}",
+                    {**meta, "trigger_price": high_n},
+                )
+            if side == "short":
+                stop = low_n + pad
+                return (
+                    "short",
+                    stop,
+                    f"凯利突破做空 盘中最低{fl:.2f}触及前{self.lookback}根低点{low_n:.2f} 止损{stop:.2f}",
+                    {**meta, "trigger_price": low_n},
+                )
+            return None
         if close > high_n:
             stop = close - pad
             return (

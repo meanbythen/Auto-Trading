@@ -293,7 +293,7 @@ def test_certification_reports_errors_in_status(monkeypatch) -> None:
             "fingerprint": "abc123",
             "checked_at": "2026-11-22 10:00:00",
             "changes": [],
-            "issues": [{"symbol": "lh2701", "field": "margin", "severity": "error", "message": "保证金没填"}],
+            "issues": [{"symbol": "lh2701", "field": "margin_rate_pct", "severity": "error", "message": "保证金比例没填"}],
             "errors": 1,
             "warnings": 0,
         },
