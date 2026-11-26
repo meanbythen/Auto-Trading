@@ -4,6 +4,19 @@
 
 规则写在 README 的「版本」一节。已经写在这里的旧版本不再改写，新的改动加在最上面。
 
+## 57.4.0 — 2026-11-26
+
+加功能（功能更新）：期权实盘隔离开关，账户未开通期权权限前只在仿真里跑。
+
+- 新增 `src/account/option_guard.py`：`trade.option_live_enabled`（默认 false）。
+  关闭时真实账号只平不开期权；仿真账号、`dry_run` 不受影响；只拦开仓，不拦平仓。
+- 策略开仓 `OrderExecutorMixin._size_open()` 在算仓前检查开关，被拦时返回 0 手并写 `option_live_locked` 告警。
+- 柜台兜底：`CtpTrader._place_order_locked()` 与 `GuiTrader.place_order()` 对期权开仓再查一次，
+  覆盖手工下单和交易台，避免绕过策略通道。
+- 配置页新增「允许期权实盘」开关；`config.example.yaml` 与本地 `config.yaml` 增加 `trade.option_live_enabled: false`。
+- 新增 `tests/test_option_guard.py` 7 条：开关默认关、真实账号拦截、仿真/期货/dry_run 放行、打开开关后放行、
+  执行器算仓前拦截。全量 `pytest tests`、`ruff check src tests`、`mypy src` 通过。
+
 ## 57.3.0 — 2026-11-26
 
 加功能（功能更新）：在不改主循环、执行抽象、对账和告警的前提下，支持期权买方自动交易。

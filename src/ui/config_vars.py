@@ -128,6 +128,10 @@ class ConfigVarsMixin:
         self.volume_var = ctk.StringVar(value=str(trade.get("volume", 1)))
         self.max_slip_var = ctk.StringVar(value=str(trade.get("max_entry_slip_atr", 0.5)))
         self.max_slip_points_var = ctk.StringVar(value=str(trade.get("max_entry_slip_points", 0)))
+        # 期权实盘开关：默认关闭，先只跑仿真；账户开通期权权限后再打开。
+        self.option_live_enabled_var = ctk.BooleanVar(
+            value=bool(trade.get("option_live_enabled", False))
+        )
         self.sizing_mode_var = ctk.StringVar(value=str(risk.get("sizing_mode", "risk_pct")))
         self.capital_var = ctk.StringVar(value=str(risk.get("capital", 1000000)))
         self.risk_pct_var = ctk.StringVar(value=str(risk.get("risk_per_trade_pct", 0.5)))
@@ -925,6 +929,7 @@ class ConfigVarsMixin:
         self.volume_var.set(str(trade.get("volume", 1)))
         self.max_slip_var.set(str(trade.get("max_entry_slip_atr", 0.5)))
         self.max_slip_points_var.set(str(trade.get("max_entry_slip_points", 0)))
+        self.option_live_enabled_var.set(bool(trade.get("option_live_enabled", False)))
         self.sizing_mode_var.set(str(risk.get("sizing_mode", "risk_pct")))
         self.capital_var.set(str(risk.get("capital", 1000000)))
         self.risk_pct_var.set(str(risk.get("risk_per_trade_pct", 0.5)))

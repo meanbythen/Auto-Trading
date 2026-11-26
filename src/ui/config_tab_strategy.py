@@ -924,6 +924,33 @@ def build_strategy_section(
         anchor="w",
     ).pack(side="left", padx=(10, 0))
 
+    opt_live_row = ctk.CTkFrame(left, fg_color="transparent")
+    opt_live_row.pack(fill="x", pady=8)
+    ctk.CTkLabel(
+        opt_live_row,
+        text="允许期权实盘",
+        font=T.FONT_BODY,
+        text_color=T.TEXT_DIM,
+        width=140,
+        anchor="w",
+    ).pack(side="left", padx=(0, 8))
+    ctk.CTkSwitch(
+        opt_live_row,
+        text="",
+        variable=app.option_live_enabled_var,
+        progress_color=T.OK,
+        fg_color=T.BORDER,
+    ).pack(side="left")
+    ctk.CTkLabel(
+        opt_live_row,
+        text="关=真实账号只平不开期权，仿真账号不受影响；账户开通期权权限后再打开（trade.option_live_enabled）",
+        font=T.FONT_SMALL,
+        text_color=T.TEXT_DIM,
+        wraplength=280,
+        justify="left",
+        anchor="w",
+    ).pack(side="left", padx=(10, 0))
+
     # 模拟开关只放在运行台，避免两处开关互相覆盖。
 
     # 收盘后关机

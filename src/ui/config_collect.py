@@ -728,6 +728,8 @@ class ConfigCollectMixin:
             trade["max_entry_slip_points"] = max(0.0, float(self.max_slip_points_var.get()))
         except ValueError:
             trade["max_entry_slip_points"] = 0.0
+        # 期权实盘开关默认关；仿真账号不受影响，真实账号只平不开。
+        trade["option_live_enabled"] = bool(self.option_live_enabled_var.get())
         if st["symbols"]:
             trade["symbol"] = st["symbols"][0]
 

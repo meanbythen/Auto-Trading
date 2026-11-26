@@ -892,6 +892,15 @@ class GuiTrader(TraderBase):
     def place_order(self, req: OrderRequest) -> OrderResult:
         global _ORDER_CLICKING
         order_id = f"GUI-{uuid.uuid4().hex[:8]}"
+        # 期权实盘隔离：真实点击下单（非 dry_run）默认禁止开期权仓。
+        from src.account.option_guard import is_open_side, option_live_block_reason
+
+        if is_open_side(req.side):
+            option_block = option_live_block_reason(
+                self._full_cfg, req.symbol, is_live=not self.dry_run
+            )
+            if option_block:
+                return OrderResult(ok=False, message=option_block, order_id=order_id)
         # 同一时间只允许一笔 GUI 下单动作。等不到就跳过，绝不并发点击。
         if not _TRADE_LOCK.acquire(timeout=_TRADE_LOCK_TIMEOUT_SEC):
             message = "另一个 GUI 下单动作还没结束，本次跳过（避免并发点击同一交易窗口）"

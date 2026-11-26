@@ -479,6 +479,22 @@ strategy:
     # 是否接公共行情过滤（ADX/波动率）。规则里自己写了 filters 时可保持 false。
     use_market_filter: false
 
+  # 末日期权买方：只做买方，权利金突破买入，回撤止损，到期前强平。
+  # 合约乘数/每跳/到期日/行权价/方向在「品种与合约」表按合约填写。
+  option_long:
+    lookback: 20
+    premium_stop_pct: 30.0
+    reward_risk: 2.0
+    min_premium: 0.0
+
+  # 期货黑天鹅保护：权利金低位买入虚值保护，持有到期或止损。
+  option_hedge:
+    lookback: 30
+    premium_stop_pct: 50.0
+    entry_ratio: 1.0
+    protect_pct: 100.0
+    min_premium: 0.0
+
 data:
   source: "tq"
   # 行情来源。tq 是天勤（主源），akshare 是新浪（备源）。界面下拉里选，一次只用一家。
@@ -645,6 +661,8 @@ trade:
   max_entry_slip_atr: 0.5
   # 再叠一个绝对点数上限，和上面同时开就取更严的；0=不用
   max_entry_slip_points: 0
+  # 期权实盘开关：关=真实账号只平不开期权，仿真账号不受影响；账户开通期权权限后再打开。
+  option_live_enabled: false
   ctp:
     # 当前使用哪份券商档案；必须与 ctp_profiles 里的名字一致。
     # 换期货公司/仿真环境时，只加一段 ctp_profiles 并改这里，不改代码。

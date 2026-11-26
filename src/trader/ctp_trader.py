@@ -412,6 +412,17 @@ class CtpTrader(TraderBase):
         started_at = now_iso()
         if self.cfg.get("dry_run", True):
             return self._reject_order(req, started_at, "dry_run", "模拟开关开着，不会向 CTP 发单")
+        # 期权实盘隔离：开关关闭时，真实账号只允许平仓，不允许开仓。
+        from src.account.option_guard import is_open_side, option_live_block_reason
+
+        if is_open_side(req.side):
+            option_block = option_live_block_reason(
+                self.cfg, req.symbol, account_kind=self.settings.account_kind
+            )
+            if option_block:
+                return self._reject_order(
+                    req, started_at, "option_live_locked", option_block
+                )
         missing = self.settings.missing()
         if missing:
             return self._reject_order(req, started_at, "config", "CTP 还缺：" + "、".join(missing))

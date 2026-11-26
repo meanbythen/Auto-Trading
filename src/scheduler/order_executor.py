@@ -618,6 +618,16 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
         # 数据补齐、分配恢复正常：撤掉运行页还挂着的缺比例/越界告警。
         _ops_recovery(self, "leg_alloc_ok", f"组合保证金分配恢复：{plan.summary()}")
 
+    def _option_account_is_live(self) -> bool:
+        """当前执行通道是不是真实账号；仿真/自测都返回 False。"""
+        trader = getattr(self, "trader", None)
+        settings = getattr(trader, "settings", None)
+        kind = getattr(settings, "account_kind", "")
+        if not kind:
+            cfg = getattr(self, "cfg", None) or {}
+            kind = ((cfg.get("trade") or {}).get("ctp") or {}).get("account_kind")
+        return str(kind or "").strip().lower() in {"live", "real", "prod"}
+
     def _size_open(self, decision: StrategyDecision) -> tuple[int, str]:
         """
         开仓手数：先按资金管理算，策略指定的手数只能往下压。
@@ -626,6 +636,21 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
         每笔风险%和仓位上限，否则小权益下会开出买不起的仓。
         """
         meta = decision.meta or {}
+        # 期权实盘隔离：账户没开通期权权限前，真实账号只平不开。
+        from src.account.option_guard import option_live_block_reason
+
+        cfg = getattr(self, "cfg", None)
+        live_check = getattr(self, "_option_account_is_live", None)
+        is_live = bool(live_check()) if callable(live_check) else False
+        blocked = option_live_block_reason(
+            cfg,
+            decision.symbol,
+            is_live=is_live,
+            dry_run=bool((cfg or {}).get("dry_run", False)),
+        )
+        if blocked:
+            _ops_alert(self, "option_live_locked", blocked)
+            return 0, blocked
         # 期权到期/最后交易日限制：缺到期日或已到只平不开，直接拒绝开仓。
         from src.account.option_lifecycle import assert_tradable
 
