@@ -788,6 +788,40 @@ def build_strategy_section(
         pady=(0, 4),
     )
 
+    opt_long_box = detail_panel(
+        app,
+        "option_long",
+        "末日期权买方",
+        "只做买方：权利金突破买入，权利金回撤止损，最后交易日前强制平仓。",
+    )
+    note_block(
+        opt_long_box,
+        "参数写在 config.yaml 的 strategy.option_long：\n"
+        "lookback = 权利金突破回看根数（默认 20）\n"
+        "premium_stop_pct = 权利金回撤止损百分比（默认 30）\n"
+        "reward_risk = 止盈盈亏比（默认 2）\n"
+        "min_premium = 最低权利金，低于它不开（默认 0）\n"
+        "合约乘数、每跳、到期日、行权价、方向请在「品种与合约」表按合约填写。",
+        pady=(0, 4),
+    )
+
+    opt_hedge_box = detail_panel(
+        app,
+        "option_hedge",
+        "期权黑天鹅对冲",
+        "只做买方：权利金处于近期区间偏低位置时买入保护，持有到期或止损。",
+    )
+    note_block(
+        opt_hedge_box,
+        "参数写在 config.yaml 的 strategy.option_hedge：\n"
+        "lookback = 权利金区间回看根数（默认 30）\n"
+        "premium_stop_pct = 权利金回撤止损百分比（默认 50）\n"
+        "entry_ratio = 不高于区间中值的这个比例才买（默认 1.0）\n"
+        "protect_pct = 目标保护比例，仅用于说明（默认 100）\n"
+        "保护哪条期货腿由 strategy.legs / 组合额度配置决定；到期前强平。",
+        pady=(0, 4),
+    )
+
     try:
         app.engine_var.trace_add("write", app._refresh_strategy_param_panel)
     except Exception:  # noqa: BLE001

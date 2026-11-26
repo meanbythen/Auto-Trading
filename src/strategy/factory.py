@@ -28,6 +28,8 @@ from .liq_stop import LiquidityStopStrategy
 from .dual_ma import DualMaStrategy
 from .ema_swing import EmaSwingStrategy
 from .multi_factor import MultiFactorStrategy
+from .option_hedge import OptionHedgeStrategy
+from .option_long import OptionLongStrategy
 from .params import DEFAULT_ENGINE, ENGINE_SECTION_DEFAULTS, StrategyParams
 from .rule_dsl import RuleConfigError, RuleStrategy, rule_engine_stem
 from .sar_trend import SarTrendStrategy
@@ -197,6 +199,8 @@ ENGINE_LABELS: dict[str, str] = {
     "dual_donchian": "双周期通道突破",
     "dual_fractal": "双周期回调分型",
     "rule_dsl": "自定义规则（DSL）",
+    "option_long": "末日期权买方",
+    "option_hedge": "期权黑天鹅对冲",
 }
 
 # 选股交叉测试名单里的短名：同一策略不重复标「主推」。
@@ -245,6 +249,8 @@ ENGINE_AUDIT_MODES: dict[str, MarketFilterMode | None] = {
     "dual_donchian": None,  # ADX 写在大周期自己里
     "dual_fractal": None,
     "rule_dsl": None,  # 过滤条件写在用户规则文件里
+    "option_long": None,  # 期权买方只做权利金突破，不接期货趋势过滤
+    "option_hedge": None,
 }
 
 
@@ -284,6 +290,9 @@ REGISTRY: dict[str, StrategyFactory] = {
     "dual_fractal": DualFractalStrategy,
     # 用户自己写的指标条件组合（rules/*.yaml），不写代码就能加策略
     "rule_dsl": RuleStrategy,
+    # 期权买方：末日期权投机 / 期货黑天鹅保护
+    "option_long": OptionLongStrategy,
+    "option_hedge": OptionHedgeStrategy,
 }
 
 # 只含正式引擎名（不含别名），顺序与注册表一致。审计/复盘按这个顺序列策略。

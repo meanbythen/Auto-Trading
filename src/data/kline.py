@@ -419,7 +419,16 @@ class KlineProvider:
         规则（重要）：
         - 写具体合约 bu2612 / BU2612 → 直接扫该合约（不再偷换成主连 BU0）
         - 只写品种 bu / c / 沥青 → 才用 symbol_map 映射到主连（如 BU0）
+        - 期权没有新浪分钟线：主源是天勤时返回空串占位，主源是新浪时直接报错
         """
+        from src.domain.options import is_option
+
+        if is_option(symbol):
+            if self.source == "akshare":
+                raise RuntimeError(
+                    "新浪没有商品/股指期权分钟线。期权请把行情主源改成天勤。"
+                )
+            return ""
         s = symbol.strip()
         key = s.lower()
 

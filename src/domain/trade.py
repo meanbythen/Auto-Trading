@@ -41,6 +41,11 @@ class TradeRecord:
     multiplier: float | None = None
     # 开仓那根K线的 ADX（评估时用来分趋势组/震荡组）。老结果没有这个字段时为 None。
     adx_at_entry: float | None = None
+    # 期权专用；期货这些字段保持空，旧导出不受影响。
+    option_type: str = ""  # C / P
+    strike: float | None = None
+    expiry: str = ""
+    underlying: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         """导出可 JSON 的成交字典。"""

@@ -28,10 +28,12 @@ def _frame(close: float = 100.0, rows: int = 4) -> pd.DataFrame:
 
 
 def test_safe_last_alert_returns_value_and_swallows_errors(monkeypatch) -> None:
-    monkeypatch.setattr("src.ops.alerts.last_alert", lambda max_daily_loss=None: {"kind": "x"})
+    monkeypatch.setattr(
+        "src.ops.alerts.last_alert", lambda *a, **k: {"kind": "x"}
+    )
     assert runner._safe_last_alert(100.0) == {"kind": "x"}
 
-    def boom(max_daily_loss=None):
+    def boom(*args, **kwargs):
         raise RuntimeError("events file broken")
 
     monkeypatch.setattr("src.ops.alerts.last_alert", boom)

@@ -610,6 +610,10 @@ def build_spi(tdapi: Any, client: OpenctpClient) -> Any:
                     "price_tick": float(getattr(data, "PriceTick", 0) or 0),
                     "open_date": str(getattr(data, "OpenDate", "") or ""),
                     "expire_date": str(getattr(data, "ExpireDate", "") or ""),
+                    # 期权静态信息：柜台一次查询就带回来了，落表时用得上。
+                    "strike_price": float(getattr(data, "StrikePrice", 0) or 0),
+                    "options_type": str(getattr(data, "OptionsType", "") or ""),
+                    "underlying_instr_id": str(getattr(data, "UnderlyingInstrID", "") or ""),
                 }
             client.listener.on_contract_row(row, bool(last))
             if not ok and message:

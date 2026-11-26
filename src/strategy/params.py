@@ -257,6 +257,21 @@ ENGINE_SECTION_DEFAULTS: dict[str, dict[str, Any]] = {
         "file": "rules/dual_ma_equiv.yaml",
         "use_market_filter": False,
     },
+    # 末日期权买方：权利金突破买入，权利金回撤止损，盈利目标止盈。
+    "option_long": {
+        "lookback": 20,
+        "premium_stop_pct": 30.0,
+        "reward_risk": 2.0,
+        "min_premium": 0.0,
+    },
+    # 期货黑天鹅保护：权利金低位买入，持有到期或止损，不设止盈。
+    "option_hedge": {
+        "lookback": 30,
+        "premium_stop_pct": 50.0,
+        "entry_ratio": 1.0,
+        "protect_pct": 100.0,
+        "min_premium": 0.0,
+    },
 }
 
 

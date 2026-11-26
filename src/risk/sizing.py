@@ -135,32 +135,63 @@ class PositionSizer:
         """
         从合约名取出品种代码。
 
-        bu2612 / BU0 → bu。只认完整的字母段，不用「字符串里包含某个字母」。
-        否则 c 会误匹配 cu、sc，玉米的乘数就会套到别的品种上。
+        bu2612 / BU0 → bu；期权取标的（rb2601C3500 → rb）。
+        只认完整的字母段，不用「字符串里包含某个字母」。
         """
+        from src.domain.options import is_option, option_product
+
         s = symbol.strip().lower()
-        alpha = "".join(ch for ch in s if ("a" <= ch <= "z"))
+        # 期权每个行权价都是独立合约，组合额度也按完整合约分开算。
+        if is_option(s):
+            return s
+        alpha = option_product(s)
         if alpha in self.contracts:
             return alpha
         return alpha or s
+
+    def _contract_box(self, symbol: str) -> dict[str, Any]:
+        """先按完整合约找配置；期货再退回品种。期权不拿标的期货的比例顶替。"""
+        from src.domain.options import is_option
+
+        key = str(symbol or "").strip().lower()
+        box = self.contracts.get(key)
+        if isinstance(box, dict):
+            return box
+        if is_option(key):
+            return {}
+        box = self.contracts.get(self._product_key(symbol))
+        return box if isinstance(box, dict) else {}
 
     def product_key(self, symbol: str) -> str:
         """品种代码（bu2612 → bu）。组合分配按品种对齐时用。"""
         return self._product_key(symbol)
 
     def multiplier_for(self, symbol: str) -> float:
-        key = self._product_key(symbol)
-        return float(self.contracts.get(key, {}).get("multiplier", DEFAULT_MULTIPLIER))
+        box = self._contract_box(symbol)
+        return float(box.get("multiplier", DEFAULT_MULTIPLIER))
 
-    def margin_for(self, symbol: str, price: float | None = None) -> float:
+    def margin_for(
+        self,
+        symbol: str,
+        price: float | None = None,
+        side: str | None = None,
+    ) -> float:
         """
-        这个品种 1 手现在要占用多少保证金。
+        这个合约 1 手现在要占用多少资金。
 
-        只用「保证金比例%」：开仓价 × 每手数量 × 比例%。
-        没填比例、或价格不可用时返回 0，由 calc_open 直接拒绝开仓。
+        期货：开仓价 × 每手数量 × 保证金比例%。
+        期权买方：权利金（价格 × 每手数量）。
+        期权卖方：保证金（优先每手金额，其次标的/行权价 × 每手数量 × 比例%）。
+        缺数据返回 0，由 calc_open 直接拒绝开仓。
         """
-        key = self._product_key(symbol)
-        box = self.contracts.get(key, {})
+        from src.domain.options import is_option
+
+        box = self._contract_box(symbol)
+        if is_option(symbol) or str(box.get("instrument_type") or "") == "期权":
+            from src.risk.option_margin import lot_margin as option_lot_margin
+
+            value, _ = option_lot_margin(self._cfg, symbol, price, side)
+            return value
         rate = float(box.get("margin_rate_pct", 0) or 0)
         qty = float(box.get("multiplier", DEFAULT_MULTIPLIER) or DEFAULT_MULTIPLIER)
         if rate > 0 and price is not None:
@@ -181,19 +212,23 @@ class PositionSizer:
         positions: dict[str, int] | None = None,
         max_per_order: int | None = None,
         kelly_rows: list[dict[str, Any]] | None = None,
+        side: str | None = None,
     ) -> SizeResult:
         """
         计算开仓手数。
 
         参数:
-            symbol: 品种代码
+            symbol: 品种或期权合约代码
             entry_price: 计划入场价（可空）
             stop_price: 策略止损价（可空；按风险百分比算仓时必须有效，否则拒单）
             current_abs_position: 当前已持手数绝对值（用于已占用保证金）
             positions: 各品种净持仓。用来按各自的保证金扣掉已经占用的钱。
             max_per_order: 本机单笔上限（交易对象的 max_order_volume）。
             kelly_rows: 当前账本已平仓配对；传入空列表也表示这条腿确实没有样本。
+            side: long/short。期权买方按权利金、卖方按保证金；缺省按卖方（更保守）。
         """
+        from src.domain.options import is_option
+
         intent, intent_note, risk_cash, risk_per_lot, stop_dist = self._intent_for_symbol(
             symbol, entry_price, stop_price, kelly_rows=kelly_rows
         )
@@ -204,12 +239,21 @@ class PositionSizer:
             # 研究/交叉测试显式关闭：只看风险手数与单笔上限，不需要保证金数据。
             margin_lots, lot_margin, margin_note = None, 0.0, ""
         else:
-            lot_margin = self.margin_for(symbol, entry_price)
+            data_note = ""
+            if is_option(symbol):
+                from src.risk.option_margin import lot_margin as option_lot_margin
+
+                lot_margin, data_note = option_lot_margin(
+                    self._cfg, symbol, entry_price, side
+                )
+            else:
+                lot_margin = self.margin_for(symbol, entry_price)
             if lot_margin <= 0:
-                # 没有保证金比例：宁可不开，也不用任何固定金额估算。
+                # 没有保证金/权利金数据：宁可不开，也不用任何固定金额估算。
                 return SizeResult(
                     0,
-                    (
+                    data_note
+                    or (
                         f"品种与合约表没有 {symbol} 的保证金比例，"
                         "无法估算仓位上限，拒绝开仓。"
                         "请先在「品种与合约」表里补上保证金比例%。"
@@ -221,8 +265,14 @@ class PositionSizer:
                     margin_lots=0,
                 )
             margin_lots, lot_margin, margin_note = self._lots_by_margin_cap(
-                symbol, current_abs_position, positions, entry_price
+                symbol, current_abs_position, positions, entry_price, side
             )
+            premium_lots = self._premium_budget_lots(
+                symbol, entry_price, positions, current_abs_position, side
+            )
+            if premium_lots is not None:
+                margin_lots = premium_lots if margin_lots is None else min(margin_lots, premium_lots)
+                margin_note = f"{margin_note}，期权权利金预算上限{premium_lots}手"
 
         caps = [intent]
         if margin_lots is not None:
@@ -360,16 +410,19 @@ class PositionSizer:
         current_abs_position: int,
         positions: dict[str, int] | None,
         entry_price: float | None = None,
+        side: str | None = None,
     ) -> tuple[int, float, str]:
         """
         仓位上限层：还能再开几手。
 
-        预算 = 权益 × 仓位上限%。已占用按各品种自己的保证金扣。
+        预算 = 权益 × 仓位上限%。已占用按各合约自己的保证金扣。
         有比例时按这笔开仓价现算每手占用。
         缺保证金数据由 calc_open 先拒绝，本函数只处理 need>0 的情况。
         仓位上限% ≤ 0 → 仍按全部权益估买得起几手（兼容旧「钱够就开」）。
         """
-        need = self.margin_for(symbol, entry_price)
+        from src.domain.options import is_option
+
+        need = self.margin_for(symbol, entry_price, side)
 
         pct = float(self.margin_usage_pct or 0)
         if pct <= 0:
@@ -384,12 +437,17 @@ class PositionSizer:
             used = 0.0
             this_key = self._product_key(symbol)
             for held, vol in positions.items():
-                held_price = entry_price if self._product_key(str(held)) == this_key else None
-                held_margin = self.margin_for(str(held), held_price)
+                held_text = str(held)
+                same_contract = held_text.strip().lower() == str(symbol).strip().lower()
+                same_product = (not is_option(str(symbol))) and self._product_key(held_text) == this_key
+                held_price = entry_price if (same_contract or same_product) else None
+                held_side = "long" if int(vol) > 0 else "short"
+                held_margin = self.margin_for(held_text, held_price, held_side)
                 if held_margin <= 0:
                     # 组合分配时存过各腿的每手保证金，按它估，别拿本品种的占用代替。
                     held_margin = float(
-                        self.leg_lot_margin.get(self._product_key(str(held)), 0.0)
+                        self.leg_lot_margin.get(held_text.strip().lower(), 0.0)
+                        or self.leg_lot_margin.get(self._product_key(held_text), 0.0)
                     )
                 if held_margin <= 0:
                     held_margin = need
@@ -420,6 +478,58 @@ class PositionSizer:
             note = note + f"，组合分配上限{total_cap}手"
             lots = quota_left
         return lots, need, note
+
+    def _premium_budget_lots(
+        self,
+        symbol: str,
+        entry_price: float | None,
+        positions: dict[str, int] | None,
+        current_abs_position: int,
+        side: str | None,
+    ) -> int | None:
+        """
+        期权买方专用的权利金预算上限。
+
+        权利金口径下「仓位上限%」会显得很便宜，必须再有一道总预算，
+        否则可能把所有权益都买成期权。非期权或卖方返回 None（本层不启用）。
+        """
+        from src.domain.options import is_option
+        from src.risk.option_margin import is_buy_side
+
+        if not is_option(symbol) or not is_buy_side(side):
+            return None
+        risk = self._cfg.get("risk") or {}
+        try:
+            pct = float(risk.get("option_premium_budget_pct", 20.0))
+        except (TypeError, ValueError):
+            pct = 20.0
+        if pct <= 0:
+            return None
+        budget = max(0.0, self.capital * pct / 100.0)
+        need = self.margin_for(symbol, entry_price, "long")
+        if need <= 0:
+            return None
+        used = 0.0
+        if positions:
+            for held, vol in positions.items():
+                if int(vol) <= 0:
+                    continue
+                held_text = str(held)
+                if not is_option(held_text):
+                    continue
+                same = held_text.strip().lower() == str(symbol).strip().lower()
+                cost = self.margin_for(
+                    held_text, entry_price if same else None, "long"
+                )
+                if cost <= 0:
+                    cost = float(
+                        self.leg_lot_margin.get(held_text.strip().lower(), 0.0)
+                        or self.leg_lot_margin.get(self._product_key(held_text), 0.0)
+                    )
+                used += abs(int(vol)) * cost
+        elif current_abs_position > 0:
+            used = abs(current_abs_position) * need
+        return max(0, int((budget - used) // need))
 
     def _leg_quota_left(
         self,

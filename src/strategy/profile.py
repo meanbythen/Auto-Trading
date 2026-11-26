@@ -181,6 +181,24 @@ PROFILES: dict[str, EngineProfile] = {
         public_filter="无（过滤条件写在规则里）",
         weak_market="规则未覆盖的行情结构，需人工复核",
     ),
+    "option_long": EngineProfile(
+        code="option_long",
+        entry="期权权利金收盘突破前 N 根高点才买入（只做买方）",
+        exit_rule="权利金回撤比例止损；盈利目标止盈；最后交易日前强制平仓",
+        timeframe="权利金 K 线周期，末日期权常用 1 / 5 分钟",
+        close_default=True,
+        public_filter="无（期权买方只做权利金突破）",
+        weak_market="权利金横盘、流动性差、临近到期时间价值快速衰减",
+    ),
+    "option_hedge": EngineProfile(
+        code="option_hedge",
+        entry="权利金回落到近期区间偏低位置时买入虚值保护（只做买方）",
+        exit_rule="权利金回撤止损；不设止盈；最后交易日前强制平仓",
+        timeframe="权利金 K 线周期，保护单常用 15 / 60 分钟",
+        close_default=False,
+        public_filter="无（只看权利金自身区间）",
+        weak_market="权利金长期偏高、隐含波动率处于高位时买入不划算",
+    ),
 }
 
 

@@ -97,7 +97,7 @@ class LoginFlowMixin:
         try:
             from src.ops.alerts import emit_alert
 
-            emit_alert("window_lost", "交易软件窗口丢失，本轮跳过扫描", level="error", root=self.root)
+            emit_alert("window_lost", "交易软件窗口丢失，本轮跳过扫描", level="error", root=getattr(self, "root", None))
         except Exception:  # noqa: BLE001
             pass
         return False
@@ -254,7 +254,7 @@ class LoginFlowMixin:
             try:
                 from src.ops.alerts import emit_alert
 
-                emit_alert("ctp_book_mismatch", book_block, level="error", root=self.root)
+                emit_alert("ctp_book_mismatch", book_block, level="error", root=getattr(self, "root", None))
             except Exception:  # noqa: BLE001
                 pass
             return False
@@ -284,7 +284,7 @@ class LoginFlowMixin:
         try:
             from src.ops.alerts import emit_alert
 
-            emit_alert("ctp_down", f"CTP 没有连上：{message}", level="error", root=self.root)
+            emit_alert("ctp_down", f"CTP 没有连上：{message}", level="error", root=getattr(self, "root", None))
         except Exception:  # noqa: BLE001
             pass
         return False

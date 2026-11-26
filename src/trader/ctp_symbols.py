@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+# 品种归属表和行情、期权解析共用一份，避免三处各写一份后对不上。
+from src.domain.exchanges import EXCHANGE_BY_PRODUCT as _CTP_EXCHANGE_BY_PRODUCT
+
 
 def product_code(symbol: str) -> str:
     """bu2612 -> bu，c2511 -> c，cu2601 -> cu。"""
@@ -18,26 +21,6 @@ def symbol_key(symbol: str) -> str:
 
 
 # 郑商所、中金所的合约代码必须大写。上期所、能源中心、大商所、广期所必须小写。
-_CTP_EXCHANGE_BY_PRODUCT: dict[str, str] = {
-    "AP": "CZCE", "CF": "CZCE", "CJ": "CZCE", "CY": "CZCE", "FG": "CZCE",
-    "JR": "CZCE", "LR": "CZCE", "MA": "CZCE", "OI": "CZCE", "PF": "CZCE",
-    "PK": "CZCE", "PL": "CZCE", "PM": "CZCE", "PR": "CZCE", "PX": "CZCE",
-    "RI": "CZCE", "RM": "CZCE", "RS": "CZCE", "SA": "CZCE", "SF": "CZCE",
-    "SH": "CZCE", "SM": "CZCE", "SR": "CZCE", "TA": "CZCE", "UR": "CZCE",
-    "WH": "CZCE", "ZC": "CZCE",
-    "IF": "CFFEX", "IH": "CFFEX", "IC": "CFFEX", "IM": "CFFEX",
-    "T": "CFFEX", "TF": "CFFEX", "TS": "CFFEX", "TL": "CFFEX",
-    "CU": "SHFE", "AL": "SHFE", "ZN": "SHFE", "PB": "SHFE", "NI": "SHFE",
-    "SN": "SHFE", "AU": "SHFE", "AG": "SHFE", "RB": "SHFE", "HC": "SHFE",
-    "SS": "SHFE", "BU": "SHFE", "RU": "SHFE", "SP": "SHFE", "FU": "SHFE",
-    "WR": "SHFE", "AO": "SHFE", "BR": "SHFE", "AD": "SHFE",
-    "SC": "INE", "NR": "INE", "LU": "INE", "BC": "INE", "EC": "INE",
-    "A": "DCE", "B": "DCE", "C": "DCE", "CS": "DCE", "EB": "DCE", "EG": "DCE",
-    "I": "DCE", "J": "DCE", "JM": "DCE", "L": "DCE", "M": "DCE", "P": "DCE",
-    "PG": "DCE", "PP": "DCE", "V": "DCE", "Y": "DCE", "LH": "DCE", "JD": "DCE",
-    "FB": "DCE", "BB": "DCE", "RR": "DCE", "LG": "DCE",
-    "SI": "GFEX", "LC": "GFEX", "PS": "GFEX",
-}
 
 
 def ctp_exchange_id(symbol: str) -> str:
@@ -46,8 +29,16 @@ def ctp_exchange_id(symbol: str) -> str:
 
 
 def ctp_instrument_id(symbol: str) -> str:
-    """按交易所规范合约代码大小写，避免柜台因代码格式拒单。"""
+    """按交易所规范合约代码大小写，避免柜台因代码格式拒单。
+
+    期权不能整串大写或小写：上期所/大商所的品种小写、C/P 大写，
+    郑商所/中金所整串大写，大商所/广期所/中金所还带连字符。
+    """
     text = str(symbol or "").strip()
+    from src.domain.options import is_option, normalize_option_code
+
+    if is_option(text):
+        return normalize_option_code(text)
     exchange = ctp_exchange_id(text)
     if exchange in {"CZCE", "CFFEX"}:
         return text.upper()

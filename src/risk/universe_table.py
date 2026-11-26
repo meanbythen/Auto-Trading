@@ -43,12 +43,22 @@ HEADERS = (
     "每跳价格",
     "交易时段",
     "清仓时刻",
+    "合约类型",
+    "标的",
+    "到期日",
+    "行权价",
+    "期权方向",
 )
+
+# 期权专用列。旧表没有这几列时，启动会整表重写补上（空值不填）。
+OPTION_HEADERS = ("合约类型", "标的", "到期日", "行权价", "期权方向")
 
 
 def product_key(symbol: str) -> str:
-    """fu2701 / BU2612 → fu / bu。只留字母。"""
-    return "".join(ch for ch in str(symbol or "").strip().lower() if "a" <= ch <= "z")
+    """fu2701 / BU2612 → fu / bu；期权取标的品种（rb2601C3500 → rb）。"""
+    from src.domain.options import option_product
+
+    return option_product(symbol)
 
 
 def resolve_universe_path(cfg: dict[str, Any] | None = None, root: str | Path | None = None) -> Path:
@@ -127,18 +137,23 @@ def rows_from_cfg(cfg: dict[str, Any]) -> list[dict[str, Any]]:
     seen_sym: set[str] = set()
     covered_products: set[str] = set()
 
+    from src.domain.options import is_option
+
     for sym in symbols:
-        key = product_key(sym)
+        is_opt = is_option(sym)
+        key = sym.lower() if is_opt else product_key(sym)
         if not key or sym.lower() in seen_sym:
             continue
         seen_sym.add(sym.lower())
         covered_products.add(key)
         box = contracts.get(key) if isinstance(contracts.get(key), dict) else {}
+        if not box and not is_opt:
+            box = contracts.get(product_key(sym)) if isinstance(contracts.get(product_key(sym)), dict) else {}
         box = box or {}
         rows.append(_normalize_row(
             {
                 "symbol": sym,
-                "name": str(box.get("name") or key),
+                "name": str(box.get("name") or product_key(sym)),
                 "margin_rate_pct": parse_margin_rate_pct(box.get("margin_rate_pct")),
                 "multiplier": max(0.1, _as_float(box.get("multiplier"), 10.0)),
                 "commission": max(0.0, _as_float(box.get("commission"), 0.0)),
@@ -147,13 +162,20 @@ def rows_from_cfg(cfg: dict[str, Any]) -> list[dict[str, Any]]:
                 "price_tick": _optional_tick(box),
                 "trading_sessions": str(box.get("trading_sessions") or ""),
                 "flatten_times": str(box.get("flatten_times") or ""),
+                "instrument_type": str(box.get("instrument_type") or ("期权" if is_opt else "")),
+                "underlying": str(box.get("underlying") or (product_key(sym) if is_opt else "")),
+                "expiry": str(box.get("expiry") or ""),
+                "strike": _as_float(box.get("strike"), 0.0),
+                "option_type": str(box.get("option_type") or ""),
                 "enabled": True,
             }
         ))
 
     # 保证金里有、关注里还没有对应合约的品种：留一行启用=否，方便你以后填合约。
     for key, item in (contracts or {}).items():
-        code = product_key(str(key))
+        raw_key = str(key)
+        is_opt = is_option(raw_key)
+        code = raw_key.lower() if is_opt else product_key(raw_key)
         if not code or code in covered_products:
             continue
         if not isinstance(item, dict):
@@ -161,8 +183,8 @@ def rows_from_cfg(cfg: dict[str, Any]) -> list[dict[str, Any]]:
         covered_products.add(code)
         rows.append(_normalize_row(
             {
-                "symbol": code,
-                "name": str(item.get("name") or code),
+                "symbol": raw_key,
+                "name": str(item.get("name") or product_key(raw_key)),
                 "margin_rate_pct": parse_margin_rate_pct(item.get("margin_rate_pct")),
                 "multiplier": max(0.1, _as_float(item.get("multiplier"), 10.0)),
                 "commission": max(0.0, _as_float(item.get("commission"), 0.0)),
@@ -171,6 +193,11 @@ def rows_from_cfg(cfg: dict[str, Any]) -> list[dict[str, Any]]:
                 "price_tick": _optional_tick(item),
                 "trading_sessions": str(item.get("trading_sessions") or ""),
                 "flatten_times": str(item.get("flatten_times") or ""),
+                "instrument_type": str(item.get("instrument_type") or ("期权" if is_opt else "")),
+                "underlying": str(item.get("underlying") or (product_key(raw_key) if is_opt else "")),
+                "expiry": str(item.get("expiry") or ""),
+                "strike": _as_float(item.get("strike"), 0.0),
+                "option_type": str(item.get("option_type") or ""),
                 "enabled": False,
             }
         ))
@@ -216,6 +243,11 @@ def _normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     out["price_tick"] = _optional_tick(out)
     out["trading_sessions"] = str(out.get("trading_sessions") or "").strip()
     out["flatten_times"] = str(out.get("flatten_times") or "").strip()
+    out["instrument_type"] = str(out.get("instrument_type") or "").strip()
+    out["underlying"] = str(out.get("underlying") or "").strip().lower()
+    out["expiry"] = str(out.get("expiry") or "").strip()
+    out["strike"] = _as_float(out.get("strike"), 0.0)
+    out["option_type"] = str(out.get("option_type") or "").strip().upper()
     return out
 
 
@@ -263,6 +295,11 @@ def write_universe_table(path: Path | str, rows: list[dict[str, Any]]) -> Path:
                 _excel_number(tick) if tick is not None else None,
                 str(item.get("trading_sessions") or ""),
                 str(item.get("flatten_times") or ""),
+                str(item.get("instrument_type") or ""),
+                str(item.get("underlying") or ""),
+                str(item.get("expiry") or ""),
+                _excel_number(float(item.get("strike") or 0)) if float(item.get("strike") or 0) > 0 else None,
+                str(item.get("option_type") or ""),
             ]
         )
     sheet.column_dimensions["A"].width = 12
@@ -276,6 +313,11 @@ def write_universe_table(path: Path | str, rows: list[dict[str, Any]]) -> Path:
     sheet.column_dimensions["I"].width = 12
     sheet.column_dimensions["J"].width = 42
     sheet.column_dimensions["K"].width = 16
+    sheet.column_dimensions["L"].width = 10
+    sheet.column_dimensions["M"].width = 10
+    sheet.column_dimensions["N"].width = 12
+    sheet.column_dimensions["O"].width = 10
+    sheet.column_dimensions["P"].width = 10
     book.save(file)
     return file
 
@@ -318,6 +360,13 @@ def read_universe_table(path: Path | str) -> list[dict[str, Any]]:
         idx_tick = _find_col(names, ("每跳价格", "每跳", "最小变动价位", "tick", "price_tick"))
         idx_sess = _find_col(names, ("交易时段", "时段", "trading_sessions", "sessions"))
         idx_flat = _find_col(names, ("清仓时刻", "清仓", "flatten_times", "flatten"))
+        idx_type = _find_col(names, ("合约类型", "类型", "instrument_type"))
+        idx_under = _find_col(names, ("标的", "标的品种", "underlying"))
+        idx_expiry = _find_col(
+            names, ("到期日", "最后交易日", "expiry", "expire_date", "last_trading_day")
+        )
+        idx_strike = _find_col(names, ("行权价", "strike"))
+        idx_kind = _find_col(names, ("期权方向", "看涨看跌", "option_type"))
         if idx_sym is None:
             raise ValueError("表格至少要有「合约代码」")
         if idx_rate is None:
@@ -367,6 +416,21 @@ def read_universe_table(path: Path | str) -> list[dict[str, Any]]:
             flats = ""
             if idx_flat is not None and idx_flat < len(raw):
                 flats = str(raw[idx_flat] or "").strip()
+            instrument_type = ""
+            if idx_type is not None and idx_type < len(raw):
+                instrument_type = str(raw[idx_type] or "").strip()
+            underlying = ""
+            if idx_under is not None and idx_under < len(raw):
+                underlying = str(raw[idx_under] or "").strip()
+            expiry = ""
+            if idx_expiry is not None and idx_expiry < len(raw):
+                expiry = str(raw[idx_expiry] or "").strip()
+            strike = 0.0
+            if idx_strike is not None and idx_strike < len(raw):
+                strike = max(0.0, _as_float(raw[idx_strike], 0.0))
+            option_type = ""
+            if idx_kind is not None and idx_kind < len(raw):
+                option_type = str(raw[idx_kind] or "").strip()
             rows.append(
                 _normalize_row(
                     {
@@ -380,6 +444,11 @@ def read_universe_table(path: Path | str) -> list[dict[str, Any]]:
                         "price_tick": tick,
                         "trading_sessions": sessions,
                         "flatten_times": flats,
+                        "instrument_type": instrument_type,
+                        "underlying": underlying,
+                        "expiry": expiry,
+                        "strike": strike,
+                        "option_type": option_type,
                         "enabled": enabled,
                     }
                 )
@@ -400,10 +469,16 @@ def _fee_signature(row: dict[str, Any]) -> tuple[float, float | None, float | No
 
 
 def _assert_product_margins_consistent(rows: list[dict[str, Any]]) -> None:
-    """同品种多行时，保证金比例、每手数量、手续费、每跳价格必须完全一致。"""
+    """同品种多行时，保证金比例、每手数量、手续费、每跳价格必须完全一致。
+
+    期权每个行权价都是独立合约，比例/乘数可以不同，按完整合约各自校验。
+    """
+    from src.domain.options import is_option
+
     seen: dict[str, tuple[float, float, tuple[float, float | None, float | None], float | None, str]] = {}
     for row in rows:
-        key = product_key(str(row.get("symbol") or ""))
+        text = str(row.get("symbol") or "")
+        key = text.strip().lower() if is_option(text) else product_key(text)
         if not key:
             continue
         rate = float(row.get("margin_rate_pct") or 0)
@@ -443,10 +518,13 @@ def parse_universe_rows(rows: list[dict[str, Any]]) -> tuple[list[str], dict[str
     symbols: list[str] = []
     seen_sym: set[str] = set()
     contracts: dict[str, dict[str, Any]] = {}
+    from src.domain.options import is_option
+
     for row in rows:
         item = _normalize_row(row)
         sym = str(item.get("symbol") or "").strip()
-        key = product_key(sym)
+        is_opt = is_option(sym)
+        key = sym.lower() if is_opt else product_key(sym)
         if not key:
             continue
         # 合约代码若只是品种字母（如 c），不当成可交易合约，除非带数字。
@@ -473,6 +551,15 @@ def parse_universe_rows(rows: list[dict[str, Any]]) -> tuple[list[str], dict[str
         flats = str(item.get("flatten_times") or "").strip()
         if flats:
             box["flatten_times"] = flats
+        if is_opt:
+            box["instrument_type"] = str(item.get("instrument_type") or "期权")
+            box["underlying"] = str(item.get("underlying") or product_key(sym))
+            if item.get("expiry"):
+                box["expiry"] = str(item["expiry"])
+            if float(item.get("strike") or 0) > 0:
+                box["strike"] = float(item["strike"])
+            if item.get("option_type"):
+                box["option_type"] = str(item["option_type"]).upper()
         contracts[key] = box
     return symbols, contracts
 
@@ -535,6 +622,11 @@ def _put_universe_into_cfg(
             box["trading_sessions"] = str(item["trading_sessions"])
         if item.get("flatten_times"):
             box["flatten_times"] = str(item["flatten_times"])
+        for field in ("instrument_type", "underlying", "expiry", "option_type"):
+            if item.get(field):
+                box[field] = str(item[field])
+        if float(item.get("strike") or 0) > 0:
+            box["strike"] = float(item["strike"])
         risk["contracts"][code] = box
 
 
@@ -577,6 +669,7 @@ def apply_universe_table_to_cfg(
     # 旧表没有每跳价格列时也补上，留空表示用全局 price_tick。
     upgrade_universe_tick_column(table_path, rows)
     upgrade_universe_session_columns(table_path, rows)
+    upgrade_universe_option_columns(table_path, rows)
     symbols, contracts = parse_universe_rows(rows)
     _put_universe_into_cfg(cfg, symbols, contracts)
     if table_path.exists():
@@ -709,6 +802,23 @@ def upgrade_universe_session_columns(path: Path | str, rows: list[dict[str, Any]
         )
         return False
     logger.info("品种与合约表已补上交易时段/清仓时刻: {}", file)
+    return True
+
+
+def upgrade_universe_option_columns(path: Path | str, rows: list[dict[str, Any]] | None = None) -> bool:
+    """旧表缺期权五列（类型/标的/到期日/行权价/方向）时整表重写补上，值先留空。"""
+    file = Path(path)
+    if all(_universe_headers_have(file, (name,)) for name in OPTION_HEADERS):
+        return False
+    data = rows if rows is not None else read_universe_table(file)
+    try:
+        write_universe_table(file, data)
+    except PermissionError:
+        logger.warning(
+            "品种与合约表正在被 Excel 打开，没能写入期权列。请先关掉表格再重新打开本程序。"
+        )
+        return False
+    logger.info("品种与合约表已补上期权列（合约类型/标的/到期日/行权价/期权方向）: {}", file)
     return True
 
 
@@ -847,6 +957,9 @@ def sync_ctp_contract_to_universe(
     if not symbol:
         raise ValueError("没有合约代码，不能写入品种表。")
     rows = read_universe_table(file)
+    from src.domain.options import is_option
+
+    is_opt = is_option(symbol)
     key = product_key(symbol)
     matched = False
     cost_keys = (
@@ -857,9 +970,11 @@ def sync_ctp_contract_to_universe(
         "commission_close",
         "commission_close_today",
     )
+    option_keys = ("instrument_type", "underlying", "expiry", "strike", "option_type")
     for row in rows:
         same = str(row.get("symbol") or "").strip().lower() == symbol.lower()
-        same_product = product_key(str(row.get("symbol") or "")) == key
+        # 期权每个行权价是独立合约，不能顺手改同品种的期货行。
+        same_product = (not is_opt) and product_key(str(row.get("symbol") or "")) == key
         if not same and not same_product:
             continue
         matched = True
@@ -870,6 +985,9 @@ def sync_ctp_contract_to_universe(
             row["name"] = str(fields["name"]).strip()
         for ck in cost_keys:
             if ck in fields and fields.get(ck) is not None:
+                row[ck] = fields[ck]
+        for ck in option_keys:
+            if fields.get(ck) not in (None, ""):
                 row[ck] = fields[ck]
     if not matched:
         rows.append(
@@ -883,6 +1001,11 @@ def sync_ctp_contract_to_universe(
                     "commission_close": fields.get("commission_close"),
                     "commission_close_today": fields.get("commission_close_today"),
                     "price_tick": fields.get("price_tick"),
+                    "instrument_type": fields.get("instrument_type") or "",
+                    "underlying": fields.get("underlying") or "",
+                    "expiry": fields.get("expiry") or "",
+                    "strike": fields.get("strike") or 0,
+                    "option_type": fields.get("option_type") or "",
                     "enabled": False,
                 }
             )

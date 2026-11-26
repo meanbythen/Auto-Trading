@@ -548,7 +548,14 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
                     price = float(self.kline.latest_price(symbol) or 0)
                 except Exception:  # noqa: BLE001 - 取不到价格按缺数据处理
                     price = 0.0
-            lot_margin = sizer.margin_for(symbol, price) if price > 0 else 0.0
+            from src.domain.options import is_option
+
+            # 期权腿默认按买方权利金估占用；真正的方向仍由 calc_open 按信号校验。
+            lot_margin = (
+                sizer.margin_for(symbol, price, "long")
+                if is_option(symbol)
+                else sizer.margin_for(symbol, price)
+            ) if price > 0 else 0.0
             if price <= 0 or lot_margin <= 0:
                 missing.append(symbol)
                 continue
@@ -619,6 +626,13 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
         每笔风险%和仓位上限，否则小权益下会开出买不起的仓。
         """
         meta = decision.meta or {}
+        # 期权到期/最后交易日限制：缺到期日或已到只平不开，直接拒绝开仓。
+        from src.account.option_lifecycle import assert_tradable
+
+        tradable, why_not = assert_tradable(getattr(self, "cfg", None), decision.symbol)
+        if not tradable:
+            _ops_alert(self, "option_not_tradable", why_not)
+            return 0, why_not
         kelly_rows: list[dict[str, Any]] | None = None
         from src.risk.kelly import kelly_box
 
@@ -634,6 +648,14 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
         sync_quota = getattr(self, "_sync_leg_quota", None)
         if callable(sync_quota):
             sync_quota({decision.symbol: float(decision.entry_price or 0)})
+        action = getattr(decision, "action", None)
+        side = (
+            "long"
+            if action == StrategyAction.BUY_OPEN
+            else "short"
+            if action == StrategyAction.SELL_OPEN
+            else None
+        )
         sized = self.sizer.calc_open(
             decision.symbol,
             decision.entry_price,
@@ -642,6 +664,7 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
             positions=self.risk.positions,
             max_per_order=order_volume_cap(getattr(self, "trader", None)),
             kelly_rows=kelly_rows,
+            side=side,
         )
         if sized.volume <= 0 and "保证金比例" in sized.reason:
             # 缺保证金比例时单信号算仓会拒开；除日志外再写一条运行页告警。

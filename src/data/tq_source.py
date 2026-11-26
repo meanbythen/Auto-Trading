@@ -21,18 +21,12 @@ import pandas as pd
 from loguru import logger
 
 from src.data.periods import canonical_period, trading_minutes_between
+from src.domain.exchanges import EXCHANGE_BY_PRODUCT as _EXCHANGE_BY_PRODUCT
 
 # 品种代码在天勤属于哪家交易所。主连用 KQ.m@交易所.品种。
-_EXCHANGES = {
-    "SHFE": "cu al zn pb ni sn au ag rb wr hc ss bu ru sp fu ao br ad op".split(),
-    "INE": "sc lu nr bc ec".split(),
-    "DCE": "a b m y p c cs jd lh l v pp j jm i eg eb pg rr fb bb bz lg".split(),
-    "CZCE": "sr cf ta ma fg rm oi sa pf ur sm sf ap cj pk cy sh px pl pr".split(),
-    "CFFEX": "if ih ic im t tf ts tl".split(),
-    "GFEX": "si lc ps pt pd".split(),
-}
+# 归属表与柜台、期权解析共用一份，这里只把小写键留给原有调用点。
 EXCHANGE_BY_PRODUCT = {
-    product: exchange for exchange, products in _EXCHANGES.items() for product in products
+    product.lower(): exchange for product, exchange in _EXCHANGE_BY_PRODUCT.items()
 }
 
 # 各交易所开盘时刻（分钟数）。K 线是右标签（结束时刻），正好落在开盘上的不可能存在。
@@ -43,8 +37,10 @@ CFFEX_OPEN_MINUTES = (9 * 60 + 30, 13 * 60)  # 中金所：09:30 / 13:00，没�
 
 def session_open_minutes(symbol: str) -> tuple[int, ...]:
     """这个合约所在交易时段的开盘时刻。中金所下午 13:30 是正常收盘时刻，不能按商品那套算。"""
+    from src.domain.options import option_product
+
     text = str(symbol or "").split("@")[0]
-    product = "".join(ch for ch in text if ch.isalpha()).lower()
+    product = option_product(text)
     if EXCHANGE_BY_PRODUCT.get(product) == "CFFEX":
         return CFFEX_OPEN_MINUTES
     return COMMODITY_OPEN_MINUTES
@@ -105,10 +101,18 @@ def tq_symbol(symbol: str) -> str:
 
     fu2701 → SHFE.fu2701；只写品种 bu → KQ.m@SHFE.bu（主连）。
     CZCE 的合约是 3 位年月，配置里常写 4 位（SR2701 → CZCE.SR701）。
+    期权按交易所原生写法直出：rb2601C3500 → SHFE.rb2601C3500。
     """
     text = str(symbol or "").strip()
     if not text:
         raise ValueError("合约名是空的")
+    from src.domain.options import is_option, normalize_option_code, option_exchange
+
+    if is_option(text):
+        exchange = option_exchange(text)
+        if not exchange:
+            raise ValueError(f"还不知道期权 {symbol} 属于哪家交易所")
+        return f"{exchange}.{normalize_option_code(text)}"
     if "." in text:
         exchange, code = text.split(".", 1)
         exchange = exchange.upper()

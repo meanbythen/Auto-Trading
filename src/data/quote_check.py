@@ -137,5 +137,7 @@ def storage_symbol(symbol: str, source: str | None) -> str:
 
 
 def product_code(symbol: str) -> str:
-    """bu2612 → bu。只留字母，用来判断是哪家交易所。"""
-    return "".join(ch for ch in str(symbol or "") if ch.isalpha()).lower()
+    """bu2612 → bu；期权取标的品种（rb2601C3500 → rb）。"""
+    from src.domain.options import option_product
+
+    return option_product(symbol)

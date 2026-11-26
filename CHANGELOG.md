@@ -4,6 +4,27 @@
 
 规则写在 README 的「版本」一节。已经写在这里的旧版本不再改写，新的改动加在最上面。
 
+## 57.3.0 — 2026-11-26
+
+加功能（功能更新）：在不改主循环、执行抽象、对账和告警的前提下，支持期权买方自动交易。
+
+- 新增 `src/domain/options.py`：统一解析 `rb2601C3500`、`m2601-C-3000`、`SR605C6000`、`IO2512-C-4000` 四种写法，
+  并按交易所规范重写 CTP / 天勤代码；`quote_check.product_code`、`sizing._product_key` 等原先「去掉数字当品种」的写法改为走这里。
+- 新增 `src/domain/exchanges.py`：行情、柜台、期权解析共用一份品种归属表，补上中金所 `IO/HO/MO` 等期权品种，消除导入环。
+- 新增 `src/domain/option_contract.py`、`src/risk/option_margin.py`：买方按权利金、卖方按保证金；
+  缺保证金/权利金数据返回 0，由 `PositionSizer` 拒绝开仓并给出原因。
+- 新增 `src/account/option_lifecycle.py`：到期日解析（`YYYY-MM-DD / YYYYMMDD / YYYY-MM / YYMM`）、
+  最后交易日只平不开、到期前强平；缺到期日拒绝开仓。
+- 新增策略 `option_long`（末日期权买方）与 `option_hedge`（期货黑天鹅保护），登记进 `REGISTRY`、
+  策略档案和配置页参数面板；期权买方额外受 `risk.option_premium_budget_pct`（默认 20%）总预算约束。
+- 数据：`tq_symbol` 支持期权交易所前缀；新浪源遇到期权明确报错；`_price_tick_for` 先按完整合约取每跳。
+- 合约表：`品种与合约.xlsx` 新增「合约类型 / 标的 / 到期日 / 行权价 / 期权方向」五列，启动时自动补列；
+  CTP 查合约落表时带上 `StrikePrice / OptionsType / UnderlyingInstrID / ExpireDate`。
+- `TradeRecord` 追加可选期权字段，旧导出不受影响。
+- 测试：新增 `test_option_symbols.py`、`test_option_sizing.py`、`test_option_lifecycle.py` 共 16 条；
+  全量 `pytest tests` 通过，`ruff check src tests`、`mypy src` 通过；本地仿真冒烟完成「算仓 → 买入 20 手 → 写模拟成交 → 到期强平」。
+- 限制：本期只做买方；卖方策略、Greeks、行权/被指派、期权回测列为二期。
+
 ## 57.2.5 — 2026-11-26
 
 修错误（小更新）：清理「重启后对账相关告警误报/不消失」的最后两处来源。

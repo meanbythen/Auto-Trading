@@ -24,19 +24,46 @@ DEFAULT_CONTRACTS: dict[str, dict[str, Any]] = {
 }
 
 
+def _optional_float(value: Any) -> float | None:
+    """可选数字：空值或写错时返回 None，不把 0 当有效数据。"""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _contract_entry(key: str, value: Any) -> dict[str, Any]:
+    """把一个品种/合约配置收成统一字典，保留计价和期权需要的可选字段。"""
+    if not isinstance(value, dict):
+        return {"multiplier": float(value), "name": str(key)}
+    entry: dict[str, Any] = {
+        "multiplier": float(value.get("multiplier", DEFAULT_MULTIPLIER)),
+        "name": str(value.get("name", key)),
+        "margin_rate_pct": float(value.get("margin_rate_pct", 0) or 0),
+    }
+    for field in ("price_tick", "strike", "seller_margin_ratio", "underlying_price"):
+        number = _optional_float(value.get(field))
+        if number is not None:
+            entry[field] = number
+    for field in ("option_type", "expiry", "underlying"):
+        text = str(value.get(field) or "").strip()
+        if text:
+            entry[field] = text
+    return entry
+
+
 def build_contracts(cfg: dict[str, Any] | None) -> dict[str, dict[str, Any]]:
-    """默认品种表叠加配置里的 risk.contracts，键统一成小写品种代码。"""
+    """默认品种表叠加配置里的 risk.contracts，键统一成小写。
+
+    期货按品种配（rb）；期权可以按完整合约配（rb2601C3500），
+    两种键同时保留，查的时候先按合约、再退回品种。
+    """
     contracts: dict[str, dict[str, Any]] = {key: dict(info) for key, info in DEFAULT_CONTRACTS.items()}
     risk = (cfg or {}).get("risk") or {}
     for key, value in (risk.get("contracts") or {}).items():
-        if isinstance(value, dict):
-            contracts[str(key).lower()] = {
-                "multiplier": float(value.get("multiplier", DEFAULT_MULTIPLIER)),
-                "name": str(value.get("name", key)),
-                "margin_rate_pct": float(value.get("margin_rate_pct", 0) or 0),
-            }
-        else:
-            contracts[str(key).lower()] = {"multiplier": float(value), "name": str(key)}
+        contracts[str(key).lower()] = _contract_entry(str(key), value)
     return contracts
 
 

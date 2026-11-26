@@ -122,6 +122,25 @@ def ctp_row_to_universe_costs(row: dict[str, Any] | None, last_price: float) -> 
     if ratio > 0:
         fields["margin_rate_pct"] = round(ratio * 100.0, 4)
     notes: list[str] = []
+    from src.domain.options import is_option, option_kind
+
+    symbol_text = str(fields.get("symbol") or "")
+    product_class = str(row.get("product_class") or "")
+    if is_option(symbol_text) or product_class in {"2", "Options", "期权"}:
+        fields["instrument_type"] = "期权"
+        underlying = str(row.get("underlying_instr_id") or "").strip()
+        if underlying:
+            fields["underlying"] = underlying
+        expire = str(row.get("expire_date") or "").strip()
+        if expire:
+            fields["expiry"] = expire
+        strike = float(row.get("strike_price") or 0)
+        if strike > 0:
+            fields["strike"] = strike
+        options_type = str(row.get("options_type") or "").strip()
+        kind = "C" if options_type == "1" else "P" if options_type == "2" else option_kind(symbol_text)
+        if kind:
+            fields["option_type"] = kind
     open_fee = fee_yuan_per_lot(
         float(row.get("open_volume") or 0),
         float(row.get("open_money") or 0),

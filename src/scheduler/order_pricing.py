@@ -95,11 +95,15 @@ class OrderPricingMixin:
     """价格、盘口与滑点闸门；只读 cfg/trader/kline，不改账本。"""
 
     def _price_tick_for(self, symbol: str) -> float:
-        """每跳价格：先看品种表，再看 CTP/交易配置，最后退回 1。"""
+        """每跳价格：先按完整合约找，再按品种，再看 CTP/交易配置，最后退回 1。"""
         from src.risk.universe_table import product_key
 
         contracts = (self.cfg.get("risk") or {}).get("contracts") or {}
-        box = contracts.get(product_key(symbol)) if isinstance(contracts, dict) else {}
+        box: dict = {}
+        if isinstance(contracts, dict):
+            box = contracts.get(str(symbol or "").strip().lower()) or {}
+            if not box:
+                box = contracts.get(product_key(symbol)) or {}
         raw = (box or {}).get("price_tick")
         if raw in (None, ""):
             trade = self.cfg.get("trade") or {}
