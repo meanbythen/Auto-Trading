@@ -433,3 +433,44 @@ def test_reconcile_still_flattens_if_own_fill_helper_missing(tmp_path, monkeypat
     bot._apply_reconcile(report, phase="runtime")
     assert bot.strategy.positions["bu2612"].side == "flat"
     assert len(_close_rows(tmp_path)) == 1
+
+
+def test_startup_reconcile_unavailable_stays_silent(tmp_path, monkeypatch) -> None:
+    """重启时柜台还没查完不写告警；已连上却查不到才报。"""
+    bot = TradingBot(_cfg(tmp_path))
+    alerts: list[tuple] = []
+    monkeypatch.setattr("src.ops.alerts.emit_alert", lambda *a, **k: alerts.append((a, k)))
+
+    bot._apply_reconcile(_report(queried=False), phase="startup")
+    assert alerts == []
+    assert bot._reconcile_alerted is False
+
+    bot.logged_in = True
+    bot._apply_reconcile(_report(queried=False), phase="runtime")
+    assert [item[0][0] for item in alerts] == ["reconcile_unavailable"]
+    assert bot._reconcile_alerted is True
+
+
+def test_reconcile_ok_writes_recovery_once(tmp_path, monkeypatch) -> None:
+    """对账异常恢复一致后补一条恢复记录，之后不再重复写。"""
+    bot = TradingBot(_cfg(tmp_path))
+    bot.logged_in = True
+    alerts: list[tuple] = []
+    recoveries: list[tuple] = []
+    monkeypatch.setattr("src.ops.alerts.emit_alert", lambda *a, **k: alerts.append(a))
+    monkeypatch.setattr(
+        "src.ops.alerts.emit_recovery", lambda *a, **k: recoveries.append(a)
+    )
+    monkeypatch.setattr(bot, "_reconcile_repair_enabled", lambda: False)
+
+    bot._apply_reconcile(
+        _report(broker={"bu2612": 1}, diffs=["bu2612 柜台 1 手，账本 0 手"]),
+        phase="runtime",
+    )
+    assert [item[0] for item in alerts] == ["reconcile_mismatch"]
+
+    ok_report = _report(broker={"bu2612": 1}, ledger={"bu2612": 1}, memory={"bu2612": 1})
+    bot._apply_reconcile(ok_report, phase="runtime")
+    assert [item[0] for item in recoveries] == ["reconcile_ok"]
+    bot._apply_reconcile(ok_report, phase="runtime")
+    assert len(recoveries) == 1

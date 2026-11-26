@@ -245,7 +245,9 @@ class OrderIntentMixin:
         try:
             from src.ops.alerts import emit_alert
 
-            emit_alert("pending_intent", message, level="error")
+            emit_alert(
+                "pending_intent", message, level="error", root=getattr(self, "root", None)
+            )
         except Exception:  # noqa: BLE001
             pass
 

@@ -34,7 +34,13 @@ RECOVERY_OF: dict[str, tuple[str, ...]] = {
     "ctp_up": ("ctp_down", "ctp_book_mismatch"),
     "window_up": ("window_lost",),
     "leg_alloc_ok": ("leg_margin_missing", "leg_alloc_overflow"),
-    "reconcile_ok": ("exit_with_positions",),
+    "reconcile_ok": (
+        "exit_with_positions",
+        "reconcile_unavailable",
+        "reconcile_mismatch",
+        "position_phantom",
+        "position_unclaimed",
+    ),
 }
 # 熔断告警正文里「已超过限额 100」这一段数字，用来对照现在配置页填的日最大亏损。
 _HALT_LIMIT_RE = re.compile(r"已超过限额\s*([0-9]+(?:\.[0-9]+)?)")

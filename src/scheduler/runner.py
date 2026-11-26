@@ -439,6 +439,8 @@ class TradingBot(
         self._frozen_symbols: set[str] = set()
         self._frozen_noted: set[str] = set()
         self._reconcile_state: dict[str, Any] = {}
+        # 是否因为对账异常写过告警；恢复正常时补一条恢复记录，别让旧告警一直挂着。
+        self._reconcile_alerted = False
         self._phantom_rounds: dict[str, int] = {}
         self._startup_reconcile_pending = False
         self._load_persisted_state()
@@ -1382,10 +1384,11 @@ class TradingBot(
 
     def _reconcile_alert(self, kind: str, message: str, level: str = "warning") -> None:
         """对账告警；告警通道异常时只写日志。"""
+        self._reconcile_alerted = True
         try:
             from src.ops.alerts import emit_alert
 
-            emit_alert(kind, message, level=level)
+            emit_alert(kind, message, level=level, root=self.root)
         except Exception as exc:  # noqa: BLE001
             logger.warning("对账告警 {} 发送失败: {}", kind, exc)
 
@@ -1412,7 +1415,12 @@ class TradingBot(
         state["phase"] = phase
         self._reconcile_state = state
         if not report.queried:
-            self._reconcile_alert("reconcile_unavailable", "柜台对账未完成，本轮不修复持仓")
+            if phase != "startup" and bool(getattr(self, "logged_in", False)):
+                # 已连上柜台却查不到持仓，才是真异常；启动阶段还没登录完成
+                # 属于正常过程，只记日志，别在重启后留一条吓人的告警。
+                self._reconcile_alert("reconcile_unavailable", "柜台对账未完成，本轮不修复持仓")
+            else:
+                logger.info("柜台对账暂不可用（{}），本轮不修复持仓", phase)
             self._safe_event("reconcile_unavailable", phase=phase, diffs=list(report.diffs))
             return
 
@@ -1461,6 +1469,23 @@ class TradingBot(
                     break
             if not noisy:
                 self._reconcile_alert("reconcile_mismatch", "；".join(report.diffs))
+
+        ok_now = (
+            bool(report.queried)
+            and not real_unclaimed
+            and not real_phantom
+            and not state.get("diffs")
+        )
+        if ok_now and getattr(self, "_reconcile_alerted", False):
+            # 之前报过对账异常，现在已经完全对上：补一条恢复记录，
+            # 别让「缺持仓/未完成」一直挂在最近告警里。
+            self._reconcile_alerted = False
+            try:
+                from src.ops.alerts import emit_recovery
+
+                emit_recovery("reconcile_ok", "柜台对账已恢复：持仓与资金一致", root=self.root)
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("对账恢复记录写入失败: {}", exc)
 
         # 幽灵仓：runtime 连续两轮确认才补记，避免刚成交、柜台还没更新时误平。
         phantom_now = {str(name).strip().lower() for name in real_phantom}
