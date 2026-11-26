@@ -285,6 +285,12 @@ class AutoTradingApp(
             return
         if name == "策略研究":
             self._on_research_tab_change()
+        elif name == "交易配置":
+            # 账户权益只读，打开配置页就按当前账本对一次，别让用户看到旧余额。
+            try:
+                self._pull_signal_balance(force=True)
+            except Exception as exc:  # noqa: BLE001 - 对不上不影响切页
+                logger.warning("切到交易配置时对账户权益跳过: {}", exc)
 
 
     def _on_backtest_done(self, event: Event) -> None:

@@ -35,6 +35,17 @@ def _no_live_tq_login():
 
 
 @pytest.fixture(autouse=True)
+def _isolated_alert_store(tmp_path, monkeypatch):
+    """每个用例的告警写自己的临时目录，别污染正在使用的实盘 alerts.jsonl。"""
+    from src.ops import alerts as alerts_module
+
+    monkeypatch.setattr(alerts_module, "_default_root", tmp_path)
+    monkeypatch.setattr(alerts_module, "_last_emit", {})
+    monkeypatch.setattr(alerts_module, "_run_id", "")
+    yield tmp_path
+
+
+@pytest.fixture(autouse=True)
 def _isolated_secret_store(tmp_path, monkeypatch):
     """每个用例用自己的空密钥库，别把开发机上的真实密码读进断言。"""
     from src.account import registry as registry_module

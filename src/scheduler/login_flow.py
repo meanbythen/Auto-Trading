@@ -80,15 +80,24 @@ class LoginFlowMixin:
         if not self.trader_capabilities.window_driven or self.cfg.get("dry_run", True):
             return True
         if self.login_mgr.window_exists():
+            if getattr(self, "_window_lost_alerted", False):
+                self._window_lost_alerted = False
+                try:
+                    from src.ops.alerts import emit_recovery
+
+                    emit_recovery("window_up", "交易软件窗口已恢复")
+                except Exception:  # noqa: BLE001
+                    pass
             return True
         logger.error("未找到交易软件窗口，本轮跳过扫描。请重新打开并登录后再挂机。")
         self.logged_in = False
         self.last_error = "交易软件窗口丢失"
+        self._window_lost_alerted = True
         self._record_event("window_lost")
         try:
             from src.ops.alerts import emit_alert
 
-            emit_alert("window_lost", "交易软件窗口丢失，本轮跳过扫描", level="error")
+            emit_alert("window_lost", "交易软件窗口丢失，本轮跳过扫描", level="error", root=self.root)
         except Exception:  # noqa: BLE001
             pass
         return False
@@ -245,7 +254,7 @@ class LoginFlowMixin:
             try:
                 from src.ops.alerts import emit_alert
 
-                emit_alert("ctp_book_mismatch", book_block, level="error")
+                emit_alert("ctp_book_mismatch", book_block, level="error", root=self.root)
             except Exception:  # noqa: BLE001
                 pass
             return False
@@ -255,6 +264,13 @@ class LoginFlowMixin:
             self.logged_in = True
             self._ctp_retry_at = None
             logger.info("CTP {}", message)
+            try:
+                # 连上了就把「CTP 没有连上」这类过期告警撤掉，别让面板一直挂着旧状态。
+                from src.ops.alerts import emit_recovery
+
+                emit_recovery("ctp_up", f"CTP 已连上：{message}")
+            except Exception:  # noqa: BLE001
+                pass
             self._startup_equity_sync()
             return True
 
@@ -268,7 +284,7 @@ class LoginFlowMixin:
         try:
             from src.ops.alerts import emit_alert
 
-            emit_alert("ctp_down", f"CTP 没有连上：{message}", level="error")
+            emit_alert("ctp_down", f"CTP 没有连上：{message}", level="error", root=self.root)
         except Exception:  # noqa: BLE001
             pass
         return False

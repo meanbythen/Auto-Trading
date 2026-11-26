@@ -1044,12 +1044,14 @@ class AccountTabMixin:
         self._paint_account_stats(book)
 
 
-    def _pull_signal_balance(self) -> None:
+    def _pull_signal_balance(self, force: bool = False) -> None:
         """
         常驻做完一笔后，把配置页的账户权益改成新余额。
 
         这个数字不能在配置页手改，所以余额一变就更新显示。
         账本文件没变时，不反复刷账户分析右边的文字。
+        force=True 用于保存配置、启动常驻、重新读配置之后：
+        这些时机必须按账本重新对一遍，免得把配置文件里的旧权益又写回去。
         """
         from src.account.signal_book import multiplier_map
         from src.account.signal_book import book_path, load_book, shown_equity
@@ -1061,8 +1063,9 @@ class AccountTabMixin:
             mtime = path.stat().st_mtime
         except OSError:
             return
+        changed = mtime != self._signal_book_mtime
         # 账本文件没变，余额和右边文字都不会变，不必每 800ms 全量读一遍 JSON。
-        if mtime == self._signal_book_mtime:
+        if not changed and not force:
             return
         book = load_book(self.root_dir)
         if book is None:
@@ -1074,7 +1077,8 @@ class AccountTabMixin:
             shown = None
         if shown is None or abs(balance - shown) > 0.01:
             self._apply_book_balance(balance)
-        self._refresh_signal_view()
+        if changed:
+            self._refresh_signal_view()
 
     def _shift_account_month(self, step: int) -> None:
         """盈亏日历翻到上一个月或下一个月。"""

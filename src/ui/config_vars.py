@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from typing import Any
 
+from loguru import logger
+
 from src.data.periods import ui_parts
 from src.ui.app_common import _eth_minutes_from_strategy
 from src.ui.app_common import _ui_engine
@@ -1150,6 +1152,14 @@ class ConfigVarsMixin:
         self.kelly_win_var.set(win_rate_pct_display(_kr))
         self.kelly_payoff_var.set("" if _kp is None else f"{_kp:g}")
         self._refresh_kelly_status()
+        # 从磁盘重读后，配置文件里的权益可能是旧的（例如上次没保存成）。
+        # 账户权益只读，必须再按当前账本对一次，不能停在磁盘旧值上。
+        pull = getattr(self, "_pull_signal_balance", None)
+        if callable(pull):
+            try:
+                pull(force=True)
+            except Exception as exc:  # noqa: BLE001 - 对权益失败不影响其他配置重读
+                logger.debug("重读配置后对账户权益跳过: {}", exc)
 
     def _rebuild_leg_rows(self) -> None:
         """按当前配置重画策略腿输入行；页面还没建好时什么都不做。"""

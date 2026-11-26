@@ -304,7 +304,8 @@ class ConfigSupportMixin:
         except (TypeError, ValueError):
             old_limit = 0.0
         # 保存前用最新余额填上账户权益。这个数不能在配置页手改。
-        self._pull_signal_balance()
+        # 必须强制对一次：账本文件没变时也要拿掉配置文件里的旧权益，否则又会把旧值写回去。
+        self._pull_signal_balance(force=True)
         # 扫描间隔夹到 5~600 秒，并把夹过的值显示回输入框，避免界面和配置对不上。
         self.scan_var.set(str(self._scan_interval_value()))
         cfg = self._merge_disk_gui_coords(self._apply_ui_to_cfg())
@@ -564,6 +565,8 @@ class ConfigSupportMixin:
         save_config(merged)
         write_gui_coords_file(self.root_dir, coords)
         self.cfg = load_config()
+        # self.cfg 换成磁盘那份后，账户权益要按当前账本再对一次，不能留旧值。
+        self._pull_signal_balance(force=True)
         self._append_log(f"已改用下单坐标: {label}")
         messagebox.showinfo("已换上", "当前下单坐标已经换成这一套。请再启动常驻。")
 

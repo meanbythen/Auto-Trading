@@ -312,3 +312,328 @@ def test_resolve_margin_rate_rejects_illegal_backtest_config() -> None:
     cfg = {"risk": {"contracts": {}}}
     assert resolve_margin_rate(cfg, "rb2510", {"margin_rate": 5}) == MARGIN_RATE
     assert resolve_margin_rate(cfg, "rb2510", {"margin_rate": "bad"}) == MARGIN_RATE
+
+
+def test_leg_alloc_keeps_one_lot_each_then_fills_budget() -> None:
+    """4.2万权益、80%上限：燃油每手8864、生猪每手15152 → 2手燃油+1手生猪，占用78%。"""
+    from src.risk.leg_alloc import allocate
+
+    plan = allocate({"fu2701": 8864, "lh2703": 15152}, 42171.81 * 0.8)
+    assert plan.lots == {"fu2701": 2, "lh2703": 1}
+    assert plan.uncovered == ()
+    assert plan.used <= plan.budget
+    assert "fu2701 2手" in plan.summary()
+
+
+def test_leg_alloc_reports_uncovered_leg_when_budget_too_small() -> None:
+    """预算连一人一手都不够时，先保便宜的腿，另一条腿明确报未覆盖。"""
+    from src.risk.leg_alloc import allocate
+
+    plan = allocate({"fu2701": 8864, "lh2703": 15152}, 20000)
+    assert plan.lots["fu2701"] == 2
+    assert plan.lots["lh2703"] == 0
+    assert plan.uncovered == ("lh2703",)
+    assert plan.used <= 20000
+
+
+def test_leg_quota_caps_each_leg_even_if_money_allows_more() -> None:
+    """组合分配 2 手燃油 + 1 手生猪：燃油不能再开第 3 手，生猪留得住 1 手。"""
+    cfg = _cfg(22.74, capital=42171.81, margin_usage_pct=80)
+    cfg["risk"]["contracts"] = {
+        "fu": {"multiplier": 10, "margin_rate_pct": 22.74},
+        "lh": {"multiplier": 16, "margin_rate_pct": 10},
+    }
+    sizer = PositionSizer(cfg)
+    sizer.set_leg_quota({"fu": 2, "lh": 1}, {"fu": 8864.05, "lh": 15152})
+    fu = sizer.calc_open("fu2701", 3898, 3858)
+    assert fu.volume == 2
+    assert "组合分配上限2手" in fu.reason
+    lh = sizer.calc_open("lh2703", 9470, 9440, positions={"fu2701": 2})
+    assert lh.volume == 1
+    again = sizer.calc_open("fu2701", 3898, 3858, positions={"fu2701": 2, "lh2703": 1})
+    assert again.volume == 0
+    assert "组合分配2手已用完" in again.reason
+
+
+def test_no_leg_quota_keeps_first_come_first_served() -> None:
+    """没配组合分配时保持原行为：同一笔预算里燃油可以开到 3 手。"""
+    cfg = _cfg(22.74, capital=42171.81, margin_usage_pct=80)
+    cfg["risk"]["contracts"] = {
+        "fu": {"multiplier": 10, "margin_rate_pct": 22.74},
+        "lh": {"multiplier": 16, "margin_rate_pct": 10},
+    }
+    sized = PositionSizer(cfg).calc_open("fu2701", 3898, 3858)
+    assert sized.volume == 3
+    assert "组合分配" not in sized.reason
+
+
+def test_sync_leg_quota_only_in_multi_symbol_mode() -> None:
+    """多品种挂机时按当前价格自动分配 2 手燃油 + 1 手生猪；单品种模式清空分配。"""
+    from types import SimpleNamespace
+
+    from src.scheduler.order_executor import OrderExecutorMixin
+
+    cfg = _cfg(22.74, capital=42171.81, margin_usage_pct=80)
+    cfg["risk"]["contracts"] = {
+        "fu": {"multiplier": 10, "margin_rate_pct": 22.74},
+        "lh": {"multiplier": 16, "margin_rate_pct": 10},
+    }
+    prices = {"fu2701": 3898.0, "lh2703": 9470.0}
+    host = SimpleNamespace(
+        _multi_enabled=True,
+        symbols=["fu2701", "lh2703"],
+        _multi_symbols=[],
+        sizer=PositionSizer(cfg),
+        kline=SimpleNamespace(latest_price=lambda symbol: prices.get(symbol, 0.0)),
+    )
+    OrderExecutorMixin._sync_leg_quota(host, {"fu2701": 3898.0})
+    assert host.sizer.leg_quota == {"fu": 2, "lh": 1}
+    assert host.sizer.leg_lot_margin["lh"] == pytest.approx(15152, rel=1e-6)
+
+    host._multi_enabled = False
+    OrderExecutorMixin._sync_leg_quota(host, {})
+    assert host.sizer.leg_quota is None
+
+
+def test_leg_quota_never_exceeds_the_risk_budget() -> None:
+    """分配只是上限：给到 99 手也不能越过权益×仓位上限%算出来的手数。"""
+    cfg = _cfg(22.74, capital=42171.81, margin_usage_pct=80)
+    cfg["risk"]["contracts"] = {"fu": {"multiplier": 10, "margin_rate_pct": 22.74}}
+    sizer = PositionSizer(cfg)
+    sizer.set_leg_quota({"fu": 99}, {"fu": 8864.05})
+    sized = sizer.calc_open("fu2701", 3898, 3858)
+    assert sized.volume == 3
+    assert sized.volume < 99
+    assert "仓位上限" in sized.reason
+
+
+def test_leg_alloc_never_exceeds_budget_for_any_budget() -> None:
+    """任何预算下分配占用都不得越界，且先保每腿至少 1 手。"""
+    from src.risk.leg_alloc import allocate
+
+    legs = {"fu2701": 8864.05, "lh2703": 15152.0}
+    for budget in range(0, 40001, 500):
+        plan = allocate(legs, float(budget))
+        assert plan.used <= plan.budget + 1e-6
+        if budget >= 24016.05:
+            assert plan.lots["fu2701"] >= 1
+            assert plan.lots["lh2703"] >= 1
+
+
+def test_sync_leg_quota_skips_and_warns_when_margin_missing() -> None:
+    """某条腿缺保证金比例时不做「占用最大化」，退回单信号风控；该腿开仓被拒绝。"""
+    from types import SimpleNamespace
+
+    from src.scheduler.order_executor import OrderExecutorMixin
+
+    cfg = _cfg(22.74, capital=42171.81, margin_usage_pct=80)
+    cfg["risk"]["contracts"] = {
+        "fu": {"multiplier": 10, "margin_rate_pct": 22.74},
+        "lh": {"multiplier": 16},  # 故意不填保证金比例
+    }
+    prices = {"fu2701": 3898.0, "lh2703": 9470.0}
+    host = SimpleNamespace(
+        _multi_enabled=True,
+        symbols=["fu2701", "lh2703"],
+        _multi_symbols=[],
+        sizer=PositionSizer(cfg),
+        kline=SimpleNamespace(latest_price=lambda symbol: prices.get(symbol, 0.0)),
+    )
+    OrderExecutorMixin._sync_leg_quota(host, {"fu2701": 3898.0})
+    assert host.sizer.leg_quota is None
+    rejected = host.sizer.calc_open("lh2703", 9470, 9440)
+    assert rejected.volume == 0
+    assert "保证金比例" in rejected.reason
+    assert "拒绝开仓" in rejected.reason
+
+
+def test_sync_leg_quota_skips_when_margin_cap_disabled() -> None:
+    """研究/交叉测试关掉保证金层时，组合分配也必须停用。"""
+    from types import SimpleNamespace
+
+    from src.scheduler.order_executor import OrderExecutorMixin
+
+    cfg = _cfg(22.74, capital=42171.81, margin_usage_pct=80)
+    cfg["risk"]["contracts"] = {
+        "fu": {"multiplier": 10, "margin_rate_pct": 22.74},
+        "lh": {"multiplier": 16, "margin_rate_pct": 10},
+    }
+    disable_margin_cap(cfg)
+    prices = {"fu2701": 3898.0, "lh2703": 9470.0}
+    host = SimpleNamespace(
+        _multi_enabled=True,
+        symbols=["fu2701", "lh2703"],
+        _multi_symbols=[],
+        sizer=PositionSizer(cfg),
+        kline=SimpleNamespace(latest_price=lambda symbol: prices.get(symbol, 0.0)),
+    )
+    OrderExecutorMixin._sync_leg_quota(host, {"fu2701": 3898.0})
+    assert host.sizer.leg_quota is None
+
+
+def test_margin_missing_writes_run_page_alert(tmp_path) -> None:
+    """缺保证金比例时除日志外，还要在运行页「最近告警」留一条。"""
+    from types import SimpleNamespace
+
+    from src.ops.alerts import last_alert
+    from src.scheduler.order_executor import OrderExecutorMixin
+
+    cfg = _cfg(22.74, capital=42171.81, margin_usage_pct=80)
+    cfg["risk"]["contracts"] = {
+        "fu": {"multiplier": 10, "margin_rate_pct": 22.74},
+        "lh": {"multiplier": 16},
+    }
+    prices = {"fu2701": 3898.0, "lh2703": 9470.0}
+    host = SimpleNamespace(
+        root=tmp_path,
+        _multi_enabled=True,
+        symbols=["fu2701", "lh2703"],
+        _multi_symbols=[],
+        sizer=PositionSizer(cfg),
+        kline=SimpleNamespace(latest_price=lambda symbol: prices.get(symbol, 0.0)),
+    )
+    OrderExecutorMixin._sync_leg_quota(host, {"fu2701": 3898.0})
+    row = last_alert(tmp_path)
+    assert row is not None
+    assert row["code"] == "leg_margin_missing"
+    assert "lh2703" in row["message"]
+    assert "补上比例" in row["message"] or "补上保证金比例" in row["message"]
+
+
+def test_single_symbol_open_rejected_writes_alert(tmp_path) -> None:
+    """单品种模式下缺保证金比例，算仓拒开的同时也写运行页告警。"""
+    from types import SimpleNamespace
+
+    from src.ops.alerts import last_alert
+    from src.scheduler.order_executor import OrderExecutorMixin
+
+    cfg = _cfg(22.74, capital=42171.81, margin_usage_pct=80)
+    cfg["risk"]["contracts"] = {"lh": {"multiplier": 16}}  # 故意不填比例
+    host = SimpleNamespace(
+        root=tmp_path,
+        cfg=cfg,
+        sizer=PositionSizer(cfg),
+        risk=SimpleNamespace(total_abs_position=lambda: 0, positions={}),
+    )
+    decision = SimpleNamespace(
+        symbol="lh2703", entry_price=9470.0, stop_price=9440.0, meta={}
+    )
+    volume, _reason = OrderExecutorMixin._size_open(host, decision)
+    assert volume == 0
+    row = last_alert(tmp_path)
+    assert row is not None
+    assert row["code"] == "leg_margin_missing"
+    assert "lh2703" in row["message"]
+
+
+def _write_alert(root, code: str, message: str) -> None:
+    import json
+
+    from src.ops.alerts import alerts_path
+
+    path = alerts_path(root)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "ts": "2026-11-26 09:00:00",
+        "level": "warning",
+        "code": code,
+        "message": message,
+        "run_id": "",
+    }
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def _multi_host(tmp_path, cfg, prices):
+    from types import SimpleNamespace
+
+    return SimpleNamespace(
+        root=tmp_path,
+        _multi_enabled=True,
+        symbols=["fu2701", "lh2703"],
+        _multi_symbols=[],
+        sizer=PositionSizer(cfg),
+        kline=SimpleNamespace(latest_price=lambda symbol: prices.get(symbol, 0.0)),
+    )
+
+
+def test_leg_quota_success_clears_stale_margin_alert(tmp_path) -> None:
+    """数据补齐、分配恢复正常后，运行页那条缺比例告警转为「已恢复」，不再当活跃故障。"""
+    from src.ops.alerts import last_alert
+    from src.scheduler.order_executor import OrderExecutorMixin
+
+    cfg = _cfg(22.74, capital=42171.81, margin_usage_pct=80)
+    cfg["risk"]["contracts"] = {
+        "fu": {"multiplier": 10, "margin_rate_pct": 22.74},
+        "lh": {"multiplier": 16, "margin_rate_pct": 10},
+    }
+    _write_alert(tmp_path, "leg_margin_missing", "缺保证金比例，lh2703 开仓被拒绝：请先补比例")
+    host = _multi_host(tmp_path, cfg, {"fu2701": 3898.0, "lh2703": 9470.0})
+    OrderExecutorMixin._sync_leg_quota(host, {"fu2701": 3898.0})
+    assert host.sizer.leg_quota == {"fu": 2, "lh": 1}
+    row = last_alert(tmp_path)
+    assert row is not None
+    assert row["code"] == "leg_margin_missing"
+    assert row["recovered"] is True
+
+
+def test_leg_quota_success_writes_no_recovery_without_alert(tmp_path) -> None:
+    """本来就没有告警时，不写多余的恢复行。"""
+    from src.ops.alerts import alerts_path
+    from src.scheduler.order_executor import OrderExecutorMixin
+
+    cfg = _cfg(22.74, capital=42171.81, margin_usage_pct=80)
+    cfg["risk"]["contracts"] = {
+        "fu": {"multiplier": 10, "margin_rate_pct": 22.74},
+        "lh": {"multiplier": 16, "margin_rate_pct": 10},
+    }
+    host = _multi_host(tmp_path, cfg, {"fu2701": 3898.0, "lh2703": 9470.0})
+    OrderExecutorMixin._sync_leg_quota(host, {"fu2701": 3898.0})
+    assert not alerts_path(tmp_path).exists()
+
+
+def test_single_symbol_success_keeps_other_leg_alert(tmp_path) -> None:
+    """只有正文提到本合约的告警才撤；另一条腿的缺比例告警不能被顺手清掉。"""
+    from types import SimpleNamespace
+
+    from src.ops.alerts import last_alert
+    from src.scheduler.order_executor import OrderExecutorMixin
+
+    cfg = _cfg(22.74, capital=42171.81, margin_usage_pct=80)
+    cfg["risk"]["contracts"] = {
+        "fu": {"multiplier": 10, "margin_rate_pct": 22.74},
+        "lh": {"multiplier": 16, "margin_rate_pct": 10},
+    }
+    _write_alert(tmp_path, "leg_margin_missing", "缺保证金比例，fu2701 开仓被拒绝：请先补比例")
+    host = SimpleNamespace(
+        root=tmp_path,
+        cfg=cfg,
+        sizer=PositionSizer(cfg),
+        risk=SimpleNamespace(total_abs_position=lambda: 0, positions={}),
+    )
+    decision = SimpleNamespace(
+        symbol="lh2703", entry_price=9470.0, stop_price=9440.0, meta={}
+    )
+    OrderExecutorMixin._size_open(host, decision)
+    row = last_alert(tmp_path)
+    assert row is not None
+    assert "fu2701" in row["message"]
+    assert not row.get("recovered")
+
+
+def test_leg_quota_recovery_written_once(tmp_path) -> None:
+    """连续多次分配成功只补一条恢复行，不能每笔信号都往告警文件里写。"""
+    from src.ops.alerts import alerts_path
+    from src.scheduler.order_executor import OrderExecutorMixin
+
+    cfg = _cfg(22.74, capital=42171.81, margin_usage_pct=80)
+    cfg["risk"]["contracts"] = {
+        "fu": {"multiplier": 10, "margin_rate_pct": 22.74},
+        "lh": {"multiplier": 16, "margin_rate_pct": 10},
+    }
+    _write_alert(tmp_path, "leg_margin_missing", "缺保证金比例，lh2703 开仓被拒绝：请先补比例")
+    host = _multi_host(tmp_path, cfg, {"fu2701": 3898.0, "lh2703": 9470.0})
+    for _ in range(3):
+        OrderExecutorMixin._sync_leg_quota(host, {"fu2701": 3898.0})
+    text = alerts_path(tmp_path).read_text(encoding="utf-8")
+    assert text.count('"code": "leg_alloc_ok"') == 1

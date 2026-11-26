@@ -24,6 +24,57 @@ from src.trader.ctp_orders import ctp_order
 from src.trader.order_timeline import elapsed_ms, now_iso
 
 
+def _ops_alert(host: Any, code: str, message: str, *, level: str = "warning") -> None:
+    """
+    除日志外，再写一条运行页「最近告警」能看到的事。
+
+    只在常驻对象有 root 时写文件（轻量测试宿主没有 root，不落盘）；
+    写失败只记 debug，绝不反过来影响风控结论。
+    """
+    root = getattr(host, "root", None)
+    if root is None:
+        return
+    try:
+        from src.ops.alerts import emit_alert
+
+        emit_alert(code, message, level=level, root=root)
+    except Exception as exc:  # noqa: BLE001 - 告警是同步旁路，不能影响开仓判断
+        logger.debug("运行页告警写入失败: {}", exc)
+
+
+def _ops_recovery(
+    host: Any,
+    code: str,
+    message: str,
+    *,
+    symbol: str = "",
+) -> None:
+    """
+    条件恢复：补一条 info 恢复行，运行页「最近告警」自动撤掉旧的缺比例/越界告警。
+
+    没有挂着的相关告警时什么都不写；传 symbol 时只清正文提到这条腿的那条，
+    避免把另一条腿还在缺比例的告警一起撤掉。
+    """
+    root = getattr(host, "root", None)
+    if root is None:
+        return
+    try:
+        from src.ops.alerts import active_alert, emit_recovery
+
+        active = active_alert(
+            root,
+            codes=("leg_margin_missing", "leg_alloc_overflow"),
+            run_id=getattr(host, "run_id", None),
+        )
+        if not isinstance(active, dict):
+            return
+        if symbol and symbol not in str(active.get("message") or ""):
+            return
+        emit_recovery(code, message, root=root)
+    except Exception as exc:  # noqa: BLE001 - 恢复记录是同步旁路，不能影响开仓
+        logger.debug("运行页告警恢复写入失败: {}", exc)
+
+
 def order_volume_cap(trader: Any) -> int | None:
     """
     交易对象的单笔最大手数。算仓时就按这个数压，避免到柜台前才被拦成废单。
@@ -447,6 +498,119 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
         return float(self.sizer.multiplier_for(symbol))
 
 
+    def _sync_leg_quota(self, prices: dict[str, float] | None = None) -> None:
+        """
+        多品种挂机时，按当前权益把仓位上限预算分给各条腿。
+
+        口径：每条腿至少保 1 手，剩余额度尽量用满。分配结果只写入
+        sizer.leg_quota 作为每条腿的总手数上限；止损、风险%、单笔上限、
+        柜台可用资金仍由 calc_open 继续取小。单品种模式不启用。
+        """
+        sizer = getattr(self, "sizer", None)
+        if sizer is None:
+            return
+        setter = getattr(sizer, "set_leg_quota", None)
+        key_of = getattr(sizer, "product_key", None)
+        if not callable(setter) or not callable(key_of):
+            return
+        if not getattr(self, "_multi_enabled", False):
+            setter(None)
+            self._leg_quota_key = None
+            return
+        if getattr(sizer, "ignore_margin_cap", False):
+            # 研究/交叉测试关掉了保证金层，这里也不做组合分配，避免两套口径打架。
+            setter(None)
+            self._leg_quota_key = None
+            return
+        symbols = [
+            str(item).strip()
+            for item in (getattr(self, "symbols", None) or [])
+            if str(item).strip()
+        ]
+        wanted = [
+            str(item).strip()
+            for item in (getattr(self, "_multi_symbols", None) or [])
+            if str(item).strip()
+        ]
+        legs = [item for item in symbols if not wanted or item in wanted]
+        if len(legs) < 2:
+            setter(None)
+            self._leg_quota_key = None
+            return
+        need: dict[str, float] = {}
+        missing: list[str] = []
+        for symbol in legs:
+            price = 0.0
+            if prices and symbol in prices:
+                price = float(prices.get(symbol) or 0)
+            if price <= 0:
+                try:
+                    price = float(self.kline.latest_price(symbol) or 0)
+                except Exception:  # noqa: BLE001 - 取不到价格按缺数据处理
+                    price = 0.0
+            lot_margin = sizer.margin_for(symbol, price) if price > 0 else 0.0
+            if price <= 0 or lot_margin <= 0:
+                missing.append(symbol)
+                continue
+            need[symbol] = lot_margin
+        if missing:
+            # 缺价格/保证金比例时不能拿不完整的数据做「占用最大化」分配：
+            # 退回单信号风控，该腿开仓仍会被 calc_open 拒绝并写警告。
+            setter(None)
+            missing_key: tuple[Any, ...] = ("missing", tuple(sorted(missing)))
+            if missing_key != getattr(self, "_leg_quota_key", None):
+                self._leg_quota_key = missing_key
+                message = (
+                    "组合保证金分配跳过："
+                    + "、".join(missing)
+                    + " 缺价格或保证金比例，无法在风控内分额度；"
+                    "该腿开仓会被拒绝，请先在「品种与合约」表补上比例"
+                )
+                logger.warning(message)
+                _ops_alert(self, "leg_margin_missing", message)
+            return
+        if len(need) < 2:
+            setter(None)
+            self._leg_quota_key = None
+            return
+        pct = float(getattr(sizer, "margin_usage_pct", 0.0) or 0.0)
+        budget = float(sizer.capital) if pct <= 0 else float(sizer.capital) * (min(pct, 100.0) / 100.0)
+        from src.risk.leg_alloc import allocate
+
+        plan = allocate(need, budget)
+        if plan.used > plan.budget + 0.01:
+            # 分配绝不能越过仓位上限；真出现也宁可退回单信号风控。
+            setter(None)
+            self._leg_quota_key = ("overflow", round(budget))
+            logger.warning(
+                "组合保证金分配结果越界（占用{:.0f} > 预算{:.0f}），已退回单信号风控",
+                plan.used,
+                plan.budget,
+            )
+            _ops_alert(
+                self,
+                "leg_alloc_overflow",
+                f"组合保证金分配结果越界（占用{plan.used:.0f} > 预算{plan.budget:.0f}），已退回单信号风控",
+                level="error",
+            )
+            return
+        # sizer 按品种键（fu / lh）对齐：同一品种多合约时把额度合起来。
+        quota: dict[str, int] = {}
+        for symbol, lots in plan.lots.items():
+            key = key_of(symbol)
+            quota[key] = quota.get(key, 0) + int(lots)
+        margins: dict[str, float] = {}
+        for symbol, value in need.items():
+            key = key_of(symbol)
+            margins[key] = max(margins.get(key, 0.0), value)
+        setter(quota, margins)
+        plan_key: tuple[Any, ...] = (tuple(sorted(quota.items())), round(budget))
+        if plan_key != getattr(self, "_leg_quota_key", None):
+            self._leg_quota_key = plan_key
+            logger.info("组合保证金分配：{}", plan.summary())
+        # 数据补齐、分配恢复正常：撤掉运行页还挂着的缺比例/越界告警。
+        _ops_recovery(self, "leg_alloc_ok", f"组合保证金分配恢复：{plan.summary()}")
+
     def _size_open(self, decision: StrategyDecision) -> tuple[int, str]:
         """
         开仓手数：先按资金管理算，策略指定的手数只能往下压。
@@ -465,6 +629,11 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
             # 自动模式没有账本也按真实零样本处理，绝不能退回手工全账户统计。
             book = load_book(getattr(self, "root", Path(".")))
             kelly_rows = matched_closes(book) if book is not None else []
+        # 多品种组合分配：每条腿先留好额度，避免先出信号的腿把预算占满。
+        # 用 __new__ 搭的轻量测试对象没有这个方法，按单品种处理。
+        sync_quota = getattr(self, "_sync_leg_quota", None)
+        if callable(sync_quota):
+            sync_quota({decision.symbol: float(decision.entry_price or 0)})
         sized = self.sizer.calc_open(
             decision.symbol,
             decision.entry_price,
@@ -474,6 +643,21 @@ class OrderExecutorMixin(OrderPricingMixin, OrderIntentMixin, FillReconcileMixin
             max_per_order=order_volume_cap(getattr(self, "trader", None)),
             kelly_rows=kelly_rows,
         )
+        if sized.volume <= 0 and "保证金比例" in sized.reason:
+            # 缺保证金比例时单信号算仓会拒开；除日志外再写一条运行页告警。
+            _ops_alert(
+                self,
+                "leg_margin_missing",
+                f"缺保证金比例，{decision.symbol} 开仓被拒绝：请先在「品种与合约」表补上比例",
+            )
+        elif sized.volume > 0 and not getattr(self, "_multi_enabled", False):
+            # 单品种模式没有组合分配那一步，数据补齐后在这里把旧告警撤掉。
+            _ops_recovery(
+                self,
+                "leg_alloc_ok",
+                f"{decision.symbol} 保证金口径已恢复，可以正常算仓",
+                symbol=decision.symbol,
+            )
         raw = meta.get("volume")
         if raw is None:
             vol, note = sized.volume, sized.reason

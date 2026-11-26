@@ -233,18 +233,29 @@ class DashboardMixin:
             except (TypeError, ValueError):
                 now_limit = None
             alert = None
+            alert_tone = T.DANGER
             try:
                 from src.ops.alerts import last_alert
 
-                alert = last_alert(self.root_dir, max_daily_loss=now_limit)
+                # 只看当前这次运行写的告警；别的进程/测试写进同一文件的不显示。
+                alert = last_alert(
+                    self.root_dir,
+                    max_daily_loss=now_limit,
+                    run_id=str(snap.get("run_id") or "") or None,
+                )
             except Exception:  # noqa: BLE001
                 alert = snap.get("last_alert") if running else None
             if isinstance(alert, dict) and alert.get("message"):
-                alert_text = f"最近告警 {alert.get('ts', '')}  {alert.get('message')}"
+                recovered = bool(alert.get("recovered"))
+                suffix = "（已恢复）" if recovered else ""
+                alert_text = f"最近告警 {alert.get('ts', '')}  {alert.get('message')}{suffix}"
+                if recovered:
+                    alert_tone = T.TEXT_DIM
             else:
                 alert_text = ""
         else:
             alert_text = ""
+            alert_tone = T.DANGER
         # 对账结果：跑着看内存快照，没跑看上次落盘的状态文件。
         rec: dict[str, Any] = {}
         unprotected = False
@@ -340,7 +351,7 @@ class DashboardMixin:
             dyn_text = f"{market_text}\n{dyn_text}" if dyn_text else market_text
         if running and snap.get("orders_paused"):
             alert_text = (alert_text + "  " if alert_text else "") + "已暂停开新仓，止损和清仓仍会发"
-        self._show_status_notes(alert_text, health_text, health_tone, dyn_text, rec=rec)
+        self._show_status_notes(alert_text, health_text, health_tone, dyn_text, rec=rec, alert_tone=alert_tone)
         # 跑着：左边停止常驻，右边暂停/恢复报单。没跑：只能点启动。
         if running:
             paused = bool(snap.get("orders_paused"))
@@ -402,6 +413,7 @@ class DashboardMixin:
         health_tone: str,
         dyn_text: str,
         rec: dict[str, Any] | None = None,
+        alert_tone: str = "",
     ) -> None:
         """
         有字才占一行。三句都可能很长，不并成一行，免得挤成看不清的一段。
@@ -416,7 +428,7 @@ class DashboardMixin:
         if box is not None:
             width = max(240, int(box.winfo_width() or 0) - 4) or 900
         rows = (
-            (self.alert_line, (alert_text or "").strip(), T.DANGER),
+            (self.alert_line, (alert_text or "").strip(), alert_tone or T.DANGER),
             (self.health_line, (health_text or "").strip(), health_tone or T.TEXT_DIM),
             (self.dyn_line, (dyn_text or "").strip(), T.TEXT_DIM),
         )

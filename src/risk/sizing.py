@@ -16,6 +16,8 @@
    - 填了保证金比例：每手占用 = 开仓价 × 每手数量 × 比例%
      价格高了同一手要交的钱也变多
    - 有占用数时：floor( (权益 × 仓位上限% − 已占用) ÷ 这一手占用 )
+   - 多品种同时挂机时，先按组合分配给每条腿留额度（每腿至少 1 手，剩余尽量用满）；
+     单品种模式不分，仍是先到先得。分配结果只作为这条腿的上限，不绕过下面这些检查。
    - 没填保证金比例：直接拒绝开仓，提示去品种与合约表补比例。
      表里不再保留「每手保证金」固定金额，避免长期不更新导致占用失真。
    - 研究/交叉测试显式设 ignore_margin_cap 时本层不限制（不需要保证金数据）
@@ -98,6 +100,36 @@ class PositionSizer:
             self.margin_usage_pct = DEFAULT_MARGIN_USAGE_PCT
 
         self.contracts = build_contracts(cfg)
+        # 多品种组合分配：品种 → 这条腿最多几手（含已持有）。None=不启用。
+        # 由下单前按当前权益和价格现算，单品种模式保持原来的先到先得。
+        self.leg_quota: dict[str, int] | None = None
+        # 组合分配时各腿的每手保证金，用来给「已持有的其它腿」估占用。
+        self.leg_lot_margin: dict[str, float] = {}
+
+    def set_leg_quota(
+        self,
+        quota: dict[str, int] | None,
+        lot_margin: dict[str, float] | None = None,
+    ) -> None:
+        """写入组合分配手数上限（品种 → 总手数，含已持）。None/空表示不启用。"""
+        if not quota:
+            self.leg_quota = None
+            self.leg_lot_margin = {}
+            return
+        clean: dict[str, int] = {}
+        for symbol, lots in quota.items():
+            try:
+                clean[str(symbol)] = max(0, int(lots))
+            except (TypeError, ValueError):
+                continue
+        self.leg_quota = clean or None
+        margins: dict[str, float] = {}
+        for symbol, value in (lot_margin or {}).items():
+            try:
+                margins[str(symbol)] = max(0.0, float(value))
+            except (TypeError, ValueError):
+                continue
+        self.leg_lot_margin = margins
 
     def _product_key(self, symbol: str) -> str:
         """
@@ -111,6 +143,10 @@ class PositionSizer:
         if alpha in self.contracts:
             return alpha
         return alpha or s
+
+    def product_key(self, symbol: str) -> str:
+        """品种代码（bu2612 → bu）。组合分配按品种对齐时用。"""
+        return self._product_key(symbol)
 
     def multiplier_for(self, symbol: str) -> float:
         key = self._product_key(symbol)
@@ -351,6 +387,11 @@ class PositionSizer:
                 held_price = entry_price if self._product_key(str(held)) == this_key else None
                 held_margin = self.margin_for(str(held), held_price)
                 if held_margin <= 0:
+                    # 组合分配时存过各腿的每手保证金，按它估，别拿本品种的占用代替。
+                    held_margin = float(
+                        self.leg_lot_margin.get(self._product_key(str(held)), 0.0)
+                    )
+                if held_margin <= 0:
                     held_margin = need
                 used += abs(int(vol)) * held_margin
         else:
@@ -368,6 +409,35 @@ class PositionSizer:
             if avail is not None:
                 remain = min(remain, avail)
                 note = note + f"，柜台可用{avail:.0f}元"
+        quota_left = self._leg_quota_left(symbol, current_abs_position, positions)
+        total_cap = int((self.leg_quota or {}).get(self._product_key(symbol), 0))
+        if quota_left is not None and quota_left <= 0:
+            return 0, need, note + f"，组合分配{total_cap}手已用完"
         if remain < need:
             return 0, need, note
-        return int(remain // need), need, note
+        lots = int(remain // need)
+        if quota_left is not None and quota_left < lots:
+            note = note + f"，组合分配上限{total_cap}手"
+            lots = quota_left
+        return lots, need, note
+
+    def _leg_quota_left(
+        self,
+        symbol: str,
+        current_abs_position: int,
+        positions: dict[str, int] | None,
+    ) -> int | None:
+        """这条腿还能再开几手；没配组合分配（或不在分配表里）返回 None。"""
+        if not self.leg_quota:
+            return None
+        key = self._product_key(symbol)
+        if key not in self.leg_quota:
+            return None
+        held = 0
+        if positions:
+            for held_symbol, volume in positions.items():
+                if self._product_key(str(held_symbol)) == key:
+                    held += abs(int(volume))
+        else:
+            held = abs(int(current_abs_position))
+        return max(0, int(self.leg_quota[key]) - held)

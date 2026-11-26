@@ -69,12 +69,16 @@ from src.utils.trading_day import calendar_coverage_ok, futures_trading_day
 EVENT_LOG_MAX_BYTES = 20 * 1024 * 1024
 
 
-def _safe_last_alert(max_daily_loss: float | None = None) -> dict[str, Any] | None:
+def _safe_last_alert(
+    max_daily_loss: float | None = None,
+    root: Any = None,
+    run_id: str | None = None,
+) -> dict[str, Any] | None:
     """读最近一条告警；文件坏了也不要拖垮运行台刷新。限额对不上现在配置的熔断行会删掉。"""
     try:
         from src.ops.alerts import last_alert
 
-        return last_alert(max_daily_loss=max_daily_loss)
+        return last_alert(root, max_daily_loss=max_daily_loss, run_id=run_id)
     except Exception:  # noqa: BLE001
         return None
 
@@ -270,9 +274,12 @@ class TradingBot(
         # 同进程同秒内建两个实例（测试、脚本）也不会撞号，末尾加 4 位随机。
         self.run_id = f"{datetime.now():%Y%m%d-%H%M%S}-{os.getpid()}-{uuid4().hex[:4]}"
         self.started_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        from src.ops.alerts import set_run_id
+        from src.ops.alerts import set_default_root, set_run_id
 
         set_run_id(self.run_id)
+        # 告警默认写进本实例的数据目录：脚本/测试各跑各的，不能把别的进程的
+        # 「CTP 没连上」「退出时仍有持仓」写进正在使用的实盘 alerts.jsonl。
+        set_default_root(root)
         from src.version import __version__
 
         logger.info(
@@ -554,6 +561,7 @@ class TradingBot(
                 "exit_with_positions",
                 "退出时仍有持仓或挂单，重启后先对账再交易",
                 level="error",
+                root=self.root,
             )
         except Exception:  # noqa: BLE001
             logger.exception("写退出持仓告警失败")
@@ -1989,7 +1997,9 @@ class TradingBot(
             "positions": snapshot_positions(self.strategy),
             "symbols": self.symbols,
             "scan_symbols": list(getattr(self, "scan_symbols", None) or []),
-            "last_alert": _safe_last_alert(self.risk.max_daily_loss),
+            "last_alert": _safe_last_alert(
+                self.risk.max_daily_loss, root=self.root, run_id=self.run_id
+            ),
             "health": getattr(self, "_health_report", None),
             "market_health": {
                 key: dict(value)
@@ -2750,6 +2760,20 @@ class TradingBot(
                 self._clear_unprotected_flag()
                 self._record_event("unprotected_recovered")
                 logger.warning("启动保护恢复：已完成对账与止损评估，恢复报单")
+                try:
+                    from src.ops.alerts import active_alert, emit_recovery
+
+                    pending = active_alert(
+                        self.root, codes=("exit_with_positions",), run_id=self.run_id
+                    )
+                    if pending:
+                        emit_recovery(
+                            "reconcile_ok",
+                            "启动对账完成，已确认没有持仓或挂单",
+                            root=self.root,
+                        )
+                except Exception:  # noqa: BLE001
+                    logger.debug("退出保护告警的恢复记录写入失败")
         self._protective_state = self._protective_status()
         self._maybe_check_health()
         self._persist_state()

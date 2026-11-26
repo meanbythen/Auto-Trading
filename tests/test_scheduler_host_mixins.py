@@ -793,7 +793,9 @@ def test_arm_ctp_book_guard_blocks_and_alerts(monkeypatch, tmp_path: Path) -> No
     assert ok is False
     assert host.logged_in is False
     assert host._ctp_retry_at is not None
-    assert alerts == [(("ctp_book_mismatch", "常驻账本不一致"), {"level": "error"})]
+    assert alerts == [
+        (("ctp_book_mismatch", "常驻账本不一致"), {"level": "error", "root": tmp_path})
+    ]
 
 
 def test_startup_equity_sync_applies_report(monkeypatch, tmp_path: Path) -> None:

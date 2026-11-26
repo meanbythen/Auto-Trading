@@ -666,6 +666,8 @@ class RunTabMixin:
                 "请只保留一个（如 bu2612）或确保盘面合约正确。"
             )
         # 磁盘上保存的是配置页本身。交给机器人的是副本，后面回测改副本不会牵动正在跑的程序。
+        # 启动前强制按账本对一次权益，避免把配置文件里的旧余额写回去。
+        self._pull_signal_balance(force=True)
         save_config(self.cfg)
         self._status = "启动中"
         self._refresh_status_cards()
